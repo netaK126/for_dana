@@ -131,6 +131,11 @@ function get_nn(model_path, model_name, dim, c, dataset)
         stride = 0
         layer_number = 2
         layers_n = 10
+    elseif model_name == "4x10"
+        is_conv = false
+        stride = 0
+        layer_number = 4
+        layers_n = 10
     elseif model_name == "3x10"
         is_conv = false
         stride = 0
@@ -187,6 +192,18 @@ function get_nn(model_path, model_name, dim, c, dataset)
         fc2 = get_matrix_params(dict, "fc2", (layers_n, layers_n))
         fc3 = get_matrix_params(dict, "fc3", (layers_n, c))
         nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ], "nn",)
+    elseif occursin("4x",model_name)
+        dict = Dict{String,Any}(
+            "fc1/weight"=>model_pth[1],"fc1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+            "fc2/weight"=>model_pth[3],"fc2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+            "fc3/weight"=>model_pth[5],"fc3/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+            "fc4/weight"=>model_pth[7],"fc4/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+        # dict = add_random_noise_to_dict!(dict, 0.001)
+        fc1 = get_matrix_params(dict, "fc1", (dim, layers_n))
+        fc2 = get_matrix_params(dict, "fc2", (layers_n, layers_n))
+        fc3 = get_matrix_params(dict, "fc3", (layers_n, layers_n))
+        fc4 = get_matrix_params(dict, "fc4", (layers_n, c))
+        nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ReLU(), fc4, ], "nn",)
     elseif occursin("5x",model_name)
         w,h,k=28,28,1
         is_conv = false
@@ -213,7 +230,7 @@ function get_nn(model_path, model_name, dim, c, dataset)
         fc4 = get_matrix_params(dict, "fc4", (layers_n, c))
         fc5 = get_matrix_params(dict, "fc5", (layers_n, c))
 #         fc3 = get_matrix_params_mod(dict, "fc3", (layers_n, c),weight_addition)
-        nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ReLU(), fc4,ReLU(), fc5,], "nn",)
+        nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ReLU(), fc4, ReLU(), fc5,], "nn",)
     elseif occursin("10x",model_name)
         w,h,k=28,28,1
         is_conv = false
@@ -496,6 +513,11 @@ function get_nn_hyper(model_path, model_name, dim, c, dataset, hypers_dir_path, 
         stride = 0
         layer_number = 2
         layers_n = 10
+    elseif model_name == "4x10"
+        is_conv = false
+        stride = 0
+        layer_number = 4
+        layers_n = 10
     elseif model_name == "3x10"
         is_conv = false
         stride = 0
@@ -564,6 +586,41 @@ function get_nn_hyper(model_path, model_name, dim, c, dataset, hypers_dir_path, 
             nn_second = Sequential( [ Flatten([1, 3, 2, 4]),fc1, deps1In, ReLU(), deps1, fc2, deps2In, ReLU(), deps2, fc3, ], "nn",)
         else
             nn_second = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ], "nn",)
+        end
+    elseif occursin("4x",model_name)
+        dicto = Dict{String,Any}(
+            "fc1/weight"=>model_pth[1],"fc1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+            "fc2/weight"=>model_pth[3],"fc2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+            "fc3/weight"=>model_pth[5],"fc3/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+            "fc4/weight"=>model_pth[7],"fc4/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+            # dicto = add_random_noise_to_dict!(dicto, 0.001)
+        model_pth = myunpickle(hypers_dir_path*"/hypernetwork_min_box.p")
+        dict_min = Dict{String,Any}(
+            "fc1/weight"=>model_pth[1],"fc1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+            "fc2/weight"=>model_pth[3],"fc2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+            "fc3/weight"=>model_pth[5],"fc3/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+            "fc4/weight"=>model_pth[7],"fc4/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+        model_pth = myunpickle(hypers_dir_path*"/hypernetwork_max_box.p")
+        dict_max = Dict{String,Any}(
+            "fc1/weight"=>model_pth[1],"fc1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+            "fc2/weight"=>model_pth[3],"fc2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+            "fc3/weight"=>model_pth[5],"fc3/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+            "fc4/weight"=>model_pth[7],"fc4/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+
+        fc1 = get_hyper_network_params(dict_min, dict_max, "fc1", (dim, layers_n))
+        deps1In = get_hyper_network_deps_paramsIn(dict_min, dict_max, dicto, "fc1", (layers_n, layers_n))
+        deps1 = get_hyper_network_deps_params(dict_min, dict_max, dicto, "fc1", (layers_n, layers_n))
+        fc2 = get_hyper_network_params(dict_min, dict_max, "fc2", (layers_n, layers_n))
+        deps2In = get_hyper_network_deps_paramsIn(dict_min, dict_max, dicto, "fc2", (layers_n, layers_n))
+        deps2 = get_hyper_network_deps_params(dict_min, dict_max, dicto, "fc2", (layers_n, layers_n))
+        fc3 = get_hyper_network_params(dict_min, dict_max, "fc3", (layers_n, c))
+        deps3In = get_hyper_network_deps_paramsIn(dict_min, dict_max, dicto, "fc3", (layers_n, layers_n))
+        deps3 = get_hyper_network_deps_params(dict_min, dict_max, dicto, "fc3", (layers_n, layers_n))
+        fc4 = get_hyper_network_params(dict_min, dict_max, "fc4", (layers_n, c))
+        if is_deps==1
+            nn_second = Sequential( [ Flatten([1, 3, 2, 4]),fc1, deps1In, ReLU(), deps1, fc2, deps2In, ReLU(), deps2, fc3, deps3In, ReLU(), deps3, fc4], "nn",)
+        else
+            nn_second = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ReLU(), fc4], "nn",)
         end
 
     elseif occursin("10x",model_name)

@@ -177,7 +177,7 @@ function parse_numbers_to_Int64(input_str::String)
     return numbers
 end
 
-function update_results_str(results, c_tag, c_target, d)
-    return results*string(c_tag-1)*","*string(c_target-1)*","*string(d[:incumbent_obj])*","*
-        string(d[:best_bound])*","*string(d[:solve_time])*"\n"
+function update_results_str(results, c_tag, d)
+    return results*"c_tag="*string(c_tag-1)*", delta_diff lower bound="*string(round(d[:incumbent_obj],digits=2))*", delta_diff upper bound="*
+        string(round(d[:best_bound],digits=2))*", solve_time="*string(d[:solve_time])*"\n"
 end

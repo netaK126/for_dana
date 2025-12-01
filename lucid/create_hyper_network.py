@@ -53,7 +53,7 @@ def load_hyper_dataset(models_path, dataset, device='cpu'):
     results = []
     return W, w_rel, model, w_indexes, results
 
-def load_dataset_images(models_path, dataset, device='cpu'):
+def load_dataset_images(models_path, dataset, model_hyper_path, device='cpu'):
     print('device:', device)
     mnist_num = 1
     if dataset == "mnist":
@@ -62,19 +62,19 @@ def load_dataset_images(models_path, dataset, device='cpu'):
         trainset = dsets.MNIST(root='./data/', train=True, transform=transform, download=True)
         testset = dsets.MNIST(root='./data/',train=False, transform=transform, download=True)
     N = len(trainset)
-    path = models_path + dataset 
-    model = torch.load(path + str(mnist_num) +'.pth', map_location=torch.device(device))
+    path = models_path #+ dataset 
+    model = torch.load(path+'model.pth', map_location=torch.device(device))
     if os.path.exists(path+'W_all.pth'):
         W = torch.load(path+'W_all.pth')
     else:
         W = (flatten_params(model).unsqueeze(0),)
         for i in [mnist_num]:#range(N):
             print('\r{:5.2f}%'.format(100 * i / N), end='')
-            model = torch.load(path + str(i) + '.pth', map_location=torch.device(device))
+            model = torch.load(path + 'model.pth', map_location=torch.device(device))
             W = W + (flatten_params(model).unsqueeze(0),)
         print('\rdone!')
         W = torch.cat(W, dim=0)
-        torch.save(W, path+'W_all.pth')
+        torch.save(W, model_hyper_path +dataset+'W_all.pth')
     w_rel = W + 0.0
     w_indexes = []
     results = []
@@ -84,7 +84,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Privacy Example',  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('--dataset', type=str, default="mnist", help='Dataset: twitter, crypto, adult, or credit.')
-    parser.add_argument('--models_path', type=str, default="./models/", help='Path of the models.')
+    parser.add_argument('--models_path', type=str, default="/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/", help='Path of the models.')
+    parser.add_argument('--model_hyper_path', type=str, default="/root/Downloads/lucid/models_mnist/", help='Path of the models.')
     parser.add_argument('--models_indexes', type=str, default="all",
                         help='Indexes of models to include in the hypernetowrk. all to include all of them and 1,2,3 to include only first three networks')
 
@@ -92,8 +93,9 @@ if __name__ == '__main__':
     dataset = args.dataset
     models_path = args.models_path
     models_indexes = args.models_indexes
+    model_hyper_path = args.model_hyper_path
     if "mnist" in dataset:
-        W, w_rel, model, w_indexes, results = load_dataset_images(models_path, dataset)
+        W, w_rel, model, w_indexes, results = load_dataset_images(models_path, dataset, model_hyper_path)
     else:
         W, w_rel, model, w_indexes, results = load_hyper_dataset(models_path, dataset)
     print(W.shape)
@@ -116,12 +118,12 @@ if __name__ == '__main__':
     for (i, j) in dmin.items():
         a.append(np.transpose(j.cpu().detach().numpy()))
     for i in a:
-        pickle.dump(a, open(models_path + '/hypernetwork_min_box.p', "wb"))
+        pickle.dump(a, open(model_hyper_path + '/hypernetwork_min_box.p', "wb"))
     a = []
     for (i, j) in dmax.items():
         a.append(np.transpose(j.cpu().detach().numpy()))
     for i in a:
-        pickle.dump(a, open(models_path + '/hypernetwork_max_box.p', "wb"))
+        pickle.dump(a, open(model_hyper_path + '/hypernetwork_max_box.p', "wb"))
 
 
 
