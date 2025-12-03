@@ -7,6 +7,12 @@ function mip_reset()
 end
 
 function mip_set_delta_diff_property!(m, d, c_tag, forcingDelta1ToBePositive_item; M=1e4)
+
+    println(string(d[:v_out_p][c_tag]))
+    println(string(typeof(d[:v_out_p][c_tag])))
+    println(string(d[:v_out][c_tag]))
+    println(string(typeof(d[:v_out][c_tag])))
+    exit()
     
     # setting delta2
     indices = [i for i in 1:10 if i != c_tag] # contains binary variables. if a_delta_p[j]==1 then j=arg {max_{j \ne c_tag}N2(fp(x,eps))[j]}
