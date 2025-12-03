@@ -103,7 +103,7 @@ end
 
 function save_results(results_path, model_name, results_str, type_of_problem,c_tag)
     global separation_index
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_GeminiAlgorithm_CEandKLloss_alphaVal0.1_Tval2_EpochNum0_Network"*"_mnist"*".txt", "w")
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_sameNetworkTestOneLastTime"*"_mnist"*".txt", "w")
     write(file, results_str)
     close(file)
 end
@@ -122,7 +122,7 @@ function main()
     print("image_mode = ")
     println(image_mode)
     global me_th
-    me_th = 0.0#args["me"]
+    me_th = args["me"]
     running_type_list = ["noLucid"]
     dim, c = get_dataset_params( dataset )
     c_tag_list = parse_numbers_to_Int64(args["ctag"])
@@ -130,6 +130,8 @@ function main()
     for c_tag in c_tag_list
         nn,is_conv = get_nn(model_path_nn, model_name, dim, c, dataset)
         nn_hyper = get_nn_hyper(model_path_nn, model_name, dim, c, dataset, hypers_dir_path, is_deps)
+        # nn_hyper, _ = get_nn("/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/model.p", model_name, dim, c, dataset)
+        # nn_hyper = get_nn_hyper("/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/model.p", model_name, dim, c, dataset, hypers_dir_path, is_deps)
 
         for problem_type_str in running_type_list
             global activate_lucid
@@ -137,6 +139,7 @@ function main()
                 activate_lucid=true
             else
                 activate_lucid=false
+                me_th = 0.0
             end
             global all_bounds_of_original
             all_bounds_of_original = []

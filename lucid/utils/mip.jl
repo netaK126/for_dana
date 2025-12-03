@@ -13,7 +13,7 @@ function mip_set_delta_diff_propery(m,d,c_tag)
     @constraint(m, delta2 == d[:v_out_p][c_tag] - max_kk_2)
     a_delta2 = Dict()
     for i in 1:10
-        if i == d[:SourceIndex]
+        if i == c_tag
             continue  # Skip this iteration
         end
         a_delta2[i] = @variable(m, binary = true, base_name = "a$(i)_delta2")
@@ -92,7 +92,7 @@ function mip_set_attr(m, d, timout)
     set_optimizer_attribute(m, "Cutoff", 0)
     set_optimizer_attribute(m, "Threads", 8)
     set_optimizer_attribute(m, "TimeLimit", timout)
-    set_optimizer_attribute(m, "MIPGap", 0.1)
+    set_optimizer_attribute(m, "MIPGap", 0.01)
 end
 
 function mip_log(m, d)
