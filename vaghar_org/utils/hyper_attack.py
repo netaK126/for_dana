@@ -234,6 +234,8 @@ def load_model( model_arch, model_path):
         model = FNN_3_10()
     elif model_arch == "3x50":
         model = FNN_3_50()
+    elif model_arch == "10x10":
+        model = FNN_10_10()
     elif model_arch == "cnn0":
         model = CNN0()
     elif model_arch == "cnn1":

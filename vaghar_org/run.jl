@@ -106,7 +106,7 @@ function main()
     nn = get_nn(model_path, model_name, w, h, k, c, dataset)
     token_signature = string(now().instant.periods.value)
     for c_target in c_targets
-        suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
+        suboptimal_solution, suboptimal_time =  0,0#hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
         optimizer = Gurobi.Optimizer
         d = Dict()
         d[:TargetIndex] = get_target_indexes(c_target, c)
@@ -120,8 +120,8 @@ function main()
         end
         d[:bounds_time] = bounds_time
         m = d[:Model]
-        hyper_attack_hints(m, token_signature, c_tag, c_target)
-        perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
+        # hyper_attack_hints(m, token_signature, c_tag, c_target)
+        # perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
         mip_set_delta_property(m, perturbation, d)
         set_optimizer(m, optimizer)
         mip_set_attr(m, perturbation, d, timout)
@@ -132,7 +132,6 @@ function main()
         results.str = update_results_str(results.str, c_tag, c_target, d)
         println(results_path)
         save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k)
-        exit()
     end
 end
 

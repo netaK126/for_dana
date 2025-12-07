@@ -1,6 +1,40 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+class FNN_10_10(nn.Module):
+    def __init__(self, k=1, w=28, h=28):
+        super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
+        self.flatten1 = nn.Flatten()
+        self.fc1 = nn.Linear(self.k*self.w*self.h, 10)
+        self.fc2 = nn.Linear(10, 10)
+        self.fc3 = nn.Linear(10, 10)
+        self.fc4 = nn.Linear(10, 10)
+        self.fc5 = nn.Linear(10, 10)
+        self.fc6 = nn.Linear(10, 10)
+        self.fc7 = nn.Linear(10, 10)
+        self.fc8 = nn.Linear(10, 10)
+        self.fc9 = nn.Linear(10, 10)
+        self.fc10 = nn.Linear(10, 10)
+        self.m = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.k*self.w*self.h)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = F.relu(self.fc6(x))
+        x = F.relu(self.fc7(x))
+        x = F.relu(self.fc8(x))
+        x = F.relu(self.fc9(x))
+        x = self.fc10(x)
+        return x
+    
+    
 class FNN_3_10(nn.Module):
     def __init__(self, k=1, w=28, h=28):
         super().__init__()

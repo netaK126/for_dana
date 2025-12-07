@@ -87,7 +87,7 @@ function get_perturbation_specific_keys_max(perturbation_size, nn::NeuralNet, in
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_output = v_in |> nn
-    return Dict(:v_in_p => v_in, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
+    return Dict(:v_in_p => v_in, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_output)
 end
 
 #contrast

@@ -56,13 +56,17 @@ function mip_set_delta_diff_propery(m,d,c_tag)
     # else # Min
     #     @objective(m, Min, diff)
     # end
-    @constraint(m, diff >= delta1 - delta2)
-    @constraint(m, diff >= delta2 - delta1)
+    @constraint(m, diff == delta1 - delta2)
+    # @constraint(m, diff >= delta2 - delta1)
     @variable(m, z, Bin)  # z ∈ {0,1}
     M = 1e6  # large constant (big-M method)
 
-    @constraint(m, diff ≤ delta1 - delta2 + M * z)
-    @constraint(m, diff ≤ delta2 - delta1 + M * (1 - z))
+    # @constraint(m, diff ≤ delta1 - delta2 + M * z)
+    # @constraint(m, diff ≤ delta2 - delta1 + M * (1 - z))
+
+    @constraint(m, delta1>=10)
+    @constraint(m, delta2>=10)
+
     @objective(m, Max, diff)
 end
 

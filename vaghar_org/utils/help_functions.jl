@@ -69,7 +69,7 @@ end
 
 function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_)
 
-    file = open(results_path * model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*".txt", "w")
+    file = open(results_path * model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_differentNetworktrained19"*".txt", "w")
     write(file, results_str)
     close(file)
     try

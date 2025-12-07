@@ -103,7 +103,7 @@ end
 
 function save_results(results_path, model_name, results_str, type_of_problem,c_tag)
     global separation_index
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_sameNetworkTestOneLastTime"*"_mnist"*".txt", "w")
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_differentNetworks_EddedSomeContations"*"_mnist"*".txt", "w")
     write(file, results_str)
     close(file)
 end
@@ -139,7 +139,7 @@ function main()
                 activate_lucid=true
             else
                 activate_lucid=false
-                me_th = 0.0
+                me_th = 0
             end
             global all_bounds_of_original
             all_bounds_of_original = []
