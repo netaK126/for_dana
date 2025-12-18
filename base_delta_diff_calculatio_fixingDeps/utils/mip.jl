@@ -34,13 +34,13 @@ function mip_set_delta_diff_property(m, d,delta1_vaghar, c_tag)
     conf2_p = define_conf!(m,d,c_tag, :v_out_p_2, "conf2_p")
     conf1 = define_conf!(m,d,c_tag, :v_out_1, "conf1")
     conf1_p = define_conf!(m,d,c_tag, :v_out_p_1, "conf1_p")
-    
+    margin = 0.001
     # the objective and problem definition
     diff = @variable(m, base_name="diff_obj")
-    @constraint(m, conf1>=delta1_vaghar + 0.001)
+    @constraint(m, conf1>=delta1_vaghar + margin)
     @constraint(m, conf2 - conf1==diff)
     @constraint(m, diff>=0)
-    @constraint(m,-conf2_p+conf1_p<=-0)
+    @constraint(m,conf2_p-conf1_p<=-margin)
 
     @objective(m, Max, diff)
 end
