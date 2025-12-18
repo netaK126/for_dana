@@ -87,7 +87,7 @@ function parse_commandline()
         help = "output dir"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_trying_something/"
+        default = "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_max/"
         "--verbose", "-v"
         help = "Increase verbosity"
         action = :store_true
@@ -122,6 +122,29 @@ function max_number_in_dir(dir_path, splitting_index, c_tag)
     
 end
 
+
+function print_variables_by_base_name!(model, base_name)
+    println("--- Printing variables starting with '$(base_name)' ---")
+
+    # 1. Get all variables from the model
+    all_vars = all_variables(model)
+
+    # 2. Iterate and check the name
+    for v in all_vars
+        var_name = JuMP.name(v)
+        
+        # Check if the variable name starts with the desired base name
+        if startswith(var_name, base_name)
+            # The 'value()' function retrieves the final solution value in JuMP
+            var_value = JuMP.value(v) 
+            println("$(var_name): $(var_value)")
+            return var_value
+        end
+    end
+
+    println("-----------------------------------------------------")
+end
+
 # Example usage:
 function main()
     
@@ -130,28 +153,28 @@ function main()
     model_name = args["model_name"] # the model architecture. it an be 4x10, 3x10 and so on...
     folder_path = args["folder_path"] # a path to a directory/folder with multiple models of the same type (as "model_name")
     files_and_dirs = readdir(folder_path) # getting all the models' paths from folder_path
-    models_path_list= []
+    models_path_list= [args["model_path"]]
 
     # the following code only considers ".p" files (and skips ".pth" files)
-    for item in files_and_dirs
-        full_path = joinpath(folder_path, item)
-        if isfile(full_path)
-            # Perform operations on the file here
-            if endswith(full_path, ".p")
-                if startswith(item,"CONF_alphaVal") # these are models with low accuracy, so there was no point in verifying them here.
-                    continue
-                else
-                    push!(models_path_list,full_path)
-                end
-            end
-        end
-    end
+    # for item in files_and_dirs
+    #     full_path = joinpath(folder_path, item)
+    #     if isfile(full_path)
+    #         # Perform operations on the file here
+    #         if endswith(full_path, ".p")
+    #             if startswith(item,"CONF_alphaVal") # these are models with low accuracy, so there was no point in verifying them here.
+    #                 continue
+    #             else
+    #                 push!(models_path_list,full_path)
+    #             end
+    #         end
+    #     end
+    # end
 
 
     for model_path in models_path_list
         perturbation = args["perturbation"]
-        perturbation_size_list = [0.05,0.1]
-        c_tag_list = [1,2,3,4,5] #args["ctag"]
+        perturbation_size_list = [0.1]#[0.05,0.1]
+        c_tag_list = [1,2,3,4,5,6,7,8,9,10] #args["ctag"]
         c_targets = parse_numbers_to_Int64(args["ct"])
         results_path = args["output_dir"]
         timout = args["timout"]
@@ -173,7 +196,7 @@ function main()
                         print("delta_diff = ")
                         println(max_abs_value)
                         suboptimal_solution, suboptimal_time = 0,0
-                        if perturbation != "max"
+                        if perturbation != "max" && perturbation != "min"
                             println("Applying hyper attack")
                             suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size, max_abs_value)
                         end
@@ -195,7 +218,7 @@ function main()
                         m = d[:Model]
                         println("encoded model")
                         d[:max_abs_value] = Float64(max_abs_value)
-                        if perturbation != "max"
+                        if perturbation != "max" && perturbation != "min"
                             hyper_attack_hints(m, token_signature, c_tag, c_target)
                             println("encoded hints")
                         end
@@ -210,6 +233,7 @@ function main()
                         MOI.set(m, Gurobi.CallbackFunction(), my_callback)
                         optimize!(m)
                         mip_log(m, d)
+                        
                         try
                             results.str = update_results_str(results.str, c_tag, c_target, d)
                         catch  e

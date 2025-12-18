@@ -67,9 +67,9 @@ function read_best_val_via_optimization(ss, tt, token_signature)
     return value
 end
 
-function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_)
+function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_,name_to_save,token_signature)
 
-    file = open(results_path * model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_differentNetworktrained19"*".txt", "w")
+    file = open(results_path * token_signature*"_"*model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_"*name_to_save*".txt", "w")
     write(file, results_str)
     close(file)
     try

@@ -77,7 +77,7 @@ function parse_commandline()
         help = "target classes"
         arg_type = String
         required = false
-        default = "2,3,4,5,6,7,8,9,10"
+        default = "2"
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
@@ -86,6 +86,11 @@ function parse_commandline()
         "--verbose", "-v"
         help = "Increase verbosity"
         action = :store_true
+        "--name_to_save"
+        help = "string for results name file"
+        arg_type = String
+        required = false
+        default = ""
     end
     return parse_args(s)
 end
@@ -97,6 +102,7 @@ function main()
     model_path = args["model_path"] # a path to a directory/folder with multiple models of the same type (as "model_name")
     model_name = args["model_name"]
     perturbation = args["perturbation"]
+    name_to_save = args["name_to_save"]
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     c_tag = args["ctag"]
     c_targets = parse_numbers_to_Int64(args["ct"])
@@ -131,7 +137,7 @@ function main()
         mip_reuse_bounds()
         results.str = update_results_str(results.str, c_tag, c_target, d)
         println(results_path)
-        save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k)
+        save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save,token_signature)
     end
 end
 

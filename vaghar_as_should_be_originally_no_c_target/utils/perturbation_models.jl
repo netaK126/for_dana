@@ -25,7 +25,7 @@ function get_model(w_, h_, k_,
         return merge(d_common, get_perturbation_specific_keys_brightness(perturbation_size,nn, input, m))
     elseif perturbation == "linf"
         return merge(d_common, get_perturbation_specific_keys_linf(perturbation_size,nn, input, m))
-    elseif perturbation == "max"
+    elseif perturbation == "max" || perturbation == "min"
         return merge(d_common, get_perturbation_specific_keys_max(perturbation_size,nn, input, m))
     elseif perturbation == "contrast"
         return merge(d_common, get_perturbation_specific_keys_contrast(perturbation_size,nn, input, m))

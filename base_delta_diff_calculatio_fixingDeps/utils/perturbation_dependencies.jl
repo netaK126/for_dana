@@ -70,7 +70,7 @@ function layers_number(nn)
     return cnt
 end
 
-function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt)
+function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt, activation_function_num)
     if (perturbation == "brightness") & (activation_cnt == 1)
         b = perturbation_size[1]
         ls =deepcopy(layer)
@@ -88,9 +88,9 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
         end
         for n in 1:size(phi_dep_c)[1]
             dep = phi_dep_c[n]
-            layers_info_dict[activation_cnt,n]
-            if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
+            if haskey(layers_info_dict,(activation_cnt+activation_function_num*layers_n,n)) && haskey(layers_info_dict,(activation_cnt+(activation_function_num+1)*layers_n,n))
                 if (dep == NaN)
+                    println("constraint NAN")
                     @constraint(m,av[ind_o+1]==(1+av[1])*av[ind_p+1])
                     @constraint(m,av[ind_o+2]==av[ind_p+2])
                 end
@@ -103,7 +103,7 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
     return phi_dep
 end
 
-function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_tolerance = 1e-4)
+function encode_dependencies(m, layers_n, phi_dep, activation_cnt,activation_function_num, non_equality_tolerance = 1e-4)
     av = JuMP.all_variables(m)
     if length(size(phi_dep)) == 4
         phi_dep_c = phi_dep |> Flatten([1, 2, 3, 4])
@@ -112,10 +112,9 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
     end
     for n in 1:size(phi_dep_c)[1]
         dep = phi_dep_c[n]
-        # layers_info_dict[activation_cnt,n]
-        if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
-            u_o, l_o, ind_o = layers_info_dict[activation_cnt,n]
-            u_p, l_p, ind_p = layers_info_dict[activation_cnt+layers_n,n]
+        if haskey(layers_info_dict,(activation_cnt+activation_function_num*layers_n,n)) && haskey(layers_info_dict,(activation_cnt+(activation_function_num+1)*layers_n,n))
+            u_o, l_o, ind_o = layers_info_dict[activation_cnt+activation_function_num*layers_n,n]
+            u_p, l_p, ind_p = layers_info_dict[activation_cnt+(activation_function_num+1)*layers_n,n]
             if dep == 0
 		        println("dep 0 adds" * str(av[ind_o+1]) *" " * str(av[ind_p+1] ))
                 @constraint(m,av[ind_o+1]==av[ind_p+1])
@@ -182,22 +181,20 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
     return phi_dep
 end
 
-function perturbation_dependencies(m, nn, w, h, k)
+function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k, activation_function_num)
     layers_n = layers_number(nn)
     phi_dep = fill(NaN, (1, w, h, k))
+    perturbation_init_deps(phi_dep, perturbation, perturbation_size)
     activation_cnt = 1
     println("Encoding dependencies...")
     for l in nn.layers
-        println("here1")
         if occursin("Flatten", string(typeof(l)))
-            println("Flatten")
             phi_dep = phi_dep |> l
         elseif occursin("Linear", string(typeof(l))) || occursin("Conv", string(typeof(l)))
-            println("Linear")
-            phi_dep = dep_propagation(l, phi_dep)
+            phi_dep_l = dep_propagation(l, phi_dep)
+            phi_dep = dep_additional(m, layers_n, l, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt, activation_function_num)
         elseif occursin("ReLU", string(typeof(l)))
-            println("ReLU")
-            phi_dep = encode_dependencies(m, layers_n, phi_dep, activation_cnt)
+            phi_dep = encode_dependencies(m, layers_n, phi_dep, activation_cnt, activation_function_num)
             push!(reuse_bounds_conf.reusable_deps,phi_dep)
             if all(isnan, phi_dep)
                 break
@@ -206,3 +203,4 @@ function perturbation_dependencies(m, nn, w, h, k)
         end
     end
 end
+

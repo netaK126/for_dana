@@ -7,7 +7,7 @@ function mip_reset()
 end
 
 function mip_set_delta_property(m, perturbation, d,c_tag)
-    if perturbation != "max"
+    if perturbation != "max" && perturbation != "min"
         # in that case, we should encode delta_p
         max_num = 1e6 # Big number
         delta_p = @variable(m, base_name="delta_p")
@@ -34,10 +34,19 @@ function mip_set_delta_property(m, perturbation, d,c_tag)
 
     # encoding delta
     (maximum_target_var, nontarget_vars) = get_vars_for_max_index(d[:v_out], d[:SourceIndex])
-    maximum_nontarget_var = maximum_ge(nontarget_vars)
-    delta = @variable(m)
+    if  perturbation == "min"
+        maximum_nontarget_var = maximum_ge_2(nontarget_vars)
+    else
+        maximum_nontarget_var = maximum_ge(nontarget_vars)
+    end
+    delta = @variable(m, base_name = "delta_vaghar")
     @constraint(m, delta == maximum_target_var - maximum_nontarget_var)
-    @objective(m, Max, delta)
+
+    if  perturbation == "min"
+        @objective(m, Min, delta)
+    else
+        @objective(m, Max, delta)
+    end
 end
 
 function mip_set_attr(m, perturbation, d, timout)

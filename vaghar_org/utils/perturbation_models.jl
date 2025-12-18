@@ -84,6 +84,7 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
 end
 
 function get_perturbation_specific_keys_max(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+    println("HERE")
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_output = v_in |> nn

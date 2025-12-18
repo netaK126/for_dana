@@ -68,7 +68,7 @@ function read_best_val_via_optimization(ss, tt, token_signature)
 end
 
 function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_,c_tag,model_name_in_path)
-    file = open(results_path * model_name * "_" * model_name_in_path * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_NoCtarget_"*"RegularVaghar"*"_TesingNewcode"*".txt", "w")
+    file = open(results_path * model_name * "_" * model_name_in_path * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_NoCtarget_"*"RegularVaghar"*"_Itr17"*".txt", "w")
     write(file, results_str)
     close(file)
     try

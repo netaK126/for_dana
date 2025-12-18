@@ -14,6 +14,21 @@ function get_nn(model_path, model_name, w, h, k, c, dataset)
         fc2 = get_matrix_params(dict, "fc2", (layers_n, layers_n))
         fc3 = get_matrix_params(dict, "fc3", (layers_n, c))
         nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ], "nn",)
+    elseif model_name == "4x10"
+        is_conv = false
+        stride = 0
+        layer_number = 4
+        layers_n = 10
+        model_pth = myunpickle(model_path)
+        dict = Dict{String,Any}( "fc1/weight"=>model_pth[1],"fc1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+            "fc2/weight"=>model_pth[3],"fc2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+            "fc3/weight"=>model_pth[5],"fc3/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+            "fc4/weight"=>model_pth[7],"fc4/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+        fc1 = get_matrix_params(dict, "fc1", (w*h*k, layers_n))
+        fc2 = get_matrix_params(dict, "fc2", (layers_n, layers_n))
+        fc3 = get_matrix_params(dict, "fc3", (layers_n, layers_n))
+        fc4 = get_matrix_params(dict, "fc4", (layers_n, c))
+        nn = Sequential( [ Flatten([1, 3, 2, 4]),fc1, ReLU(), fc2, ReLU(), fc3, ReLU(), fc4 ], "nn",)
     elseif model_name == "10x10"
         is_conv = false
         stride = 0

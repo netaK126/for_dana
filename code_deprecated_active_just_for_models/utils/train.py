@@ -22,7 +22,7 @@ def save_model(model, itr,output):
     for i in a:
         print(i.shape)
     model_name = "model"
-    model_path = "./"+output+"/"+str(itr)+"/"
+    model_path = output+"/"+str(itr)+"/"
     os.system("mkdir " + model_path)
     pickle.dump(a, open(model_path + model_name + ".p", "wb"))
     torch.save(model.state_dict(), model_path + model_name + '.pth')
@@ -31,11 +31,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--batch_size', type=int, default=128, help='batch size')
-    parser.add_argument('--model', type=str, default="cnn0", help='3x10, 3x50,3x100,3x50 cnn1, cnn2 or cnn3')
+    parser.add_argument('--model', type=str, default="4x10", help='3x10, 3x50,3x100,3x50 cnn1, cnn2 or cnn3')
     parser.add_argument('--output_dir', type=str, default="./model/", help='output directory')
     parser.add_argument('--epochs', type=int, default=20, help='number of epochs')
     parser.add_argument('--loss', type=str, default="Cross", help='Cross, MSE, or L1')
-    parser.add_argument('--optimizer', type=str, default="Adam", help='Adam, or SGD')
+    parser.add_argument('--optimizer', type=str, default="SGD", help='Adam, or SGD')
     args = parser.parse_args()
 
     batch_size = args.batch_size
@@ -126,5 +126,5 @@ if __name__ == '__main__':
                 total += labels.size(0)
                 correct += (predicted == labels.to(device)).sum()
             print('Test accuracy: %.2f %%' % (100 * float(correct) / total))
-
-        save_model(model, epoch, output_dir)
+            if (100 * float(correct) / total)>=90 and epoch<19:
+                save_model(model, epoch, output_dir)

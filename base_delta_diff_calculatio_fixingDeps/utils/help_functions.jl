@@ -69,7 +69,7 @@ end
 
 function save_results(results_path, model_name, results_str, d, nn, ss, tt, w_, h_, k_, model_name_in_path)
 
-    file = open(results_path * model_name * "_" * model_name_in_path * ".txt", "w")
+    file = open(results_path * model_name * "_" * model_name_in_path, "w")
     write(file, results_str)
     close(file)
     try

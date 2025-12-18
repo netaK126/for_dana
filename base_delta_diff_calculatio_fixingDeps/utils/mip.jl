@@ -6,79 +6,42 @@ function mip_reset()
     first_mip_solution.time = 0.0
 end
 
-function mip_set_delta_diff_property!(m, d, c_tag, forcingDelta1ToBePositive_item, direction, c_t)
-
-
-    @variable(m, delta1)
-    @constraint(m, delta1 == d[:v_out][c_tag] - d[:v_out][c_t])
-    @variable(m, delta2)
-    @constraint(m, delta2 == d[:v_out_p][c_tag] - d[:v_out_p][c_t])
-
-    @objective(m, Max, (delta1-delta2)*direction+(delta2-delta1)*(1-direction))
-
-    return (delta1=delta1, delta2=delta2, max_kk_1=max_kk_1, max_kk_2=max_kk_2,
-            a_delta1=a_delta1, a_delta2=a_delta2, diff=diff)
+function define_conf!(m, d, c_tag, key, name)
+    max_num = 1e6 # Big number
+    conf = @variable(m, base_name=name)
+    max_kk = @variable(m)
+    @constraint(m, conf == d[key][c_tag] - max_kk)
+    a_conf = Dict()
+    for i in 1:10
+        if i == c_tag
+            continue  # Skip this iteration
+        end
+        a_conf[i] = @variable(m, binary = true)
+    end
+    @constraint(m, sum(a_conf[i] for i in keys(a_conf)) == 1)
+    for i in 1:10
+        if i == c_tag
+            continue  # Skip this iteration
+        end
+        @constraint(m, max_kk >= d[key][i])
+        @constraint(m, max_kk <= d[key][i]+max_num*(1-a_conf[i]))
+    end
+    return conf
 end
 
-function mip_set_delta_diff_propery(m,perturbation, d,c_tag)
-    max_num = 1e6 # Big number
-    delta2 = @variable(m, base_name="delta2")
-    @variable(m, max_kk_2)
-    @constraint(m, delta2 == d[:v_out_p][c_tag] - max_kk_2)
-    a_delta2 = Dict()
-    for i in 1:10
-        if i == c_tag
-            continue  # Skip this iteration
-        end
-        a_delta2[i] = @variable(m, binary = true, base_name = "a$(i)_delta2")
-    end
-    # Add constraint: exactly one variable equals 1
-    @constraint(m, sum(a_delta2[i] for i in keys(a_delta2)) == 1)
-    for i in 1:10
-        if i == c_tag
-            continue  # Skip this iteration
-        end
-        @constraint(m, max_kk_2 >= d[:v_out_p][i])
-        @constraint(m, max_kk_2 <= d[:v_out_p][i]+max_num*(1-a_delta2[i]))
-    end
+function mip_set_delta_diff_property(m, d,delta1_vaghar, c_tag)
+    conf2 = define_conf!(m,d,c_tag, :v_out_2, "conf2")
+    conf2_p = define_conf!(m,d,c_tag, :v_out_p_2, "conf2_p")
+    conf1 = define_conf!(m,d,c_tag, :v_out_1, "conf1")
+    conf1_p = define_conf!(m,d,c_tag, :v_out_p_1, "conf1_p")
     
-
-    delta1 = @variable(m, base_name="delta1")
-    @variable(m, max_kk_1)
-    @constraint(m, delta1 == d[:v_out][c_tag] - max_kk_1)
-    a_delta1 = Dict()
-    for i in 1:10
-        if i == c_tag
-            continue  # Skip this iteration
-        end
-        a_delta1[i] = @variable(m, binary = true, base_name = "a$(i)_delta1")
-    end
-    # Add constraint: exactly one variable equals 1
-    @constraint(m, sum(a_delta1[i] for i in keys(a_delta1)) == 1)
-    for i in 1:10
-        if i == c_tag
-            continue  # Skip this iteration
-        end
-        @constraint(m, max_kk_1 >= d[:v_out][i])
-        @constraint(m, max_kk_1 <= d[:v_out][i]+max_num*(1-a_delta1[i]))
-    end
-
+    # the objective and problem definition
     diff = @variable(m, base_name="diff_obj")
-    # @constraint(m, diff == delta1 - delta2)
-    # if occursin("Max",problem_type_str)
-    #     @objective(m, Max, diff)
-    # else # Min
-    #     @objective(m, Min, diff)
-    # end
-    # @constraint(m, diff >= delta1 - delta2)
-    # @constraint(m, diff >= delta2 - delta1)
-    @variable(m, z, Bin)  # z ∈ {0,1}
-    M = 1e6  # large constant (big-M method)
+    @constraint(m, conf1>=delta1_vaghar + 0.001)
+    @constraint(m, conf2 - conf1==diff)
+    @constraint(m, diff>=0)
+    @constraint(m,-conf2_p+conf1_p<=-0)
 
-    @constraint(m, diff <= delta1 - delta2 + M * z)
-    @constraint(m, diff <= delta2 - delta1 + M * (1 - z))
-    @constraint(m, diff >= delta1 - delta2)
-    @constraint(m, diff >= delta2 - delta1)
     @objective(m, Max, diff)
 end
 
@@ -91,6 +54,10 @@ function mip_set_attr(m, perturbation, d, timout)
     set_optimizer_attribute(m, "Threads", 32)
     set_optimizer_attribute(m, "TimeLimit", timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)
+
+    # To prioritize finding a feasible solution quickly
+    # set_optimizer_attribute(m, "MIPFocus", 1) 
+    # set_optimizer_attribute(m, "Heuristics", 0.5) 
 end
 
 function mip_log(m, d)
