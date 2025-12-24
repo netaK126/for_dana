@@ -145,7 +145,6 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
         parsed_tokens = Base.split(requested_line, ',')
         println("vaghar_solve_time")
         println(string(parse(Float64, parsed_tokens[end])))
-        exit()
         return parse(Float64, parsed_tokens[end-1])
     end
 end
@@ -200,7 +199,6 @@ function main()
             delta1_vaghar = get_delta1_vaghar(model_path_vaghar_results, c_tag)
             println("delta1_vaghar")
             println(string(delta1_vaghar))
-            exit()
             suboptimal_solution, suboptimal_time =  0,0
             optimizer = Gurobi.Optimizer
             d = Dict()

@@ -52,17 +52,17 @@ function parse_commandline()
         help = "model name"
         arg_type = String
         required = false
-        default = "./models/3x10/model.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
         "--perturbation", "-p"
         help = "perturbation type: occ, patch, brightness, linf, contrast, translation, rotation, or max"
         arg_type = String
         required = false
-        default = "brightness"
+        default = "linf"
         "--perturbation_size", "-s"
         help = "occ: i,j,width , patch: eps,i,j,width, brightness: eps, linf: eps, contrast: eps, translation: tx,ty, rotation: angle"
         arg_type = String
         required = false
-        default = "0.1"
+        default = "0.05"
         "--ctag", "-c"
         help = "ctag, source class"
         arg_type = Int
@@ -77,7 +77,7 @@ function parse_commandline()
         help = "target classes"
         arg_type = String
         required = false
-        default = "2"
+        default = "2,3,4,5,6,7,8,9"
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
@@ -90,7 +90,7 @@ function parse_commandline()
         help = "string for results name file"
         arg_type = String
         required = false
-        default = ""
+        default = "itr18"
     end
     return parse_args(s)
 end

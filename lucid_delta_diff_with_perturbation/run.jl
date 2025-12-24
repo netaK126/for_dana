@@ -52,22 +52,22 @@ function parse_commandline()
         help = "model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/model.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
         "--hypers_dir_path"
         help = "hypers model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid/models_mnist/"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/"
         "--ctag", "-c" 
         help = "ctag, source class"
         arg_type = String
         required = false
-        default = "1,2,3,4,5,6,7,8,9,10"
+        default = "1"
         "--ct", "-t"
         help = "target classes"
         arg_type = String
         required = false
-        default = "2"
+        default = "1,2,3,4,5,6,7,8,9,10"
         "--timout"
         help = "MIP timeout"
         arg_type = Int
@@ -77,7 +77,7 @@ function parse_commandline()
         help = "output dir"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid/results/"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/results/"
         "--deps"
         help = "is deps"
         arg_type = Int
@@ -96,23 +96,64 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
-
+        "--perturbation", "-p" #not needed
+        help = "perturbation type: occ, patch, brightness, linf, contrast, translation, rotation, or max"
+        arg_type = String
+        required = false
+        default = "linf"
+        "--perturbation_size", "-s" #not needed
+        help = "occ: i,j,width , patch: eps,i,j,width, brightness: eps, linf: eps, contrast: eps, translation: tx,ty, rotation: angle"
+        arg_type = String
+        required = false
+        default = "0.05"
+        "--model_path_vaghar_results"
+        help = "model_path_vaghar_results"
+        arg_type = String
+        required = false
+        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"
+        
     end
     return parse_args(s)
 end
 
-function save_results(results_path, model_name, results_str, type_of_problem,c_tag)
+function save_results_neta(results_path, model_name, results_str, type_of_problem,c_tag)
     global separation_index
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_differentNetworks_EddedSomeContations"*"_mnist"*".txt", "w")
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and18_cTargetVersion"*".txt", "w")
     write(file, results_str)
     close(file)
 end
 
+function get_delta1_vaghar(model_path_vaghar_results, line_index)
+    open(model_path_vaghar_results, "r") do io
+        current_line_number = 0
+        requested_line = ""
+        while !eof(io)
+            current_line_number += 1
+            line_content = readline(io)
+            c_target = Base.split(line_content, ',')[2]
+            if c_target == string(line_index)
+                requested_line = line_content
+            end
+        end
+        if requested_line==""
+            println("Error with requested_line")
+            exit()
+        end
+        parsed_tokens = Base.split(requested_line, ',')
+        return parse(Float64, parsed_tokens[end-1])
+    end
+end
+
 function main()
+    # 18 is hyper nn
+    # 17 is regular nn
     args = parse_commandline()
     dataset = args["dataset"]
     model_name = args["model_name"]
     model_path_nn = args["model_path"]
+    perturbation = args["perturbation"]
+    perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
+    model_path_vaghar_results = args["model_path_vaghar_results"]
     hypers_dir_path = args["hypers_dir_path"]
     c_targets = parse_numbers_to_Int64(args["ct"])
     results_path = args["output_dir"]
@@ -128,65 +169,51 @@ function main()
     c_tag_list = parse_numbers_to_Int64(args["ctag"])
     results.str = ""
     for c_tag in c_tag_list
-        nn,is_conv = get_nn(model_path_nn, model_name, dim, c, dataset)
-        nn_hyper = get_nn_hyper(model_path_nn, model_name, dim, c, dataset, hypers_dir_path, is_deps)
-        # nn_hyper, _ = get_nn("/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/model.p", model_name, dim, c, dataset)
-        # nn_hyper = get_nn_hyper("/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/model.p", model_name, dim, c, dataset, hypers_dir_path, is_deps)
-
-        for problem_type_str in running_type_list
-            global activate_lucid
-            if occursin("with",problem_type_str)
-                activate_lucid=true
-            else
-                activate_lucid=false
-                me_th = 0
+        for c_target in c_targets
+            if c_target==c_tag
+                continue
             end
-            global all_bounds_of_original
-            all_bounds_of_original = []
-            optimizer = Gurobi.Optimizer
-            d= Dict()
-            d[:SourceIndex] = get_target_indexes(c_tag, c)
-            mip_reset()
-            println("Run: computing bounds.")
-            dummy_input = zeros(Float64, 1,1,1,dim)
-            bounds_time = @elapsed begin
-                merge!(d, get_model(nn, nn_hyper, dummy_input, optimizer,
-                get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
+            delta1_vaghar = get_delta1_vaghar(model_path_vaghar_results, c_target)
+            println("delta1_vaghar")
+            println(string(delta1_vaghar))
+            nn,is_conv = get_nn(model_path_nn, model_name, dim, c, dataset)
+            nn_hyper = get_nn_hyper(model_path_nn, model_name, dim, c, dataset, hypers_dir_path, is_deps)
+            for problem_type_str in running_type_list
+                if !occursin("with",problem_type_str)
+                    me_th = 0
+                end
+                global all_bounds_of_original
+                global all_bounds_of_perturbation
+                all_bounds_of_original = []
+                all_bounds_of_perturbation = []
+                optimizer = Gurobi.Optimizer
+                d= Dict()
+                d[:SourceIndex] = get_target_indexes(c_tag, c)
+                mip_reset()
+                println("Run: computing bounds.")
+                dummy_input = zeros(Float64, 1,1,1,dim)
+                bounds_time = @elapsed begin
+                    merge!(d, get_model(perturbation, perturbation_size,nn, nn_hyper, dummy_input, optimizer,
+                    get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
+                end
+                d[:bounds_time] = bounds_time
+                m = d[:Model]
+
+                # mip_set_delta_diff_propery(m, d, c_tag)
+                mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target)
+                set_optimizer(m, optimizer)
+                mip_set_attr(m, d, timout)
+                MOI.set(m, Gurobi.CallbackFunction(), my_callback)
+                println("Run: optimize.")
+                optimize!(m)
+                mip_log(m, d)
+                results.str = update_results_str(results.str, c_tag, d, c_target)
+
+                global network_version
+                global diff_
+                diff_  = []
+                save_results_neta(results_path, model_name, results.str, problem_type_str*"_",c_tag)
             end
-            d[:bounds_time] = bounds_time
-            m = d[:Model]
-            # println(I_z_prev_up)
-            # println(I_z_prev_down)
-            # diff_max_upper_bound = I_z_prev_up[c_target] - maximum(I_z_prev_down[[i for i in eachindex(I_z_prev_up) if i != c_target]])
-            # diff_max_lower_bound = I_z_prev_down[c_target] - maximum(I_z_prev_up[[i for i in eachindex(I_z_prev_up) if i != c_target]])
-            # println(diff_max_upper_bound)
-            # println(diff_max_lower_bound)
-
-            mip_set_delta_diff_propery(m, d, c_tag)
-            set_optimizer(m, optimizer)
-            mip_set_attr(m, d, timout)
-            MOI.set(m, Gurobi.CallbackFunction(), my_callback)
-            println("Run: optimize.")
-            optimize!(m)
-            mip_log(m, d)
-            results.str = update_results_str(results.str, c_tag, d)
-
-            global network_version
-            global upper_bound_prev
-            global lower_bound_prev
-            global u_for_spread
-            global l_for_spread
-            global diff_
-            global I_u
-            global I_l
-            upper_bound_prev = []
-            lower_bound_prev = []
-            u_for_spread = []
-            l_for_spread = []
-            diff_  = []
-            I_u = []
-            I_l = []
-            save_results(results_path, model_name, results.str, problem_type_str*"_",c_tag)
         end
     end
     println("---------------------------")

@@ -63,14 +63,14 @@ def load_dataset_images(models_path, dataset, model_hyper_path, device='cpu'):
         testset = dsets.MNIST(root='./data/',train=False, transform=transform, download=True)
     N = len(trainset)
     path = models_path #+ dataset 
-    model = torch.load(path+'model.pth', map_location=torch.device(device))
+    model = torch.load(path+'model_itr18.pth', map_location=torch.device(device))
     if os.path.exists(path+'W_all.pth'):
         W = torch.load(path+'W_all.pth')
     else:
         W = (flatten_params(model).unsqueeze(0),)
         for i in [mnist_num]:#range(N):
             print('\r{:5.2f}%'.format(100 * i / N), end='')
-            model = torch.load(path + 'model.pth', map_location=torch.device(device))
+            model = torch.load(path + 'model_itr18.pth', map_location=torch.device(device))
             W = W + (flatten_params(model).unsqueeze(0),)
         print('\rdone!')
         W = torch.cat(W, dim=0)
@@ -84,8 +84,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Privacy Example',  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('--dataset', type=str, default="mnist", help='Dataset: twitter, crypto, adult, or credit.')
-    parser.add_argument('--models_path', type=str, default="/root/Downloads/code_deprecated_active_just_for_models/models/4x10/19/", help='Path of the models.')
-    parser.add_argument('--model_hyper_path', type=str, default="/root/Downloads/lucid/models_mnist/", help='Path of the models.')
+    parser.add_argument('--models_path', type=str, default="/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/", help='Path of the models.')
+    parser.add_argument('--model_hyper_path', type=str, default="/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/", help='Path of the models.')
     parser.add_argument('--models_indexes', type=str, default="all",
                         help='Indexes of models to include in the hypernetowrk. all to include all of them and 1,2,3 to include only first three networks')
 

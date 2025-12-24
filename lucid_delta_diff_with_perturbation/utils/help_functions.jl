@@ -1,22 +1,16 @@
 global network_version
-global upper_bound_prev
-global lower_bound_prev
-global u_for_spread
-global l_for_spread
 global me_th
 global diff_ = []
-global I_u = []
-global I_l = []
 global all_bounds_of_original = []
+global all_bounds_of_perturbation = []
 global I_z_prev_up = []
 global I_z_prev_down = []
-global activate_lucid = false
+global I_z_prev_up_perturbation = []
+global I_z_prev_down_perturbation = []
 global suffix_input_nn
 global suffix_input_hyper_nn
-global preffix_or_suffix = "preffix"
+global input_type = "regular" # it can also be "perturbation"
 global first_layer_suffix = true
-global preffix_last_seen_z_up = ""
-global preffix_last_seen_z_down = ""
 
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
@@ -177,7 +171,7 @@ function parse_numbers_to_Int64(input_str::String)
     return numbers
 end
 
-function update_results_str(results, c_tag, d)
-    return results*"c_tag="*string(c_tag-1)*", delta_diff lower bound="*string(round(d[:incumbent_obj],digits=2))*", delta_diff upper bound="*
+function update_results_str(results, c_tag, d, c_target)
+    return results*"c_tag="*string(c_tag-1)*", c_target="*string(c_target-1)*", delta_diff lower bound="*string(round(d[:incumbent_obj],digits=2))*", delta_diff upper bound="*
         string(round(d[:best_bound],digits=2))*", solve_time="*string(d[:solve_time])*"\n"
 end

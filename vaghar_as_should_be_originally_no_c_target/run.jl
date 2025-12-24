@@ -62,7 +62,7 @@ function parse_commandline()
         help = "occ: i,j,width , patch: eps,i,j,width, brightness: eps, linf: eps, contrast: eps, translation: tx,ty, rotation: angle"
         arg_type = String
         required = false
-        default = "0.1"
+        default = "0.05"
         "--ctag", "-c"
         help = "ctag, source class"
         arg_type = Int
@@ -173,7 +173,7 @@ function main()
 
     for model_path in models_path_list
         perturbation = args["perturbation"]
-        perturbation_size_list = [0.1]#[0.05,0.1]
+        perturbation_size_list = [0.05]#[0.05,0.1]
         c_tag_list = [1,2,3,4,5,6,7,8,9,10] #args["ctag"]
         c_targets = parse_numbers_to_Int64(args["ct"])
         results_path = args["output_dir"]
