@@ -94,18 +94,24 @@ function define_conf!(m, d, c_tag, key, name)
 end
 
 
-function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target)
+function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target,c_target_version)
     conf1 = define_conf!(m,d,c_tag, :v_out_hyper, "conf1")
     conf1_p = define_conf!(m,d,c_tag, :v_out_hyper_perturbation, "conf1_p")
     conf2 = define_conf!(m,d,c_target, :v_out_nn, "conf2")
     conf2_p = define_conf!(m,d,c_target, :v_out_nn_perturbation, "conf2_p")
-    margin = 0
+    margin = 0.01
     # the objective and problem definition
+    # delta1_vaghar = 0
     diff = @variable(m, base_name="diff_obj")
     @constraint(m, conf1>=delta1_vaghar + margin)
     @constraint(m, conf2 - conf1==diff)
     @constraint(m, diff>=0)
-    @constraint(m,conf2_p-conf1_p<=-margin)
+    if c_target_version
+        @constraint(m,conf2_p-conf1_p>=margin)
+        # @constraint(m,conf2_p-conf1_p<=-margin)
+    else
+        @constraint(m,conf2_p-conf1_p<=-margin)
+    end
 
     @objective(m, Max, diff)
 end

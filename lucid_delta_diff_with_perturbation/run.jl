@@ -52,7 +52,7 @@ function parse_commandline()
         help = "model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--hypers_dir_path"
         help = "hypers model path"
         arg_type = String
@@ -62,7 +62,7 @@ function parse_commandline()
         help = "ctag, source class"
         arg_type = String
         required = false
-        default = "1"
+        default = "2"
         "--ct", "-t"
         help = "target classes"
         arg_type = String
@@ -72,7 +72,7 @@ function parse_commandline()
         help = "MIP timeout"
         arg_type = Int
         required = false
-        default = 2000
+        default = 3000000000
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
@@ -105,20 +105,28 @@ function parse_commandline()
         help = "occ: i,j,width , patch: eps,i,j,width, brightness: eps, linf: eps, contrast: eps, translation: tx,ty, rotation: angle"
         arg_type = String
         required = false
-        default = "0.05"
+        default = "0.008"
         "--model_path_vaghar_results"
         help = "model_path_vaghar_results"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"
+        default = "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_max/4x10_model_itr18.p_linf_0.008_NoCtarget_RegularVaghar.txt"#"/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"
+        "--c_target_version"
+        help = "is it c_target version or regular"
+        arg_type = Bool
+        required = false
+        default = false
         
     end
     return parse_args(s)
 end
 
-function save_results_neta(results_path, model_name, results_str, type_of_problem,c_tag)
-    global separation_index
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and18_cTargetVersion"*".txt", "w")
+function save_results_neta(results_path, model_name, results_str, type_of_problem,c_target_version)
+    c_target_string = "noCtarget"
+    if c_target_version
+        c_target_string = "cTargetVersion"
+    end
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr17and18_"*c_target_string*".txt", "w")
     write(file, results_str)
     close(file)
 end
@@ -128,12 +136,12 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
         current_line_number = 0
         requested_line = ""
         while !eof(io)
-            current_line_number += 1
             line_content = readline(io)
-            c_target = Base.split(line_content, ',')[2]
-            if c_target == string(line_index)
+            c_target = parse_numbers_to_Int64(String(Base.split(line_content, ',')[2]))[1]
+            if c_target == line_index-1
                 requested_line = line_content
             end
+            current_line_number += 1
         end
         if requested_line==""
             println("Error with requested_line")
@@ -160,6 +168,7 @@ function main()
     timout = args["timout"]
     is_deps = args["deps"]
     image_mode = args["image_mode"]
+    c_target_version = args["c_target_version"]
     print("image_mode = ")
     println(image_mode)
     global me_th
@@ -170,12 +179,19 @@ function main()
     results.str = ""
     for c_tag in c_tag_list
         for c_target in c_targets
-            if c_target==c_tag
-                continue
+            if c_target_version
+                if c_target==c_tag
+                    continue
+                end
+            else
+                if c_target!=c_tag
+                    continue
+                end
             end
+            println("c_tag = "* string(c_tag))
+            println("c_target = "* string(c_target))
             delta1_vaghar = get_delta1_vaghar(model_path_vaghar_results, c_target)
-            println("delta1_vaghar")
-            println(string(delta1_vaghar))
+            println("delta1_vaghar = "*string(delta1_vaghar))
             nn,is_conv = get_nn(model_path_nn, model_name, dim, c, dataset)
             nn_hyper = get_nn_hyper(model_path_nn, model_name, dim, c, dataset, hypers_dir_path, is_deps)
             for problem_type_str in running_type_list
@@ -200,7 +216,7 @@ function main()
                 m = d[:Model]
 
                 # mip_set_delta_diff_propery(m, d, c_tag)
-                mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target)
+                mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target,c_target_version)
                 set_optimizer(m, optimizer)
                 mip_set_attr(m, d, timout)
                 MOI.set(m, Gurobi.CallbackFunction(), my_callback)
@@ -212,11 +228,37 @@ function main()
                 global network_version
                 global diff_
                 diff_  = []
-                save_results_neta(results_path, model_name, results.str, problem_type_str*"_",c_tag)
+                try
+                    println("NN1 - the output layer scores:")
+                    for i in 1:10
+                        println("d[:v_out_hyper]["*string(i)*"] = "* string(JuMP.value(d[:v_out_hyper][i])))
+                    end
+                    println("---------------------------")
+                    println("NN1_perturbation - the output layer scores:")
+                    for i in 1:10
+                        println("d[:v_out_hyper_perturbation]["*string(i)*"] = "* string(JuMP.value(d[:v_out_hyper_perturbation][i])))
+                    end
+                    println("---------------------------")
+                    
+                    println("NN2 - the output layer scores:")
+                    for i in 1:10
+                        println("d[:v_out_nn]["*string(i)*"] = "* string(JuMP.value(d[:v_out_nn][i])))
+                    end
+                    println("---------------------------")
+                    println("NN2_perturbation - the output layer scores:")
+                    for i in 1:10
+                        println("d[:v_out_nn_perturbation]["*string(i)*"] = "* string(JuMP.value(d[:v_out_nn_perturbation][i])))
+                    end
+                    println("---------------------------")
+                catch
+                    println("NO SOLUTION")
+                end
+
+                save_results_neta(results_path, model_name, results.str, problem_type_str*"_"*perturbation*"_"*args["perturbation_size"]*"_",c_target_version)
             end
         end
     end
-    println("---------------------------")
+
     
 end
 

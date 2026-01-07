@@ -46,23 +46,23 @@ def run_julia_script_with_args(julia_script_path: str, arguments: list):
 if __name__ == "__main__":
     julia_file = "/root/Downloads/base_delta_diff_calculatio_fixingDeps/run.jl"
 
-    my_arguments = ["--model_path_org",
-                    "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",
-                    "--model_path_second",
-                    "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",
-                    "--model_path_vaghar_results",
-                    "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_trying_something/4x10_model.p_linf_0.05_NoCtarget_RegularVaghar_Itr18.txt",
-                    "--string_for_name", "sameNetwork"]
-    run_julia_script_with_args(julia_file, my_arguments)
-
     # my_arguments = ["--model_path_org",
     #                 "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",
     #                 "--model_path_second",
-    #                 "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/17/model.p",
+    #                 "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",
     #                 "--model_path_vaghar_results",
     #                 "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_trying_something/4x10_model.p_linf_0.05_NoCtarget_RegularVaghar_Itr18.txt",
-    #                 "--string_for_name", "itr17AndItr18"]
+    #                 "--string_for_name", "sameNetwork"]
     # run_julia_script_with_args(julia_file, my_arguments)
+
+    my_arguments = ["--model_path_org",
+                    "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",
+                    "--model_path_second",
+                    "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/17/model.p",
+                    "--model_path_vaghar_results",
+                    "/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_trying_something/4x10_model.p_linf_0.05_NoCtarget_RegularVaghar_Itr18.txt",
+                    "--string_for_name", "itr17AndItr18"]
+    run_julia_script_with_args(julia_file, my_arguments)
 
     # my_arguments = ["--model_path_org",
     #                 "/root/Downloads/code_deprecated_active_just_for_models/models/4x10_2/18/model.p",

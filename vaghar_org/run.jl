@@ -77,7 +77,7 @@ function parse_commandline()
         help = "target classes"
         arg_type = String
         required = false
-        default = "2,3,4,5,6,7,8,9"
+        default = "10"
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
@@ -90,7 +90,7 @@ function parse_commandline()
         help = "string for results name file"
         arg_type = String
         required = false
-        default = "itr18"
+        default = "itr18_cTarget9"
     end
     return parse_args(s)
 end
