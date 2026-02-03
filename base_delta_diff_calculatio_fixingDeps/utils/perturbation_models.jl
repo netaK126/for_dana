@@ -27,16 +27,42 @@ function get_model(w_, h_, k_,
     end
 end
 
-function get_delta_diff_keys(perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+function get_delta_diff_keys(perturbation_size, nn_hyper::NeuralNet, nn::NeuralNet,input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = map(_ -> @variable(m, lower_bound = -p_size, upper_bound = p_size), input_range,)
-    v_in = map( i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     @constraint(m, v_x0 .== v_in + v_e)
-    v_output_nn1 = v_in |> nn1
-    v_output_p_nn1 = v_x0 |> nn1
-    v_output_nn2 = v_in |> nn2
-    v_output_p_nn2 = v_x0 |> nn2
-    return Dict(:Perturbation => "None", :v_out_2 => v_output_nn2, :v_in => v_in, :v_out_1 => v_output_nn1,:v_out_p_2 => v_output_p_nn2,:v_out_p_1 => v_output_p_nn1)
+
+    println("regular nns")
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
+    v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "hyper"
+    v_output = v_in |> nn_hyper
+
+    println("perturbed nns")
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "orgP"
+    v_in_output_p = v_x0 |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "hyperP"
+    v_output_p = v_x0 |> nn_hyper
+
+
+    return Dict(:v_in_hyper => v_in,
+                :Perturbation => "None",
+                :v_out_hyper => v_output,
+                :v_in_nn => v_in,
+                :v_out_nn => v_in_output,
+                :v_in_hyper_perturbation => v_x0,
+                :v_out_hyper_perturbation => v_output_p,
+                :v_in_nn_perturbation => v_x0,
+                :v_out_nn_perturbation => v_in_output_p)
 end

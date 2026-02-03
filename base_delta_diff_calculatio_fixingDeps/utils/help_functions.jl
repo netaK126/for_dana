@@ -158,6 +158,6 @@ function parse_numbers_to_Int64(input_str::String)
 end
 
 function update_results_str(results, c_tag, c_target, d)
-    return results*string(c_tag-1)*","*string(c_target)*","*string(d[:incumbent_obj])*","*
+    return results*string(c_tag-1)*","*string(c_target-1)*","*string(d[:incumbent_obj])*","*
         string(d[:best_bound])*","*string(d[:solve_time])*"\n"
 end

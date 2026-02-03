@@ -72,7 +72,7 @@ function parse_commandline()
         help = "MIP timeout"
         arg_type = Int
         required = false
-        default = 108000000
+        default = 4000
         "--ct", "-t"
         help = "target classes"
         arg_type = String
@@ -153,7 +153,8 @@ function main()
     model_name = args["model_name"] # the model architecture. it an be 4x10, 3x10 and so on...
     folder_path = args["folder_path"] # a path to a directory/folder with multiple models of the same type (as "model_name")
     files_and_dirs = readdir(folder_path) # getting all the models' paths from folder_path
-    models_path_list= [args["model_path"]]
+    models_path_list= [#"/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p",
+                        "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"]
 
     # the following code only considers ".p" files (and skips ".pth" files)
     # for item in files_and_dirs
@@ -173,9 +174,9 @@ function main()
 
     for model_path in models_path_list
         perturbation = args["perturbation"]
-        perturbation_size_list = [0.05]#[0.05,0.1]
+        perturbation_size_list = [0.02]#[0.05,0.1]
         c_tag_list = [1,2,3,4,5,6,7,8,9,10] #args["ctag"]
-        c_targets = parse_numbers_to_Int64(args["ct"])
+        c_targets = [1]#parse_numbers_to_Int64(args["ct"])
         results_path = args["output_dir"]
         timout = args["timout"]
         w, h, k, c = get_dataset_params( dataset )

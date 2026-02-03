@@ -52,7 +52,7 @@ function parse_commandline()
         help = "model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--hypers_dir_path"
         help = "hypers model path"
         arg_type = String
@@ -62,7 +62,7 @@ function parse_commandline()
         help = "ctag, source class"
         arg_type = String
         required = false
-        default = "1"
+        default = "1,2,3,4,5,6,7,8,9,10"
         "--ct", "-t"
         help = "target classes"
         arg_type = String
@@ -110,15 +110,24 @@ function parse_commandline()
         help = "model_path_vaghar_results"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"
+        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#"/root/Downloads/vaghar_org/results/63904068084000_4x10_linf_0.02_ctag0_itr18_cTag1.txt"
+        "--c_tag_mode"
+        help = "c_tag_mode"
+        arg_type = Bool
+        required = false
+        default = true
         
     end
     return parse_args(s)
 end
 
-function save_results_neta(results_path, model_name, results_str, type_of_problem,c_tag)
+function save_results_neta(results_path, model_name, results_str, type_of_problem,c_tag,c_tag_mode)
     global separation_index
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and18_cTargetVersion"*".txt", "w")
+    ct_str="NocTragetVersion"
+    if c_tag_mode
+        ct_str="cTargetVersion"
+    end
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and17_ctag"*string(c_tag)*"_"*ct_str*"_3rdTryDifferentEncoding"*".txt", "w")
     write(file, results_str)
     close(file)
 end
@@ -130,9 +139,11 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
         while !eof(io)
             current_line_number += 1
             line_content = readline(io)
+            println(line_content)
             c_target = Base.split(line_content, ',')[2]
-            if c_target == string(line_index)
+            if parse(Int, c_target) == parse(Int, string(line_index))-1
                 requested_line = line_content
+                println("FOUND")
             end
         end
         if requested_line==""
@@ -160,6 +171,7 @@ function main()
     timout = args["timout"]
     is_deps = args["deps"]
     image_mode = args["image_mode"]
+    c_tag_mode = args["c_tag_mode"]
     print("image_mode = ")
     println(image_mode)
     global me_th
@@ -170,12 +182,24 @@ function main()
     results.str = ""
     for c_tag in c_tag_list
         for c_target in c_targets
-            if c_target==c_tag
-                continue
+            if c_tag_mode
+                if c_target==c_tag
+                    continue
+                end
+            else
+                if c_target!=c_tag
+                    continue
+                end
             end
+            println("c_tag = "* string(c_tag))
+            println("c_target = "* string(c_target))
             delta1_vaghar = get_delta1_vaghar(model_path_vaghar_results, c_target)
             println("delta1_vaghar")
             println(string(delta1_vaghar))
+            if delta1_vaghar<=0
+                println("delta1_vaghgar is negative")
+                continue
+            end
             nn,is_conv = get_nn(model_path_nn, model_name, dim, c, dataset)
             nn_hyper = get_nn_hyper(model_path_nn, model_name, dim, c, dataset, hypers_dir_path, is_deps)
             for problem_type_str in running_type_list
@@ -200,19 +224,23 @@ function main()
                 m = d[:Model]
 
                 # mip_set_delta_diff_propery(m, d, c_tag)
-                mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target)
+                mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target, c_tag_mode)
                 set_optimizer(m, optimizer)
                 mip_set_attr(m, d, timout)
                 MOI.set(m, Gurobi.CallbackFunction(), my_callback)
                 println("Run: optimize.")
                 optimize!(m)
-                mip_log(m, d)
-                results.str = update_results_str(results.str, c_tag, d, c_target)
+                try
+                    mip_log(m, d)
+                    results.str = update_results_str(results.str, c_tag, d, c_target)
+                catch e
+                    results.str = results.str * "Couldnt find Delta_diff for c_tag="*str(c_tag)*", c_target="*str(c_target)*"\n"
+                end 
 
                 global network_version
                 global diff_
                 diff_  = []
-                save_results_neta(results_path, model_name, results.str, problem_type_str*"_",c_tag)
+                save_results_neta(results_path, model_name, results.str, problem_type_str*"_"*perturbation*"_"*args["perturbation_size"],c_tag,c_tag_mode)
             end
         end
     end

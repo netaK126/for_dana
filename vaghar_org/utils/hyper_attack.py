@@ -170,6 +170,24 @@ def attack(model, X, source_, target_, device, token_signature,\
             layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2((F.relu(model.fc1(images_to.reshape(-1, 784))))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, 784))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, 784))))))), dim=0))
+        elif "4x" in model_name:
+            # Clean input through layers
+            x = images_to.reshape(-1, 784)
+            x1 = F.relu(model.fc1(x))
+            x2 = F.relu(model.fc2(x1))
+            x3 = F.relu(model.fc3(x2))
+            layers_outputs.append(torch.mean(torch.sign(x1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x3), dim=0))
+
+            # Attacked input through layers
+            attacked_x = create_attacked(images_to, eps_to, type_, size_, dims).reshape(-1, 784)
+            ax1 = F.relu(model.fc1(attacked_x))
+            ax2 = F.relu(model.fc2(ax1))
+            ax3 = F.relu(model.fc3(ax2))
+            layers_outputs.append(torch.mean(torch.sign(ax1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax3), dim=0))
         elif "2x" in model_name:
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, 784))))), dim=0))
@@ -232,6 +250,8 @@ def load_dataset( dataset ):
 def load_model( model_arch, model_path):
     if model_arch == "3x10":
         model = FNN_3_10()
+    elif model_arch == "4x10":
+        model = FNN_4_10()
     elif model_arch == "3x50":
         model = FNN_3_50()
     elif model_arch == "10x10":
@@ -253,12 +273,12 @@ def load_model( model_arch, model_path):
 def create_hyper_input(source, trainset, testset, M, dims):
 
     train_images = [image for image, _ in trainset]
-    train_images = torch.stack(train_images)
+    train_images = torch.stack(train_images).to(device)
     test_images = [image for image, _ in testset]
-    test_images = torch.stack(test_images)
+    test_images = torch.stack(test_images).to(device)
     random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2]).to(device)
-    all_samples = torch.cat((random_images, train_images, test_images), dim=0)
-    classification = model(all_samples)
+    all_samples = torch.cat((random_images, train_images, test_images), dim=0).to(device)
+    classification = model(all_samples).to(device)
     _, predicted_labels = torch.max(classification, dim=1)
     indices_of_s = (predicted_labels == source).nonzero().squeeze()
     source_samples_classification = classification[indices_of_s]

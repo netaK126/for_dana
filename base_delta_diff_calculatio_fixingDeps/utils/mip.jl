@@ -29,6 +29,36 @@ function define_conf!(m, d, c_tag, key, name)
     return conf
 end
 
+
+function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target, c_tag_mode, margin)
+    # conf1 = define_conf!(m,d,c_tag, :v_out_hyper, "conf1")
+    # (maximum_target_var, nontarget_vars) = get_vars_for_max_index(d[:v_out_hyper], d[:SourceIndex])
+    # maximum_nontarget_var = maximum_ge(nontarget_vars)
+    # conf1 = @variable(m)
+    # @constraint(m, conf1 == maximum_target_var - maximum_nontarget_var)
+
+    conf1 = define_conf!(m,d,c_tag, :v_out_hyper, "conf1")
+    conf1_p = define_conf!(m,d,c_target, :v_out_hyper_perturbation, "conf1_p")
+    conf2 = define_conf!(m,d,c_tag, :v_out_nn, "conf2")
+    conf2_p = define_conf!(m,d,c_target, :v_out_nn_perturbation, "conf2_p")
+    # margin = 0.000001
+    # the objective and problem definition
+    diff = @variable(m, base_name="diff_obj")
+    @constraint(m, conf1>=delta1_vaghar + margin)
+    @constraint(m, conf2 - conf1==diff)
+    @constraint(m, diff>=0)
+    if c_tag_mode
+        println("c_tag_mode")
+        # @constraint(m,conf2_p-conf1_p>=margin)
+    else
+        @constraint(m,conf2_p-conf1_p<=-margin)
+    end
+    @objective(m, Max, diff)
+    # @objective(m, Max, conf1)
+    
+end
+
+
 function mip_set_delta_diff_property(m, d,delta1_vaghar, c_tag)
     conf2 = define_conf!(m,d,c_tag, :v_out_2, "conf2")
     conf2_p = define_conf!(m,d,c_tag, :v_out_p_2, "conf2_p")

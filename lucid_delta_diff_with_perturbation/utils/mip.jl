@@ -80,7 +80,7 @@ function define_conf!(m, d, c_tag, key, name)
         if i == c_tag
             continue  # Skip this iteration
         end
-        a_conf[i] = @variable(m, binary = true)
+        a_conf[i] = @variable(m, binary = true, base_name=name*"binaryVariable")
     end
     @constraint(m, sum(a_conf[i] for i in keys(a_conf)) == 1)
     for i in 1:10
@@ -94,20 +94,36 @@ function define_conf!(m, d, c_tag, key, name)
 end
 
 
-function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target)
-    conf1 = define_conf!(m,d,c_tag, :v_out_hyper, "conf1")
-    conf1_p = define_conf!(m,d,c_tag, :v_out_hyper_perturbation, "conf1_p")
-    conf2 = define_conf!(m,d,c_target, :v_out_nn, "conf2")
+function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target, c_tag_mode)
+    (maximum_target_var, nontarget_vars) = get_vars_for_max_index(d[:v_out_hyper], d[:SourceIndex])
+    maximum_nontarget_var = maximum_ge(nontarget_vars)
+    conf1 = @variable(m)
+    @constraint(m, conf1 == maximum_target_var - maximum_nontarget_var)
+    # conf1 = define_conf!(m,d,c_tag, :v_out_hyper, "conf1")
+    conf1_p = define_conf!(m,d,c_target, :v_out_hyper_perturbation, "conf1_p")
+
+    # (maximum_target_var2, nontarget_vars2) = get_vars_for_max_index(d[:v_out_nn], d[:SourceIndex])
+    # maximum_nontarget_var2 = maximum_ge(nontarget_vars2)
+    # conf2 = @variable(m)
+    # @constraint(m, conf2 == maximum_target_var2 - maximum_nontarget_var2)
+    conf2 = define_conf!(m,d,c_tag, :v_out_nn, "conf2")
     conf2_p = define_conf!(m,d,c_target, :v_out_nn_perturbation, "conf2_p")
-    margin = 0
+
+    
+    margin = 0.01
     # the objective and problem definition
     diff = @variable(m, base_name="diff_obj")
     @constraint(m, conf1>=delta1_vaghar + margin)
     @constraint(m, conf2 - conf1==diff)
     @constraint(m, diff>=0)
-    @constraint(m,conf2_p-conf1_p<=-margin)
-
+    if c_tag_mode
+        println("c_tag_mode")
+        @constraint(m,conf2_p-conf1_p>=margin)
+    else
+        @constraint(m,conf2_p-conf1_p<=-margin)
+    end
     @objective(m, Max, diff)
+
 end
 
 
