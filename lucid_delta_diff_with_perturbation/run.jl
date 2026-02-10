@@ -52,12 +52,12 @@ function parse_commandline()
         help = "model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
         "--hypers_dir_path"
         help = "hypers model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist _hyper_is_17/"#"/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/"
         "--ctag", "-c" 
         help = "ctag, source class"
         arg_type = String
@@ -72,7 +72,7 @@ function parse_commandline()
         help = "MIP timeout"
         arg_type = Int
         required = false
-        default = 2000
+        default = 500
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
@@ -110,7 +110,7 @@ function parse_commandline()
         help = "model_path_vaghar_results"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#"/root/Downloads/vaghar_org/results/63904068084000_4x10_linf_0.02_ctag0_itr18_cTag1.txt"
+        default = "/root/Downloads/vaghar_org/results/63902078677641_4x10_linf_0.05_ctag0_itr17.txt"#"/root/Downloads/vaghar_as_should_be_originally_no_c_target/results_max/4x10_model_itr17.p_linf_0.05_NoCtarget_RegularVaghar_Itr17.txt"#"/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#"/root/Downloads/vaghar_org/results/63904068084000_4x10_linf_0.02_ctag0_itr18_cTag1.txt"
         "--c_tag_mode"
         help = "c_tag_mode"
         arg_type = Bool
@@ -127,7 +127,7 @@ function save_results_neta(results_path, model_name, results_str, type_of_proble
     if c_tag_mode
         ct_str="cTargetVersion"
     end
-    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and17_ctag"*string(c_tag)*"_"*ct_str*"_3rdTryDifferentEncoding"*".txt", "w")
+    file = open(results_path*model_name *"_"*type_of_problem*"DeltaDiff_itr18and17_ctag"*string(c_tag)*"_"*ct_str*"_RemovingHyperPerturbationEncoding_HyperIs17"*".txt", "w")
     write(file, results_str)
     close(file)
 end
@@ -153,6 +153,21 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
         parsed_tokens = Base.split(requested_line, ',')
         return parse(Float64, parsed_tokens[end-1])
     end
+end
+
+function find_var(var_name, m)
+    v_ref = variable_by_name(m, var_name)
+
+    if v_ref !== nothing && has_values(m)
+        # Using the explicit module prefix to avoid the "String" error
+        val = JuMP.value(v_ref) 
+        var_name = JuMP.name(v_ref)
+        println("Variable $var_name found. Optimization result: $val")
+        exit()
+    else
+        println("Variable not found or no solution exists.")
+    end
+
 end
 
 function main()
@@ -235,8 +250,10 @@ function main()
                     results.str = update_results_str(results.str, c_tag, d, c_target)
                 catch e
                     results.str = results.str * "Couldnt find Delta_diff for c_tag="*str(c_tag)*", c_target="*str(c_target)*"\n"
-                end 
+                end     
 
+                find_var("conf2_p",m)
+                # exit()
                 global network_version
                 global diff_
                 diff_  = []
