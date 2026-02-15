@@ -173,13 +173,14 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
     return phi_dep
 end
 
-function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
-    layers_n = layers_number(nn)
+function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
+                                   activation_start=1, layers_offset=nothing)
+    layers_n = isnothing(layers_offset) ? layers_number(nn) : layers_offset
     phi_dep = fill(NaN, (1, w, h, k))
     perturbation_init_deps(phi_dep, perturbation, perturbation_size)
-    activation_cnt = 1
-    println("Encoding dependencies...")
-    if reuse_bounds_conf.is_reuse_bounds_and_deps
+    activation_cnt = activation_start
+    println("Encoding dependencies (activation_start=$activation_start, layers_offset=$layers_n)...")
+    if reuse_bounds_conf.is_reuse_bounds_and_deps && activation_start == 1
         for (activation_cnt, phi_dep) in enumerate(reuse_bounds_conf.reusable_deps)
             encode_dependencies(m, layers_n, phi_dep, activation_cnt)
         end
@@ -192,7 +193,9 @@ function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h,
                 phi_dep = dep_additional(m, layers_n, l, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt)
             elseif occursin("ReLU", string(typeof(l)))
                 phi_dep = encode_dependencies(m, layers_n, phi_dep, activation_cnt)
-                push!(reuse_bounds_conf.reusable_deps,phi_dep)
+                if activation_start == 1
+                    push!(reuse_bounds_conf.reusable_deps,phi_dep)
+                end
                 if all(isnan, phi_dep)
                     break
                 end

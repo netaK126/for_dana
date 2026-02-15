@@ -60,3 +60,82 @@ function mip_reuse_bounds()
     reuse_bounds_conf.is_reuse_bounds_and_deps = true
     reuse_bounds_conf.reusable_indexes = 1
 end
+
+# ============================================================
+# Transfer proof: define confidence margin C(N, x, c) as a
+# JuMP variable using big-M encoding for the max over
+# non-target classes.
+# C(N, x, c) = N(x)[c] - max_{k≠c} N(x)[k]
+# ============================================================
+function define_conf!(m, d, c, key, name)
+    max_num = 1e6
+    conf = @variable(m, base_name=name)
+    max_kk = @variable(m, base_name=name*"_max_kk")
+    @constraint(m, conf == d[key][c] - max_kk)
+    n_classes = length(d[key])
+    a_conf = Dict()
+    for i in 1:n_classes
+        if i == c
+            continue
+        end
+        a_conf[i] = @variable(m, binary = true, base_name=name*"_bin_"*string(i))
+    end
+    @constraint(m, sum(a_conf[i] for i in keys(a_conf)) == 1)
+    for i in 1:n_classes
+        if i == c
+            continue
+        end
+        @constraint(m, max_kk >= d[key][i])
+        @constraint(m, max_kk <= d[key][i] + max_num * (1 - a_conf[i]))
+    end
+    return conf
+end
+
+# ============================================================
+# Transfer proof objective:
+#   max delta_diff  s.t.
+#     C(N1, x, c)  >=  delta_1 + 1e-8
+#     C(N2, x, c) - C(N1, x, c)  >=  delta_diff
+#     delta_diff  >=  0
+#     C(N2, f(x,ε), c_pert) - C(N1, f(x,ε), c_pert)  <=  -1e-5
+#
+# c_tag_mode=true  → c_pert = c_tag  (untargeted)
+# c_tag_mode=false → c_pert = c_target (targeted)
+# ============================================================
+function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode)
+    # Confidence margins on clean input (both measured for source class c_tag)
+    conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
+    conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
+
+    # Confidence margins on perturbed input
+    c_pert = c_tag_mode ? c_tag : c_target
+    conf_n1_xp = define_conf!(m, d, c_pert, :v_out_n1_p, "conf_n1_xp")
+    conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+
+    # Constraint (1): N1 is confident on clean input
+    @constraint(m, conf_n1_x >= delta_1 + 1e-3)
+
+    # Constraint (2)+(3): delta_diff = C(N2,x,c) - C(N1,x,c) >= 0
+    delta_diff = @variable(m, base_name="delta_diff")
+    @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
+    @constraint(m, delta_diff >= 0)
+
+    # Constraint (4): confidence gap flips under perturbation
+    if !c_tag_mode
+        @constraint(m, conf_n2_xp - conf_n1_xp <= -1e-3)
+
+    else
+        @constraint(m, conf_n2_xp - conf_n1_xp >= 1e-3)
+    end
+
+    # Objective: maximize delta_diff
+    @objective(m, Max, delta_diff)
+end
+
+function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
+    set_optimizer_attribute(m, "MIPFocus", 3)
+    set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
+    set_optimizer_attribute(m, "Threads", 32)
+    set_optimizer_attribute(m, "TimeLimit", timout)
+    set_optimizer_attribute(m, "MIPGap", 0.01)
+end

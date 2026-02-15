@@ -161,3 +161,30 @@ function update_results_str(results, c_tag, c_target, d)
     return results*string(c_tag-1)*","*string(c_target-1)*","*string(d[:incumbent_obj])*","*
         string(d[:best_bound])*","*string(d[:solve_time])*"\n"
 end
+
+# Read delta_1 (best_bound) from a VHAGaR results file for a given c_target.
+# VHAGaR results format per line: source,target,incumbent_obj,best_bound,solve_time
+function get_delta1_vaghar(results_path, c_target_index)
+    open(results_path, "r") do io
+        requested_line = ""
+        while !eof(io)
+            line_content = readline(io)
+            if isempty(strip(line_content))
+                continue
+            end
+            tokens = Base.split(line_content, ',')
+            if length(tokens) >= 4
+                target_in_file = parse(Int, tokens[2])
+                if target_in_file == c_target_index - 1
+                    requested_line = line_content
+                end
+            end
+        end
+        if requested_line == ""
+            println("Warning: no delta_1 found for c_target=$c_target_index in $results_path")
+            return -1.0
+        end
+        parsed_tokens = Base.split(requested_line, ',')
+        return parse(Float64, parsed_tokens[4])
+    end
+end
