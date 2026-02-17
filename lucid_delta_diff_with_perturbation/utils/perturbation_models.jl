@@ -81,10 +81,10 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, n
     nueron_counter = 0
     network_version = "orgP"
     v_in_output_p = v_x0 |> nn
-    # layer_counter = 0
-    # nueron_counter = 0
-    # network_version = "hyperP"
-    # v_output_p = v_x0 |> nn_hyper
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "hyperP"
+    v_output_p = v_x0 |> nn_hyper
 
 
     return Dict(:v_in_hyper => v_in,
@@ -93,7 +93,7 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, n
                 :v_in_nn => v_in,
                 :v_out_nn => v_in_output,
                 :v_in_hyper_perturbation => v_x0,
-                # :v_out_hyper_perturbation => v_output_p,
+                :v_out_hyper_perturbation => v_output_p,
                 :v_in_nn_perturbation => v_x0,
                 :v_out_nn_perturbation => v_in_output_p)
 end

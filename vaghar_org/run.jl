@@ -34,6 +34,7 @@ include("utils/hyper_attack.jl")
 include("utils/datasets.jl")
 include("utils/models.jl")
 include("utils/mip.jl")
+include("utils/perturbation_intervals.jl")
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -52,7 +53,7 @@ function parse_commandline()
         help = "model name"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
         "--perturbation", "-p"
         help = "perturbation type: occ, patch, brightness, linf, contrast, translation, rotation, or max"
         arg_type = String
@@ -72,17 +73,17 @@ function parse_commandline()
         help = "MIP timeout"
         arg_type = Int
         required = false
-        default = 4000
+        default = 500#4000
         "--ct", "-t"
         help = "target classes"
         arg_type = String
         required = false
-        default = "2,3,4,5,6,7,8,9"
+        default = "1,2,3,4,5,6"
         "--output_dir", "-o"
         help = "output dir"
         arg_type = String
         required = false
-        default = "./results/"
+        default = "/root/Downloads/vaghar_org/results_PerturbationInterval/"
         "--verbose", "-v"
         help = "Increase verbosity"
         action = :store_true
@@ -90,7 +91,7 @@ function parse_commandline()
         help = "string for results name file"
         arg_type = String
         required = false
-        default = "itr17"
+        default = "itr18"
         "--mode"
         help = "standard or transfer"
         arg_type = String
@@ -100,17 +101,37 @@ function parse_commandline()
         help = "path to second network N2 (transfer mode)"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--vaghar_results"
         help = "path to VHAGaR results file for delta_1 values (transfer mode)"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_org/results/63902078677641_4x10_linf_0.05_ctag0_itr17.txt"
+        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#"/root/Downloads/vaghar_org/results/63902078677641_4x10_linf_0.05_ctag0_itr17.txt"
         "--c_tag_mode"
         help = "true: c_pert=c_tag (untargeted), false: c_pert=c_target (targeted)"
         arg_type = Bool
         required = false
         default = true
+        "--use_intervals"
+        help = "activate interval bound constraints between N1 and N2 (transfer mode)"
+        arg_type = Bool
+        required = false
+        default = false
+        "--use_hyper_attack"
+        help = "activate hyper attack"
+        arg_type = Bool
+        required = false
+        default = false
+        "--use_perturbed_intervals"
+        help = "activate perturbation interval constraints between clean and perturbed copies"
+        arg_type = Bool
+        required = false
+        default = false
+        "--activate_vaghgar_deps"
+        help = "activate activate vaghgar depandencies"
+        arg_type = Bool
+        required = false
+        default = false
     end
     return parse_args(s)
 end
@@ -122,28 +143,38 @@ function main()
     model_path = args["model_path"]
     perturbation = args["perturbation"]
     name_to_save = args["name_to_save"]
+    use_hyper_attack = args["use_hyper_attack"]
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
 
     if mode == "transfer"
-        main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save)
+        main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     else
-        main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save)
+        main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     end
 end
 
-function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save)
-    c_tag_list = [1,2,3,4,5,6,7,8,9]
+function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
+    c_tag_list = [1,2,3]#[args["ctag"]]
+    activate_vaghgar_deps = args["activate_vaghgar_deps"]
+    name_to_save_init = name_to_save
     for c_tag in c_tag_list
         results.str = ""
         c_targets = parse_numbers_to_Int64(args["ct"])
         results_path = args["output_dir"]
         timout = args["timout"]
         w, h, k, c = get_dataset_params( dataset )
-        nn = get_nn(model_path, model_name, w, h, k, c, dataset)
         token_signature = string(now().instant.periods.value)
         for c_target in c_targets
-            suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
+            nn = get_nn(model_path, model_name, w, h, k, c, dataset)
+            name_to_save = name_to_save_init
+            if c_tag==c_target
+                continue
+            end
+            suboptimal_solution, suboptimal_time =  0,0
+            if use_hyper_attack
+                suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
+            end
             optimizer = Gurobi.Optimizer
             d = Dict()
             d[:TargetIndex] = get_target_indexes(c_target, c)
@@ -157,15 +188,26 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             d[:bounds_time] = bounds_time
             m = d[:Model]
-            hyper_attack_hints(m, token_signature, c_tag, c_target)
-            perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
+            if use_hyper_attack
+                hyper_attack_hints(m, token_signature, c_tag, c_target)
+                name_to_save = name_to_save*"_HyperAttackNoHints"
+            end
+            if activate_vaghgar_deps
+                name_to_save = name_to_save*"_VagharDeps"
+                perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
+            end
+            if args["use_perturbed_intervals"]
+                name_to_save = name_to_save*"_PertruebedIntervals"
+                println("Adding perturbed interval constraints...")
+                perturbed_interval_constraints(m, nn, "org", "perturbation")
+            end
             mip_set_delta_property(m, perturbation, d)
             set_optimizer(m, optimizer)
             mip_set_attr(m, perturbation, d, timout)
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)
             optimize!(m)
             mip_log(m, d)
-            mip_reuse_bounds()
+            # mip_reuse_bounds()
             results.str = update_results_str(results.str, c_tag, c_target, d)
             println(results_path)
             save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save*"_cTag"*string(c_tag),token_signature)
@@ -173,13 +215,14 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     end
 end
 
-function main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save)
+function main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_Attack_delta_diff)
     model_path2 = args["model_path2"]
     vaghar_results = args["vaghar_results"]
     c_tag_mode = args["c_tag_mode"]
+    use_intervals = args["use_intervals"]
     results_path = args["output_dir"]
     timout = args["timout"]
-    c_tag_list = [1,2,3,4,5,6,7,8,9]
+    c_tag_list = [args["ctag"]]
     c_targets = parse_numbers_to_Int64(args["ct"])
     w, h, k, c = get_dataset_params(dataset)
 
@@ -194,8 +237,6 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     for c_tag in c_tag_list
         results.str = ""
         for c_target in c_targets
-            # In c_tag_mode: skip when c_target == c_tag (same class)
-            # In c_target_mode: skip when c_target != c_tag
             if c_tag_mode
                 if c_target == c_tag
                     continue
@@ -216,10 +257,13 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             # PGD attack for warm-start lower bound
             token_signature = string(now().instant.periods.value)
-            suboptimal_solution, suboptimal_time = hyper_attack_transfer(
-                dataset, c_tag, c_target, token_signature,
-                model_name, model_path, model_path2,
-                perturbation, perturbation_size, delta_1, c_tag_mode)
+            suboptimal_solution, suboptimal_time = 0, 0
+            if use_hyper_Attack_delta_diff
+                suboptimal_solution, suboptimal_time =hyper_attack_transfer(
+                    dataset, c_tag, c_target, token_signature,
+                    model_name, model_path, model_path2,
+                    perturbation, perturbation_size, delta_1, c_tag_mode)
+            end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
 
             optimizer = Gurobi.Optimizer
@@ -236,7 +280,9 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             m = d[:Model]
 
             # Apply warm-start hints from PGD attack
-            hyper_attack_hints(m, token_signature, c_tag, c_target)
+            if use_hyper_Attack_delta_diff
+                hyper_attack_hints(m, token_signature, c_tag, c_target)
+            end
 
             # Dependencies for N1: original layers 1..K ↔ perturbed layers 2K+1..3K
             perturbation_dependencies(m, nn1, perturbation, perturbation_size, w, h, k;
@@ -244,6 +290,19 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             # Dependencies for N2: original layers K+1..2K ↔ perturbed layers 3K+1..4K
             perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
                                       activation_start=K+1, layers_offset=2*K)
+
+            # Interval bounds between N1 and N2
+            if use_intervals
+                println("Adding interval constraints between N1 and N2...")
+                transfer_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
+            end
+
+            # Perturbation interval bounds (clean ↔ perturbed for each network)
+            if args["use_perturbed_intervals"]
+                println("Adding perturbed interval constraints for N1 and N2...")
+                perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
+                perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
+            end
 
             # Set transfer proof constraints and objective
             mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode)

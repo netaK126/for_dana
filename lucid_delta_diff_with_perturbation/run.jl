@@ -62,12 +62,12 @@ function parse_commandline()
         help = "ctag, source class"
         arg_type = String
         required = false
-        default = "1,2,3,4,5,6,7,8,9,10"
+        default = "1"
         "--ct", "-t"
         help = "target classes"
         arg_type = String
         required = false
-        default = "1,2,3,4,5,6,7,8,9,10"
+        default = "2"
         "--timout"
         help = "MIP timeout"
         arg_type = Int

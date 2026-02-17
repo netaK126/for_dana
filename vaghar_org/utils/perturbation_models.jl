@@ -55,6 +55,8 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     global layer_counter
     global nueron_counter
     global network_version
+    global I_pert_prev_up
+    global I_pert_prev_down
 
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
@@ -62,6 +64,15 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     v_in = map( i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     @constraint(m, v_x0 .== v_in + v_e)
+
+    # Initialize perturbation interval globals: Δ_{0,k} = e_k ∈ [-ε, ε]
+    if size(input)[4] > 1
+        I_pert_prev_up = p_size .* ones(Float64, size(input)[4], 1)
+        I_pert_prev_down = -p_size .* ones(Float64, size(input)[4], 1)
+    else
+        I_pert_prev_up = p_size .* ones(Float64, size(input))
+        I_pert_prev_down = -p_size .* ones(Float64, size(input))
+    end
 
     layer_counter = 0
     nueron_counter = 0
@@ -295,6 +306,14 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     global layer_counter
     global nueron_counter
     global network_version
+    global I_pert_prev_up
+    global I_pert_prev_down
+    global all_bounds_of_original
+    global all_bounds_of_perturbation
+    global I_z_prev_up
+    global I_z_prev_up_perturbation
+    global I_z_prev_down
+    global I_z_prev_down_perturbation
 
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
@@ -304,6 +323,36 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
     @constraint(m, v_x0 .== v_in + v_e)
+
+    # Initialize interval globals (same pattern as lucid: append! on untyped [])
+    all_bounds_of_original = []
+    all_bounds_of_perturbation = []
+    if size(input)[4] > 1
+        # conv input
+        append!(all_bounds_of_original, [[ones(Float64, size(input)[4], 1), zeros(Float64, size(input)[4], 1)]])
+        I_z_prev_up = zeros(Float64, size(input)[4], 1)
+        I_z_prev_down = zeros(Float64, size(input)[4], 1)
+        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)[4], 1), zeros(Float64, size(input)[4], 1)]])
+        I_z_prev_up_perturbation = zeros(Float64, size(input)[4], 1)
+        I_z_prev_down_perturbation = zeros(Float64, size(input)[4], 1)
+    else
+        # FC input
+        append!(all_bounds_of_original, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        I_z_prev_up = zeros(Float64, size(input))
+        I_z_prev_down = zeros(Float64, size(input))
+        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        I_z_prev_up_perturbation = zeros(Float64, size(input))
+        I_z_prev_down_perturbation = zeros(Float64, size(input))
+    end
+
+    # Initialize perturbation interval globals: Δ_{0,k} = e_k ∈ [-ε, ε]
+    if size(input)[4] > 1
+        I_pert_prev_up = p_size .* ones(Float64, size(input)[4], 1)
+        I_pert_prev_down = -p_size .* ones(Float64, size(input)[4], 1)
+    else
+        I_pert_prev_up = p_size .* ones(Float64, size(input))
+        I_pert_prev_down = -p_size .* ones(Float64, size(input))
+    end
 
     # Encode N1 on clean input x → layers 1..K in layers_info_dict
     println("Encoding N1(x)...")

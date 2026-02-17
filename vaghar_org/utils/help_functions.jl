@@ -1,3 +1,12 @@
+global I_z_prev_up = []
+global I_z_prev_down = []
+global I_z_prev_up_perturbation = []
+global I_z_prev_down_perturbation = []
+global all_bounds_of_original = []
+global all_bounds_of_perturbation = []
+global I_pert_prev_up = []
+global I_pert_prev_down = []
+
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
     reusable_indexes::Int
