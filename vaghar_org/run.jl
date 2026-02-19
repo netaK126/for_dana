@@ -53,7 +53,7 @@ function parse_commandline()
         help = "model name"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--perturbation", "-p"
         help = "perturbation type: occ, patch, brightness, linf, contrast, translation, rotation, or max"
         arg_type = String
@@ -101,12 +101,12 @@ function parse_commandline()
         help = "path to second network N2 (transfer mode)"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
         "--vaghar_results"
         help = "path to VHAGaR results file for delta_1 values (transfer mode)"
         arg_type = String
         required = false
-        default = "/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#"/root/Downloads/vaghar_org/results/63902078677641_4x10_linf_0.05_ctag0_itr17.txt"
+        default = "/root/Downloads/vaghar_org/results/63902078677641_4x10_linf_0.05_ctag0_itr17.txt" #"/root/Downloads/vaghar_org/results/63902082439234_4x10_linf_0.05_ctag0_itr18.txt"#
         "--c_tag_mode"
         help = "true: c_pert=c_tag (untargeted), false: c_pert=c_target (targeted)"
         arg_type = Bool
@@ -128,7 +128,12 @@ function parse_commandline()
         required = false
         default = false
         "--activate_vaghgar_deps"
-        help = "activate activate vaghgar depandencies"
+        help = "activate  vaghgar depandencies"
+        arg_type = Bool
+        required = false
+        default = false
+        "--n1_p_mode"
+        help = "activate n1_p mode and encode it (relevant for transfer)"
         arg_type = Bool
         required = false
         default = false
@@ -224,6 +229,8 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     timout = args["timout"]
     c_tag_list = [args["ctag"]]
     c_targets = parse_numbers_to_Int64(args["ct"])
+    n1_p_mode = args["n1_p_mode"]
+    use_vaghgarDeps = args["activate_vaghgar_deps"]
     w, h, k, c = get_dataset_params(dataset)
 
     println("Loading N1 from: $model_path")
@@ -233,22 +240,24 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
     K = layers_number(nn1)
     println("ReLU layers per network: $K, dependency offset: $(2*K)")
+    name_to_save_init = name_to_save
 
     for c_tag in c_tag_list
         results.str = ""
         for c_target in c_targets
             if c_tag_mode
-                if c_target == c_tag
+                if c_target != c_tag
                     continue
                 end
             else
-                if c_target != c_tag
+                if c_target == c_tag
                     continue
                 end
             end
 
             println("=== c_tag=$c_tag, c_target=$c_target ===")
             delta_1 = get_delta1_vaghar(vaghar_results, c_target)
+            name_to_save = name_to_save_init
             println("delta_1 = $delta_1")
             if delta_1 <= 0
                 println("Skipping: delta_1 <= 0")
@@ -259,10 +268,11 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             token_signature = string(now().instant.periods.value)
             suboptimal_solution, suboptimal_time = 0, 0
             if use_hyper_Attack_delta_diff
+                name_to_save = name_to_save * "_HyperAttack"
                 suboptimal_solution, suboptimal_time =hyper_attack_transfer(
                     dataset, c_tag, c_target, token_signature,
                     model_name, model_path, model_path2,
-                    perturbation, perturbation_size, delta_1, c_tag_mode)
+                    perturbation, perturbation_size, delta_1, c_tag_mode, n1_p_mode)
             end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
 
@@ -281,31 +291,37 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             # Apply warm-start hints from PGD attack
             if use_hyper_Attack_delta_diff
+                name_to_save = name_to_save * "_Hints"
                 hyper_attack_hints(m, token_signature, c_tag, c_target)
             end
 
-            # Dependencies for N1: original layers 1..K ↔ perturbed layers 2K+1..3K
-            perturbation_dependencies(m, nn1, perturbation, perturbation_size, w, h, k;
-                                      activation_start=1, layers_offset=2*K)
-            # Dependencies for N2: original layers K+1..2K ↔ perturbed layers 3K+1..4K
-            perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
-                                      activation_start=K+1, layers_offset=2*K)
+            if use_vaghgarDeps
+                name_to_save = name_to_save * "_VaghgarDeps"
+                # Dependencies for N1: original layers 1..K ↔ perturbed layers 2K+1..3K
+                perturbation_dependencies(m, nn1, perturbation, perturbation_size, w, h, k;
+                                        activation_start=1, layers_offset=2*K)
+                # Dependencies for N2: original layers K+1..2K ↔ perturbed layers 3K+1..4K
+                perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
+                                        activation_start=K+1, layers_offset=2*K)
+            end
 
             # Interval bounds between N1 and N2
             if use_intervals
+                name_to_save = name_to_save * "_LucidIntervals"
                 println("Adding interval constraints between N1 and N2...")
                 transfer_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
             end
 
             # Perturbation interval bounds (clean ↔ perturbed for each network)
             if args["use_perturbed_intervals"]
+                name_to_save = name_to_save * "_PerturbedIntervals"
                 println("Adding perturbed interval constraints for N1 and N2...")
                 perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
                 perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
             end
 
             # Set transfer proof constraints and objective
-            mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode)
+            mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode)
             set_optimizer(m, optimizer)
             mip_set_attr_transfer(m, timout, suboptimal_solution)
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)

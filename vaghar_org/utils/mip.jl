@@ -102,7 +102,7 @@ end
 # c_tag_mode=true  → c_pert = c_tag  (untargeted)
 # c_tag_mode=false → c_pert = c_target (targeted)
 # ============================================================
-function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode)
+function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode)
     # Confidence margins on clean input (both measured for source class c_tag)
     conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
@@ -121,11 +121,20 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode)
     @constraint(m, delta_diff >= 0)
 
     # Constraint (4): confidence gap flips under perturbation
-    if !c_tag_mode
-        @constraint(m, conf_n2_xp - conf_n1_xp <= -1e-3)
 
-    else
-        @constraint(m, conf_n2_xp - conf_n1_xp >= 1e-3)
+    if c_tag_mode 
+        if n1_p_mode
+            @constraint(m, conf_n2_xp - conf_n1_xp <= -1e-3)
+        else
+            @constraint(m, conf_n2_xp <= -1e-3)
+        end
+
+    else # c_target is on
+        if n1_p_mode
+            @constraint(m, conf_n2_xp - conf_n1_xp >= 1e-3)
+        else
+            @constraint(m, conf_n2_xp >= 1e-3)
+        end
     end
 
     # Objective: maximize delta_diff

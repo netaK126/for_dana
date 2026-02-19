@@ -246,11 +246,13 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
 
         # Perturbed outputs
         X_pert = create_attacked(X_pgd, eps_pgd, type_, size_, dims)
-        out_n1_p = model1(X_pert)
         out_n2_p = model2(X_pert)
-        c_n1_xp = confidence_margin(out_n1_p, c_pert)
         c_n2_xp = confidence_margin(out_n2_p, c_pert)
-        gap_pert = c_n2_xp - c_n1_xp
+        gap_pert = c_n2_xp
+        if N1_P_VERSION:
+            out_n1_p = model1(X_pert)
+            c_n1_xp = confidence_margin(out_n1_p, c_pert)
+            gap_pert = gap_pert - c_n1_xp
 
         # Handle NaNs
         nan_mask = torch.isnan(gap_pert) | torch.isnan(delta_diff)
@@ -294,11 +296,13 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
         delta_diff_final = c_n2_x - c_n1_x
 
         X_pert = create_attacked(X_pgd, eps_pgd, type_, size_, dims)
-        out_n1_p = model1(X_pert)
         out_n2_p = model2(X_pert)
-        c_n1_xp = confidence_margin(out_n1_p, c_pert)
         c_n2_xp = confidence_margin(out_n2_p, c_pert)
-        gap_pert_final = c_n2_xp - c_n1_xp
+        gap_pert_final = c_n2_xp
+        if N1_P_VERSION:
+            out_n1_p = model1(X_pert)
+            c_n1_xp = confidence_margin(out_n1_p, c_pert)
+            gap_pert_final = gap_pert_final - c_n1_xp
 
         # Check N1 classifies as source
         _, max_labels_n1 = out_n1.max(dim=1)
@@ -307,9 +311,9 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
         # Feasibility conditions
         feasible = n1_correct & (c_n1_x >= delta1) & (delta_diff_final >= 0)
         if c_tag_mode:
-            feasible = feasible & (gap_pert_final > 0)
-        else:
             feasible = feasible & (gap_pert_final < 0)
+        else:
+            feasible = feasible & (gap_pert_final > 0)
 
     s_indices = feasible.nonzero()
     k_to_use = min(K_max, len(s_indices))
@@ -325,23 +329,25 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
         # Extract activations for the best sample
         best_x = X_pgd[best_idx].unsqueeze(0)
         best_xp = create_attacked(best_x, eps_pgd[best_idx].unsqueeze(0), type_, size_, dims)
+        
 
         act_n1_x = extract_activations(model1, best_x, model_name)
         act_n2_x = extract_activations(model2, best_x, model_name)
-        act_n1_xp = extract_activations(model1, best_xp, model_name)
         act_n2_xp = extract_activations(model2, best_xp, model_name)
-
         K = len(act_n1_x)  # number of ReLU layers
+        list_to_iterate = [
+            ("n1_org", act_n1_x, 0),
+            ("n2_org", act_n2_x, K),
+            ("n2_pert", act_n2_xp, 3 * K),
+        ]
+        if N1_P_VERSION:
+            act_n1_xp = extract_activations(model1, best_xp, model_name)
+            list_to_iterate.append(("n1_pert", act_n1_xp, 2 * K))
 
         # Build hint strings for all 4 network copies
         bools = ""
         strings = ""
-        for nv, acts, abs_offset in [
-            ("n1_org", act_n1_x, 0),
-            ("n2_org", act_n2_x, K),
-            ("n1_pert", act_n1_xp, 2 * K),
-            ("n2_pert", act_n2_xp, 3 * K),
-        ]:
+        for nv, acts, abs_offset in list_to_iterate:
             for rel_layer_idx, layer_data in enumerate(acts):
                 rel_layer = rel_layer_idx + 1
                 abs_layer = abs_offset + rel_layer
@@ -389,9 +395,10 @@ if __name__ == '__main__':
     parser.add_argument('--M', type=int, default=1000, help='Number of samples')
     parser.add_argument('--itr', type=int, default=500, help='Number of PGD iterations')
     parser.add_argument('--alpha', type=float, default=0.01, help='PGD step size')
+    parser.add_argument('--n1_p_mode', type=bool, default=True, help='n1_p_mode')
 
     args = parser.parse_args()
-
+    N1_P_VERSION = args.n1_p_mode
     source = int(args.source)
     target = int(args.target)
     token_signature = args.token
