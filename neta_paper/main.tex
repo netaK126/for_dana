@@ -1,0 +1,149 @@
+\documentclass[runningheads]{llncs}
+
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,array,multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{lineno}
+
+%% ── note: llncs provides theorem, lemma, corollary, proposition,
+%%   definition, remark, example, problem, and proof environments
+
+%% ── math macros (Paper 1 — VHAGaR transfer mode) ────────────────────────────
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\Ball}[2]{B_{#1}(#2)}
+\newcommand{\conf}[3]{\mathcal{C}(#1,#2,#3)}   % 3-arg: network, input, class
+\newcommand{\xp}{x'}
+\newcommand{\ep}{\varepsilon}
+\newcommand{\dD}{\delta_{\mathrm{diff}}}
+\newcommand{\dO}{\delta_1}
+\newcommand{\mI}{\mathcal{I}}
+\newcommand{\up}{\mathrm{up}}
+\newcommand{\dn}{\mathrm{dn}}
+\newcommand{\Iup}{I^{\up}}
+\newcommand{\Idn}{I^{\dn}}
+\newcommand{\layer}[1]{^{[#1]}}
+\newcommand{\net}[1]{^{\langle #1\rangle}}
+
+%% ── math macros (Paper 2 — Formal analysis / counterexample) ────────────────
+\newcommand{\R}{\mathbb{R}}           % alias for \RR used in Paper 2
+\newcommand{\dN}[1]{\delta_1(N_{#1})}
+\newcommand{\dNmod}[1]{\hat{\delta}_1(N_{#1})}
+\newcommand{\ddiff}{\delta_{\mathrm{diff}}^{*}}
+\newcommand{\ddiffmod}{\hat{\delta}_{\mathrm{diff}}}
+\newcommand{\Xdom}{\mathcal{X}}
+\newcommand{\Edom}{\mathcal{E}}
+\newcommand{\Ffool}[1]{\mathcal{F}_{#1}}
+\newcommand{\Fjoint}{\mathcal{F}_{1\wedge 2}}
+% 2-class confidence shorthand (class fixed as c_tag; used in formal analysis)
+\newcommand{\confB}[2]{\mathcal{C}(#1,#2)}
+
+%% ── listing style ────────────────────────────────────────────────────────────
+\lstset{basicstyle=\ttfamily\small,breaklines=true,
+        keywordstyle=\color{blue!70!black},
+        commentstyle=\color{gray},
+        frame=single,framesep=3pt,numbers=left,numberstyle=\tiny\color{gray}}
+
+\begin{document}
+
+\title{Verification of Robustness Transfer Between Neural Networks}
+\titlerunning{Verification of Robustness Transfer}
+
+\author{Neta Nessing\inst{1} \and Shir Drive\inst{1} \and Dana Drachsler Cohen\inst{1}}
+\authorrunning{N. Nessing et al.}
+
+\institute{Technion, Israel\\
+\email{\{neta.nessing,shir.drive,ddana\}@technion.ac.il}}
+
+\maketitle
+
+\begin{abstract}
+Neural networks have achieved remarkable success across a wide range of applications, but they remain vulnerable to \emph{adversarial examples}---maliciously perturbed inputs designed to deceive the network. Verifying the robustness of neural networks against such attacks is a challenging task. In particular, verifying the \emph{global robustness} of a network---ensuring robustness for any input under a given perturbation function and scale---is computationally difficult.
+In this work, we address the problem of \emph{robustness transfer verification}. Given a source network $N_1$ with a known robustness guarantee and a target network $N_2$, we compute a formal certificate guaranteeing $N_2$'s global robustness property. We encode this problem as a mixed-integer program (MIP).
+Our approach supports seven perturbation types and employs four complementary tightening techniques: adversarial warm-starting, perturbation-difference interval propagation, inter-network interval bounds, and dependency analysis. We provide a complete formal analysis, including a proof that the transfer MIP yields a sound lower bound on the robustness improvement, a counterexample demonstrating that this bound can be strict, and a modified formulation that provides a matching upper bound over a restricted domain. Finally, we present a method for computing a sound upper bound during inference.
+
+\keywords{Neural Network Verification \and Global Robustness \and Constrained Optimization}
+\end{abstract}
+
+\linenumbers
+
+%% sections ───────────────────────────────────────────────────────────────────
+\input{sections/sec_intro}
+\input{sections/sec_notation}
+\input{sections/sec_perturbations}
+\input{sections/sec_standard_mode}
+\input{sections/sec_transfer_mode}
+\input{sections/sec_attack_modes}
+\input{sections/sec_formal_analysis}
+\input{sections/sec_tightening_flags}
+\input{sections/sec_complete_mip}
+\input{sections/sec_inference}
+\input{sections/sec_conclusion}
+
+%% ── bibliography ─────────────────────────────────────────────────────────────
+\begin{thebibliography}{11}
+
+\bibitem{katz2017reluplex}
+  Katz, G., Barrett, C., Dill, D.L., Julian, K., Kochenderfer, M.J.:
+  Reluplex: An efficient SMT solver for verifying deep neural networks.
+  In: CAV (2017)
+
+\bibitem{vaghar}
+  Elboher, E., G\"unther, J., Katz, G.:
+  An Abstraction-Based Framework for Neural Network Verification.
+  In: Computer Aided Verification (CAV) (2020)
+
+\bibitem{mipverify}
+  Anderson, R., Huchette, J., Ma, W., Tjeng, V., Vielma, J.P.:
+  Strong Mixed-Integer Programming Formulations for Trained Neural Networks.
+  Mathematical Programming \textbf{183}(1), 3--39 (2020)
+
+\bibitem{gurobi}
+  Gurobi Optimization, LLC:
+  Gurobi Optimizer Reference Manual (2023)
+
+\bibitem{jump}
+  Dunning, I., Huchette, J., Lubin, M.:
+  JuMP: A Modeling Language for Mathematical Optimization.
+  SIAM Review \textbf{59}(2), 295--320 (2017)
+
+\bibitem{singh2019}
+  Singh, G., Gehr, T., P\"uschel, M., Vechev, M.:
+  An abstract domain for certifying neural networks.
+  In: POPL (2019)
+
+\bibitem{wang2021}
+  Wang, S., Zhang, H., Xu, K., Lin, X., Jana, S., Hsieh, C.-J., Kolter, J.Z.:
+  Beta-CROWN: Efficient bound propagation with per-neuron split constraints for neural network robustness verification.
+  In: NeurIPS (2021)
+
+\bibitem{tjeng2019}
+  Tjeng, V., Xiao, K., Tedrake, R.:
+  Evaluating robustness of neural networks: An extreme value theory approach.
+  In: ICLR (2019)
+
+\bibitem{madry2018}
+  Madry, A., Makelov, A., Schmidt, L., Tsipras, D., Vladu, A.:
+  Towards deep learning models resistant to adversarial attacks.
+  In: ICLR (2018)
+
+\bibitem{szegedy2014}
+  Szegedy, C., Zaremba, W., Sutskever, I., Bruna, J., Erhan, D., Goodfellow, I., Fergus, R.:
+  Intriguing properties of neural networks.
+  In: ICLR (2014)
+
+\bibitem{carlini2017}
+  Carlini, N., Wagner, D.:
+  Towards evaluating the robustness of neural networks.
+  In: IEEE S\&P (2017)
+
+\end{thebibliography}
+
+\end{document}

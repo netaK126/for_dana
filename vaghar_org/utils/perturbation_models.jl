@@ -283,6 +283,7 @@ function get_model_transfer(w_, h_, k_,
     optimizer,
     tightening_options::Dict,
     tightening_algorithm::TighteningAlgorithm,
+    n1_p_mode::Bool,
 )::Dict{Symbol,Any}
     notice(
         MIPVerify.LOGGER,
@@ -294,15 +295,30 @@ function get_model_transfer(w_, h_, k_,
         :Model => m,
         :TighteningApproach => string(tightening_algorithm),
     )
+    # Contrast uses a bilinear constraint (x' = e*x), which requires
+    # Gurobi's NonConvex=2 mode to handle products of two variables.
+    if perturbation == "contrast"
+        set_optimizer_attribute(m, "NonConvex", 2)
+    end
     println("Encoding four network copies for transfer proof...")
     if perturbation == "linf"
-        return merge(d_common, get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1, nn2, input, m))
+        return merge(d_common, get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "brightness"
+        return merge(d_common, get_perturbation_specific_keys_brightness_transfer(perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "contrast"
+        return merge(d_common, get_perturbation_specific_keys_contrast_transfer(perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "translation"
+        return merge(d_common, get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "patch"
+        return merge(d_common, get_perturbation_specific_keys_patch_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "occ"
+        return merge(d_common, get_perturbation_specific_keys_occ_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
     else
-        error("Transfer mode currently only supports linf perturbation. Got: $perturbation")
+        error("Transfer mode does not support perturbation type: $perturbation")
     end
 end
 
-function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
     global layer_counter
     global nueron_counter
     global network_version
@@ -345,7 +361,11 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         I_z_prev_down_perturbation = zeros(Float64, size(input))
     end
 
-    # Initialize perturbation interval globals: Δ_{0,k} = e_k ∈ [-ε, ε]
+    # I_pert_prev_up/down — initial perturbation interval at the input layer:
+    #   Δ[i] = x'[i] - x[i] = e[i],  e[i] ∈ [-ε, ε]  (per-pixel, independent)
+    #   → I_pert_prev_up[i]   =  ε  for all i
+    #   → I_pert_prev_down[i] = -ε  for all i
+    # Used by perturbed_interval_constraints() to propagate Δ through layers.
     if size(input)[4] > 1
         I_pert_prev_up = p_size .* ones(Float64, size(input)[4], 1)
         I_pert_prev_down = -p_size .* ones(Float64, size(input)[4], 1)
@@ -368,12 +388,16 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     network_version = "n2_org"
     v_out_n2 = v_in |> nn2
 
-    # Encode N1 on perturbed input x_p → layers 2K+1..3K
-    println("Encoding N1(x_p)...")
-    layer_counter = 0
-    nueron_counter = 0
-    network_version = "n1_pert"
-    v_out_n1_p = v_x0 |> nn1
+    # Only encode N1(x') when n1_p_mode is on (see _four_network_passes_transfer! for rationale)
+    if n1_p_mode
+        println("Encoding N1(x_p)...")
+        layer_counter = 0
+        nueron_counter = 0
+        network_version = "n1_pert"
+        v_out_n1_p = v_x0 |> nn1
+    else
+        v_out_n1_p = nothing
+    end
 
     # Encode N2 on perturbed input x_p → layers 3K+1..4K
     println("Encoding N2(x_p)...")
@@ -391,6 +415,327 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         :v_out_n1_p => v_out_n1_p,
         :v_out_n2_p => v_out_n2_p,
     )
+end
+
+# ============================================================
+# Shared helper: initialise interval globals and run the four
+# forward passes (N1/N2 × clean/perturbed) for transfer mode.
+#
+# I_pert_up / I_pert_down (passed in, same shape as `input`) are
+# the INITIAL perturbation interval at the INPUT LAYER:
+#
+#   I_pert_prev_up[i]   = upper bound of  Δ[i] = x'[i] - x[i]
+#   I_pert_prev_down[i] = lower bound of  Δ[i] = x'[i] - x[i]
+#
+# These globals are read by perturbed_interval_constraints()
+# (perturbation_intervals.jl) which propagates them layer-by-layer
+# through each Linear and ReLU, producing per-layer intervals on
+# the DIFFERENCE between perturbed and clean activations, and
+# then adds MIP constraints:
+#
+#   a_pert[l][i] ∈ [ a_clean[l][i] + I_pert_down[l][i],
+#                    a_clean[l][i] + I_pert_up[l][i]  ]
+#
+# Tighter initial intervals → tighter propagated bounds → stronger
+# tightening constraints → faster MIP solving.
+# ============================================================
+function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    global layer_counter, nueron_counter, network_version
+    global I_pert_prev_up, I_pert_prev_down
+    global all_bounds_of_original, all_bounds_of_perturbation
+    global I_z_prev_up, I_z_prev_up_perturbation
+    global I_z_prev_down, I_z_prev_down_perturbation
+
+    # all_bounds_of_original[l]    = [upper, lower] activation bounds for N1(x)  at layer l
+    # all_bounds_of_perturbation[l] = [upper, lower] activation bounds for N1(x') at layer l
+    # Used by transfer_interval_constraints() to tighten N1 vs N2 interval constraints.
+    all_bounds_of_original    = []
+    all_bounds_of_perturbation = []
+    if size(input)[4] > 1
+        append!(all_bounds_of_original,    [[ones(Float64, size(input)[4], 1), zeros(Float64, size(input)[4], 1)]])
+        I_z_prev_up                   = zeros(Float64, size(input)[4], 1)
+        I_z_prev_down                 = zeros(Float64, size(input)[4], 1)
+        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)[4], 1), zeros(Float64, size(input)[4], 1)]])
+        I_z_prev_up_perturbation      = zeros(Float64, size(input)[4], 1)
+        I_z_prev_down_perturbation    = zeros(Float64, size(input)[4], 1)
+    else
+        append!(all_bounds_of_original,    [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        I_z_prev_up                   = zeros(Float64, size(input))
+        I_z_prev_down                 = zeros(Float64, size(input))
+        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        I_z_prev_up_perturbation      = zeros(Float64, size(input))
+        I_z_prev_down_perturbation    = zeros(Float64, size(input))
+    end
+
+    # Store input-layer perturbation interval for perturbed_interval_constraints()
+    I_pert_prev_up   = I_pert_up
+    I_pert_prev_down = I_pert_down
+
+    println("Encoding N1(x)...")
+    layer_counter = 0; nueron_counter = 0; network_version = "n1_org"
+    v_out_n1 = v_in |> nn1
+
+    println("Encoding N2(x)...")
+    layer_counter = 0; nueron_counter = 0; network_version = "n2_org"
+    v_out_n2 = v_in |> nn2
+
+    # Only encode N1(x') when n1_p_mode is on — its output d[:v_out_n1_p] is only
+    # used by mip_set_transfer_property to form conf_n1_xp (the relative attack
+    # constraint).  Skipping it when n1_p_mode=false saves all of N1's binary
+    # ReLU variables for the perturbed pass.
+    if n1_p_mode
+        println("Encoding N1(x_p)...")
+        layer_counter = 0; nueron_counter = 0; network_version = "n1_pert"
+        v_out_n1_p = v_x0 |> nn1
+    else
+        v_out_n1_p = nothing
+    end
+
+    println("Encoding N2(x_p)...")
+    layer_counter = 0; nueron_counter = 0; network_version = "n2_pert"
+    v_out_n2_p = v_x0 |> nn2
+
+    return v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p
+end
+
+# ============================================================
+# Transfer: brightness  x'[i] = x[i] + e,  e ∈ [0, ε]  (scalar, same for all pixels)
+#
+# I_pert_prev_up/down explanation:
+#   Δ[i] = x'[i] - x[i] = e
+#   Since e ∈ [0, ε]:  Δ[i] ∈ [0, ε]  for every pixel i.
+#   → I_pert_up   = ε  (uniform upper bound)
+#   → I_pert_down = 0  (uniform lower bound — brightness only adds light)
+# ============================================================
+function get_perturbation_specific_keys_brightness_transfer(perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    p_size = perturbation_size[1]
+    v_e  = @variable(m, lower_bound = 0, upper_bound = p_size)
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),       input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range)
+    @constraint(m, v_x0 .== v_in .+ v_e)
+
+    # Δ = e ∈ [0, ε] for every pixel — uniform, non-negative shift
+    I_pert_up   = p_size .* ones(Float64, size(input))
+    I_pert_down = zeros(Float64, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => v_e,
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+end
+
+# ============================================================
+# Transfer: contrast  x'[i] = e * x[i],  e ∈ [1, 1+ε]  (scalar multiplier)
+# Requires NonConvex=2 (bilinear constraint — set in get_model_transfer).
+#
+# I_pert_prev_up/down explanation:
+#   Δ[i] = x'[i] - x[i] = (e - 1) * x[i]
+#   Since e-1 ∈ [0, ε] and x[i] ∈ [0, 1]:
+#     Δ[i] ∈ [0,  ε * 1] = [0, ε]  (over-approximation; tighter per-pixel
+#     bound would be [0, ε*x[i]], but x[i] is a MIP variable, not a constant)
+#   → I_pert_up   = ε  (uniform upper bound — contrast only brightens)
+#   → I_pert_down = 0  (uniform lower bound — multiplier ≥ 1, so x'[i] ≥ x[i])
+# ============================================================
+function get_perturbation_specific_keys_contrast_transfer(perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    p_size = perturbation_size[1]
+    v_e  = @variable(m, lower_bound = 1.0, upper_bound = 1+p_size)
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),       input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range)
+    @constraint(m, v_x0 .== v_e .* v_in)
+
+    # Δ = (e-1)*x[i] ∈ [0, ε] — over-approx since x[i] ≤ 1 and e-1 ≤ ε
+    I_pert_up   = p_size .* ones(Float64, size(input))
+    I_pert_down = zeros(Float64, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => v_e,
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+end
+
+# ============================================================
+# Transfer: translation  x'[j] = x[j - offset]  (rigid shift by (t_down, t_right))
+#                         x'[j] = 0              (zero-padded border pixels)
+#
+# I_pert_prev_up/down explanation:
+#   Δ[j] = x'[j] - x[j]
+#
+#   Interior pixels (valid after shift):
+#     x'[j] = x[j - offset]  where both x[j], x[j-offset] ∈ [0, 1]
+#     → Δ[j] ∈ [-1, 1]  (difference of two values in [0,1])
+#
+#   Border pixels (zero-padded):
+#     x'[j] = 0, x[j] ∈ [0, 1]
+#     → Δ[j] = -x[j] ∈ [-1, 0]
+#
+#   Using [-1, 1] uniformly is a conservative (but sound) over-approximation
+#   that covers both cases.  A tighter per-pixel bound is possible but would
+#   require knowing which pixels are interior vs border, adding complexity.
+#   → I_pert_up   =  1  (uniform upper bound)
+#   → I_pert_down = -1  (uniform lower bound)
+# ============================================================
+function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    t_down  = perturbation_size[1]
+    t_right = perturbation_size[2]
+    k = k_; w = w_; h = h_; res = w * h
+    # Interior pixels: x'[j+offset] = x[j]
+    for i2 = 1:w-t_right
+        for i1 = 1:h-t_down
+            i = i1 + h*(i2-1)
+            @constraint(m, v_x0[i+t_down+w*t_right] == v_in[i])
+            if k == 3
+                @constraint(m, v_x0[res+i+t_down+w*t_right] == v_in[res+i])
+                @constraint(m, v_x0[2*res+i+t_down+w*t_right] == v_in[2*res+i])
+            end
+        end
+    end
+    # Border pixels: zero-padded
+    for j = 1:t_down
+        @constraint(m, [i=j:w:res], v_x0[i] == 0)
+        if k == 3
+            @constraint(m, [i=j+res:w:2*res], v_x0[i] == 0)
+            @constraint(m, [i=j+2*res:w:3*res], v_x0[i] == 0)
+        end
+    end
+    for j = 1:t_right
+        @constraint(m, [i=1+w*(j-1):1:w*j], v_x0[i] == 0)
+        if k == 3
+            @constraint(m, [i=res+1+w*(j-1):1:res+w*j], v_x0[i] == 0)
+            @constraint(m, [i=2*res+1+w*(j-1):1:2*res+w*j], v_x0[i] == 0)
+        end
+    end
+
+    # Δ[j] ∈ [-1, 1] — conservative uniform bound covering all pixel cases
+    I_pert_up   =  ones(Float64, size(input))
+    I_pert_down = -ones(Float64, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+end
+
+# ============================================================
+# Transfer: patch  x'[i] ∈ [x[i]-ε, x[i]+ε]  for i in the patch region
+#                  x'[i] = x[i]                 for i outside the patch
+#
+# I_pert_prev_up/down explanation:
+#   Δ[i] = x'[i] - x[i]
+#
+#   Patch pixels (indices in `l`):
+#     x'[i] - x[i] ∈ [-ε, ε]  (free additive noise bounded by ε)
+#     → I_pert_up[i]   =  ε
+#     → I_pert_down[i] = -ε
+#
+#   Non-patch pixels:
+#     x'[i] = x[i]  ⟹  Δ[i] = 0  (no perturbation outside patch)
+#     → I_pert_up[i]   = 0
+#     → I_pert_down[i] = 0
+#
+#   This gives the tightest possible initial interval: only the patch
+#   pixels carry uncertainty; everything else is fixed.
+# ============================================================
+function get_perturbation_specific_keys_patch_transfer(w_, h_, k_, perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    eps  = perturbation_size[1]
+    ind1 = Int(perturbation_size[2])
+    ind2 = Int(perturbation_size[3])
+    w = w_; h = h_; k = k_; res_ = w * h
+    ind  = ind1 + (ind2-1)*w
+    l = Int[]  # flat pixel indices inside the patch
+    for i_ in 0:Int(perturbation_size[4])-1
+        for j_ in 0:Int(perturbation_size[4])-1
+            push!(l, ind+j_+w*i_)
+            if k == 3
+                push!(l, res_+ind+j_+w*i_)
+                push!(l, 2*res_+ind+j_+w*i_)
+            end
+        end
+    end
+    res = [tt for tt in 1:Int(w_*h_*k_) if !(tt in l)]
+    @constraint(m, c0[i=l], v_x0[i] <= v_in[i] + eps)
+    @constraint(m, c1[i=l], v_x0[i] >= v_in[i] - eps)
+    @constraint(m, c2[i=res], v_x0[i] == v_in[i])
+
+    # Per-pixel interval: ±ε inside patch, 0 outside
+    flat_up   = zeros(Float64, w_*h_*k_)
+    flat_down = zeros(Float64, w_*h_*k_)
+    for i in l; flat_up[i] = eps; flat_down[i] = -eps; end
+    I_pert_up   = reshape(flat_up,   size(input))
+    I_pert_down = reshape(flat_down, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+end
+
+# ============================================================
+# Transfer: occ  x'[i] = 0          for i in occluded patch
+#                x'[i] = x[i]        for i outside patch
+#
+# I_pert_prev_up/down explanation:
+#   Δ[i] = x'[i] - x[i]
+#
+#   Occluded pixels (indices in `l`):
+#     x'[i] = 0, x[i] ∈ [0, 1]
+#     → Δ[i] = 0 - x[i] = -x[i] ∈ [-1, 0]
+#     → I_pert_up[i]   = 0   (occlusion can only darken, never brighten)
+#     → I_pert_down[i] = -1  (worst case: x[i]=1 was fully white, now 0)
+#
+#   Non-occluded pixels:
+#     x'[i] = x[i]  ⟹  Δ[i] = 0
+#     → I_pert_up[i]   = 0
+#     → I_pert_down[i] = 0
+#
+#   This is the tightest possible sound bound: occluded pixels can only
+#   decrease (Δ ≤ 0), so the upper interval is exactly 0.
+# ============================================================
+function get_perturbation_specific_keys_occ_transfer(w_, h_, k_, perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    ind1 = Int(perturbation_size[1])
+    ind2 = Int(perturbation_size[2])
+    w = w_; h = h_; k = k_; res_ = w * h
+    ind  = ind1 + (ind2-1)*w
+    l = Int[]  # flat pixel indices inside the occluded patch
+    for i_ in 0:Int(perturbation_size[3])-1
+        for j_ in 0:Int(perturbation_size[3])-1
+            push!(l, ind+j_+w*i_)
+            if k == 3
+                push!(l, res_+ind+j_+w*i_)
+                push!(l, 2*res_+ind+j_+w*i_)
+            end
+        end
+    end
+    res = [tt for tt in 1:Int(w_*h_*k_) if !(tt in l)]
+    @constraint(m, c1[i=l],   v_x0[i] == 0.0)
+    @constraint(m, c2[i=res], v_x0[i] == v_in[i])
+
+    # Per-pixel interval: occluded → Δ ∈ [-1, 0]; non-occluded → Δ = 0
+    flat_up   = zeros(Float64, w_*h_*k_)
+    flat_down = zeros(Float64, w_*h_*k_)
+    for i in l; flat_down[i] = -1.0; end  # upper stays 0: occlusion only removes signal
+    I_pert_up   = reshape(flat_up,   size(input))
+    I_pert_down = reshape(flat_down, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
 end
 
 

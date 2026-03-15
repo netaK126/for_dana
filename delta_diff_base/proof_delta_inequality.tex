@@ -1,0 +1,348 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\geometry{margin=1.2in}
+
+%% ---- theorem environments ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+%% ---- macros ----
+\newcommand{\conf}[2]{\mathrm{conf}_{#1}(#2)}
+\newcommand{\dN}[1]{\delta_1(N_{#1})}
+\newcommand{\ddiff}{\delta_{\mathrm{diff}}^{*}}
+\newcommand{\Xdom}{\mathcal{X}}
+\newcommand{\Edom}{\mathcal{E}}
+
+\title{%
+  The Inequality $\delta_1(N_1)+\delta_{\mathrm{diff}}^{*} \geq \delta_1(N_2)$
+  Does \textbf{Not} Hold in General:\\[6pt]
+  \large A Counterexample with Full Calculations,
+         and the Correct Inequality}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%% ====================================================================
+\section{Setting}
+
+Throughout this document:
+\begin{itemize}
+  \item Input domain: $\Xdom = [0,1]^2$, with $x=(x_1,x_2)$.
+  \item Perturbation set: $\Edom = [-p,\,p]^2$ with $p=\tfrac{1}{10}$.
+  \item $c_{\mathrm{tag}}=1$ (correct class), $c_{\mathrm{target}}=2$ (adversarial class).
+  \item Attack margin $\eta = 10^{-3}$.
+  \item Transition margin $\varepsilon_0 = 10^{-3}$ (used in constraint C1).
+\end{itemize}
+
+\begin{definition}[Confidence margin]\label{def:conf}
+For a network $N$ with output logits
+$\mathrm{logit}_N(x) = \bigl[\mathrm{logit}_N(x)[1],\,\mathrm{logit}_N(x)[2]\bigr]$,
+\[
+  \conf{N}{x}
+  \;:=\;
+  \mathrm{logit}_N(x)[1] \;-\; \mathrm{logit}_N(x)[2].
+\]
+$\conf{N}{x}>0$ means $N$ predicts class $c_{\mathrm{tag}}=1$ (correct prediction).
+\end{definition}
+
+\begin{definition}[$N$-foolable]\label{def:foolable}
+$x\in\Xdom$ is \emph{$N$-foolable} if there exists $\varepsilon\in\Edom$ with
+$x+\varepsilon\in\Xdom$ and
+\[
+  \mathrm{logit}_N(x+\varepsilon)[2]
+  \;\geq\;
+  \mathrm{logit}_N(x+\varepsilon)[1] + \eta.
+\]
+Equivalently, $\conf{N}{x+\varepsilon} \leq -\eta$.
+\end{definition}
+
+\begin{definition}[$\delta_1(N)$ — standard mode]\label{def:delta1}
+\[
+  \delta_1(N) := \sup\bigl\{\,\conf{N}{x}
+    \;\big|\;
+    x\in\Xdom,\;
+    \conf{N}{x}\geq 0,\;
+    x\ N\text{-foolable}\,\bigr\}.
+\]
+\end{definition}
+
+\begin{definition}[$\ddiff$ — transfer MIP]\label{def:ddiff}
+\[
+  \ddiff := \sup\bigl\{\,
+    \conf{N_2}{x}-\conf{N_1}{x}
+    \;\big|\;
+    \underbrace{\conf{N_1}{x}\geq\dN{1}+\varepsilon_0}_{(\mathrm{C1})},\;
+    \underbrace{\conf{N_2}{x}\geq\conf{N_1}{x}}_{(\mathrm{C2})},\;
+    \underbrace{x\ N_2\text{-foolable}}_{(\mathrm{C3})}
+  \,\bigr\}.
+\]
+\end{definition}
+
+%% ====================================================================
+\section{Networks}
+
+We use two \emph{linear} networks (the ReLU layers are inactive because
+$x_1,x_2\in[0,1]\geq 0$):
+
+\medskip
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Network & Logits & Confidence margin \\
+\midrule
+$N_1$ & $\mathrm{logit}_{N_1}(x)=\bigl[x_1,\;x_2\bigr]$
+      & $\conf{N_1}{x} = x_1 - x_2$ \\[4pt]
+$N_2$ & $\mathrm{logit}_{N_2}(x)=\bigl[2x_1,\;5x_2\bigr]$
+      & $\conf{N_2}{x} = 2x_1 - 5x_2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip\noindent
+Both are two-layer sequential nets with a $2\times2$ identity first layer,
+an inactive ReLU, and a $2\times2$ diagonal second layer
+($\mathrm{diag}(1,1)$ for $N_1$ and $\mathrm{diag}(2,5)$ for $N_2$).
+
+%% ====================================================================
+\section{Step-by-Step Calculations}
+
+\subsection{Foolability conditions (closed form)}
+
+\paragraph{$N_1$.}
+$N_1(x+\varepsilon)$ predicts class 2 iff
+$(x_2+\varepsilon_2)\geq(x_1+\varepsilon_1)+\eta$,
+i.e., $\varepsilon_2-\varepsilon_1\geq(x_1-x_2)+\eta$.
+The maximum of $\varepsilon_2-\varepsilon_1$ over $\Edom$ is
+$p-(-p)=0.2$.
+Hence:
+\[
+  \boxed{x\ N_1\text{-foolable}
+  \;\Longleftrightarrow\;
+  x_1-x_2 \;\leq\; 0.2-\eta.}
+\]
+
+\paragraph{$N_2$.}
+$N_2(x+\varepsilon)$ predicts class 2 iff
+$5(x_2+\varepsilon_2)\geq 2(x_1+\varepsilon_1)+\eta$,
+i.e., $5\varepsilon_2-2\varepsilon_1\geq(2x_1-5x_2)+\eta$.
+The maximum of $5\varepsilon_2-2\varepsilon_1$ over $\Edom$ is
+$5\cdot 0.1+2\cdot 0.1=0.7$.
+Hence:
+\[
+  \boxed{x\ N_2\text{-foolable}
+  \;\Longleftrightarrow\;
+  2x_1-5x_2 \;\leq\; 0.7-\eta.}
+\]
+
+\subsection{Computing $\dN{1}$}
+
+Maximize $x_1-x_2$ subject to $x_1-x_2\leq 0.2-\eta$,
+$x_1-x_2\geq 0$, $x\in[0,1]^2$:
+\[
+  \dN{1} = 0.2-\eta = 0.199.
+\]
+This is achieved at $x_1=0.199$, $x_2=0$:
+\[
+  \underbrace{x_1-x_2}_{=\,0.199}
+  \leq 0.2-\eta=0.199. \quad\checkmark
+\]
+
+\subsection{Computing $\dN{2}$}
+
+Maximize $2x_1-5x_2$ subject to $2x_1-5x_2\leq 0.7-\eta$,
+$2x_1-5x_2\geq 0$, $x\in[0,1]^2$:
+\[
+  \dN{2} = 0.7-\eta = 0.699.
+\]
+Achieved at $x_2=0$, $x_1=\frac{0.699}{2}=0.3495$:
+\[
+  2(0.3495)-5(0) = 0.699 \leq 0.699.\quad\checkmark
+\]
+
+\noindent
+\textbf{Explicit verification of $N_2$-foolability at $(0.3495,0)$
+with $\varepsilon^*=(-0.1,+0.1)$:}
+\[
+  5(0+0.1)-2(0.3495-0.1)
+  = 0.5 - 2\times 0.2495
+  = 0.5 - 0.499
+  = 0.001
+  = \eta.
+  \quad\checkmark
+\]
+
+\subsection{Computing $\ddiff$}
+
+The transfer MIP objective is
+\[
+  \conf{N_2}{x}-\conf{N_1}{x}
+  =(2x_1-5x_2)-(x_1-x_2)
+  = x_1 - 4x_2.
+\]
+Constraints (substituting the closed forms from Section~3.1):
+\begin{alignat}{2}
+  &\text{C1:} & \quad x_1-x_2 &\;\geq\; \dN{1}+\varepsilon_0
+    = 0.199+0.001 = 0.200, \label{eq:C1}\\
+  &\text{C2:} & \quad x_1-4x_2 &\;\geq\; 0, \label{eq:C2}\\
+  &\text{C3:} & \quad 2x_1-5x_2 &\;\leq\; 0.699, \label{eq:C3}\\
+  &\text{domain:} & \quad x &\;\in\; [0,1]^2. \notag
+\end{alignat}
+
+\paragraph{Solving.}
+Setting $x_2=0$ eliminates the $-4x_2$ penalty (the objective $x_1-4x_2$ is
+maximised by setting $x_2$ as small as possible):
+\begin{itemize}
+  \item C1 becomes $x_1\geq 0.200$.
+  \item C2 becomes $x_1\geq 0$ (automatically satisfied).
+  \item C3 becomes $2x_1\leq 0.699$, i.e., $x_1\leq 0.3495$.
+\end{itemize}
+Maximising $x_1$ over $[0.200,\,0.3495]$ gives $x_1^*=0.3495$.
+
+\[
+  \ddiff = x_1^*-4\cdot 0 = \mathbf{0.3495}.
+\]
+
+\paragraph{Verification at $x^*=(0.3495,\,0)$:}
+\[
+\begin{array}{ll}
+\text{C1:} & 0.3495-0=0.3495\geq 0.200.\quad\checkmark\\[2pt]
+\text{C2:} & 0.3495-0=0.3495\geq 0.\quad\checkmark\\[2pt]
+\text{C3:} & 2(0.3495)-5(0)=0.699\leq 0.699.\quad\checkmark\text{ (tight)}\\[4pt]
+\multicolumn{2}{l}{\conf{N_1}{x^*}=0.3495,\quad
+                   \conf{N_2}{x^*}=0.699,\quad
+                   \text{difference}=0.3495=\ddiff.\quad\checkmark}
+\end{array}
+\]
+
+%% ====================================================================
+\section{The Stated Inequality Fails}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{lc}
+\toprule
+Quantity & Value \\
+\midrule
+$\dN{1}$ (standard mode on $N_1$) & $0.199$ \\
+$\ddiff$ (transfer MIP) & $0.3495$ \\
+$\dN{1}+\ddiff$ & $\mathbf{0.5485}$ \\
+\midrule
+$\dN{2}$ (standard mode on $N_2$) & $\mathbf{0.699}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\bigskip
+\[
+  \dN{1}+\ddiff
+  \;=\; 0.5485
+  \;\;\mathbf{<}\;\;
+  0.699
+  \;=\; \dN{2}.
+\]
+
+\noindent
+The inequality $\dN{1}+\ddiff\geq\dN{2}$
+\textbf{does not hold} for these networks. The gap is
+$0.699-0.5485 = 0.1505$.
+
+\paragraph{Why does the gap arise?}
+The transfer MIP optimal point is $x^*=(0.3495,0)$ with
+$\conf{N_1}{x^*}=0.3495$.
+Since $\conf{N_1}{x^*}=0.3495 > 0.199=\dN{1}$, the transfer MIP's witness
+has \emph{strictly higher} $N_1$-confidence than the worst-case $N_1$-vulnerable input.
+Consequently:
+\[
+  \dN{2}
+  \;\geq\; \conf{N_2}{x^*}
+  \;=\; \underbrace{\conf{N_1}{x^*}}_{0.3495}
+        + \underbrace{\ddiff}_{0.3495}
+  \;=\; 0.699
+  \;\;>\;\;
+  \underbrace{\dN{1}}_{0.199}+\underbrace{\ddiff}_{0.3495}=0.5485.
+\]
+The formula $\dN{1}+\ddiff$ replaces $\conf{N_1}{x^*)=0.3495$ with the
+\emph{smaller} quantity $\dN{1}=0.199$, losing the gap of
+$0.3495-0.199=0.1505$.
+
+%% ====================================================================
+\section{The Correct Inequality}
+
+The inequality holds in the \emph{reverse} direction.
+
+\begin{theorem}\label{thm:correct}
+If $\ddiff>-\infty$ (the transfer MIP is feasible), then
+\[
+  \boxed{\dN{2} \;\geq\; \dN{1} + \ddiff.}
+\]
+\end{theorem}
+
+\begin{proof}
+Fix $\epsilon>0$.
+Let $x^*\in\Xdom$ be a point feasible for the transfer MIP achieving the
+objective within $\epsilon$ of the supremum; write $\varepsilon^*$ for the
+corresponding attack perturbation (from C3). Then:
+\begin{align}
+  \conf{N_1}{x^*} &\geq \dN{1}+\varepsilon_0, \tag{C1}\\
+  \conf{N_2}{x^*} &\geq \conf{N_1}{x^*}, \tag{C2}\\
+  x^* &\ N_2\text{-foolable (via }\varepsilon^*\text{)}, \tag{C3}\\
+  \conf{N_2}{x^*}-\conf{N_1}{x^*} &\geq \ddiff-\epsilon. \tag{obj}
+\end{align}
+
+\noindent\textbf{Lower-bounding $\conf{N_2}{x^*}$:}
+\begin{align*}
+  \conf{N_2}{x^*}
+  &= \conf{N_1}{x^*}
+     + \bigl(\conf{N_2}{x^*}-\conf{N_1}{x^*}\bigr)\\
+  &\geq (\dN{1}+\varepsilon_0)+(\ddiff-\epsilon)
+  \tag{by C1 and (obj)}\\
+  &\geq \dN{1}+\ddiff-\epsilon.
+\end{align*}
+
+\noindent\textbf{Feasibility for standard mode on $N_2$:}
+By C2 and C1, $\conf{N_2}{x^*}\geq\conf{N_1}{x^*}\geq\dN{1}+\varepsilon_0>0$,
+so $N_2$ \emph{correctly} classifies $x^*$.
+Combined with C3 ($x^*$ is $N_2$-foolable), the point $x^*$ is feasible for
+the standard-mode MIP on $N_2$. Therefore
+\[
+  \dN{2} \;\geq\; \conf{N_2}{x^*} \;\geq\; \dN{1}+\ddiff-\epsilon.
+\]
+Since $\epsilon>0$ was arbitrary, $\dN{2}\geq\dN{1}+\ddiff$.
+\end{proof}
+
+\paragraph{Numerical check (our networks):}
+\[
+  \dN{2}=0.699
+  \;\geq\;
+  \dN{1}+\ddiff=0.199+0.3495=0.5485.
+  \quad\checkmark
+\]
+The gap of $0.1505=\conf{N_1}{x^*}-\dN{1}=0.3495-0.199$ is exactly the
+surplus $N_1$-confidence at the transfer MIP optimum (cf.\ Remark~\ref{rem:gap}).
+
+\begin{remark}[The gap quantified]\label{rem:gap}
+Let $x^*$ denote the transfer MIP optimum. Then:
+\[
+  \dN{2}-\bigl(\dN{1}+\ddiff\bigr)
+  \;\geq\;
+  \conf{N_1}{x^*}-\dN{1}
+  \;\geq\; \varepsilon_0 > 0.
+\]
+The gap is non-negative because C1 forces $\conf{N_1}{x^*}\geq\dN{1}+\varepsilon_0$,
+so the transfer MIP's witness always has strictly higher $N_1$-confidence
+than the worst-case $N_1$-vulnerable input.
+\end{remark}
+
+\end{document}

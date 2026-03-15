@@ -1,0 +1,132 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Preliminaries}
+\label{sec:notation}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we provide background on neural network classifiers and formalize the central quantities used throughout this paper. We begin with the definitions of networks and confidence margins, then introduce the notions of robustness and foolability that underlie both the standard-mode and transfer-mode formulations.
+
+\subsection{Neural Network Classifiers}
+
+A classifier maps an input into a score vector over a set of labels (also called classes) $C$, i.e., it is a function $N : [0,1]^n \to \RR^{|C|}$. Given an input $x$, its classification is the label with the maximal score: $c = \mathrm{argmax}(N(x))$. We focus on classifiers implemented as neural networks. A neural network consists of an input layer followed by $L$ layers, where the last layer is the output layer. Layers consist of neurons, each connected to some or all neurons in the next layer.
+
+We denote by $z_{m,k}$ the $k$-th neuron in layer $m$, for $m \in \{0, \ldots, L\}$ (where $0$ denotes the input layer) and $k \in \{1, \ldots, k_m\}$. The input layer $z_0$ passes the input $x$ to the next layer (i.e., $z_{0,k} = x_k$ for all $k \in [n]$). In a fully-connected layer, a neuron $z_{m,k}$ gets as input the outputs of all neurons in the preceding layer. It has a weight $w_{m,k,k'}$ for each input and a single bias $b_{m,k}$. Its function is the weighted sum of its inputs and bias followed by an activation function. Formally, the function of a non-input neuron is $z_{m,k} = \mathrm{ReLU}(\hat{z}_{m,k}) = \max(0, \hat{z}_{m,k})$, where $\hat{z}_{m,k}$ is the weighted sum: $\hat{z}_{m,k} = b_{m,k} + \sum_{k'=1}^{k_{m-1}} w_{m,k,k'} \cdot z_{m-1,k'}$. The network's parameters --- the weights and biases --- are determined by a training algorithm. The output layer consists of $|C|$ neurons, each outputting the score of one of the labels. We denote the output logits by $\hat{y}(x) = z^{[L]}(x)$.
+
+Our definitions focus on fully-connected layers, but our implementation also supports convolutional layers and it is easily extensible to other layer types such as max-pooling layers~\cite{mipverify}.
+
+\subsection{Confidence Margin}
+
+The \emph{confidence margin} captures how certain a network is in its classification. Intuitively, a high confidence margin means the network assigns the correct class a score well above all other classes, making it harder for a perturbation to change the classification.
+
+\begin{definition}[Confidence margin]
+  \label{def:conf}
+  Given a network $N$, an input $x$, and a class $c \in C$, the \emph{class confidence} of $N$ in $c$ at $x$ is:
+  \[
+    \conf{N}{x}{c} \;:=\; \hat{y}_c(x) \;-\; \max_{k \neq c}\, \hat{y}_k(x).
+  \]
+  The confidence $\conf{N}{x}{c} > 0$ if and only if $N$ classifies $x$ as $c$.
+
+  \noindent\emph{Two-class setting.}
+  When there are only two output classes $c_{\mathrm{tag}}$ and
+  $c_{\mathrm{target}}$, we write $\confB{N}{x}$ as shorthand for
+  $\conf{N}{x}{c_{\mathrm{tag}}} = \hat{y}_{c_{\mathrm{tag}}}(x)
+  - \hat{y}_{c_{\mathrm{target}}}(x)$.
+\end{definition}
+
+\subsection{Robustness and Foolability}
+
+We next define robustness and foolability with respect to a perturbation set. These notions form the building blocks of both the standard-mode and transfer-mode problems.
+
+\begin{definition}[$(\varepsilon, c \to t)$-robustness]
+  \label{def:robust}
+  Given a network $N$ and a perturbation set $\mI_\ep(x)$ (defined per perturbation type in Section~\ref{sec:perturbations}), an input $x$ is \emph{$(\varepsilon, c \to t)$-robust} for $N$ if
+  $\forall\, \xp \in \mI_\ep(x):\; N(\xp) \neq t$.
+  That is, no perturbation in the allowed set causes $N$ to misclassify $x$ as the target class $t$.
+\end{definition}
+
+\begin{definition}[$N$-foolability]
+  \label{def:foolable}
+  An input $x\in\Xdom$ is \emph{$N$-foolable} if there exists a perturbation $\varepsilon\in\Edom$ with $x+\varepsilon\in\Xdom$ such that $\confB{N}{x+\varepsilon}\leq -\eta$, where $\eta > 0$ is a small attack margin (typically $10^{-3}$). We write $\Ffool{N}$ for the set of all $N$-foolable inputs.
+\end{definition}
+
+Intuitively, an input is foolable if the adversary can find a perturbation that causes the network to misclassify it. The set $\Ffool{N}$ contains all inputs that are vulnerable to adversarial attack under the given perturbation model.
+
+\subsection{MIP Encoding of ReLU}
+
+Our approach encodes the network's computation as a mixed-integer program (MIP). The JuMP/Gurobi MIP~\cite{jump,gurobi} encodes each linear layer exactly and linearizes every ReLU via the standard big-$M$ formulation with a binary variable $b \in \{0,1\}$:
+\[
+  a \;=\; \max(0,z), \qquad
+  0 \le a \le M\,b, \qquad
+  z \le a, \qquad
+  a \le z + M(1-b).
+\]
+This encoding assigns each non-input ReLU neuron a binary variable, whose domain is $\{0,1\}$. Generally, the time complexity of a MIP problem over boolean and real variables is exponential in the number of boolean variables. To make the analysis more efficient, several works propose ways to identify boolean variables that can be removed (e.g., ReLUs whose inputs are non-positive or non-negative), thereby reducing the complexity~\cite{tjeng2019}.
+
+\subsection{Formal Definitions of the Central Quantities}
+\label{sec:notation:formal}
+
+We now formalize the three central MIP quantities. Throughout, we use:
+$\Xdom = [0,1]^n$ (input domain),
+$\Edom = [-p,p]^n$ (perturbation ball for radius $p > 0$),
+attack margin $\eta > 0$, and transition margin $\ep_0 > 0$ (both typically $10^{-3}$).
+
+\begin{definition}[Standard-mode value]
+  \label{def:delta1}
+  The \emph{standard-mode value} of network $N_i$ is:
+  \[
+    \dN{i} \;:=\;
+    \sup\bigl\{\,\confB{N_i}{x}
+      \;\big|\;
+      x\in\Ffool{i},\;
+      \confB{N_i}{x}\geq 0
+    \,\bigr\}.
+  \]
+  Intuitively, this is the maximum confidence $N_i$ attains on any input that is correctly classified yet can still be misclassified by some perturbation $\varepsilon\in\Edom$. Any input with confidence above $\dN{i}$ is provably robust.
+\end{definition}
+
+\begin{definition}[Transfer MIP --- original]
+  \label{def:ddiff}
+  Given networks $N_1$ and $N_2$ with pre-computed $\dN{1}$, the \emph{transfer value} is:
+  \begin{align}
+    \ddiff
+    \;:=\;\sup\Bigl\{\,
+      &\confB{N_2}{x}-\confB{N_1}{x}
+      \;\Big|\notag\\
+      &(\mathrm{C1})\;\confB{N_1}{x}\geq\dN{1}+\ep_0,\notag\\
+      &(\mathrm{C2})\;\confB{N_2}{x}\geq\confB{N_1}{x},\notag\\
+      &(\mathrm{C3})\;x\in\Ffool{2}
+    \,\Bigr\}.\label{eq:ddiff}
+  \end{align}
+  Constraint C1 ensures $x$ lies in the region where $N_1$ is certifiably robust. C2 ensures $N_2$ is at least as confident as $N_1$. C3 ensures a perturbation exists that fools $N_2$. The objective maximizes the confidence gap, finding the worst-case scenario for the transfer guarantee.
+\end{definition}
+
+\begin{definition}[Modified transfer MIP]
+  \label{def:ddiffmod}
+  \begin{align}
+    \ddiffmod
+    \;:=\;\sup\Bigl\{\,
+      &\confB{N_2}{x}-\confB{N_1}{x}
+      \;\Big|\notag\\
+      &(\widehat{\mathrm{C1}})\;x\in\Ffool{1},\notag\\
+      &(\mathrm{C3})\;x\in\Ffool{2}
+    \,\Bigr\}.\label{eq:ddiffmod}
+  \end{align}
+  The key change: C1 is replaced by $\widehat{\mathrm{C1}}$, which requires $x$ to be $N_1$-\emph{foolable} rather than $N_1$-robust.
+\end{definition}
+
+\begin{definition}[Joint-foolable set]
+  \label{def:joint}
+  $\Fjoint := \Ffool{1}\cap\Ffool{2}$: the set of inputs simultaneously foolable by both networks.
+\end{definition}
+
+\begin{definition}[Modified standard-mode value]
+  \label{def:delta1mod}
+  \[
+    \dNmod{2} \;:=\;
+    \sup\bigl\{\,\confB{N_2}{x}
+      \;\big|\;
+      x\in\Fjoint,\;
+      \confB{N_2}{x}\geq 0
+    \,\bigr\}.
+  \]
+  This is the maximum confidence $N_2$ achieves at inputs simultaneously foolable by \emph{both} networks. By definition, $\dNmod{2} \leq \dN{2}$, since restricting to the joint-foolable set can only decrease the supremum.
+\end{definition}

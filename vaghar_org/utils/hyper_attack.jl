@@ -60,6 +60,33 @@ function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
     return best_feasible_via_optimization, pre_time
 end
 
+function hyper_attack_transfer_distilation(dataset, c_tag, c_target, token_signature,
+                               model_name, model_name2, model_path, model_path2,
+                               perturbation, perturbation_size,
+                               delta_1, c_tag_mode, n1_p_mode)
+    best_feasible_via_optimization = 0
+    pre_time = 0
+    pre_time = @elapsed begin
+        cmd = Cmd(["python3", "./utils/hyper_attack_transfer.py",
+            "--dataset", string(dataset),
+            "--source", string(c_tag-1),
+            "--target", string(c_target-1),
+            "--token", token_signature,
+            "--model", model_name,
+            "--model2", model_name2,
+            "--model_path", model_path*"th",
+            "--model_path2", model_path2*"th",
+            "--perturbation", perturbation,
+            "--perturbation_size", create_perturbation_string(perturbation_size),
+            "--delta1", string(delta_1),
+            "--c_tag_mode", string(c_tag_mode),
+            "--n1_p_mode", string(n1_p_mode)])
+        run(cmd)
+        best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
+    end
+    return best_feasible_via_optimization, pre_time
+end
+
 function hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
     best_feasible_via_optimization = 0
     pre_time = 0

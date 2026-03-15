@@ -88,7 +88,6 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
         end
         for n in 1:size(phi_dep_c)[1]
             dep = phi_dep_c[n]
-            layers_info_dict[activation_cnt,n]
             if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
                 if (dep == NaN)
                     @constraint(m,av[ind_o+1]==(1+av[1])*av[ind_p+1])
@@ -112,7 +111,6 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
     end
     for n in 1:size(phi_dep_c)[1]
         dep = phi_dep_c[n]
-        layers_info_dict[activation_cnt,n]
         if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
             u_o, l_o, ind_o = layers_info_dict[activation_cnt,n]
             u_p, l_p, ind_p = layers_info_dict[activation_cnt+layers_n,n]

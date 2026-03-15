@@ -1,0 +1,48 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Complete MIP Formulation}
+\label{sec:mip}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we present the complete transfer-mode MIP with all four tightening techniques enabled. The formulation brings together the transfer constraints from Section~\ref{sec:transfer} and the tightening constraints from Section~\ref{sec:flags} into a single optimization problem.
+
+The objective is:
+\begin{equation}
+  \label{eq:full-mip}
+  \max_{x,\,\xp,\,\{a\net{m}\layer{l}\},\,\{b\net{m}\layer{l}\}}\;
+  \conf{N_2}{x}{c} - \conf{N_1}{x}{c}
+\end{equation}
+
+subject to the following constraints:
+\begin{align}
+  &\text{(Perturbation)}\quad
+    &&\xp \in \mI_\ep(x) \\
+  &\text{(T1)}\quad
+    &&\conf{N_1}{x}{c} \ge \dO + 10^{-3} \\
+  &\text{(T2)}\quad
+    &&\conf{N_2}{x}{c} \ge \conf{N_1}{x}{c} \\
+  &\text{(T3)}\quad
+    &&\text{Targeted or untargeted attack (Section~\ref{sec:modes})} \\
+  &\text{(ReLU encoding)}\quad
+    &&\text{Big-$M$ for each network pass: } N_1(x),\, N_2(x),\, N_2(\xp) \\
+  &\text{(Pert.\ diff.\ intervals)}\quad
+    &&a\net{org}\layer{l}_j + \Idn\layer{l}_j \le a\net{pert}\layer{l}_j
+       \le a\net{org}\layer{l}_j + \Iup\layer{l}_j \\
+  &\text{(Inter-network intervals)}\quad
+    &&a^{N_1}\layer{l}_j + \alpha\layer{l}_j \le a^{N_2}\layer{l}_j
+       \le a^{N_1}\layer{l}_j + \beta\layer{l}_j \\
+  &\text{(Dependency constraints)}\quad
+    &&a\net{pert}\layer{l}_j \;\gtrless\; a\net{org}\layer{l}_j
+       \text{ per sign of } \varphi_j\layer{l} \\
+  &\text{(Warm-start)}\quad
+    &&b_j^{\text{hint}} \leftarrow \text{PGD activation signs}
+\end{align}
+
+We note the following about the formulation:
+\begin{itemize}
+  \item The MIP encodes three forward passes: $N_1(x)$, $N_2(x)$, and $N_2(\xp)$. The pass $N_1(\xp)$ is not needed since no constraint involves $N_1$'s output on the perturbed input.
+  \item Constraints T1--T3 are encoded via the big-$M$ confidence-margin linearization described in Section~\ref{sec:standard}.
+  \item The perturbation-difference interval constraints (6th row) are added by the second tightening technique (Section~\ref{sec:flag:perturbed}).
+  \item The inter-network interval constraints (7th row) are added by the third tightening technique (Section~\ref{sec:flag:intervals}).
+  \item The dependency constraints (8th row) are added by the fourth tightening technique (Section~\ref{sec:flag:deps}).
+  \item The binary warm-start (9th row) is provided by the hyper-adversarial attack (Section~\ref{sec:flag:hyper}).
+\end{itemize}

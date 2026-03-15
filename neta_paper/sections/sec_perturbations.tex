@@ -1,0 +1,98 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Perturbation Models}
+\label{sec:perturbations}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we define the perturbation models supported by our framework. A perturbation is a function $f_P(x, \mathcal{E})$, defining how an input $x$ is perturbed given a perturbation amount specified by a vector $\mathcal{E}$. All perturbations are parameterized by a scalar $\ep > 0$ bounding their magnitude. For each perturbation type, we also define the \emph{perturbation-difference interval} $[\Idn, \Iup] \in \RR^n \times \RR^n$, which captures the element-wise range of $\xp - x$ at the input layer. These intervals are propagated layer-by-layer to tighten the MIP (Section~\ref{sec:flag:perturbed}).
+
+\subsection{\texorpdfstring{$\ell_\infty$}{L-inf} Perturbation}
+
+The $\ell_\infty$ perturbation has a perturbation limit $\ep \in [0,1]$ and is defined by a series of perturbations $\varepsilon_{i} \in [-\ep, \ep]$, for $i \in [n]$. The perturbation set is:
+\[
+  \mI_\ep(x) = \bigl\{\xp : \|\xp - x\|_\infty \le \ep,\;
+  \xp \in [0,1]^n\bigr\}.
+\]
+In the MIP encoding, this translates to: $x_i - \ep \le x'_i \le x_i + \ep$ for every pixel $i$, with clipping to $[0,1]$.
+
+The perturbation-difference interval is:
+$\Idn_i = -\ep$, $\Iup_i = +\ep$ for all $i$.
+
+\subsection{Brightness Perturbation}
+
+Brightness is defined by a brightness level $e \in [0, \ep]$ such that $x'_i = x_i + e$ for all pixels $i$. The perturbation set is:
+\[
+  \mI_\ep(x) = \bigl\{\xp : \xp = x + e\,\mathbf{1},\; e \in [0, \ep]\bigr\}.
+\]
+In the MIP encoding, we add a scalar variable $e \in [0, \ep]$ and set $x'_i = x_i + e$.
+
+Since $e \ge 0$, the brightness shift is non-negative. The perturbation-difference interval is therefore: $\Idn_i = 0$, $\Iup_i = +\ep$ for all $i$.
+
+\subsection{Contrast Perturbation}
+
+Contrast is defined by a scaling factor $e \in [1, 1+\ep]$ such that $x'_i = e \cdot x_i$. The perturbation set is:
+\[
+  \mI_\ep(x) = \bigl\{\xp : \xp = e\cdot x,\; e \in [1, 1+\ep]\bigr\}.
+\]
+In the MIP encoding, we add a scalar variable $e \in [1,1+\ep]$ and set $x'_i = e \cdot x_i$. Note that this introduces a bilinear constraint, which requires the Gurobi non-convex mode.
+
+Since $e \ge 1$ and $x_i \ge 0$, we have $x'_i - x_i = (e-1)x_i \in [0, \ep]$. The perturbation-difference interval is an over-approximation: $\Idn_i = 0$, $\Iup_i = +\ep$ for all $i$.
+
+\subsection{Translation Perturbation}
+
+Translation is defined by shift coordinates $(d_h, d_w)$ with $|d_h|, |d_w| \le k$ pixels, and vacated positions are zero-padded. The shift direction is selected by binary variables $b_h, b_w \in \{0,1\}$ and offset variables $d_h, d_w \in [0,k]$.
+
+Pixel values lie in $[0,1]$. After translation, the worst-case difference at any pixel is $\xp_i - x_i \in [-x_i, 1-x_i] \subseteq [-1, 1]$. We use the conservative perturbation-difference interval: $\Idn_i = -1$, $\Iup_i = +1$ for all $i$.
+
+\subsection{Patch Perturbation}
+
+A rectangular patch $P \subseteq [n]$ of pixels is perturbed by $\pm\ep$, while pixels outside $P$ are unchanged:
+\[
+  x'_i = x_i + e_i\,\ep, \quad e_i \in [-1, +1], \quad i \in P; \qquad
+  x'_i = x_i, \quad i \notin P.
+\]
+
+The perturbation-difference interval reflects this structure:
+\[
+  \Idn_i = \begin{cases}-\ep & i \in P \\ 0 & i \notin P,\end{cases}
+  \qquad
+  \Iup_i = \begin{cases}+\ep & i \in P \\ 0 & i \notin P.\end{cases}
+\]
+
+\subsection{Occlusion Perturbation}
+
+An occlusion perturbation sets a rectangular patch $P$ to zero, while pixels outside $P$ are unchanged:
+\[
+  x'_i = 0, \quad i \in P; \qquad x'_i = x_i, \quad i \notin P.
+\]
+
+Because $x_i \in [0,1]$ and $x'_i = 0$ inside $P$, the difference $x'_i - x_i = -x_i \in [-1, 0]$. Outside $P$, the difference is exactly zero. The perturbation-difference interval is therefore:
+\[
+  \Idn_i = \begin{cases}-1 & i \in P \\ 0 & i \notin P,\end{cases}
+  \qquad
+  \Iup_i = 0, \quad \forall\, i.
+\]
+
+\subsection{Summary}
+
+Table~\ref{tab:perturbations} summarizes the perturbation sets and their corresponding input-layer difference intervals.
+
+\begin{table}[ht]
+  \centering
+  \caption{Summary of perturbation sets and input-layer difference intervals.}
+  \label{tab:perturbations}
+  \begin{tabular}{llll}
+    \toprule
+    \textbf{Perturbation} & \textbf{Perturbation set} $\mI_\ep(x)$ &
+    $\Idn_i$ & $\Iup_i$ \\
+    \midrule
+    $\ell_\infty$    & $\|\xp-x\|_\infty \le \ep$      & $-\ep$ & $+\ep$ \\
+    Brightness       & $\xp = x + e$, $e\in[0,\ep]$    & $0$    & $+\ep$ \\
+    Contrast         & $\xp = e\cdot x$, $e\in[1,1+\ep]$ & $0$ & $+\ep$ \\
+    Translation      & pixel shift $\le k$ px, zero-pad & $-1$ & $+1$ \\
+    Patch            & $\pm\ep$ inside patch $P$
+                     & $-\ep \cdot \mathbf{1}_P$ & $+\ep \cdot \mathbf{1}_P$ \\
+    Occlusion        & zero inside patch $P$
+                     & $-\mathbf{1}_P$ & $0$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

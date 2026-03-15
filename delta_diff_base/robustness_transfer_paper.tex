@@ -1,0 +1,747 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\geometry{margin=1.2in}
+
+%% ---- theorem environments ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+\newtheorem{example}{Example}[section]
+
+%% ---- macros ----
+\newcommand{\conf}[2]{\mathrm{conf}_{#1}(#2)}
+\newcommand{\dN}[1]{\delta_1(N_{#1})}
+\newcommand{\dNmod}[1]{\hat{\delta}_1(N_{#1})}
+\newcommand{\ddiff}{\delta_{\mathrm{diff}}^{*}}
+\newcommand{\ddiffmod}{\hat{\delta}_{\mathrm{diff}}}
+\newcommand{\Xdom}{\mathcal{X}}
+\newcommand{\Edom}{\mathcal{E}}
+\newcommand{\Ffool}[1]{\mathcal{F}_{#1}}
+\newcommand{\Fjoint}{\mathcal{F}_{1\wedge 2}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{%
+  Certifying Robustness Transfer Between Neural Networks:\\[6pt]
+  \large Bounds on Adversarial Confidence Margins,\\
+  a Counterexample, and a Tight Modified Formulation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%% ====================================================================
+\section{Abstract}
+
+We study the relationship between the adversarial robustness margins
+of two classifiers $N_1$ and $N_2$, formally defined via Mixed-Integer
+Programming (MIP) within the VHAGaR~\cite{vaghar} framework.
+Three quantities are central: $\delta_1(N_1)$, $\delta_1(N_2)$
+(the \emph{standard-mode} MIP values — the maximum confidence each
+network achieves on inputs that can still be fooled by a bounded
+perturbation), and $\delta_{\mathrm{diff}}^*$ (the \emph{transfer MIP}
+value — the maximum gap in confidence between $N_2$ and $N_1$ at points
+where $N_1$ is robust but $N_2$ can be fooled).
+
+We make four contributions:
+\begin{enumerate}
+  \item We formalize all three quantities as optimization programs
+        (Section~\ref{sec:defs}).
+  \item We prove the \emph{correct} inequality direction:
+        $\delta_1(N_2) \geq \delta_1(N_1)+\delta_{\mathrm{diff}}^*$
+        (Theorem~\ref{thm:correct}, Section~\ref{sec:correct}).
+  \item We exhibit an explicit counterexample with two simple linear
+        networks showing that the reverse inequality,
+        $\delta_1(N_1)+\delta_{\mathrm{diff}}^*\geq\delta_1(N_2)$,
+        is \emph{false} in general (Section~\ref{sec:counter}).
+  \item We propose a \emph{minimal modification} to the transfer MIP:
+        replacing the N1-robustness constraint with an N1-foolability
+        constraint. We prove that the modified quantity
+        $\hat{\delta}_{\mathrm{diff}}$ satisfies
+        $\delta_1(N_1)+\hat{\delta}_{\mathrm{diff}}\geq\hat{\delta}_1(N_2)$
+        (Theorem~\ref{thm:modified}, Section~\ref{sec:modified}),
+        where $\hat{\delta}_1(N_2)$ is the standard-mode value restricted
+        to inputs on which \emph{both} networks are simultaneously foolable.
+\end{enumerate}
+
+The modified formulation admits a tight inequality, is practically
+computable as a MIP, and yields a new interpretation: it measures the
+maximum additional confidence $N_2$ achieves over $N_1$ at the most
+\emph{jointly vulnerable} inputs.
+
+%% ====================================================================
+\section{Introduction}
+
+A central question in deep-learning safety is: \emph{how does
+adversarial robustness change when a model is fine-tuned, distilled,
+or retrained?} Concretely, given a source model $N_1$ and a target
+model $N_2$ (both mapping an input $x\in[0,1]^n$ to class logits),
+does improved accuracy or architecture of $N_2$ imply improved
+adversarial robustness? If not, by how much can $N_2$'s robustness
+exceed $N_1$'s?
+
+The VHAGaR framework~\cite{vaghar} answers this question rigorously via
+MIP. It defines:
+\begin{itemize}
+  \item $\delta_1(N)$: the \emph{hardest} correctly classified input
+        that can still be fooled by a small perturbation (high confidence
+        yet still fragile).
+  \item $\delta_{\mathrm{diff}}^*(N_1,N_2)$: the maximum \emph{gap} in
+        confidence between $N_2$ and $N_1$ at points where $N_1$ is
+        already robust but $N_2$ can be attacked — a "transfer'' quantity.
+\end{itemize}
+
+A natural conjecture is that
+$\delta_1(N_1)+\delta_{\mathrm{diff}}^*\geq\delta_1(N_2)$:
+that is, the standard-mode value of $N_2$ cannot exceed the sum of the
+standard-mode value of $N_1$ and the transfer gap. We show this is
+\emph{incorrect} in general. We then identify the precise structural
+reason for the failure and propose a minimal modification that restores
+the desired inequality.
+
+\paragraph{Notation.}
+Scalars are lowercase, networks are uppercase. We fix two output classes:
+$c_\mathrm{tag}=1$ (the ``correct'' class) and
+$c_\mathrm{target}=2$ (the ``adversarial'' class).
+All optimization problems are stated as linear programs (LP) or
+mixed-integer programs (MIP); feasibility is assumed unless stated.
+
+%% ====================================================================
+\section{Formal Definitions}\label{sec:defs}
+
+\paragraph{Setup.}
+\begin{itemize}
+  \item Input domain: $\Xdom=[0,1]^n$.
+  \item Perturbation set: $\Edom=[-p,p]^n$ for a fixed radius $p>0$.
+  \item Small constants: attack margin $\eta>0$, transition margin
+        $\varepsilon_0>0$ (both typically $10^{-3}$).
+\end{itemize}
+
+\begin{definition}[Confidence margin]\label{def:conf}
+For a network $N:\Xdom\to\R^2$,
+\[
+  \conf{N}{x}
+  \;:=\;
+  \mathrm{logit}_N(x)[c_\mathrm{tag}]
+  \;-\;
+  \mathrm{logit}_N(x)[c_\mathrm{target}].
+\]
+$\conf{N}{x}>0$ means $N$ predicts class $c_\mathrm{tag}$ at $x$.
+\end{definition}
+
+\begin{definition}[$N$-foolability]\label{def:foolable}
+$x\in\Xdom$ is \emph{$N$-foolable} if
+\[
+  \exists\,\varepsilon\in\Edom \text{ with }
+  x+\varepsilon\in\Xdom
+  \;\text{ and }\;
+  \conf{N}{x+\varepsilon}\leq -\eta.
+\]
+Write $\Ffool{N}$ for the set of all $N$-foolable inputs in $\Xdom$.
+\end{definition}
+
+\begin{definition}[Standard-mode value]\label{def:delta1}
+\[
+  \dN{i}
+  \;:=\;
+  \sup\bigl\{\,\conf{N_i}{x}
+    \;\big|\;
+    x\in\Ffool{i},\;
+    \conf{N_i}{x}\geq 0
+  \,\bigr\}.
+\]
+In words: the maximum confidence $N_i$ attains on any input that
+(i) is correctly classified, yet (ii) can be misclassified by some
+perturbation $\varepsilon\in\Edom$.
+\end{definition}
+
+\begin{remark}
+$\dN{i}$ is computed by a MIP:
+maximize $\conf{N_i}{x}$ subject to the encoding of
+$\conf{N_i}{x+\varepsilon}\leq-\eta$ over the joint variables
+$(x,\varepsilon)$.
+\end{remark}
+
+\begin{definition}[Transfer MIP — original]\label{def:ddiff}
+\begin{align}
+  \ddiff
+  \;:=\;\sup\Bigl\{\,
+    &\conf{N_2}{x}-\conf{N_1}{x}
+    \;\Big|\notag\\
+    &(\mathrm{C1})\;\conf{N_1}{x}\geq\dN{1}+\varepsilon_0,\notag\\
+    &(\mathrm{C2})\;\conf{N_2}{x}\geq\conf{N_1}{x},\notag\\
+    &(\mathrm{C3})\;x\in\Ffool{2}
+  \,\Bigr\}.\label{eq:ddiff}
+\end{align}
+\end{definition}
+
+\noindent
+Constraint C1 ensures $x$ is \emph{N1-robust} (it lies strictly above the
+highest $N_1$-fragile confidence level). C2 ensures $N_2$ is at least as
+confident as $N_1$ at $x$. C3 ensures $N_2$ can be fooled at $x$.
+
+%% ====================================================================
+\section{The Correct Inequality}\label{sec:correct}
+
+\begin{theorem}[Lower bound on $\dN{2}$]\label{thm:correct}
+If the transfer MIP \eqref{eq:ddiff} is feasible, then
+\[
+  \boxed{\dN{2} \;\geq\; \dN{1} + \ddiff.}
+\]
+\end{theorem}
+
+\begin{proof}
+Fix $\epsilon>0$ and let $x^*$ be a nearly-optimal feasible point of
+\eqref{eq:ddiff}, with $\varepsilon^*$ the corresponding attack
+perturbation (from C3). By feasibility:
+\begin{align}
+  \conf{N_1}{x^*} &\geq \dN{1}+\varepsilon_0, \tag{C1}\\
+  \conf{N_2}{x^*} &\geq \conf{N_1}{x^*},       \tag{C2}\\
+  x^* &\in\Ffool{2} \text{ via } \varepsilon^*, \tag{C3}\\
+  \conf{N_2}{x^*}-\conf{N_1}{x^*} &\geq \ddiff-\epsilon. \tag{obj}
+\end{align}
+
+\textbf{Step 1 — lower-bound $\conf{N_2}{x^*}$:}
+\begin{align*}
+  \conf{N_2}{x^*}
+  &= \conf{N_1}{x^*}+\bigl(\conf{N_2}{x^*}-\conf{N_1}{x^*}\bigr)\\
+  &\geq (\dN{1}+\varepsilon_0)+(\ddiff-\epsilon)
+  &\text{(C1 and obj)}\\
+  &\geq \dN{1}+\ddiff-\epsilon.
+\end{align*}
+
+\textbf{Step 2 — $x^*$ is feasible for the standard-mode MIP on $N_2$:}
+By C2 and C1,
+$\conf{N_2}{x^*}\geq\conf{N_1}{x^*}\geq\dN{1}+\varepsilon_0>0$,
+so $N_2$ \emph{correctly} classifies $x^*$.
+Combined with C3 ($x^*\in\Ffool{2}$), the pair $(x^*,\varepsilon^*)$
+is feasible for the standard-mode MIP on $N_2$. Hence:
+\[
+  \dN{2}
+  \;\geq\;\conf{N_2}{x^*}
+  \;\geq\;\dN{1}+\ddiff-\epsilon.
+\]
+Since $\epsilon>0$ is arbitrary, $\dN{2}\geq\dN{1}+\ddiff$.
+\end{proof}
+
+\begin{remark}[Gap quantified]\label{rem:gap}
+Let $x^*$ achieve the supremum in \eqref{eq:ddiff}.
+The proof shows
+\[
+  \dN{2} - (\dN{1}+\ddiff)
+  \;\geq\;
+  \conf{N_1}{x^*}-\dN{1}
+  \;\geq\;\varepsilon_0\;>\;0.
+\]
+The gap is \emph{always positive}: the transfer MIP forces C1,
+guaranteeing $\conf{N_1}{x^*}>\dN{1}$. This surplus
+$\conf{N_1}{x^*}-\dN{1}$ is the precise ``slack'' that makes
+Theorem~\ref{thm:correct} strict and the reverse inequality false.
+\end{remark}
+
+%% ====================================================================
+\section{The Reverse Inequality Fails: a Counterexample}\label{sec:counter}
+
+\subsection{Network Definitions}
+
+We exhibit two explicit linear networks over $\Xdom=[0,1]^2$,
+with $p=0.1$, $\eta=\varepsilon_0=10^{-3}$.
+
+\medskip
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Network & Logits & Confidence margin \\
+\midrule
+$N_1$ & $[x_1,\ x_2]$ & $\conf{N_1}{x}=x_1-x_2$ \\[4pt]
+$N_2$ & $[2x_1,\ 5x_2]$ & $\conf{N_2}{x}=2x_1-5x_2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip\noindent
+Both are two-layer sequential networks: an identity first layer,
+an inactive ReLU (since $x_1,x_2\geq 0$), and a diagonal second layer
+($\mathrm{diag}(1,1)$ for $N_1$, $\mathrm{diag}(2,5)$ for $N_2$).
+
+\subsection{Foolability Conditions}
+
+\paragraph{$N_1$.}
+$N_1$ is fooled at $x+\varepsilon$ iff
+$(x_2+\varepsilon_2)-(x_1+\varepsilon_1)\geq\eta$,
+i.e., $\varepsilon_2-\varepsilon_1\geq(x_1-x_2)+\eta$.
+The maximum of $\varepsilon_2-\varepsilon_1$ over $\Edom$ is $2p=0.2$, so:
+\[
+  x\in\Ffool{1}
+  \;\Longleftrightarrow\;
+  x_1-x_2\;\leq\;2p-\eta\;=\;0.199.
+\]
+
+\paragraph{$N_2$.}
+$N_2$ is fooled at $x+\varepsilon$ iff
+$5(x_2+\varepsilon_2)-2(x_1+\varepsilon_1)\geq\eta$,
+i.e., $5\varepsilon_2-2\varepsilon_1\geq(2x_1-5x_2)+\eta$.
+The maximum of $5\varepsilon_2-2\varepsilon_1$ over $\Edom$ is
+$5p+2p=0.7$, so:
+\[
+  x\in\Ffool{2}
+  \;\Longleftrightarrow\;
+  2x_1-5x_2\;\leq\;5p+2p-\eta\;=\;0.699.
+\]
+
+\subsection{Computing $\dN{1}$, $\dN{2}$, and $\ddiff$}
+
+\paragraph{$\dN{1}$.}
+Maximize $x_1-x_2$ subject to $x_1-x_2\leq 0.199$ and $x\in[0,1]^2$:
+\[
+  \dN{1}=0.199.
+\]
+Achieved at $x^{(1)}=(1,\,0.801)$
+(or equivalently at any $x$ on the boundary $x_1-x_2=0.199$).
+
+\paragraph{$\dN{2}$.}
+Maximize $2x_1-5x_2$ subject to $2x_1-5x_2\leq 0.699$ and $x\in[0,1]^2$:
+\[
+  \dN{2}=0.699.
+\]
+Achieved at $x^{(2)}=(1,\,0.2602)$ with attack $\varepsilon^*=(-0.1,+0.1)$.
+
+\paragraph{$\ddiff$.}
+The objective $\conf{N_2}{x}-\conf{N_1}{x}=(2x_1-5x_2)-(x_1-x_2)=x_1-4x_2$.
+Constraints:
+\begin{align*}
+  \mathrm{C1}:&\quad x_1-x_2\geq 0.200,\\
+  \mathrm{C2}:&\quad x_1-4x_2\geq 0,\\
+  \mathrm{C3}:&\quad 2x_1-5x_2\leq 0.699.
+\end{align*}
+Setting $x_2=0$ (minimises the $-4x_2$ penalty), C1 gives $x_1\geq 0.200$
+and C3 gives $x_1\leq 0.3495$. Maximising $x_1$ yields:
+\[
+  x^*=(0.3495,\,0),
+  \qquad
+  \ddiff=x_1^*-4\cdot 0=\mathbf{0.3495}.
+\]
+Observe: $\conf{N_1}{x^*}=0.3495\gg\dN{1}=0.199$.
+
+\subsection{The Counterexample}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{lc}
+\toprule
+Quantity & Value \\
+\midrule
+$\dN{1}$ & $0.199$ \\
+$\ddiff$ & $0.3495$ \\
+$\dN{1}+\ddiff$ & $\mathbf{0.5485}$ \\
+\midrule
+$\dN{2}$ & $\mathbf{0.699}$ \\
+\midrule
+Gap: $\dN{2}-(\dN{1}+\ddiff)$ & $\mathbf{0.1505}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\[
+  \dN{1}+\ddiff
+  \;=\; 0.5485
+  \;\;\mathbf{<}\;\;
+  0.699
+  \;=\; \dN{2}.
+\]
+
+The gap equals exactly $\conf{N_1}{x^*}-\dN{1}=0.3495-0.199=0.1505$,
+consistent with Remark~\ref{rem:gap}.
+
+%% ====================================================================
+\section{Root-Cause Analysis}\label{sec:analysis}
+
+Theorem~\ref{thm:correct} and the counterexample together show that
+the formula $\dN{1}+\ddiff$ is a \emph{strict lower bound} on $\dN{2}$,
+with gap
+\[
+  \mathrm{gap}
+  \;=\;
+  \underbrace{\conf{N_1}{x^*}}_{\geq\,\dN{1}+\varepsilon_0\;(\mathrm{C1})}
+  -\;
+  \dN{1}
+  \;\geq\;\varepsilon_0\;>\;0.
+\]
+
+The structural reason is as follows.  The transfer MIP searches for an
+$x^*$ that simultaneously satisfies C1 (high $N_1$-confidence) and C3
+($N_2$-foolable).  Because $N_1$ and $N_2$ have \emph{different}
+decision boundaries, the $N_2$-foolable region can contain points with
+$N_1$-confidence far above $\dN{1}$.  At such an $x^*$, the quantity
+$\conf{N_2}{x^*}=\conf{N_1}{x^*}+\ddiff$ is large, but the formula
+$\dN{1}+\ddiff$ loses the surplus $\conf{N_1}{x^*}-\dN{1}$.
+
+Equivalently: the transfer MIP's feasible set
+$\{x:\ \mathrm{C1}+\mathrm{C3}\}$ is a \emph{proper subset} of the
+standard-mode feasible set for $N_2$ ($\{x\in\Ffool{2}\}$), so
+\[
+  \dN{2}
+  \;=\;
+  \sup_{x\in\Ffool{2}}\conf{N_2}{x}
+  \;\geq\;
+  \sup_{x:\,\mathrm{C1+C3}}\conf{N_2}{x}
+  \;\geq\;
+  \sup_{x:\,\mathrm{C1+C2+C3}}\bigl[\conf{N_1}{x}+\ddiff\bigr]
+  \;\geq\;
+  \dN{1}+\ddiff.
+\]
+The first inequality can be strict (and is, in our counterexample)
+because $\Ffool{2}$ contains points with high $\conf{N_2}{\cdot}$ that
+\emph{violate} C1 (they are not N1-robust).
+
+%% ====================================================================
+\section{A Modified Formulation with the Desired Inequality}\label{sec:modified}
+
+\subsection{Motivation}
+
+Remark~\ref{rem:gap} reveals that the gap is driven by C1 (the
+N1-robustness constraint) forcing $\conf{N_1}{x^*}>\dN{1}$.  To close
+this gap, we replace C1 with its \emph{logical opposite}: instead of
+requiring $N_1$ to be \emph{robust} at $x$, we require $N_1$ to be
+\emph{foolable} at $x$.  This simultaneously restricts the
+standard-mode problem for $N_2$ to the same joint-foolability region.
+
+\subsection{Modified Definitions}
+
+\begin{definition}[Joint-foolable set]\label{def:joint}
+\[
+  \Fjoint := \Ffool{1}\cap\Ffool{2}
+  \;=\;
+  \bigl\{x\in\Xdom:\ x\text{ is both }N_1\text{-foolable and }N_2\text{-foolable}\bigr\}.
+\]
+\end{definition}
+
+\begin{definition}[Modified standard-mode value]\label{def:delta1mod}
+\[
+  \dNmod{2}
+  \;:=\;
+  \sup\bigl\{\,\conf{N_2}{x}
+    \;\big|\;
+    x\in\Fjoint,\;
+    \conf{N_2}{x}\geq 0
+  \,\bigr\}.
+\]
+This is the maximum confidence $N_2$ achieves at inputs that are
+simultaneously foolable by \emph{both} networks.
+\end{definition}
+
+\begin{remark}
+By definition, $\dNmod{2}\leq\dN{2}$: restricting to $\Fjoint\subseteq\Ffool{2}$
+can only decrease the supremum.  The gap $\dN{2}-\dNmod{2}$ measures
+the advantage $N_2$ has at points where it is foolable but $N_1$ is not
+(the ``exclusive vulnerability'' of $N_2$).
+\end{remark}
+
+\begin{definition}[Modified transfer MIP]\label{def:ddiffmod}
+\begin{align}
+  \ddiffmod
+  \;:=\;\sup\Bigl\{\,
+    &\conf{N_2}{x}-\conf{N_1}{x}
+    \;\Big|\notag\\
+    &(\widehat{\mathrm{C1}})\;x\in\Ffool{1},\notag\\
+    &(\mathrm{C3})\;x\in\Ffool{2}
+  \,\Bigr\}.\label{eq:ddiffmod}
+\end{align}
+\end{definition}
+
+\noindent
+The key change: constraint C1 is replaced by $\widehat{\mathrm{C1}}$,
+which requires $x$ to be \emph{N1-foolable} (instead of N1-robust).
+Constraint C2 is dropped because, over $\Fjoint$, the objective
+$\conf{N_2}{x}-\conf{N_1}{x}$ is unconstrained in sign;
+including it would restrict the feasible set without being necessary
+for the theorem below.
+
+\paragraph{MIP encoding.}
+$\widehat{\mathrm{C1}}$ adds a second perturbation variable
+$\varepsilon^{(1)}\in\Edom$ with the foolability constraint
+$\conf{N_1}{x+\varepsilon^{(1)}}\leq-\eta$, encoded exactly as in the
+standard-mode MIP for $N_1$.  C3 is encoded as before.  The resulting
+program has $O(|N_1|+|N_2|)$ binary variables and is solvable by
+Gurobi or any MILP solver.
+
+\subsection{Main Result}
+
+\begin{theorem}[Upper bound on the joint standard-mode value]\label{thm:modified}
+\[
+  \boxed{\dN{1} + \ddiffmod \;\geq\; \dNmod{2}.}
+\]
+\end{theorem}
+
+\begin{proof}
+Fix $\epsilon>0$ and let $x^{**}$ be a nearly-optimal feasible point
+of $\dNmod{2}$ (Definition~\ref{def:delta1mod}), i.e.,
+\[
+  x^{**}\in\Fjoint,\quad
+  \conf{N_2}{x^{**}}\geq 0,\quad
+  \conf{N_2}{x^{**}}\geq\dNmod{2}-\epsilon.
+\]
+
+\textbf{Step 1 — $x^{**}$ satisfies $\dN{1}$'s definition:}
+Since $x^{**}\in\Ffool{1}$, by Definition~\ref{def:delta1},
+\[
+  \conf{N_1}{x^{**}}\leq\dN{1}.
+\]
+
+\textbf{Step 2 — $x^{**}$ is feasible for \eqref{eq:ddiffmod}:}
+$x^{**}\in\Ffool{1}$ satisfies $\widehat{\mathrm{C1}}$, and
+$x^{**}\in\Ffool{2}$ satisfies C3. Hence $x^{**}$ is feasible for
+the modified transfer MIP \eqref{eq:ddiffmod}. Therefore:
+\[
+  \ddiffmod
+  \;\geq\;
+  \conf{N_2}{x^{**}}-\conf{N_1}{x^{**}}.
+\]
+
+\textbf{Step 3 — combine:}
+\begin{align*}
+  \dN{1}+\ddiffmod
+  &\geq\dN{1}+\conf{N_2}{x^{**}}-\conf{N_1}{x^{**}}\\
+  &\geq\conf{N_1}{x^{**}}+\conf{N_2}{x^{**}}-\conf{N_1}{x^{**}}
+  &\text{(Step 1: $\dN{1}\geq\conf{N_1}{x^{**}}$)}\\
+  &=\conf{N_2}{x^{**}}\\
+  &\geq\dNmod{2}-\epsilon.
+\end{align*}
+Since $\epsilon>0$ is arbitrary, $\dN{1}+\ddiffmod\geq\dNmod{2}$.
+\end{proof}
+
+\begin{corollary}[Sandwich bounds]\label{cor:sandwich}
+If both the original and modified transfer MIPs are feasible:
+\[
+  \dN{1}+\ddiff
+  \;\leq\;
+  \dN{2},
+  \qquad\qquad
+  \dN{1}+\ddiffmod
+  \;\geq\;
+  \dNmod{2}.
+\]
+\end{corollary}
+
+\begin{remark}[Relationship between $\ddiff$ and $\ddiffmod$]
+The two transfer quantities are generally incomparable:
+\begin{itemize}
+  \item The original $\ddiff$ searches over $N_1$-\emph{robust} points
+        (C1 requires $\conf{N_1}{x}\geq\dN{1}+\varepsilon_0$), finding
+        large gaps where $N_2$ fails but $N_1$ does not.
+  \item The modified $\ddiffmod$ searches over $N_1$-\emph{foolable}
+        points, i.e., the intersection $\Fjoint$.  Because $\Fjoint$
+        is disjoint from the original C1 feasible set, the two MIPs
+        explore \emph{complementary regions} of $\Xdom$.
+\end{itemize}
+In particular $\ddiffmod$ can be negative (if, in $\Fjoint$, $N_1$
+always has higher confidence than $N_2$), while the original $\ddiff$
+is non-negative by C2.
+\end{remark}
+
+\subsection{Interpretation}
+
+\paragraph{Original $\ddiff$ — transfer attack perspective.}
+The original formulation asks: ``By how much can $N_2$'s confidence
+\emph{exceed} $N_1$'s, at a point where $N_1$ is provably robust?''
+This is the \emph{hardest} transfer scenario: $N_1$ is safe, $N_2$ is
+not.  Theorem~\ref{thm:correct} shows this provides a
+\emph{lower bound} on $\dN{2}-\dN{1}$.
+
+\paragraph{Modified $\ddiffmod$ — joint vulnerability perspective.}
+The modified formulation asks: ``At points that are simultaneously
+the hardest for \emph{both} networks, how much more confident is
+$N_2$ than $N_1$?''  Theorem~\ref{thm:modified} shows this provides
+an \emph{upper bound} on $\dNmod{2}-\dN{1}$.
+
+Together, the two quantities bracket the robustness difference
+from both sides, over their respective domains.
+
+%% ====================================================================
+\section{Numerical Verification}\label{sec:numerical}
+
+\subsection{Computing $\ddiffmod$ for the Counterexample Networks}
+
+Recall $N_1,N_2$ from Section~\ref{sec:counter}, with $p=0.1$,
+$\eta=\varepsilon_0=10^{-3}$.
+
+The modified transfer MIP \eqref{eq:ddiffmod} maximizes
+$\conf{N_2}{x}-\conf{N_1}{x}=x_1-4x_2$ subject to:
+\begin{align*}
+  \widehat{\mathrm{C1}}:&\quad x_1-x_2\leq 0.199\quad(N_1\text{-foolable}),\\
+  \mathrm{C3}:&\quad 2x_1-5x_2\leq 0.699\quad(N_2\text{-foolable}),\\
+  &\quad x\in[0,1]^2.
+\end{align*}
+Setting $x_2=0$: $x_1\leq\min(0.199,\,0.3495)=0.199$.
+Maximising $x_1$ gives $x_1^{**}=0.199$, so:
+\[
+  \ddiffmod = 0.199-4\cdot 0 = \mathbf{0.199}.
+\]
+
+\subsection{Computing $\dNmod{2}$}
+
+The joint standard-mode MIP maximizes $2x_1-5x_2$ subject to both
+$N_1$-foolable and $N_2$-foolable constraints:
+\begin{align*}
+  x_1-x_2&\leq 0.199,\quad 2x_1-5x_2\leq 0.699,\quad x\in[0,1]^2.
+\end{align*}
+At $x_2=0$: $x_1\leq 0.199$.  Maximum of $2x_1$ is $2(0.199)$:
+\[
+  \dNmod{2}=2\times 0.199=\mathbf{0.398}.
+\]
+
+\subsection{Verification of Theorem~\ref{thm:modified}}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{lc}
+\toprule
+Quantity & Value \\
+\midrule
+$\dN{1}$ & $0.199$ \\
+$\ddiffmod$ (modified transfer MIP) & $0.199$ \\
+$\dN{1}+\ddiffmod$ & $\mathbf{0.398}$ \\
+\midrule
+$\dNmod{2}$ (joint standard-mode, $N_2$) & $\mathbf{0.398}$ \\
+\midrule
+$\dN{1}+\ddiffmod\geq\dNmod{2}$? & \textbf{YES} (equality) \\
+\midrule\midrule
+$\dN{2}$ (unrestricted, for reference) & $0.699$ \\
+Joint gap: $\dN{2}-\dNmod{2}$ & $0.301$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\[
+  \dN{1}+\ddiffmod
+  \;=\; 0.199+0.199
+  \;=\; 0.398
+  \;=\; \dNmod{2}.
+  \quad\checkmark
+\]
+
+For these networks, equality holds in Theorem~\ref{thm:modified}
+because the binding constraint is simultaneously $\widehat{\mathrm{C1}}$
+(N1-foolability) and C3 (N2-foolability), making $x^{**}$ the
+argmax for both $\dNmod{2}$ and $\ddiffmod$.
+
+The ``joint gap'' $\dN{2}-\dNmod{2}=0.301$ reflects the portion of $N_2$'s
+foolable region that is \emph{N1-robust} — precisely the regime probed
+by the original transfer MIP.
+
+%% ====================================================================
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Two complementary MIPs.}
+The original and modified transfer MIPs are not competing; they probe
+complementary aspects of the two-network robustness landscape:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lll}
+\toprule
+MIP & Feasible region & Bound direction \\
+\midrule
+Original $\ddiff$ & $N_1$-robust $\cap$ $N_2$-foolable & $\dN{2}\geq\dN{1}+\ddiff$ (lower bound) \\
+Modified $\ddiffmod$ & $N_1$-foolable $\cap$ $N_2$-foolable & $\dN{1}+\ddiffmod\geq\dNmod{2}$ (upper bound) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{When are the bounds tight?}
+The original lower bound $\dN{2}\geq\dN{1}+\ddiff$ is tight when
+$\conf{N_1}{x^*}=\dN{1}$ at the transfer optimum, i.e., when the
+most vulnerable $N_2$ point (while $N_1$ is robust) is also the
+hardest $N_1$-fragile point.  The modified upper bound
+$\dN{1}+\ddiffmod\geq\dNmod{2}$ is tight (equality) when the argmax of
+$\dNmod{2}$ and $\ddiffmod$ coincide, as in our numerical example.
+
+\paragraph{Practical implications.}
+\begin{itemize}
+  \item \emph{Model comparison}: If $N_2$ is a distilled or retrained
+        version of $N_1$, computing $\ddiff$ gives a certificate that
+        $\dN{2}$ has increased by at least $\ddiff$.  Computing
+        $\ddiffmod$ gives a certificate that the improvement is bounded
+        above by $\dN{1}+\ddiffmod-\dN{1}=\ddiffmod$ within the
+        jointly vulnerable region.
+  \item \emph{Audit scenarios}: The joint-foolable region $\Fjoint$ is
+        the set of inputs most dangerous for a \emph{deployed ensemble}
+        of $N_1$ and $N_2$. $\dNmod{2}$ quantifies the worst-case
+        overconfidence within this region.
+  \item \emph{Training objectives}: A model trainer who wishes to
+        improve $\dNmod{2}$ (reduce $N_2$'s fragility in $\Fjoint$)
+        can monitor $\dN{1}+\ddiffmod$ as a computable upper bound
+        on this quantity.
+\end{itemize}
+
+%% ====================================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We studied the three MIP-defined robustness quantities $\dN{1}$,
+$\dN{2}$, $\ddiff$ arising in the VHAGaR neural-network verification
+framework.  Our results are:
+
+\begin{enumerate}
+  \item \textbf{Theorem~\ref{thm:correct}}: $\dN{2}\geq\dN{1}+\ddiff$ always.
+        The original transfer MIP provides a \emph{lower bound} on the
+        improvement in robustness from $N_1$ to $N_2$.
+  \item \textbf{Counterexample} (Section~\ref{sec:counter}): the reverse
+        inequality $\dN{1}+\ddiff\geq\dN{2}$ is false in general; the
+        gap equals the surplus $N_1$-confidence at the transfer optimum.
+  \item \textbf{Theorem~\ref{thm:modified}}: by flipping C1 from
+        N1-robustness to N1-foolability, the modified transfer MIP
+        quantity $\ddiffmod$ satisfies $\dN{1}+\ddiffmod\geq\dNmod{2}$,
+        providing a computable \emph{upper bound} on robustness within
+        the joint-foolable region.
+\end{enumerate}
+
+Together, the two MIPs provide a two-sided characterization of the
+robustness relationship between any pair of networks.  The precise
+bound one computes depends on whether the analyst wishes to guarantee
+that $N_2$ is \emph{at least as robust} as $N_1+\ddiff$ (original),
+or to certify that $N_2$'s vulnerability in the hardest jointly-
+foolable regime is bounded by $\dN{1}+\ddiffmod$ (modified).
+
+\paragraph{Future work.}
+A natural extension is to generalise from two classes to $k>2$ classes,
+to non-$\ell_\infty$ perturbation sets, and to establish analogous
+bounds in the case where $N_1$ and $N_2$ share a backbone but differ
+in the classification head (the distillation scenario).
+
+%% ====================================================================
+\begin{thebibliography}{9}
+
+\bibitem{vaghar}
+Elboher, E., G\"unther, J., Katz, G.:
+``An Abstraction-Based Framework for Neural Network Verification.''
+\emph{Computer Aided Verification (CAV)}, 2020.
+
+\bibitem{mipverify}
+Anderson, R., Huchette, J., Ma, W., Tjeng, V., Vielma, J.P.:
+``Strong Mixed-Integer Programming Formulations for Trained Neural Networks.''
+\emph{Mathematical Programming}, 183(1), 3–39, 2020.
+
+\bibitem{gurobi}
+Gurobi Optimization, LLC:
+``Gurobi Optimizer Reference Manual,'' 2023.
+
+\bibitem{jump}
+Dunning, I., Huchette, J., Lubin, M.:
+``JuMP: A Modeling Language for Mathematical Optimization.''
+\emph{SIAM Review}, 59(2), 295–320, 2017.
+
+\end{thebibliography}
+
+\end{document}

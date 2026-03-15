@@ -188,6 +188,80 @@ def attack(model, X, source_, target_, device, token_signature,\
             layers_outputs.append(torch.mean(torch.sign(ax1), dim=0))
             layers_outputs.append(torch.mean(torch.sign(ax2), dim=0))
             layers_outputs.append(torch.mean(torch.sign(ax3), dim=0))
+        elif "10x" in model_name:
+            # Clean input through layers
+            x = images_to.reshape(-1, 784)
+            x1 = F.relu(model.fc1(x))
+            x2 = F.relu(model.fc2(x1))
+            x3 = F.relu(model.fc3(x2))
+            x4 = F.relu(model.fc4(x3))
+            x5 = F.relu(model.fc5(x4))
+            x6 = F.relu(model.fc6(x5))
+            x7 = F.relu(model.fc7(x6))
+            x8 = F.relu(model.fc8(x7))
+            x9 = F.relu(model.fc9(x8))
+            for xi in [x1, x2, x3, x4, x5, x6, x7, x8, x9]:
+                layers_outputs.append(torch.mean(torch.sign(xi), dim=0))
+
+            # Attacked input through layers
+            attacked_x = create_attacked(images_to, eps_to, type_, size_, dims).reshape(-1, 784)
+            ax1 = F.relu(model.fc1(attacked_x))
+            ax2 = F.relu(model.fc2(ax1))
+            ax3 = F.relu(model.fc3(ax2))
+            ax4 = F.relu(model.fc4(ax3))
+            ax5 = F.relu(model.fc5(ax4))
+            ax6 = F.relu(model.fc6(ax5))
+            ax7 = F.relu(model.fc7(ax6))
+            ax8 = F.relu(model.fc8(ax7))
+            ax9 = F.relu(model.fc9(ax8))
+            for axi in [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9]:
+                layers_outputs.append(torch.mean(torch.sign(axi), dim=0))
+        elif "5x" in model_name:
+            # Clean input through layers
+            x = images_to.reshape(-1, 784)
+            x1 = F.relu(model.fc1(x))
+            x2 = F.relu(model.fc2(x1))
+            x3 = F.relu(model.fc3(x2))
+            x4 = F.relu(model.fc4(x3))
+            layers_outputs.append(torch.mean(torch.sign(x1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x3), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x4), dim=0))
+            # Attacked input through layers
+            attacked_x = create_attacked(images_to, eps_to, type_, size_, dims).reshape(-1, 784)
+            ax1 = F.relu(model.fc1(attacked_x))
+            ax2 = F.relu(model.fc2(ax1))
+            ax3 = F.relu(model.fc3(ax2))
+            ax4 = F.relu(model.fc4(ax3))
+            layers_outputs.append(torch.mean(torch.sign(ax1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax3), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax4), dim=0))
+        elif "6x" in model_name:
+            # Clean input through layers
+            x = images_to.reshape(-1, 784)
+            x1 = F.relu(model.fc1(x))
+            x2 = F.relu(model.fc2(x1))
+            x3 = F.relu(model.fc3(x2))
+            x4 = F.relu(model.fc4(x3))
+            x5 = F.relu(model.fc5(x4))
+            layers_outputs.append(torch.mean(torch.sign(x1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x3), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x4), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(x5), dim=0))
+            # Attacked input through layers
+            attacked_x = create_attacked(images_to, eps_to, type_, size_, dims).reshape(-1, 784)
+            ax1 = F.relu(model.fc1(attacked_x))
+            ax2 = F.relu(model.fc2(ax1))
+            ax3 = F.relu(model.fc3(ax2))
+            ax4 = F.relu(model.fc4(ax3))
+            ax5 = F.relu(model.fc5(ax4))
+            layers_outputs.append(torch.mean(torch.sign(ax1), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax2), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax3), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax4), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(ax5), dim=0))
         elif "2x" in model_name:
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, 784))))), dim=0))
@@ -248,12 +322,18 @@ def load_dataset( dataset ):
     return trainset, testset, (k_dim, h_dim, w_dim)
 
 def load_model( model_arch, model_path):
-    if model_arch == "3x10":
+    if model_arch == "2x10":
+        model = FNN_2_10()
+    elif model_arch == "3x10":
         model = FNN_3_10()
     elif model_arch == "4x10":
         model = FNN_4_10()
     elif model_arch == "3x50":
         model = FNN_3_50()
+    elif model_arch == "5x10":
+        model = FNN_5_10()
+    elif model_arch == "6x10":
+        model = FNN_6_10()
     elif model_arch == "10x10":
         model = FNN_10_10()
     elif model_arch == "cnn0":
@@ -262,8 +342,10 @@ def load_model( model_arch, model_path):
         model = CNN1()
     elif model_arch == "cnn2":
         model = CNN2()
+    elif model_arch == "cnn3":
+        model = CNN3()
     else:
-        assert ("New model arch has been detected, please expand models.py and this if condition.")
+        assert False, "New model arch has been detected, please expand models.py and this if condition."
 
     model = model.to(device)
     model.load_state_dict(torch.load(model_path))
@@ -286,7 +368,7 @@ def create_hyper_input(source, trainset, testset, M, dims):
     differences = values[:, 0] - values[:, 1]
     _, sorted_indices = differences.sort(descending=True)
     sorted_indices_of_s = indices_of_s[sorted_indices]
-    step_size = len(sorted_indices_of_s) // M
+    step_size = max(1, len(sorted_indices_of_s) // M)
     uniform_indices = sorted_indices_of_s[::step_size][:M]
     hyper_input = all_samples[uniform_indices]
     return hyper_input

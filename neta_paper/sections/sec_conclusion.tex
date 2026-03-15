@@ -1,0 +1,49 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this work, we addressed the problem of verifying the transfer of robustness guarantees between neural networks. We extended VHAGaR with a transfer mode that encodes the problem as a mixed-integer program, simultaneously modeling three forward passes --- $N_1(x)$, $N_2(x)$, and $N_2(\xp)$ --- to capture the interaction between two networks under adversarial perturbation. Our approach supports the $L_\infty$ perturbation and six semantic feature perturbations, and employs four complementary tightening techniques to make the MIP tractable.
+
+We established three formal results about the transfer MIP:
+\begin{enumerate}
+  \item \textbf{Theorem~\ref{thm:correct}}: the original transfer MIP provides a sound lower bound, $\dN{2}\geq\dN{1}+\ddiff$. This enables certifying $N_2$'s robustness by leveraging $N_1$'s precomputed guarantee.
+
+  \item \textbf{Counterexample} (Section~\ref{sec:formal:counter}): the reverse inequality $\dN{1}+\ddiff\geq\dN{2}$ is false in general. The gap equals the surplus $N_1$-confidence at the transfer optimum ($\confB{N_1}{x^*} - \dN{1}$), which is always positive.
+
+  \item \textbf{Theorem~\ref{thm:modified}}: the modified transfer MIP provides a matching upper bound, $\dN{1}+\ddiffmod\geq\dNmod{2}$, over the joint-foolable region $\Fjoint = \Ffool{1} \cap \Ffool{2}$.
+\end{enumerate}
+
+Together, the two formulations provide a two-sided characterization of the robustness relationship between any pair of networks: the original MIP establishes how much robustness is guaranteed to transfer, while the modified MIP bounds how much can be gained in the shared vulnerability region.
+
+\subsection{Summary of Tightening Techniques}
+
+Table~\ref{tab:flags-summary} summarizes the four tightening techniques and their effects on the MIP.
+
+\begin{table}[ht]
+  \centering
+  \caption{Summary of the four tightening techniques.}
+  \label{tab:flags-summary}
+  \begin{tabular}{p{4.5cm}p{3.5cm}p{5cm}}
+    \toprule
+    \textbf{Technique} & \textbf{Core method} & \textbf{Effect on MIP} \\
+    \midrule
+    Hyper-adversarial attack
+      & PGD attack $\to v^\star$
+      & Solver incumbent; binary hints $b_j$ \\[4pt]
+    Pert.-diff.\ interval propagation
+      & $[\Idn\layer{l},\Iup\layer{l}]$ propagation
+      & Bounds $a\net{pert}\layer{l}-a\net{org}\layer{l}$ per layer \\[4pt]
+    Inter-network intervals
+      & $[\alpha\layer{l},\beta\layer{l}]$ via $\Delta W$
+      & Bounds $a^{N_2}\layer{l}-a^{N_1}\layer{l}$ per layer \\[4pt]
+    Dependency analysis
+      & $\varphi\layer{l} \in \{-1,0,+1,\mathrm{NaN}\}$
+      & Monotone equality/inequality constraints \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Future Work}
+
+Several natural extensions of this work remain. First, generalizing the transfer formulation from two classes to the full $K$-class setting would broaden its applicability. Second, exploring non-$\ell_\infty$ perturbation sets beyond those already supported could address a wider range of adversarial threat models. Third, developing analogous bounds for backbone-sharing architectures, where $N_1$ and $N_2$ share a common encoder, could exploit additional structural constraints. Finally, closing the gap between $\dN{1}+\ddiff$ and $\dN{2}$ by searching over the full $\Ffool{2}$ region with additional structural constraints is an important direction for obtaining tighter transfer guarantees.

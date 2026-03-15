@@ -1,0 +1,50 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Attack Constraint Variants}
+\label{sec:modes}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we describe the two variants for encoding constraint T3 (``$N_2$ is fooled by $\xp$'') in the transfer MIP. The choice of variant determines whether the adversary targets a specific class or any misclassification.
+
+\subsection{Targeted Attack}
+
+In the targeted variant, the adversary forces $N_2$ to predict a specific target class $t$. Formally, the constraint requires:
+\begin{equation}
+  \label{eq:ctarget}
+  \hat{y}_t\bigl(N_2(\xp)\bigr) \;\ge\; \hat{y}_k\bigl(N_2(\xp)\bigr)
+  \quad \forall\, k \neq t,
+\end{equation}
+equivalently $\conf{N_2}{\xp}{t} \ge 0$. This is the more restrictive variant: the adversary must not only cause a misclassification but must steer the network toward a particular wrong class.
+
+\subsection{Untargeted Attack}
+
+In the untargeted variant, the adversary need only reduce $N_2$'s confidence in the true class $c$ to negative, causing any misclassification:
+\begin{equation}
+  \label{eq:ctag}
+  \conf{N_2}{\xp}{c} \;\le\; 0.
+\end{equation}
+
+\subsection{Comparison}
+
+Table~\ref{tab:modes} compares the two variants. The targeted variant has a smaller feasible region (the adversary must achieve a specific misclassification), leading to a larger or equal $\dD$ and thus a stronger transfer guarantee. The untargeted variant has a larger feasible region, yielding a smaller or equal $\dD$ and a weaker but more general guarantee.
+
+\begin{table}[ht]
+  \centering
+  \caption{Comparison of targeted and untargeted attack constraints.}
+  \label{tab:modes}
+  \begin{tabular}{lll}
+    \toprule
+    \textbf{Property} & \textbf{Targeted} & \textbf{Untargeted} \\
+    \midrule
+    Attack type
+      & $c \to t$ (specific class) & $c \to \text{any}$ \\
+    Constraint on $N_2(\xp)$
+      & $\hat{y}_t \ge \hat{y}_k,\;\forall k\neq t$
+      & $\hat{y}_c < \hat{y}_k$ for some $k$ \\
+    Feasible region    & Smaller (harder to satisfy) & Larger (easier) \\
+    Resulting $\dD$    & Larger or equal & Smaller or equal \\
+    Inference strength & Stronger guarantee & Weaker guarantee \\
+    Typical use        & Specific adversary model & General robustness \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+

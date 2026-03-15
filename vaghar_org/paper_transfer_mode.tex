@@ -1,0 +1,894 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,calc}
+
+\geometry{margin=1in}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}[section]
+
+% Convenience macros
+\newcommand{\Conf}[3]{C(#1,\,#2,\,#3)}
+\newcommand{\NN}[1]{N_{#1}}
+\newcommand{\vx}{\mathbf{x}}
+\newcommand{\ve}{\boldsymbol{\delta}}
+\newcommand{\vxp}{\mathbf{x}'}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\epszero}{\varepsilon_0}
+\newcommand{\deltadiff}{\delta_{\mathrm{diff}}}
+\newcommand{\deltaone}{\delta_1}
+\newcommand{\RI}[1]{\mathcal{I}^{#1}}
+
+\title{\textbf{VHAGaR Transfer: Certifying Adversarial Robustness Transfer Between Neural Networks via Mixed-Integer Programming}}
+
+\author{(Technical Report)}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present \emph{VHAGaR Transfer}, an extension of the VHAGaR (Verifier of Hazardous Attacks for Global Robustness) framework that addresses the following question: given two neural networks $\NN{1}$ and $\NN{2}$ of identical architecture, and a certified robustness margin $\deltaone$ for $\NN{1}$, can we determine whether $\NN{2}$ also inherits this robustness---or exhibit a \emph{transfer failure} in which $\NN{2}$ succeeds on clean inputs yet fails under adversarial perturbation while $\NN{1}$ would have been safe? We formulate this as a Mixed-Integer Program~(MIP) that simultaneously encodes all four network evaluations---$\NN{1}(\vx)$, $\NN{2}(\vx)$, $\NN{1}(\vx')$, $\NN{2}(\vx')$---into a single optimization problem whose objective is the \emph{confidence gap difference} $\deltadiff = \Conf{\NN{2}}{\vx}{c} - \Conf{\NN{1}}{\vx}{c}$. Two binary flags, \texttt{c\_tag\_mode} and \texttt{n1\_p\_mode}, yield four semantically distinct problem variants covering untargeted versus targeted transfer failures and relative versus absolute degradation. Six optional components---a PGD hyper-attack with activation-level MIP hints, VHAGaR dependency constraints, Lucid inter-network interval constraints, perturbation interval constraints, and a binary-variable reduction for targeted variants---further accelerate solving. The framework is implemented in Julia/JuMP with Gurobi and the MIPVerify encoding engine.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=============================================================
+\section{Introduction}
+%=============================================================
+
+Neural network robustness verification has produced a rich body of methods for certifying that a network $N$ cannot be fooled by adversarial perturbations bounded in some norm. VHAGaR~\cite{vaghar} addresses \emph{global} robustness by encoding the dual forward passes (clean and perturbed) into a Mixed-Integer Program (MIP) and solving with Gurobi to find the minimum perturbation causing misclassification or to certify that no such perturbation exists.
+
+A natural and practically significant question arises when two networks are compared. Suppose $\NN{1}$ has been formally verified with certified robustness margin $\deltaone$: for every input $\vx$ classified as $c_s$ by $\NN{1}$ with $\Conf{\NN{1}}{\vx}{c_s} \ge \deltaone$, no $\ell_\infty$ perturbation of size $\eps$ causes misclassification. Now suppose $\NN{2}$ is a second network---perhaps a later training checkpoint or a model with higher clean accuracy---that appears superior to $\NN{1}$ on clean inputs: $\Conf{\NN{2}}{\vx}{c_s} > \Conf{\NN{1}}{\vx}{c_s}$. Does $\NN{2}$ inherit $\NN{1}$'s robustness? Or can we find a \emph{transfer failure}: an input where $\NN{2}$'s apparent advantage disguises greater adversarial vulnerability?
+
+We call this the \emph{transfer proof problem}. A positive answer (no transfer failure found within the MIP's proven bound) is a formal transfer certificate. A negative answer (transfer failure found) provides an explicit counterexample: an input $\vx$ and perturbation $\ve$ where $\NN{2}$ confidently outperforms $\NN{1}$ on $\vx$ yet fails adversarially while $\NN{1}$ is certified safe.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item We formulate the transfer proof problem as a four-network MIP (Section~\ref{sec:mip}).
+  \item We introduce two binary flags (\texttt{c\_tag\_mode}, \texttt{n1\_p\_mode}) yielding four semantically distinct problem variants (Section~\ref{sec:variants}).
+  \item We design six optional components that accelerate MIP solving (Section~\ref{sec:components}).
+  \item We implement the full pipeline in Julia/JuMP with Gurobi (Section~\ref{sec:execution}).
+\end{enumerate}
+
+%=============================================================
+\section{Background and Notation}
+%=============================================================
+
+\subsection{Neural Networks and Confidence Margins}
+
+Let $N : \mathbb{R}^d \to \mathbb{R}^C$ denote a fully-connected feedforward neural network with $K$ hidden ReLU layers and $C$ output classes. The forward pass is
+\begin{align}
+  h_0 &= \vx, \\
+  z_k &= W_k\, h_{k-1} + b_k, \quad k = 1,\ldots,K+1, \\
+  h_k &= \mathrm{ReLU}(z_k), \quad k = 1,\ldots,K, \\
+  N(\vx) &= z_{K+1}.
+\end{align}
+
+\begin{definition}[Confidence Margin]
+For network $N$, input $\vx \in \mathbb{R}^d$, and class $c \in \{1,\ldots,C\}$,
+\[
+  \Conf{N}{\vx}{c} \;=\; N(\vx)_c \;-\; \max_{j \ne c}\, N(\vx)_j.
+\]
+The confidence margin is positive iff $N$ predicts class $c$ for $\vx$.
+\end{definition}
+
+\subsection{MIP Encoding of ReLU Networks}
+\label{sec:bigm}
+
+Each ReLU neuron with pre-activation $z$, lower bound $l$, and upper bound $u$ is encoded by the big-M formulation. Let $h = \mathrm{ReLU}(z)$:
+\begin{itemize}
+  \item \textbf{Always inactive} ($u \le 0$): fix $h = 0$.
+  \item \textbf{Always active} ($l \ge 0$): fix $h = z$.
+  \item \textbf{Split neuron} ($l < 0 < u$): introduce binary $a \in \{0,1\}$ and add
+    \begin{align}
+      h &\ge 0, \quad h \ge z, \label{eq:bigm1} \\
+      h &\le u \cdot a, \quad h \le z - l(1 - a). \label{eq:bigm2}
+    \end{align}
+\end{itemize}
+Here $a=1$ encodes the neuron as active and $a=0$ as inactive. Bounds $(l,u)$ are computed by interval arithmetic, LP relaxation, or MIP tightening layer by layer before encoding.
+
+\subsection{Standard VHAGaR: Dual-Network MIP}
+
+In standard mode, VHAGaR encodes two copies of $N$---applied to clean input $\vx$ and perturbed input $\vxp = \vx + \ve$---into a single MIP sharing the perturbation variable $\ve \in [-\eps,\eps]^d$. For source class $c_s$ and target class $c_t$, it solves
+\begin{align}
+  \maximize_{\vx, \ve} \quad & \Conf{N}{\vx}{c_s} \\
+  \mathrm{s.t.} \quad
+    & \vx \in [0,1]^d, \quad \vxp = \vx + \ve, \quad \|\ve\|_\infty \le \eps, \quad \vxp \in [0,1]^d, \nonumber \\
+    & \Conf{N}{\vxp}{c_t} > 0, \nonumber \\
+    & \text{MIP encoding of } N(\vx) \text{ and } N(\vxp). \nonumber
+\end{align}
+A non-positive optimal value certifies global robustness for the class pair $(c_s,c_t)$ at perturbation size~$\eps$.
+
+%=============================================================
+\section{The Transfer Proof Problem}
+\label{sec:problem}
+%=============================================================
+
+\subsection{Problem Setup}
+
+Let $\NN{1}$ and $\NN{2}$ share the same architecture. Let $\deltaone > 0$ be a robustness certificate for $\NN{1}$ produced by a prior VHAGaR run: the \texttt{best\_bound} column of the VHAGaR results file, which gives the MIP-proven upper bound on the confidence margin over all adversarial examples. Concretely, for every $\vx$ with $\Conf{\NN{1}}{\vx}{c_s} \ge \deltaone$, no $\ve$ with $\|\ve\|_\infty \le \eps$ causes misclassification.
+
+The \emph{transfer proof problem} asks: does there exist an input $\vx$ and perturbation $\ve$ such that
+\begin{enumerate}
+  \item \textbf{(Certification condition)} $\NN{1}$ is in its certified region: $\Conf{\NN{1}}{\vx}{c_s} \ge \deltaone$;
+  \item \textbf{(Clean advantage condition)} $\NN{2}$ outperforms $\NN{1}$ on $\vx$: $\Conf{\NN{2}}{\vx}{c_s} \ge \Conf{\NN{1}}{\vx}{c_s}$;
+  \item \textbf{(Transfer failure condition)} $\NN{2}$ fails a robustness criterion on $\vxp = \vx + \ve$ (parameterised by \texttt{c\_tag\_mode} and \texttt{n1\_p\_mode}; see Section~\ref{sec:variants}).
+\end{enumerate}
+
+\subsection{Objective: Confidence Gap Difference}
+
+\begin{definition}[Confidence Gap Difference]
+\[
+  \deltadiff(\vx) \;=\; \Conf{\NN{2}}{\vx}{c_s} \;-\; \Conf{\NN{1}}{\vx}{c_s}.
+\]
+\end{definition}
+
+Maximising $\deltadiff$ identifies the \emph{worst-case transfer failure}: the example where $\NN{2}$'s apparent clean advantage is most pronounced yet $\NN{2}$ still fails under perturbation.
+
+%=============================================================
+\section{The Transfer Proof MIP}
+\label{sec:mip}
+%=============================================================
+
+\subsection{Decision Variables}
+
+Table~\ref{tab:variables} lists the major variable groups.
+
+\begin{table}[h]
+\centering
+\caption{MIP variable groups in the transfer proof formulation.}
+\label{tab:variables}
+\begin{tabular}{lll}
+\toprule
+\textbf{Variable} & \textbf{Domain} & \textbf{Description} \\
+\midrule
+$\mathtt{v\_in}$ & $[0,1]^d$ & Clean input $\vx$ \\
+$\mathtt{v\_e}$ & $[-\eps,\eps]^d$ & Perturbation $\ve$ \\
+$\mathtt{v\_x0}$ & $[0,1]^d$ & Perturbed input $\vxp = \vx+\ve$ \\
+\midrule
+$\NN{1}(\vx)$ activations & $\mathbb{R}/\{0,1\}$ & Layers $1\ldots K$ \;(\texttt{n1\_org}) \\
+$\NN{2}(\vx)$ activations & $\mathbb{R}/\{0,1\}$ & Layers $K+1\ldots 2K$ \;(\texttt{n2\_org}) \\
+$\NN{1}(\vxp)$ activations & $\mathbb{R}/\{0,1\}$ & Layers $2K+1\ldots 3K$ \;(\texttt{n1\_pert}) \\
+$\NN{2}(\vxp)$ activations & $\mathbb{R}/\{0,1\}$ & Layers $3K+1\ldots 4K$ \;(\texttt{n2\_pert}) \\
+\midrule
+$\mathtt{v\_out\_n1}$ & $\mathbb{R}^C$ & Logits $\NN{1}(\vx)$ \\
+$\mathtt{v\_out\_n2}$ & $\mathbb{R}^C$ & Logits $\NN{2}(\vx)$ \\
+$\mathtt{v\_out\_n1\_p}$ & $\mathbb{R}^C$ & Logits $\NN{1}(\vxp)$ \\
+$\mathtt{v\_out\_n2\_p}$ & $\mathbb{R}^C$ & Logits $\NN{2}(\vxp)$ \\
+\midrule
+$\mathtt{conf\_n1\_x}$ & $\mathbb{R}$ & $\Conf{\NN{1}}{\vx}{c_s}$ \\
+$\mathtt{conf\_n2\_x}$ & $\mathbb{R}$ & $\Conf{\NN{2}}{\vx}{c_s}$ \\
+$\mathtt{conf\_n1\_xp}$ & $\mathbb{R}$ & $\Conf{\NN{1}}{\vxp}{c_{\mathrm{pert}}}$ \\
+$\mathtt{conf\_n2\_xp}$ & $\mathbb{R}$ & $\Conf{\NN{2}}{\vxp}{c_{\mathrm{pert}}}$ \\
+$\deltadiff$ & $\mathbb{R}$ & $\Conf{\NN{2}}{\vx}{c_s}-\Conf{\NN{1}}{\vx}{c_s}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Constraints}
+
+Let $\epszero = 10^{-3}$ be a numerical tolerance. The constraints are:
+
+\medskip
+\noindent\textbf{(C1) Perturbation constraint.}
+\[
+  \mathtt{v\_x0} = \mathtt{v\_in} + \mathtt{v\_e}.
+\]
+Combined with domain bounds on $\mathtt{v\_e}$ and $\mathtt{v\_x0}$, this enforces $\|\ve\|_\infty \le \eps$ and $\vxp \in [0,1]^d$.
+
+\medskip
+\noindent\textbf{(C2) Four-network MIP encodings.}
+Each of the four forward passes is encoded as a sequence of MIP constraints via the big-M ReLU formulation of Section~\ref{sec:bigm}. The four encodings share a global layer counter so each occupies a disjoint layer-index range:
+\begin{align*}
+  \NN{1}(\vx)  &\;\to\; \text{layers } 1\ldots K           &&(\texttt{network\_version} = \texttt{"n1\_org"})  \\
+  \NN{2}(\vx)  &\;\to\; \text{layers } K+1\ldots 2K         &&(\texttt{network\_version} = \texttt{"n2\_org"})  \\
+  \NN{1}(\vxp) &\;\to\; \text{layers } 2K+1\ldots 3K        &&(\texttt{network\_version} = \texttt{"n1\_pert"}) \\
+  \NN{2}(\vxp) &\;\to\; \text{layers } 3K+1\ldots 4K        &&(\texttt{network\_version} = \texttt{"n2\_pert"})
+\end{align*}
+$\NN{1}(\vx)$ and $\NN{2}(\vx)$ share $\mathtt{v\_in}$ as input; $\NN{1}(\vxp)$ and $\NN{2}(\vxp)$ share $\mathtt{v\_x0}$. The perturbation $\mathtt{v\_e}$ is the single coupling variable linking the clean and perturbed halves.
+
+\medskip
+\noindent\textbf{(C3) Confidence margin encoding.}
+Each confidence margin $\Conf{N}{\vx}{c} = N(\vx)_c - \max_{j\ne c} N(\vx)_j$ is encoded via big-M. Given output logits $\mathtt{v\_out}$ and class~$c$, introduce auxiliary variable $\mathtt{max\_kk}$ and binary variables $a_j \in \{0,1\}$ for each $j \ne c$:
+\begin{align}
+  \mathtt{conf} &= \mathtt{v\_out}[c] - \mathtt{max\_kk}, \label{eq:conf}\\
+  \mathtt{max\_kk} &\ge \mathtt{v\_out}[j] \quad \forall j \ne c, \label{eq:max_lb}\\
+  \mathtt{max\_kk} &\le \mathtt{v\_out}[j] + M_c\,(1-a_j) \quad \forall j \ne c, \label{eq:max_ub}\\
+  \sum_{j \ne c} a_j &= 1, \quad a_j \in \{0,1\}, \label{eq:max_sum}
+\end{align}
+where $M_c = 10^6$. This is applied four times to produce $\mathtt{conf\_n1\_x}$, $\mathtt{conf\_n2\_x}$, $\mathtt{conf\_n1\_xp}$, $\mathtt{conf\_n2\_xp}$. Each call introduces $C-1$ binary variables; the total for the four confidence margins is up to $4(C-1)$ binary variables. (In certain modes these are reduced; see Section~\ref{sec:n2fewer}.)
+
+\medskip
+\noindent\textbf{(C4) N1 certification constraint.}
+\[
+  \mathtt{conf\_n1\_x} \;\ge\; \deltaone + \epszero.
+\]
+This restricts the clean input to the certified region of $\NN{1}$. The value $\deltaone$ is read from the \texttt{best\_bound} column of the prior VHAGaR results file.
+
+\medskip
+\noindent\textbf{(C5) Clean confidence gap constraints.}
+\begin{align}
+  \deltadiff &= \mathtt{conf\_n2\_x} - \mathtt{conf\_n1\_x}, \label{eq:c5a} \\
+  \deltadiff &\ge 0. \label{eq:c5b}
+\end{align}
+Constraint~\eqref{eq:c5b} enforces that $\NN{2}$ is at least as confident as $\NN{1}$ on the clean input.
+
+\medskip
+\noindent\textbf{(C6) Gap-reversal constraint.}
+Parameterised by \texttt{c\_tag\_mode} and \texttt{n1\_p\_mode}; see Section~\ref{sec:variants}.
+
+\medskip
+\noindent\textbf{Objective.}
+\[
+  \maximize\; \deltadiff.
+\]
+
+\subsection{Solver Configuration}
+
+The MIP is solved with Gurobi using the settings in Table~\ref{tab:gurobi}.
+
+\begin{table}[h]
+\centering
+\caption{Gurobi solver attributes for the transfer proof MIP.}
+\label{tab:gurobi}
+\begin{tabular}{lll}
+\toprule
+\textbf{Attribute} & \textbf{Value} & \textbf{Purpose} \\
+\midrule
+\texttt{MIPFocus} & 3 & Emphasise improving the objective bound \\
+\texttt{MIPGap}   & 0.01 & Accept $1\%$ suboptimality \\
+\texttt{Threads}  & 32 & Parallel branch-and-bound \\
+\texttt{TimeLimit} & user-specified & Hard cutoff \\
+\texttt{Cutoff}   & PGD lower bound & Prune suboptimal branches \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================
+\section{Problem Variants: \texttt{c\_tag\_mode} and \texttt{n1\_p\_mode}}
+\label{sec:variants}
+%=============================================================
+
+\subsection{Overview of Flags}
+
+Two binary flags govern constraint~(C6):
+
+\begin{itemize}
+  \item \textbf{\texttt{c\_tag\_mode}} controls \emph{which class} is used to assess $\NN{2}$'s behaviour on the perturbed input, defining the \emph{perturbation target class}:
+    \[
+      c_{\mathrm{pert}} = \begin{cases} c_s & \text{if \texttt{c\_tag\_mode} = \texttt{true}} \quad\text{(untargeted)}, \\ c_t \ne c_s & \text{if \texttt{c\_tag\_mode} = \texttt{false}} \quad\text{(targeted)}. \end{cases}
+    \]
+    When \texttt{c\_tag\_mode = true}, the outer loop sets $c_t = c_s$ (same-class iteration); when \texttt{false}, it iterates over all $c_t \ne c_s$.
+  \item \textbf{\texttt{n1\_p\_mode}} controls whether (C6) is \emph{relative} (comparing $\NN{2}(\vxp)$ to $\NN{1}(\vxp)$) or \emph{absolute} (constraining $\NN{2}(\vxp)$ alone).
+\end{itemize}
+
+\subsection{Variant~A: \texttt{c\_tag\_mode = true}, \texttt{n1\_p\_mode = true}}
+
+\textbf{Gap-reversal constraint (C6):}
+\[
+  \Conf{\NN{2}}{\vxp}{c_s} - \Conf{\NN{1}}{\vxp}{c_s} \;\le\; -\epszero.
+\]
+
+\textbf{Interpretation.}
+Under adversarial perturbation $\vxp = \vx+\ve$ with $\|\ve\|_\infty \le \eps$, $\NN{2}$'s confidence in the source class $c_s$ is strictly lower than $\NN{1}$'s by at least $\epszero$. Combined with (C5), the gap \emph{reverses}:
+\[
+  \underbrace{\Conf{\NN{2}}{\vx}{c_s} \ge \Conf{\NN{1}}{\vx}{c_s}}_{\text{(C5): N2 leads on clean}} \quad\text{yet}\quad \underbrace{\Conf{\NN{2}}{\vxp}{c_s} < \Conf{\NN{1}}{\vxp}{c_s}}_{\text{(C6): N2 trails on perturbed}}.
+\]
+This is a \emph{relative untargeted} transfer failure: $\NN{2}$ degrades faster than $\NN{1}$ on the source class.
+
+\medskip
+\noindent\textbf{Full problem (Variant~A):}
+\begin{align*}
+  \maximize_{\vx,\ve}\;\; & \deltadiff = \Conf{\NN{2}}{\vx}{c_s} - \Conf{\NN{1}}{\vx}{c_s} \\
+  \mathrm{s.t.}\;\;
+    & \vx \in [0,1]^d,\; \vxp = \vx+\ve,\; \|\ve\|_\infty \le \eps,\; \vxp \in [0,1]^d \\
+    & \Conf{\NN{1}}{\vx}{c_s} \ge \deltaone + \epszero \tag{C4} \\
+    & \deltadiff = \Conf{\NN{2}}{\vx}{c_s} - \Conf{\NN{1}}{\vx}{c_s},\quad \deltadiff \ge 0 \tag{C5} \\
+    & \Conf{\NN{2}}{\vxp}{c_s} - \Conf{\NN{1}}{\vxp}{c_s} \le -\epszero \tag{C6-A} \\
+    & \text{MIP encodings of } \NN{1}(\vx),\;\NN{2}(\vx),\;\NN{1}(\vxp),\;\NN{2}(\vxp) \tag{C2}
+\end{align*}
+
+\subsection{Variant~B: \texttt{c\_tag\_mode = true}, \texttt{n1\_p\_mode = false}}
+
+\textbf{Gap-reversal constraint (C6):}
+\[
+  \Conf{\NN{2}}{\vxp}{c_s} \;\le\; -\epszero.
+\]
+
+\textbf{Interpretation.}
+$\NN{2}$ \emph{misclassifies} the perturbed input away from $c_s$ (predicts some other class). This is an \emph{absolute untargeted} transfer failure: $\NN{2}$ crosses the decision boundary, regardless of $\NN{1}$'s perturbed behaviour.
+
+Variant~B implies a strictly smaller feasible set than Variant~A: any solution where $\NN{2}$ misclassifies also satisfies Variant~A's relative condition (since $\NN{1}$ may still classify correctly), but not vice versa. However, Variant~B's solutions are more interpretable---the perturbed input $\vxp$ is an explicit adversarial example for $\NN{2}$.
+
+\medskip
+\noindent\textbf{Full problem (Variant~B):}
+\begin{align*}
+  \maximize_{\vx,\ve}\;\; & \deltadiff \\
+  \mathrm{s.t.}\;\;
+    & \text{(same as Variant~A except)} \\
+    & \Conf{\NN{2}}{\vxp}{c_s} \le -\epszero \tag{C6-B}
+\end{align*}
+
+\subsection{Variant~C: \texttt{c\_tag\_mode = false}, \texttt{n1\_p\_mode = true}}
+
+\textbf{Gap-reversal constraint (C6):}
+\[
+  \Conf{\NN{2}}{\vxp}{c_t} - \Conf{\NN{1}}{\vxp}{c_t} \;\ge\; \epszero.
+\]
+
+\textbf{Interpretation.}
+Under adversarial perturbation toward target class $c_t \ne c_s$, $\NN{2}$ gains \emph{relatively more} confidence in $c_t$ than $\NN{1}$ does. This is a \emph{relative targeted} transfer failure: $\NN{2}$ is more susceptible to targeted adversarial steering than $\NN{1}$, despite its clean advantage. The outer loop iterates over all $c_t \ne c_s$, yielding a separate MIP for each class pair.
+
+\medskip
+\noindent\textbf{Full problem (Variant~C):}
+\begin{align*}
+  \maximize_{\vx,\ve}\;\; & \deltadiff \\
+  \mathrm{s.t.}\;\;
+    & \text{(same as Variant~A, } c_{\mathrm{pert}} = c_t \ne c_s, \text{ except)} \\
+    & \Conf{\NN{2}}{\vxp}{c_t} - \Conf{\NN{1}}{\vxp}{c_t} \ge \epszero \tag{C6-C}
+\end{align*}
+
+\subsection{Variant~D: \texttt{c\_tag\_mode = false}, \texttt{n1\_p\_mode = false}}
+
+\textbf{Gap-reversal constraint (C6):}
+\[
+  \Conf{\NN{2}}{\vxp}{c_t} \;\ge\; \epszero.
+\]
+
+\textbf{Interpretation.}
+$\NN{2}$ \emph{confidently predicts the target class} $c_t$ for the perturbed input: $\vxp$ is an explicit targeted adversarial example for $\NN{2}$. Combined with~(C4), $\NN{1}$ was formally certified on $\vx$ (no perturbation of size~$\eps$ can cause $\NN{1}$ to misclassify $\vx$), yet $\vxp = \vx+\ve$ succeeds as a targeted attack against $\NN{2}$. This is the strongest form of transfer failure.
+
+\medskip
+\noindent\textbf{Full problem (Variant~D):}
+\begin{align*}
+  \maximize_{\vx,\ve}\;\; & \deltadiff \\
+  \mathrm{s.t.}\;\;
+    & \text{(same as Variant~C except)} \\
+    & \Conf{\NN{2}}{\vxp}{c_t} \ge \epszero \tag{C6-D}
+\end{align*}
+
+\subsection{Summary and Feasibility Relationships}
+
+Table~\ref{tab:variants} summarises the four variants. Variants~B and~D express \emph{absolute} failures (decision boundary crossed) and thus have smaller feasible sets but produce stronger certificates. Variants~A and~C express \emph{relative} failures (degradation relative to $\NN{1}$) and have larger feasible sets.
+
+\begin{table}[h]
+\centering
+\caption{Summary of the four problem variants.}
+\label{tab:variants}
+\begin{tabular}{ccc p{5.8cm}}
+\toprule
+\textbf{Variant} & \textbf{\texttt{c\_tag\_mode}} & \textbf{\texttt{n1\_p\_mode}} & \textbf{Constraint (C6)} \\
+\midrule
+A & \texttt{true}  & \texttt{true}  & $\Conf{\NN{2}}{\vxp}{c_s} - \Conf{\NN{1}}{\vxp}{c_s} \le -\epszero$ \\[4pt]
+B & \texttt{true}  & \texttt{false} & $\Conf{\NN{2}}{\vxp}{c_s} \le -\epszero$ \\[4pt]
+C & \texttt{false} & \texttt{true}  & $\Conf{\NN{2}}{\vxp}{c_t} - \Conf{\NN{1}}{\vxp}{c_t} \ge \epszero$ \\[4pt]
+D & \texttt{false} & \texttt{false} & $\Conf{\NN{2}}{\vxp}{c_t} \ge \epszero$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}
+Variant~B implies Variant~A (when $\NN{1}$ remains correct on $\vxp$). Variant~D implies Variant~C (when $\Conf{\NN{1}}{\vxp}{c_t} < 0$). The converse does not hold.
+\end{remark}
+
+%=============================================================
+\section{Optional Components}
+\label{sec:components}
+%=============================================================
+
+Six optional components can be enabled independently to accelerate MIP solving. They are not part of the core formulation but tighten the relaxation or provide warm-start information to the solver.
+
+%-------------------------------------------------------------
+\subsection{Hyper-Attack: PGD Warm-Start (\texttt{--use\_hyper\_attack})}
+\label{sec:hyperattack}
+%-------------------------------------------------------------
+
+\subsubsection{Motivation}
+
+Branch-and-bound MIP solving prunes nodes whose LP relaxation bound falls below the current incumbent (\texttt{Cutoff}). A tight feasible lower bound on the optimal $\deltadiff$ therefore dramatically reduces the search tree. The \emph{hyper-attack} is a Projected Gradient Descent~(PGD) procedure, implemented in \texttt{hyper\_attack\_transfer.py} and called from Julia via \texttt{hyper\_attack\_transfer.jl}, that finds feasible solutions in continuous relaxation before the MIP is built. Its output serves two purposes: (i) a \texttt{Cutoff} value for Gurobi, and (ii) activation-level MIP hints (Section~\ref{sec:hints}).
+
+\subsubsection{Input Candidate Pool}
+
+A pool of $M$ input candidates is sampled as follows:
+\begin{enumerate}
+  \item Collect images from the training set, test set, and random uniform noise.
+  \item Filter to those $\NN{1}$ classifies as $c_s$ with $\Conf{\NN{1}}{\vx}{c_s} \ge \deltaone$ (satisfying constraint C4).
+  \item Sort by $\Conf{\NN{1}}{\vx}{c_s}$ in descending order; subsample uniformly at stride $\lfloor|\text{filtered}|/M\rfloor$ to cover the confidence spectrum.
+\end{enumerate}
+
+\subsubsection{PGD Attack Loop}
+
+The attack jointly optimises over the input $\vx \in [0,1]^d$ and perturbation $\ve \in [-\eps,\eps]^d$ by sign-gradient ascent on a composite loss. At each of $T$ iterations:
+
+\paragraph{Step 1: Compute clean confidence gap.}
+\[
+  \Delta_{\mathrm{diff}} = \Conf{\NN{2}}{\vx}{c_s} - \Conf{\NN{1}}{\vx}{c_s}.
+\]
+
+\paragraph{Step 2: Compute perturbed input and gap.}
+\[
+  \vxp = \mathrm{clip}(\vx + \ve,\, 0,\, 1).
+\]
+\[
+  \mathtt{gap\_pert} = \begin{cases}
+    \Conf{\NN{2}}{\vxp}{c_{\mathrm{pert}}} & \text{if \texttt{n1\_p\_mode = false}}, \\[4pt]
+    \Conf{\NN{2}}{\vxp}{c_{\mathrm{pert}}} - \Conf{\NN{1}}{\vxp}{c_{\mathrm{pert}}} & \text{if \texttt{n1\_p\_mode = true}}.
+  \end{cases}
+\]
+
+\paragraph{Step 3: Adaptive scaling.}
+To prevent either term dominating when they differ in magnitude:
+\[
+  \tilde{\lambda} = \frac{|\Delta_{\mathrm{diff}}|}{|\mathtt{gap\_pert}| + \eta}, \qquad \eta = 10^{-9}.
+\]
+
+\paragraph{Step 4: Loss computation.}
+\[
+  \mathcal{L} = \begin{cases}
+    \Delta_{\mathrm{diff}} + \lambda_0\,\tilde{\lambda}\,\mathtt{gap\_pert} & \text{if \texttt{c\_tag\_mode = true}}, \\[4pt]
+    \Delta_{\mathrm{diff}} - \lambda_0\,\tilde{\lambda}\,\mathtt{gap\_pert} & \text{if \texttt{c\_tag\_mode = false}},
+  \end{cases}
+\]
+where $\lambda_0 = 1.01$.
+
+\paragraph{Step 5: Sign-gradient ascent step.}
+\begin{align*}
+  \vx &\leftarrow \mathrm{clip}\!\left(\vx + \alpha\,\mathrm{sign}(\nabla_{\vx}\,\mathcal{L}),\; 0,\; 1\right), \\
+  \ve &\leftarrow \mathrm{clip}\!\left(\ve + \alpha\,\mathrm{sign}(\nabla_{\ve}\,\mathcal{L}),\; -\eps,\; \eps\right),
+\end{align*}
+with step size $\alpha = 0.01$ and $T = 500$ iterations by default.
+
+\subsubsection{Feasibility Filter}
+
+After $T$ iterations, candidates are tested against all feasibility conditions. A candidate $(\vx^*,\ve^*)$ is feasible iff:
+\begin{enumerate}
+  \item $\argmax\,\NN{1}(\vx^*) = c_s$ (N1 classifies as source),
+  \item $\Conf{\NN{1}}{\vx^*}{c_s} \ge \deltaone$ (constraint C4),
+  \item $\Delta_{\mathrm{diff}} \ge 0$ (constraint C5b),
+  \item $\mathtt{gap\_pert} < 0$ if \texttt{c\_tag\_mode = true}; \quad $\mathtt{gap\_pert} > 0$ if \texttt{c\_tag\_mode = false} (constraint C6).
+\end{enumerate}
+The feasible candidate with the largest $\Delta_{\mathrm{diff}}$ is selected. Its $\Delta_{\mathrm{diff}}$ value is written to \texttt{/tmp/best\_val\_\{source\}\_\{target\}\_\{token\}.txt} and passed to Gurobi as the \texttt{Cutoff} attribute.
+
+%-------------------------------------------------------------
+\subsection{Activation-Level MIP Hints (\texttt{--use\_hyper\_attack} with hints)}
+\label{sec:hints}
+%-------------------------------------------------------------
+
+\subsubsection{From Attack to Hints}
+
+For the best feasible candidate $(\vx^*,\ve^*,\,\vxp{}^* = \mathrm{clip}(\vx^*+\ve^*))$, the ReLU activation pattern across all four network copies is extracted:
+\begin{align*}
+  \mathtt{act\_n1\_x}  &= \text{activations of } \NN{1}(\vx^*),    &&\text{layers } 1\ldots K, \\
+  \mathtt{act\_n2\_x}  &= \text{activations of } \NN{2}(\vx^*),    &&\text{layers } K+1\ldots 2K, \\
+  \mathtt{act\_n1\_xp} &= \text{activations of } \NN{1}(\vxp{}^*), &&\text{layers } 2K+1\ldots 3K, \quad\text{(if \texttt{n1\_p\_mode})},\\
+  \mathtt{act\_n2\_xp} &= \text{activations of } \NN{2}(\vxp{}^*), &&\text{layers } 3K+1\ldots 4K.
+\end{align*}
+
+Each post-ReLU activation value $h \in [0,\infty)$ is thresholded to a binary hint using threshold $\tau = 0.01$:
+\[
+  \mathtt{hint} = \begin{cases}
+    1  & \text{if } h > 1 - \tau \quad \text{(neuron active)}, \\
+    0  & \text{if } h < \tau      \quad \text{(neuron inactive)}, \\
+    -1 & \text{otherwise}          \quad \text{(unknown; solver decides)}.
+  \end{cases}
+\]
+
+\subsubsection{Hint Format and Injection}
+
+The hints are written to two \texttt{/tmp/} files:
+\begin{itemize}
+  \item \texttt{strings\_\{source\}\_\{target\}\_\{token\}.txt}: comma-separated JuMP variable names, e.g.\ \texttt{n1\_orga\_layerCount2\_neuronCount5\_5\_5}.
+  \item \texttt{booleans\_\{source\}\_\{target\}\_\{token\}.txt}: corresponding comma-separated hint values in $\{-1, 0, 1\}$.
+\end{itemize}
+The Julia function \texttt{hyper\_attack\_hints} reads these files, matches variable names against \texttt{JuMP.all\_variables(m)}, and calls \texttt{set\_start\_value} for each non-unknown hint. This seeds the branch-and-bound tree with an activation pattern observed during the PGD attack, helping Gurobi find the first integer-feasible solution quickly.
+
+\begin{remark}
+If no feasible PGD solution is found, the attack writes an empty file (\texttt{fail\_\ldots.txt}), and \texttt{hyper\_attack\_hints} skips hint injection but still uses the \texttt{Cutoff = 0} (or the best infeasible bound).
+\end{remark}
+
+%-------------------------------------------------------------
+\subsection{VHAGaR Dependency Constraints (\texttt{--activate\_vaghgar\_deps})}
+\label{sec:vaghgar_deps}
+%-------------------------------------------------------------
+
+\subsubsection{Dependency Propagation in VHAGaR}
+
+VHAGaR's standard mode computes, for each pair of neurons $(h_k^{(i)}, h_k^{(j)})$ sharing the same position in the network but applied to different inputs (clean vs.\ perturbed), a per-neuron \emph{dependency label} in the $\phi$-matrix:
+\[
+  \phi_{k,n} \in \{0,\, +1,\, -1,\, \mathrm{NaN}\},
+\]
+where:
+\begin{itemize}
+  \item $0$: equal activations ($h_k^{(j)}(\vxp) = h_k^{(i)}(\vx)$),
+  \item $+1$: monotone ($h_k^{(j)}(\vxp) \ge h_k^{(i)}(\vx)$),
+  \item $-1$: anti-monotone ($h_k^{(j)}(\vxp) \le h_k^{(i)}(\vx)$),
+  \item $\mathrm{NaN}$: unknown.
+\end{itemize}
+This label is initialised at the input layer (e.g.\ $\phi = 0$ for occluded pixels, $\phi = \pm 1$ for brightness) and propagated forward layer by layer via a sign-weighted linear operator. For unknown cases, an LP sub-problem determines the label.
+
+\subsubsection{Application to Transfer Mode}
+
+In transfer mode, the dependency constraints link the clean and perturbed encoding blocks of each network separately:
+\begin{align*}
+  &\texttt{perturbation\_dependencies}(\NN{1};\;\mathtt{activation\_start}=1,\;\mathtt{layers\_offset}=2K), \\
+  &\texttt{perturbation\_dependencies}(\NN{2};\;\mathtt{activation\_start}=K+1,\;\mathtt{layers\_offset}=2K).
+\end{align*}
+For $\NN{1}$, this adds constraints between $\NN{1}(\vx)$ (layers $1\ldots K$) and $\NN{1}(\vxp)$ (layers $2K+1\ldots 3K$). For $\NN{2}$, between $\NN{2}(\vx)$ (layers $K+1\ldots 2K$) and $\NN{2}(\vxp)$ (layers $3K+1\ldots 4K$). The \texttt{layers\_offset}$=2K$ parameter shifts the layer indices of the perturbed copy in \texttt{layers\_info\_dict} to the correct global range.
+
+\subsubsection{Effect on the MIP}
+
+Each dependency label translates to MIP constraints as follows:
+\begin{itemize}
+  \item $\phi = 0$: equality constraint on the ReLU output variables ($h^{\mathrm{pert}} = h^{\mathrm{org}}$) and on the binary activation variables ($a^{\mathrm{pert}} = a^{\mathrm{org}}$).
+  \item $\phi = +1$: inequality $h^{\mathrm{pert}} \ge h^{\mathrm{org}}$, fixing the relative ordering.
+  \item $\phi = -1$: inequality $h^{\mathrm{pert}} \le h^{\mathrm{org}}$.
+  \item $\phi = \mathrm{NaN}$: no constraint added (the MIP solver decides).
+\end{itemize}
+These constraints fix or constrain the binary activation variables of split neurons, directly reducing the effective number of free binaries in the branch-and-bound tree.
+
+%-------------------------------------------------------------
+\subsection{Lucid Inter-Network Interval Constraints (\texttt{--use\_intervals})}
+\label{sec:lucid_intervals}
+%-------------------------------------------------------------
+
+\subsubsection{Motivation}
+
+When $\NN{1}$ and $\NN{2}$ are ``close'' networks (e.g.\ different training checkpoints with the same architecture), the difference in their activations at each layer $k$ is small and bounded. The \emph{Lucid interval constraints} exploit this by adding layer-by-layer linear bounds on $h_k^{\NN{2}}(\vx) - h_k^{\NN{1}}(\vx)$ (for clean inputs) and $h_k^{\NN{2}}(\vxp) - h_k^{\NN{1}}(\vxp)$ (for perturbed inputs).
+
+\subsubsection{Interval Propagation}
+
+Define the \emph{inter-network difference interval} at layer $k$ as
+\[
+  \RI{k} = \bigl[\,I_k^{\downarrow},\; I_k^{\uparrow}\,\bigr],
+\]
+the range of $h_k^{\NN{2}}(\vx) - h_k^{\NN{1}}(\vx)$ consistent with $\vx \in [0,1]^d$. Initialise $\RI{0} = [0, 0]$ (both networks receive the same input). For each linear layer $k$ with weight matrices $W^{\NN{1}}_k$ and $W^{\NN{2}}_k$:
+
+\begin{enumerate}
+  \item Compute the weight difference: $\Delta W_k = (W^{\NN{2}}_k)^\top - (W^{\NN{1}}_k)^\top$.
+  \item Propagate:
+    \[
+      \bigl[I_{z,k}^{\downarrow}, I_{z,k}^{\uparrow}\bigr] = \mathrm{IntMul}(\Delta W_k,\, [z_{k-1}^{\downarrow}, z_{k-1}^{\uparrow}]) + W^{\NN{1}\top}_k \cdot \RI{k-1},
+    \]
+    where $\mathrm{IntMul}$ computes the interval of the matrix-vector product over the argument's range, and $[z_{k-1}^{\downarrow}, z_{k-1}^{\uparrow}]$ are the pre-ReLU bounds from the standard MIP encoding.
+  \item Apply ReLU relaxation:
+    \[
+      I_k^{\uparrow} = \max(0,\, I_{z,k}^{\uparrow}), \qquad I_k^{\downarrow} = -\max(0,\, -I_{z,k}^{\downarrow}).
+    \]
+\end{enumerate}
+
+This matches the \texttt{HyperlinearDepsIn} propagation from the Lucid framework~\cite{lucid}.
+
+\subsubsection{Constraints Added}
+
+At each ReLU layer $k$, the following linear constraints are added to the MIP between the post-ReLU variables of $\NN{1}$ and $\NN{2}$:
+\begin{align}
+  \mathtt{av}[\mathtt{vec\_n2}] &\le \mathtt{av}[\mathtt{vec\_n1}] + I_k^{\uparrow}, \label{eq:lucid_up}\\
+  \mathtt{av}[\mathtt{vec\_n2}] &\ge \mathtt{av}[\mathtt{vec\_n1}] + I_k^{\downarrow}. \label{eq:lucid_down}
+\end{align}
+This is applied for both clean copies ($\texttt{n1\_org} \leftrightarrow \texttt{n2\_org}$) and perturbed copies ($\texttt{n1\_pert} \leftrightarrow \texttt{n2\_pert}$):
+\[
+  \texttt{transfer\_interval\_constraints}(m,\, \NN{1},\, \NN{2},\, \ldots)
+    \;\Longrightarrow\;
+    \begin{cases} \texttt{add\_interval\_constraints}(\ldots,\, \texttt{"org"},\, \texttt{"n1\_org"},\, \texttt{"n2\_org"}) \\ \texttt{add\_interval\_constraints}(\ldots,\, \texttt{"perturbation"},\, \texttt{"n1\_pert"},\, \texttt{"n2\_pert"}) \end{cases}
+\]
+These are purely linear constraints (no new binary variables) that directly tighten the LP relaxation at each node of the branch-and-bound tree.
+
+%-------------------------------------------------------------
+\subsection{Perturbation Interval Constraints (\texttt{--use\_perturbed\_intervals})}
+\label{sec:pert_intervals}
+%-------------------------------------------------------------
+
+\subsubsection{Motivation}
+
+The perturbation interval constraints bound the \emph{intra-network} activation difference between clean and perturbed copies of the same network. For each network $\NN{i} \in \{\NN{1}, \NN{2}\}$, they bound $h_k^{\NN{i}}(\vxp) - h_k^{\NN{i}}(\vx)$ as a function of the perturbation size $\eps$.
+
+\subsubsection{Interval Propagation}
+
+Define the \emph{perturbation activation interval} at layer $k$ for network $\NN{i}$ as
+\[
+  \RI{\mathrm{pert},k} = \bigl[\,\Delta_k^{\downarrow},\; \Delta_k^{\uparrow}\,\bigr],
+\]
+the range of $h_k^{\NN{i}}(\vxp) - h_k^{\NN{i}}(\vx)$ consistent with $\|\ve\|_\infty \le \eps$. Initialise $\RI{\mathrm{pert},0} = [-\eps, \eps]$ (the input perturbation). For each linear layer with weight matrix $W$ (same for clean and perturbed):
+\begin{align}
+  \bigl[\Delta_{z,k}^{\downarrow},\; \Delta_{z,k}^{\uparrow}\bigr] &= \mathrm{IntMul}(W^\top,\, W^\top,\, \Delta_{k-1}^{\downarrow},\, \Delta_{k-1}^{\uparrow}). \label{eq:pert_linear}
+\end{align}
+After the ReLU:
+\begin{align}
+  \Delta_k^{\uparrow} &= \max(0,\, \Delta_{z,k}^{\uparrow}), \label{eq:pert_relu_up}\\
+  \Delta_k^{\downarrow} &= -\max(0,\, -\Delta_{z,k}^{\downarrow}). \label{eq:pert_relu_down}
+\end{align}
+The ReLU relaxation on the difference $\sigma(z+\Delta) - \sigma(z) \in [\min(0,\Delta), \max(0,\Delta)]$ is conservative but linear.
+
+\subsubsection{Constraints Added}
+
+At each ReLU layer $k$, for network $\NN{i}$ with clean prefix $p_c$ and perturbed prefix $p_p$:
+\begin{align}
+  \mathtt{av}[p_p\text{-}\mathtt{x\_rect}_k] &\le \mathtt{av}[p_c\text{-}\mathtt{x\_rect}_k] + \Delta_k^{\uparrow}, \label{eq:pertc_up}\\
+  \mathtt{av}[p_p\text{-}\mathtt{x\_rect}_k] &\ge \mathtt{av}[p_c\text{-}\mathtt{x\_rect}_k] + \Delta_k^{\downarrow}. \label{eq:pertc_down}
+\end{align}
+This is applied independently for each network:
+\begin{align*}
+  &\texttt{perturbed\_interval\_constraints}(m,\, \NN{1},\, \texttt{"n1\_org"},\, \texttt{"n1\_pert"}), \\
+  &\texttt{perturbed\_interval\_constraints}(m,\, \NN{2},\, \texttt{"n2\_org"},\, \texttt{"n2\_pert"}).
+\end{align*}
+Like the Lucid constraints, these are linear (no new binary variables) and directly tighten the LP relaxation between the clean and perturbed activation variables.
+
+\subsubsection{Comparison to Lucid Intervals}
+
+Table~\ref{tab:interval_compare} contrasts the two interval constraint families.
+
+\begin{table}[h]
+\centering
+\caption{Comparison of Lucid interval and perturbation interval constraints.}
+\label{tab:interval_compare}
+\begin{tabular}{lll}
+\toprule
+ & \textbf{Lucid Intervals} & \textbf{Perturbation Intervals} \\
+\midrule
+\textbf{Quantity bounded} & $h_k^{\NN{2}} - h_k^{\NN{1}}$ & $h_k^{\NN{i}}(\vxp) - h_k^{\NN{i}}(\vx)$ \\
+\textbf{Pair linked} & $\NN{1}$ vs.\ $\NN{2}$ (same input) & Clean vs.\ perturbed (same network) \\
+\textbf{Driver of tightness} & Weight similarity $\|W^{\NN{2}}-W^{\NN{1}}\|$ & Perturbation size $\eps$ \\
+\textbf{Applied to} & Both clean and perturbed copies & Each network separately \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%-------------------------------------------------------------
+\subsection{N2 Fewer Binaries Encoding (\texttt{--n2\_fewer\_binars\_encoding})}
+\label{sec:n2fewer}
+%-------------------------------------------------------------
+
+\subsubsection{Motivation}
+
+The confidence margin encoding of constraint~(C3) introduces $C-1$ binary variables per confidence margin (one per non-target class in the big-M max encoding). For Variant~D (\texttt{c\_tag\_mode = false}, \texttt{n1\_p\_mode = false}), the gap-reversal constraint~(C6-D) requires
+\[
+  \Conf{\NN{2}}{\vxp}{c_t} = \NN{2}(\vxp)_{c_t} - \max_{j \ne c_t}\,\NN{2}(\vxp)_j \;\ge\; \epszero.
+\]
+The standard formulation encodes $\max_{j\ne c_t}$ via $C-1$ binary variables. The \texttt{--n2\_fewer\_binars\_encoding} flag eliminates these binary variables entirely by replacing the big-M max encoding with direct linear constraints.
+
+\subsubsection{Equivalent Linear Formulation}
+
+Observe that
+\[
+  \NN{2}(\vxp)_{c_t} - \max_{j \ne c_t}\,\NN{2}(\vxp)_j \;\ge\; \epszero
+  \;\iff\;
+  \NN{2}(\vxp)_{c_t} - \NN{2}(\vxp)_j \;\ge\; \epszero \quad \forall\, j \ne c_t.
+\]
+The right-hand side is a system of $C-1$ linear constraints directly on the output logit variables $\mathtt{v\_out\_n2\_p}$, requiring no auxiliary or binary variables. In the implementation:
+\begin{equation}
+  \mathtt{v\_out\_n2\_p}[c_t] - \mathtt{v\_out\_n2\_p}[j] \;\ge\; \epszero, \quad \forall\, j \ne c_t. \label{eq:n2fewer}
+\end{equation}
+
+\subsubsection{Effect on the MIP}
+
+\begin{enumerate}
+  \item \textbf{Binary variable reduction:} Eliminates the $C-1$ binary variables introduced by \texttt{define\_conf!} for $\mathtt{conf\_n2\_xp}$, as well as the $C$ constraints in \eqref{eq:max_lb}--\eqref{eq:max_sum}. For MNIST ($C=10$), this removes 9 binary variables.
+  \item \textbf{Tighter LP relaxation:} The big-M encoding of the max (equations~\eqref{eq:max_ub}) introduces LP relaxation slack proportional to the big-M constant $M_c = 10^6$. The direct formulation~\eqref{eq:n2fewer} is an exact linear constraint without any relaxation gap, yielding a strictly tighter LP at each B\&B node.
+\end{enumerate}
+
+\subsubsection{Applicability}
+
+This optimisation is applicable only to Variant~D (\texttt{c\_tag\_mode = false}, \texttt{n1\_p\_mode = false}), since:
+\begin{itemize}
+  \item The equivalence $\text{(C6-D)} \iff \eqref{eq:n2fewer}$ holds only for the $\ge \epszero$ form (targeted, absolute).
+  \item For constraints of the form $\Conf{\NN{2}}{\vxp}{c_s} \le -\epszero$ (Variant~B), the analogous direct form would be a \emph{disjunction} (at least one class beats $c_s$ by $\epszero$), which is not directly linear.
+  \item Variants~A and~C involve $\Conf{\NN{1}}{\vxp}{\cdot}$ in (C6), so the big-M encoding of that confidence margin remains necessary.
+\end{itemize}
+
+%=============================================================
+\section{Full Execution Flow}
+\label{sec:execution}
+%=============================================================
+
+Algorithm~\ref{alg:transfer} gives the complete transfer proof pipeline for a given source class $c_s$ and target class $c_t$. The result is interpreted as:
+\begin{itemize}
+  \item \textbf{incumbent\_obj $> 0$, best\_bound $> 0$}: Transfer failure found; \texttt{incumbent\_obj} is the $\deltadiff$ of the best discovered counterexample.
+  \item \textbf{best\_bound $\le 0$}: Formal transfer certificate (within 1\% MIP gap).
+  \item \textbf{Time limit reached}: Inconclusive; \texttt{best\_bound} provides a provable upper bound on the maximum $\deltadiff$.
+\end{itemize}
+
+\begin{algorithm}[H]
+\caption{VHAGaR Transfer Proof for class pair $(c_s, c_t)$}
+\label{alg:transfer}
+\begin{algorithmic}[1]
+\Require Networks $\NN{1}$, $\NN{2}$; VHAGaR results file; perturbation type and size $\eps$; flags
+\State Read $\deltaone$ from prior VHAGaR results (\texttt{best\_bound} column)
+\If{$\deltaone \le 0$} \Return \textbf{skip} \EndIf
+\If{\texttt{use\_hyper\_attack}}
+  \State $\mathtt{suboptimal\_solution},\;\mathtt{hints} \leftarrow \texttt{hyper\_attack\_transfer}(\NN{1}, \NN{2}, \ldots)$ \Comment{Section~\ref{sec:hyperattack}}
+\EndIf
+\State Build four-network MIP:
+\State \quad Shared variables: $\mathtt{v\_in} \in [0,1]^d$, $\mathtt{v\_e} \in [-\eps,\eps]^d$, $\mathtt{v\_x0} = \mathtt{v\_in} + \mathtt{v\_e}$
+\State \quad Encode $\NN{1}(\mathtt{v\_in}) \to \mathtt{v\_out\_n1}$\quad [\texttt{n1\_org}, layers $1\ldots K$]
+\State \quad Encode $\NN{2}(\mathtt{v\_in}) \to \mathtt{v\_out\_n2}$\quad [\texttt{n2\_org}, layers $K+1\ldots 2K$]
+\State \quad Encode $\NN{1}(\mathtt{v\_x0}) \to \mathtt{v\_out\_n1\_p}$\quad [\texttt{n1\_pert}, layers $2K+1\ldots 3K$]
+\State \quad Encode $\NN{2}(\mathtt{v\_x0}) \to \mathtt{v\_out\_n2\_p}$\quad [\texttt{n2\_pert}, layers $3K+1\ldots 4K$]
+\If{\texttt{use\_hyper\_attack}}
+  \State Inject activation hints into MIP binary variables \Comment{Section~\ref{sec:hints}}
+\EndIf
+\If{\texttt{activate\_vaghgar\_deps}}
+  \State Add VHAGaR dependency constraints for $\NN{1}$ and $\NN{2}$ \Comment{Section~\ref{sec:vaghgar_deps}}
+\EndIf
+\If{\texttt{use\_intervals}}
+  \State Add Lucid inter-network interval constraints \Comment{Section~\ref{sec:lucid_intervals}}
+\EndIf
+\If{\texttt{use\_perturbed\_intervals}}
+  \State Add perturbation interval constraints for $\NN{1}$ and $\NN{2}$ \Comment{Section~\ref{sec:pert_intervals}}
+\EndIf
+\State Add constraints (C3)--(C6) and objective (\S\ref{sec:mip}); set \texttt{Cutoff}$\leftarrow$\texttt{suboptimal\_solution}
+\State $\texttt{optimize!}(m)$
+\State \Return \texttt{incumbent\_obj}, \texttt{best\_bound}, \texttt{solve\_time}
+\end{algorithmic}
+\end{algorithm}
+
+%=============================================================
+\section{Discussion}
+%=============================================================
+
+\subsection{Variant Selection}
+
+\begin{itemize}
+  \item \textbf{Variant~B} (\texttt{c\_tag\_mode=true, n1\_p\_mode=false}) produces the most interpretable result: an explicit untargeted adversarial example for $\NN{2}$ while $\NN{1}$ is certified safe. Its absolute condition also maximises the feasible set among untargeted variants, making it the easiest to find.
+  \item \textbf{Variant~D} (\texttt{c\_tag\_mode=false, n1\_p\_mode=false}) is the targeted analog. Combined with \texttt{--n2\_fewer\_binars\_encoding}, it eliminates binary variables entirely from the perturbed N2 confidence encoding, yielding the fastest-solving targeted formulation.
+  \item \textbf{Variants~A and~C} (\texttt{n1\_p\_mode=true}) enforce relative degradation and are appropriate when one wishes to certify that $\NN{2}$ never degrades faster than $\NN{1}$, even if both networks may fail.
+\end{itemize}
+
+\subsection{Component Interaction}
+
+The six optional components are independent and can be combined freely:
+\begin{itemize}
+  \item \texttt{--use\_hyper\_attack}: always recommended; provides \texttt{Cutoff} and hints.
+  \item \texttt{--activate\_vaghgar\_deps}: most effective for small-$\eps$ perturbations where many neurons have deterministic cross-input dependencies.
+  \item \texttt{--use\_intervals} (Lucid): most effective when $\NN{1}$ and $\NN{2}$ are close (small weight differences).
+  \item \texttt{--use\_perturbed\_intervals}: most effective for small $\eps$ or shallow networks.
+  \item \texttt{--n2\_fewer\_binars\_encoding}: applicable only to Variant~D; always beneficial when applicable.
+\end{itemize}
+
+\subsection{Computational Complexity}
+
+The transfer MIP has $4\times$ the network-encoding variables of a single-copy verification, plus up to $4(C-1)$ binary variables for confidence margins (reduced by \texttt{--n2\_fewer\_binars\_encoding}). For a $4\times 10$ MNIST network ($K=3$, $n=10$, $C=10$, $d=784$): approximately 120 ReLU binary variables ($4 \times 30$) plus up to 36 confidence-margin binaries.
+
+%=============================================================
+\section{Conclusion}
+%=============================================================
+
+VHAGaR Transfer formalises the adversarial robustness transfer problem as a four-network MIP and introduces four semantically distinct problem variants via two binary flags. Table~\ref{tab:conclusion} summarises the variants and applicable optional components.
+
+\begin{table}[h]
+\centering
+\caption{Variants and recommended optional components.}
+\label{tab:conclusion}
+\begin{tabular}{cccl}
+\toprule
+\textbf{Variant} & \textbf{c\_tag\_mode} & \textbf{n1\_p\_mode} & \textbf{Transfer failure type} \\
+\midrule
+A & true  & true  & Relative untargeted: N2 degrades faster than N1 on $c_s$ \\
+B & true  & false & Absolute untargeted: N2 misclassifies perturbed input \\
+C & false & true  & Relative targeted: N2 gains $c_t$ confidence faster than N1 \\
+D & false & false & Absolute targeted: N2 predicts $c_t$ on perturbed input \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The optional components---PGD hyper-attack, activation hints, VHAGaR dependency constraints, Lucid inter-network intervals, perturbation intervals, and N2 fewer-binary encoding---address the combinatorial difficulty of the four-network MIP from complementary angles: warm-starting, constraint tightening, and variable reduction.
+
+%=============================================================
+\begin{thebibliography}{9}
+
+\bibitem{vaghar}
+VHAGaR: Verifier of Hazardous Attacks for Global Robustness. Source code repository: \texttt{vaghar\_org/}.
+
+\bibitem{anderson2020}
+R.\ Anderson, J.\ Huchette, C.\ Tjandraatmadja, J.\ Vielma.
+Strong mixed-integer programming formulations for trained neural networks.
+\emph{Mathematical Programming}, 183:3--39, 2020.
+
+\bibitem{tjeng2019}
+V.\ Tjeng, K.\ Xiao, R.\ Tedrake.
+Evaluating Robustness of Neural Networks with Mixed Integer Programming.
+\emph{ICLR}, 2019.
+
+\bibitem{madry2018}
+A.\ Madry, A.\ Makelov, L.\ Schmidt, D.\ Tsipras, A.\ Vladu.
+Towards Deep Learning Models Resistant to Adversarial Attacks.
+\emph{ICLR}, 2018.
+
+\bibitem{katz2017}
+G.\ Katz, C.\ Barrett, D.\ Dill, K.\ Julian, M.\ Kochenderfer.
+Reluplex: An Efficient SMT Solver for Verifying Deep Neural Networks.
+\emph{CAV}, 2017.
+
+\bibitem{lucid}
+Lucid delta-diff framework. Source code: \texttt{lucid\_delta\_diff\_with\_perturbation/}.
+
+\bibitem{gurobi}
+Gurobi Optimization, LLC.
+\emph{Gurobi Optimizer Reference Manual}, 2023.
+
+\end{thebibliography}
+
+%=============================================================
+\appendix
+\section{Implementation Details}
+%=============================================================
+
+\subsection{Layer Indexing Convention}
+
+Global layer indices in \texttt{layers\_info\_dict[(layer, neuron)]}:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Network version} & \textbf{Layer index range} \\
+\midrule
+\texttt{n1\_org}  & $\{1, \ldots, K\}$ \\
+\texttt{n2\_org}  & $\{K+1, \ldots, 2K\}$ \\
+\texttt{n1\_pert} & $\{2K+1, \ldots, 3K\}$ \\
+\texttt{n2\_pert} & $\{3K+1, \ldots, 4K\}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For a $4\times10$ network: $K=3$, so \texttt{n1\_org} uses layers 1--3, \texttt{n2\_org} uses 4--6, \texttt{n1\_pert} uses 7--9, \texttt{n2\_pert} uses 10--12.
+
+\subsection{JuMP Variable Naming}
+
+Binary ReLU activation variables follow the naming convention:
+\[
+  \texttt{\{nv\}a\_layerCount\{r\}\_neuronCount\{n\}\_\{a\}\_\{n\}}
+\]
+where \texttt{nv} is the network version (\texttt{n1\_org}, etc.), $r$ is the relative layer index within the copy, $n$ is the neuron index, and $a$ is the absolute layer index. Example: neuron~5 in ReLU layer~2 of $\NN{2}(\vx)$ (absolute layer $K+2$):
+\[
+  \texttt{n2\_orga\_layerCount2\_neuronCount5\_{(K+2)}\_5}.
+\]
+
+\subsection{Command-Line Interface}
+
+\begin{lstlisting}[language=bash, basicstyle=\small\ttfamily, breaklines=true]
+julia run.jl \
+  --mode transfer \
+  --dataset mnist \
+  --model_name 4x10 \
+  --model_path /path/to/n1_weights.p \
+  --model_path2 /path/to/n2_weights.p \
+  --vaghar_results /path/to/vaghar_n1_results.txt \
+  --perturbation linf \
+  --perturbation_size 0.05 \
+  --ctag 1 \
+  --ct "2,3,4,5,6,7,8,9" \
+  --c_tag_mode false \
+  --n1_p_mode false \
+  --n2_fewer_binars_encoding true \
+  --timout 4000 \
+  --output_dir ./results/ \
+  --name_to_save transfer_exp1 \
+  --use_hyper_attack true \
+  --activate_vaghgar_deps false \
+  --use_intervals false \
+  --use_perturbed_intervals false
+\end{lstlisting}
+
+\end{document}

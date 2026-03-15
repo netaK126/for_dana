@@ -1,0 +1,30 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Standard Mode: Computing the Global Robustness Bound}
+\label{sec:standard}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we present the standard-mode formulation, which computes the global robustness bound for a single network. This bound serves as the foundation for the transfer-mode analysis in Section~\ref{sec:transfer}.
+
+\subsection{Problem Definition}
+
+We fix a source class $c$ and a target class $t$. The standard-mode MIP maximizes the confidence margin of the \emph{clean} input $x$ while requiring that a \emph{perturbed} input $\xp$ is misclassified as $t$:
+\begin{equation}
+  \label{eq:standard-obj}
+  \dO \;=\; \max_{x,\,\xp}\; \conf{N_1}{x}{c}
+  \quad \text{subject to} \quad
+  \xp \in \mI_\ep(x),\quad
+  \hat{y}_t(\xp) \ge \hat{y}_k(\xp)\;\forall k \neq t.
+\end{equation}
+
+Intuitively, the solution $\dO$ is the highest confidence at which the network can still be fooled. Any input classified with confidence above $\dO$ is provably robust: no perturbation in $\mI_\ep(x)$ can cause misclassification as $t$. This is equivalent to Definition~\ref{def:delta1}: $\dO = \dN{1}$ in the formal notation.
+
+\subsection{MIP Encoding of the Confidence Margin}
+
+The confidence margin involves $\max_{k \neq c} \hat{y}_k$, which is non-linear. We linearize it by introducing one binary variable $b_k \in \{0,1\}$ per class $k \neq c$, indicating whether class $k$ achieves the maximum:
+\begin{align*}
+  \delta &= \hat{y}_c - m, \\
+  m &\ge \hat{y}_k \quad \forall\, k \neq c, \\
+  m &\le \hat{y}_k + M(1 - b_k) \quad \forall\, k \neq c, \\
+  \sum_{k \neq c} b_k &= 1,
+\end{align*}
+where $M$ is a sufficiently large constant. The solver then maximizes $\delta$. This encoding is exact: the binary variables ensure that $m$ equals the maximum logit among all non-$c$ classes, and the MIP objective finds the maximum confidence at which an adversarial perturbation exists.

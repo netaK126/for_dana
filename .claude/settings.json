@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wget -q \"https://raw.githubusercontent.com/borisveytsman/acmart/refs/heads/master/acmart.cls\" -O acmart.cls)",
+      "Bash(kpsewhich llncs.cls)",
+      "Bash(curl -fsSL \"https://mirrors.ctan.org/macros/latex/contrib/llncs.zip\" -o /tmp/llncs.zip)",
+      "Bash(unzip -l /tmp/llncs.zip)",
+      "Bash(julia run.jl --mode standard --dataset mnist --model_name 10x10 --model_path ./experiment_models/10x10/N1/model.p --perturbation linf --perturbation_size 0.05 --timout 1200 --output_dir ./experiment_results/10x10/standard/linf_0.05/S1_deps_hyper/ --name_to_save S1_deps_hyper_linf_0.05 --activate_vaghgar_deps true --use_perturbed_intervals false --use_hyper_attack true --c_tag_mode false)",
+      "Bash(ls -la /root/Downloads/vaghar_org/experiment_models/10x10/N1/model.p*)",
+      "Bash(find /root/Downloads -maxdepth 2 -name *.md -o -name .cursorrules -o -name copilot-instructions)",
+      "Bash(find /root/Downloads -maxdepth 3 -path */.git -prune -o -name *.yml -o -name *.yaml)",
+      "Bash(pdflatex -interaction=nonstopmode joining_variables_proposal.tex)"
+    ]
+  }
+}

@@ -1,0 +1,200 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Tightening Techniques}
+\label{sec:flags}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we present four complementary techniques for tightening the MIP relaxation. As described in Section~\ref{sec:standard}, the time complexity of the MIP is governed by the number of boolean variables. To enable the MIP solver to reach a solution efficiently, we introduce techniques that reduce the search space by providing tighter bounds and warm-start solutions. The four techniques can be combined freely, progressively trading preprocessing time for faster solver convergence.
+
+\begin{table}[ht]
+  \centering
+  \caption{Overview of the four tightening techniques.}
+  \label{tab:flags}
+  \begin{tabular}{llll}
+    \toprule
+    \textbf{Technique} & \textbf{Method} & \textbf{Preprocess} & \textbf{Benefit} \\
+    \midrule
+    Hyper-adversarial attack
+      & PGD warm-start   & Python PGD & Incumbent cutoff \\
+    Perturbation-diff.\ intervals
+      & Interval propagation & Interval arith. & Activation bounds \\
+    Inter-network intervals
+      & Weight-difference bounds & Interval arith. & Cross-network bounds \\
+    Dependency analysis
+      & Monotonicity signatures & Symbolic prop. & Ordering constraints \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Hyper-Adversarial Attack}
+\label{sec:flag:hyper}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+Our first technique expedites the tightening of the lower bound by efficiently computing a suboptimal feasible solution and providing it to the MIP solver. Before launching the MIP solver, we run a projected gradient descent (PGD) attack~\cite{madry2018} to find a feasible solution $(x^\star, \xp{}^\star)$ with objective value $v^\star$.
+
+This solution is used in two ways. First, as an \emph{incumbent cutoff}: the solver can prune any branch whose objective value cannot exceed $v^\star$. Formally, we set the Gurobi incumbent to $v^\star$, enabling the solver to discard large portions of the search tree.
+
+Second, as a \emph{binary warm-start}: for each ReLU binary variable $b_j$, we compute the activation sign at the PGD solution and provide it as a hint:
+\[
+  b_j^{\text{hint}} \;=\; \mathbf{1}\!\left[z^{[l]}_j(x^\star) \ge 0\right].
+\]
+These hints guide the solver toward the optimal branching decisions, significantly reducing the number of explored nodes.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Perturbation-Difference Interval Propagation}
+\label{sec:flag:perturbed}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+Our second technique bounds the activation differences between the clean and perturbed forward passes. For each layer $l$, we compute an interval $[\Idn\layer{l}, \Iup\layer{l}]$ bounding the element-wise difference $a\net{pert}\layer{l} - a\net{org}\layer{l}$. The same propagation applies to both the $N_1$ and $N_2$ network pairs.
+
+\emph{Initialization (input layer).} From Table~\ref{tab:perturbations}:
+$\Idn\layer{0} = \Idn$, $\Iup\layer{0} = \Iup$.
+
+\emph{Linear layer propagation.} For weight matrix $W\layer{l}$ (the bias cancels in the difference):
+\begin{align}
+  \Iup\layer{l} &= (W\layer{l})^+ \,\Iup\layer{l-1}
+                  + (W\layer{l})^- \,\Idn\layer{l-1}, \label{eq:Iup-lin} \\
+  \Idn\layer{l} &= (W\layer{l})^+ \,\Idn\layer{l-1}
+                  + (W\layer{l})^- \,\Iup\layer{l-1}, \label{eq:Idn-lin}
+\end{align}
+where $W^+ = \max(W,0)$ and $W^- = \min(W,0)$.
+
+\emph{ReLU layer propagation.} We use a linear over-approximation:
+\[
+  \Iup\layer{l} \;\leftarrow\; \max\!\bigl(0,\, \Iup\layer{l-1}\bigr),
+  \qquad
+  \Idn\layer{l} \;\leftarrow\; \min\!\bigl(0,\, \Idn\layer{l-1}\bigr).
+\]
+
+\emph{Added MIP constraints.} At every layer $l$ and neuron $j$:
+\begin{equation}
+  \label{eq:perturbed-constraints}
+  a\net{org}\layer{l}_j + \Idn\layer{l}_j
+  \;\le\; a\net{pert}\layer{l}_j
+  \;\le\; a\net{org}\layer{l}_j + \Iup\layer{l}_j.
+\end{equation}
+These constraints couple the clean and perturbed forward passes, tightening the LP relaxation. We next prove their soundness.
+
+\emph{Soundness, completeness, and tightness.} We distinguish three properties of added constraints in a MIP verifier:
+\begin{itemize}
+  \item \textbf{Soundness} (no false negatives): a constraint is sound if it is satisfied by every feasible point of the original MIP, so it never removes a real solution.
+  \item \textbf{Completeness} (no false positives): a constraint is complete if it does not introduce spurious feasible points, so the LP relaxation does not admit solutions that could not arise from any true $(x,\xp)$ pair.
+  \item \textbf{Tightness} (quality of approximation): a sound constraint is tight at a point if the bound it provides equals the true value there.
+\end{itemize}
+
+The interval constraints~\eqref{eq:perturbed-constraints} are \textbf{sound and complete but not always tight}. They are sound because the propagated intervals are genuine over-approximations (Theorem~\ref{thm:pert-sound}). They are complete because, being over-approximations, they can only widen the set of allowed activations. They are not always tight because the ReLU propagation step uses a linear over-approximation that is loose when one of the two compared activations is negative and the other is positive.
+
+\begin{theorem}[Soundness of perturbation-difference interval propagation]
+  \label{thm:pert-sound}
+  Let $N$ be a ReLU network with weights $W\layer{l}$, biases $b\layer{l}$. Fix any $x$ and $\xp$ such that $\xp_i - x_i \in [\Idn_i\layer{0},\, \Iup_i\layer{0}]$ elementwise. Then for every layer $l$ and every neuron $j$:
+  \[
+    a_j\layer{l}(\xp) - a_j\layer{l}(x)
+    \;\in\;
+    \bigl[\Idn_j\layer{l},\; \Iup_j\layer{l}\bigr],
+  \]
+  where $[\Idn\layer{l}, \Iup\layer{l}]$ are computed by the recursion in~\eqref{eq:Iup-lin}--\eqref{eq:Idn-lin} and the ReLU propagation step.
+\end{theorem}
+
+\begin{proof}
+  By induction on $l$.
+
+  \textbf{Base case} ($l = 0$): $a\layer{0}(x) = x$ and $a\layer{0}(\xp) = \xp$, so $a_i\layer{0}(\xp) - a_i\layer{0}(x) = \xp_i - x_i \in [\Idn_i\layer{0}, \Iup_i\layer{0}]$ by assumption.
+
+  \textbf{Inductive step --- linear layer.} Assume $\Delta_i := a_i\layer{l-1}(\xp) - a_i\layer{l-1}(x) \in [\Idn_i\layer{l-1}, \Iup_i\layer{l-1}]$ for all $i$. The pre-activation difference at neuron $j$ is $z_j\layer{l}(\xp) - z_j\layer{l}(x) = \sum_i W_{ji}\layer{l}\, \Delta_i$. Decompose $W_{ji}\layer{l} = W_{ji}^+ + W_{ji}^-$ with $W_{ji}^+ \ge 0$, $W_{ji}^- \le 0$. Then:
+  \begin{align*}
+    z_j\layer{l}(\xp) - z_j\layer{l}(x)
+    &\;\le\; \sum_i W_{ji}^+\, \Iup_i\layer{l-1}
+             + \sum_i W_{ji}^-\, \Idn_i\layer{l-1}
+    \;=\; \Iup_j\layer{l}, \\
+    z_j\layer{l}(\xp) - z_j\layer{l}(x)
+    &\;\ge\; \sum_i W_{ji}^+\, \Idn_i\layer{l-1}
+             + \sum_i W_{ji}^-\, \Iup_i\layer{l-1}
+    \;=\; \Idn_j\layer{l},
+  \end{align*}
+  using monotonicity of multiplication by a non-negative (resp.\ non-positive) scalar. The bias cancels in the difference.
+
+  \textbf{Inductive step --- ReLU layer.} Write $\Delta_j^z := z_j\layer{l}(\xp) - z_j\layer{l}(x) \in [\Idn_j\layer{l}, \Iup_j\layer{l}]$. For any $u, v \in \RR$: $\max(0,u) - \max(0,v) \le \max(0, u - v)$ and $\max(0,u) - \max(0,v) \ge \min(0, u - v)$. Applying with $u = z_j(\xp)$, $v = z_j(x)$:
+  \[
+    \min(0, \Delta_j^z) \;\le\;
+    a_j\layer{l}(\xp) - a_j\layer{l}(x)
+    \;\le\; \max(0, \Delta_j^z).
+  \]
+  Since $\Delta_j^z \le \Iup_j\layer{l}$, we have $\max(0, \Delta_j^z) \le \max(0, \Iup_j\layer{l})$, and since $\Delta_j^z \ge \Idn_j\layer{l}$, we have $\min(0, \Delta_j^z) \ge \min(0, \Idn_j\layer{l})$. The updated interval $[\min(0,\Idn_j\layer{l}),\, \max(0,\Iup_j\layer{l})]$ is exactly what the ReLU propagation step produces.
+\end{proof}
+
+\begin{corollary}[Constraint validity]
+  Every feasible point $(x, \xp, \{a\net{m}\layer{l}\})$ of the MIP already satisfies constraints~\eqref{eq:perturbed-constraints}. Adding them therefore does not cut off any feasible solution, but shrinks the LP relaxation polytope, strengthening the dual bound and reducing branch-and-bound effort.
+\end{corollary}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Inter-Network Interval Bounds}
+\label{sec:flag:intervals}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+Our third technique exploits the structural similarity between $N_1$ and $N_2$. When $N_2$ is obtained by fine-tuning or distilling $N_1$, their weights are close, and we can bound the inter-network activation differences.
+
+We compute interval bounds on the activation difference $a^{N_2}\layer{l} - a^{N_1}\layer{l}$ at each layer $l$, using the weight-difference matrices:
+\[
+  \Delta W\layer{l} = W_2\layer{l} - W_1\layer{l}, \qquad
+  \Delta b\layer{l} = b_2\layer{l} - b_1\layer{l}.
+\]
+
+Let $[\alpha\layer{l}, \beta\layer{l}]$ bound $a^{N_2}\layer{l} - a^{N_1}\layer{l}$, and let $\mathbf{u}\layer{l-1}$ be the upper bound on $a^{N_1}\layer{l-1}$ from standard interval arithmetic. The propagation recursion is:
+\begin{align}
+  \beta\layer{l} &= (W_1\layer{l})^+\beta\layer{l-1}
+                   + (W_1\layer{l})^-\alpha\layer{l-1}
+                   + |\Delta W\layer{l}|\, \mathbf{u}\layer{l-1}
+                   + \Delta b\layer{l}, \\
+  \alpha\layer{l} &= (W_1\layer{l})^+\alpha\layer{l-1}
+                   + (W_1\layer{l})^-\beta\layer{l-1}
+                   - |\Delta W\layer{l}|\, \mathbf{u}\layer{l-1}
+                   + \Delta b\layer{l}.
+\end{align}
+
+The resulting MIP constraints are:
+\begin{equation}
+  \label{eq:interval-constraints}
+  a^{N_1}\layer{l}_j + \alpha\layer{l}_j
+  \;\le\; a^{N_2}\layer{l}_j
+  \;\le\; a^{N_1}\layer{l}_j + \beta\layer{l}_j.
+\end{equation}
+
+These constraints are particularly effective when $N_1$ and $N_2$ are structurally similar, as the weight differences are small and the resulting intervals are tight.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Dependency Analysis}
+\label{sec:flag:deps}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+Our fourth technique identifies \emph{monotone relationships} between the activations of the clean and perturbed forward passes. We track the direction in which each activation responds to the perturbation using a \emph{dependency signature} $\varphi_j \in \{-1, 0, +1, \mathrm{NaN}\}$: $+1$ means the activation is monotonically increasing with the perturbation, $-1$ means decreasing, $0$ means unchanged, and $\mathrm{NaN}$ means the direction is ambiguous.
+
+\emph{Initialization (input layer).} The signature depends on the perturbation type:
+\begin{itemize}
+  \item $\ell_\infty$: $\varphi_i^{[0]} = \mathrm{NaN}$ for all $i$ (each pixel can increase or decrease).
+  \item Brightness: $\varphi_i^{[0]} = +1$ for all $i$ (pixels can only increase).
+  \item Contrast: $\varphi_i^{[0]} = +1$ for all $i$.
+  \item Occlusion: $\varphi_i^{[0]} = -1$ for $i \in P$, else $0$ (occluded pixels decrease, others unchanged).
+  \item Patch: $\varphi_i^{[0]} = \mathrm{NaN}$ for $i \in P$, else $0$.
+\end{itemize}
+
+\emph{Propagation through a linear layer.} Each output neuron $j$ merges the signatures of its inputs, weighted by the sign of the connecting weight:
+\[
+  \varphi_j\layer{l} \;=\;
+  \bigoplus_{i:\, W_{ji}^{[l]} \neq 0}
+  \mathrm{sign}\!\bigl(W_{ji}^{[l]}\bigr) \cdot \varphi_i\layer{l-1},
+\]
+where $\oplus$ returns the common value if all operands agree, otherwise $\mathrm{NaN}$.
+
+\emph{Propagation through ReLU.} If the neuron is always active ($z_j \ge 0$), the signature is inherited. If the neuron is always inactive ($z_j \le 0$), the signature is $0$. Otherwise, the signature is $\mathrm{NaN}$.
+
+\emph{Added MIP constraints.} For each neuron where the signature is determined:
+\begin{align}
+  \varphi_j\layer{l} = +1 &\;\Rightarrow\;
+    a\net{pert}\layer{l}_j \;\ge\; a\net{org}\layer{l}_j, \\
+  \varphi_j\layer{l} = -1 &\;\Rightarrow\;
+    a\net{pert}\layer{l}_j \;\le\; a\net{org}\layer{l}_j, \\
+  \varphi_j\layer{l} = 0  &\;\Rightarrow\;
+    a\net{pert}\layer{l}_j \;=\; a\net{org}\layer{l}_j.
+\end{align}
+
+These ordering constraints prune the search space by eliminating variable assignments that violate the proven monotone relationships.

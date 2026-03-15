@@ -94,7 +94,9 @@ def load_dataset(dataset):
 
 
 def load_model(model_arch, model_path, device):
-    if model_arch == "3x10":
+    if model_arch == "2x10":
+        model = FNN_2_10()
+    elif model_arch == "3x10":
         model = FNN_3_10()
     elif model_arch == "4x10":
         model = FNN_4_10()
@@ -104,9 +106,8 @@ def load_model(model_arch, model_path, device):
         model = FNN_10_10()
     elif model_arch == "5x10":
         model = FNN_5_10()
-    elif model_arch == "2x10":
-        # 2x10 = 1 hidden ReLU layer + output
-        model = FNN_3_10()  # reuse 3x10 structure if 2x isn't defined
+    elif model_arch == "6x10":
+        model = FNN_6_10()
     elif model_arch == "cnn0":
         model = CNN0()
     elif model_arch == "cnn1":
@@ -141,6 +142,14 @@ def extract_activations(model, x, model_name):
         x3 = F.relu(model.fc3(x2))
         x4 = F.relu(model.fc4(x3))
         activations = [x1, x2, x3, x4]
+    elif "6x" in model_name:
+        x_flat = x.reshape(-1, 784)
+        x1 = F.relu(model.fc1(x_flat))
+        x2 = F.relu(model.fc2(x1))
+        x3 = F.relu(model.fc3(x2))
+        x4 = F.relu(model.fc4(x3))
+        x5 = F.relu(model.fc5(x4))
+        activations = [x1, x2, x3, x4, x5]
     elif "10x" in model_name:
         x_flat = x.reshape(-1, 784)
         x1 = F.relu(model.fc1(x_flat))
@@ -226,7 +235,7 @@ def create_hyper_input(model1, source, trainset, testset, M, dims, device, delta
 def attack_transfer(model1, model2, X, source_, target_, device, token_signature,
                     model_name, dims, delta1, c_tag_mode,
                     type_="linf", size_=[0.05], iterations=500, alpha=0.01,
-                    lambda_0=1.01, K_max=500):
+                    lambda_0=1.01, K_max=500, model_name2=None):
     model1.eval()
     model2.eval()
     M = len(X)
@@ -331,18 +340,23 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
         best_xp = create_attacked(best_x, eps_pgd[best_idx].unsqueeze(0), type_, size_, dims)
         
 
+        mn2 = model_name2 if model_name2 else model_name
         act_n1_x = extract_activations(model1, best_x, model_name)
-        act_n2_x = extract_activations(model2, best_x, model_name)
-        act_n2_xp = extract_activations(model2, best_xp, model_name)
-        K = len(act_n1_x)  # number of ReLU layers
+        act_n2_x = extract_activations(model2, best_x, mn2)
+        act_n2_xp = extract_activations(model2, best_xp, mn2)
+        K1 = len(act_n1_x)  # ReLU layers in N1
+        K2 = len(act_n2_x)  # ReLU layers in N2
+        # Absolute layer offsets in layers_info_dict:
+        # N1(x): 0, N2(x): K1, N1(x_p): K1+K2, N2(x_p): K1+K2+K1 (or K1+K2 without n1_p)
+        n2_pert_offset = (K1 + K2 + K1) if N1_P_VERSION else (K1 + K2)
         list_to_iterate = [
             ("n1_org", act_n1_x, 0),
-            ("n2_org", act_n2_x, K),
-            ("n2_pert", act_n2_xp, 3 * K),
+            ("n2_org", act_n2_x, K1),
+            ("n2_pert", act_n2_xp, n2_pert_offset),
         ]
         if N1_P_VERSION:
             act_n1_xp = extract_activations(model1, best_xp, model_name)
-            list_to_iterate.append(("n1_pert", act_n1_xp, 2 * K))
+            list_to_iterate.append(("n1_pert", act_n1_xp, K1 + K2))
 
         # Build hint strings for all 4 network copies
         bools = ""
@@ -384,7 +398,8 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=float, default=0, help='source class (0-indexed)')
     parser.add_argument('--target', type=float, default=1, help='target class (0-indexed)')
     parser.add_argument('--token', type=str, default="04082021", help='token signature')
-    parser.add_argument('--model', type=str, default="4x10", help='model architecture')
+    parser.add_argument('--model', type=str, default="4x10", help='model architecture for N1')
+    parser.add_argument('--model2', type=str, default="", help='model architecture for N2 (if different from N1)')
     parser.add_argument('--model_path', type=str, default="./models/model1.pth", help='path to N1 weights')
     parser.add_argument('--model_path2', type=str, default="./models/model2.pth", help='path to N2 weights')
     parser.add_argument('--perturbation', type=str, default="linf", help='perturbation type')
@@ -403,6 +418,7 @@ if __name__ == '__main__':
     target = int(args.target)
     token_signature = args.token
     model_arch = args.model
+    model_arch2 = args.model2 if args.model2 else args.model
     model_path = args.model_path
     model_path2 = args.model_path2
     perturbation_type = args.perturbation
@@ -419,18 +435,20 @@ if __name__ == '__main__':
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Transfer attack - source:", source, "target:", target, "model:", model_arch,
+    print("Transfer attack - source:", source, "target:", target,
+          "model1:", model_arch, "model2:", model_arch2,
           "perturbation:", perturbation_type, "size:", perturbation_size,
           "delta1:", delta1, "c_tag_mode:", c_tag_mode)
 
     trainset, testset, dims = load_dataset(dataset)
     model1 = load_model(model_arch, model_path, device)
-    model2 = load_model(model_arch, model_path2, device)
+    model2 = load_model(model_arch2, model_path2, device)
     X = create_hyper_input(model1, source, trainset, testset, M, dims, device, delta1)
 
     best_val = attack_transfer(model1, model2, X, source, target, device,
                                token_signature, model_arch, dims, delta1, c_tag_mode,
-                               perturbation_type, perturbation_size, iterations, alpha)
+                               perturbation_type, perturbation_size, iterations, alpha,
+                               model_name2=model_arch2)
 
     print("best_val", best_val.item())
     with open("/tmp/best_val_" + str(source) + "_" + str(target) + "_" + str(token_signature) + ".txt", "w") as f:

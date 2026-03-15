@@ -1,0 +1,28 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Inference-Time Decision Procedure}
+\label{sec:inference}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we describe how the precomputed transfer guarantee is applied at inference time. Given the standard-mode value $\dO$ (from Section~\ref{sec:standard}) and the transfer value $\dD$ (from Section~\ref{sec:transfer}), the runtime procedure certifies individual inputs using only two forward passes.
+
+For each input $x$, the procedure applies a two-stage test:
+\begin{enumerate}
+  \item \textbf{Standard-mode check.}
+    Compute $c_1 := \conf{N_1}{x}{c}$.
+    If $c_1 < \dO$, the input cannot be certified as robust for $N_1$ (or, consequently, for $N_2$).
+
+  \item \textbf{Transfer check.}
+    Compute $c_2 := \conf{N_2}{x}{c}$.
+    If $c_2 - c_1 > \dD$, certify $x$ as $(\ep,c\to t)$-robust for $N_2$.
+\end{enumerate}
+
+By Corollary~\ref{cor:single}, an equivalent single-threshold condition is:
+\[
+  c_1 \ge \dO \;\;\text{and}\;\; c_2 > \dO + \dD
+  \;\;\Longrightarrow\;\;
+  x \text{ is } (\ep, c \to t)\text{-robust for } N_2.
+\]
+
+This procedure requires only two forward passes at inference time and no additional optimization. The MIP is solved once offline, and the resulting thresholds $\dO$ and $\dD$ are used for all subsequent inputs.
+
+Note that, in the notation of Section~\ref{sec:notation:formal}, $\dO = \dN{1}$ and $\dD = \ddiff$. By Theorem~\ref{thm:correct}, $\dN{2} \geq \dN{1} + \ddiff$, so the threshold $\dO + \dD$ is always a valid (conservative) certificate for $N_2$. The certificate is strict: there may exist inputs with $\conf{N_2}{x}{c} \in [\dN{1}+\ddiff,\; \dN{2}]$ that are also robust but not certified by this procedure. This gap is precisely characterized in Section~\ref{sec:formal:analysis}.

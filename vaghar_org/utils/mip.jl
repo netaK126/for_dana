@@ -102,15 +102,23 @@ end
 # c_tag_mode=true  → c_pert = c_tag  (untargeted)
 # c_tag_mode=false → c_pert = c_target (targeted)
 # ============================================================
-function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode)
+function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
     # Confidence margins on clean input (both measured for source class c_tag)
     conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
 
-    # Confidence margins on perturbed input
+    # Confidence margins on perturbed input.
+    # conf_n1_xp is only needed (and d[:v_out_n1_p] only encoded) when n1_p_mode is on.
     c_pert = c_tag_mode ? c_tag : c_target
-    conf_n1_xp = define_conf!(m, d, c_pert, :v_out_n1_p, "conf_n1_xp")
-    conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+    if n1_p_mode
+        conf_n1_xp = define_conf!(m, d, c_pert, :v_out_n1_p, "conf_n1_xp")
+    end
+
+    # conf_n2_xp is always needed except when n2_fewer_binars_encoding handles
+    # the perturbed constraint directly via per-class inequalities.
+    if !n2_fewer_binars_encoding || n1_p_mode || c_tag_mode
+        conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+    end
 
     # Constraint (1): N1 is confident on clean input
     @constraint(m, conf_n1_x >= delta_1 + 1e-3)
@@ -119,21 +127,30 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n
     delta_diff = @variable(m, base_name="delta_diff")
     @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
     @constraint(m, delta_diff >= 0)
-
+    margin = 1e-3
     # Constraint (4): confidence gap flips under perturbation
 
     if c_tag_mode 
         if n1_p_mode
-            @constraint(m, conf_n2_xp - conf_n1_xp <= -1e-3)
+            @constraint(m, conf_n2_xp - conf_n1_xp <= -margin)
         else
-            @constraint(m, conf_n2_xp <= -1e-3)
+            @constraint(m, conf_n2_xp <= -margin)
         end
 
     else # c_target is on
         if n1_p_mode
-            @constraint(m, conf_n2_xp - conf_n1_xp >= 1e-3)
+            @constraint(m, conf_n2_xp - conf_n1_xp >= margin)
         else
-            @constraint(m, conf_n2_xp >= 1e-3)
+            if n2_fewer_binars_encoding
+                for i in eachindex(d[:v_out_n2_p])
+                    if i == c_target
+                        continue
+                    end
+                    @constraint(m, d[:v_out_n2_p][c_target] - d[:v_out_n2_p][i] >= margin)
+                end
+            else
+                @constraint(m, conf_n2_xp >= margin)
+            end
         end
     end
 

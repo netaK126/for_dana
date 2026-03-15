@@ -1,0 +1,88 @@
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Transfer Mode: Verifying Robustness Across Networks}
+\label{sec:transfer}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+In this section, we present our main contribution: the transfer-mode formulation. We begin by motivating the problem, then describe our three-network MIP encoding, state the transfer MIP, and prove its correctness.
+
+\subsection{Motivation}
+
+Training a more accurate network $N_2$ from $N_1$ (e.g., via distillation or fine-tuning) often increases prediction confidence on correctly classified inputs. A natural question is: \emph{by how much can $N_2$'s confidence exceed $N_1$'s in the worst case, in the regime where $N_1$ is already certifiably robust but $N_2$ can still be fooled?} The answer to this question determines whether $N_1$'s robustness guarantee transfers to $N_2$.
+
+\subsection{Three-Network Encoding}
+
+To answer this question, the transfer mode encodes \textbf{three} forward passes simultaneously in a single MIP: $N_1(x)$, $N_2(x)$, and $N_2(\xp)$.
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners,minimum width=2.4cm,minimum height=0.9cm,
+               text centered,fill=blue!10},
+  arr/.style={-Stealth,thick}]
+  \node[box] (n1c) {$N_1(x)$};
+  \node[box,right=2cm of n1c] (n2c) {$N_2(x)$};
+  \node[box,below=1.2cm of n2c] (n2p) {$N_2(\xp)$};
+  \draw[arr] (n1c) -- node[above,font=\small]{same $x$} (n2c);
+  \draw[arr,dashed] (n2c) -- node[right,font=\small]{$\xp\in\mI_\ep(x)$} (n2p);
+\end{tikzpicture}
+\end{center}
+
+Each forward pass uses a unique variable-name prefix to distinguish the three copies. The clean input $x$ is shared between $N_1(x)$ and $N_2(x)$, and the perturbed input $\xp$ is linked to $x$ via the perturbation constraint. Note that $N_1(\xp)$ is \emph{not} encoded: the transfer MIP only requires $N_1$'s confidence on the clean input to establish the robustness baseline, and $N_2$'s computation on both the clean and perturbed inputs to verify whether the attack succeeds. This saves all of the ReLU binary variables that would be needed for a fourth network pass, significantly reducing the problem size.
+
+\subsection{Transfer MIP Formulation}
+
+Let $c_1 = \conf{N_1}{x}{c}$, $c_2 = \conf{N_2}{x}{c}$, and $c_2' = \conf{N_2}{\xp}{c}$.
+The transfer MIP is:
+
+\begin{equation}
+  \label{eq:transfer}
+  \dD \;=\; \max_{x,\,\xp,\,e}\; (c_2 - c_1)
+  \quad\text{s.t.}\quad
+  \begin{cases}
+    \xp \in \mI_\ep(x) & \text{(perturbation constraint)} \\
+    c_1 \;\ge\; \dO + \epsilon_0 & \text{(T1: $N_1$ is certifiably robust)} \\
+    c_2 - c_1 \;\ge\; 0 & \text{(T2: $N_2$ at least as confident as $N_1$)} \\
+    \text{attack constraint on } N_2(\xp) & \text{(T3: $N_2$ can be fooled)}
+  \end{cases}
+\end{equation}
+
+where $\epsilon_0 = 10^{-3}$ is a strict-inequality guard. In the formal notation of Section~\ref{sec:notation:formal}, this is exactly the transfer MIP of Definition~\ref{def:ddiff}, with $\dD = \ddiff$.
+
+The constraint T1 restricts the search to inputs where $N_1$ is certifiably robust (its confidence exceeds the standard-mode bound $\dO$). Constraint T2 focuses on the regime where $N_2$ is more confident than $N_1$. Constraint T3 requires that a perturbation exists that fools $N_2$, making the transfer problem non-trivial. The encoding of T3 depends on the chosen attack mode (Section~\ref{sec:modes}).
+
+\subsection{Correctness of the Transfer Guarantee}
+
+We now prove that the transfer MIP provides a sound robustness certificate. The key insight is that any input violating the transfer guarantee would be a feasible solution to the MIP with objective value exceeding $\dD$, contradicting its optimality.
+
+\begin{theorem}[Transfer Robustness]
+  \label{thm:transfer}
+  Let $\dO$ be the standard-mode value for $N_1$ on perturbation $(\ep, c \to t)$. Let $\dD$ be the optimal value of the transfer MIP~\eqref{eq:transfer}. Then for any input $x$:
+  \[
+    \conf{N_1}{x}{c} \;\ge\; \dO
+    \;\;\text{and}\;\;
+    \conf{N_2}{x}{c} - \conf{N_1}{x}{c} \;>\; \dD
+    \;\;\implies\;\; x \text{ is } (\ep,c\to t)\text{-robust for } N_2.
+  \]
+\end{theorem}
+
+\begin{proof}
+  Suppose for contradiction that $x$ is \emph{not} $(\ep,c\to t)$-robust for $N_2$. Then there exists $\xp \in \mI_\ep(x)$ such that $N_2(\xp) = t$, meaning the attack constraint T3 holds.
+
+  Since $\conf{N_1}{x}{c} \ge \dO$, constraint T1 is satisfied (with the $\epsilon_0$ guard). Since $\conf{N_2}{x}{c} - \conf{N_1}{x}{c} > \dD \geq 0$, constraint T2 is also satisfied.
+
+  Therefore $(x, \xp)$ is a feasible solution to the transfer MIP~\eqref{eq:transfer} with objective value $c_2 - c_1 > \dD$, contradicting the fact that $\dD$ is the maximum feasible objective value.
+\end{proof}
+
+\begin{corollary}[Single-threshold inference]
+  \label{cor:single}
+  Define $\Delta := \dO + \dD$. If $\conf{N_1}{x}{c} \ge \dO$ and $\conf{N_2}{x}{c} > \Delta$, then $x$ is $(\ep, c \to t)$-robust for $N_2$.
+\end{corollary}
+
+This corollary shows that at inference time, the transfer guarantee reduces to checking two confidence thresholds, requiring only two forward passes and no additional optimization.
+
+\begin{remark}
+  Checking $\conf{N_2}{x}{c} > \Delta$ alone (without verifying $N_1$'s threshold) is \emph{unsound}: constraint T1 would not be guaranteed, making the transfer MIP potentially infeasible and $\dD$ meaningless. Both conditions must be verified.
+\end{remark}
+
+\subsection{Relationship to the Formal Quantities}
+
+The transfer MIP~\eqref{eq:transfer} computes $\dD = \ddiff$, which satisfies $\dN{2} \geq \dN{1} + \ddiff$ (Theorem~\ref{thm:correct} in Section~\ref{sec:formal}). This is a \emph{lower bound}: knowing $\dD$ certifies that $N_2$'s standard-mode value is at least $\dO + \dD$, but $N_2$'s actual standard-mode value may be strictly larger. The precise gap and a counterexample are analyzed in Section~\ref{sec:formal}.
