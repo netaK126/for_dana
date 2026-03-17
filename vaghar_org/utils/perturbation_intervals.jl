@@ -195,8 +195,9 @@ function propagate_intervals(nn1, nn2, version)
 
             result_min_1, result_max_1 = interval_matrix_vector_multiplication(I_w_down, I_w_up, z_prev_down, z_prev_up)
             result_min_2, result_max_2 = interval_matrix_vector_multiplication(w1, w1, I_z_prev_down_to_use, I_z_prev_up_to_use)
-            I_z_down_in = result_min_1 .+ result_min_2
-            I_z_up_in   = result_max_1 .+ result_max_2
+            bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
+            I_z_down_in = result_min_1 .+ result_min_2 .+ bias_diff
+            I_z_up_in   = result_max_1 .+ result_max_2 .+ bias_diff
 
             # Propagate activation bounds through W1
             new_up   = zeros(Float64, size(w1, 1))
@@ -263,8 +264,16 @@ function propagate_intervals(nn1, nn2, version)
             result_min_2, result_max_2 = interval_conv2d_bounds(
                 F1, F1, I_down_4d, I_up_4d, zero_bias, l.stride, l.padding)
 
+            # Bias difference: constant offset on the interval
+            bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
+
             I_z_down_in = result_min_1 .+ result_min_2
             I_z_up_in   = result_max_1 .+ result_max_2
+            # Broadcast bias_diff into the spatial dimensions
+            for oc in 1:length(bias_diff)
+                I_z_down_in[:, :, :, oc] .+= bias_diff[oc]
+                I_z_up_in[:, :, :, oc]   .+= bias_diff[oc]
+            end
 
             # Activation bounds through F1 (with bias)
             new_down, new_up = interval_conv2d_bounds(
@@ -549,8 +558,9 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
             result_min_2, result_max_2 = interval_matrix_vector_multiplication(
                 W2, W2, I_C_down_local, I_C_up_local)
 
-            I_C_down_local = result_min_1 .+ result_min_2
-            I_C_up_local   = result_max_1 .+ result_max_2
+            bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
+            I_C_down_local = result_min_1 .+ result_min_2 .+ bias_diff
+            I_C_up_local   = result_max_1 .+ result_max_2 .+ bias_diff
 
         elseif occursin("Conv", string(typeof(l)))
             l2 = nn2.layers[layer_idx]
@@ -576,8 +586,14 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
             result_min_2, result_max_2 = interval_conv2d_bounds(
                 F2, F2, I_C_down_4d, I_C_up_4d, zero_bias, l.stride, l.padding)
 
+            bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
+
             I_C_down_local = result_min_1 .+ result_min_2
             I_C_up_local   = result_max_1 .+ result_max_2
+            for oc in 1:length(bias_diff)
+                I_C_down_local[:, :, :, oc] .+= bias_diff[oc]
+                I_C_up_local[:, :, :, oc]   .+= bias_diff[oc]
+            end
 
         elseif occursin("ReLU", string(typeof(l)))
             layer_cnt += 1
