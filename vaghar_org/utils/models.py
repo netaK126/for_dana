@@ -237,6 +237,9 @@ class CNN2(nn.Module):
     def __init__(self, k=1, w=28, h=28):
         # call constructor from superclass
         super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
         # define network layers
         self.conv1 = nn.Conv2d(self.k, 3, 4, stride=(1, 1), padding='valid')
         self.conv2 = nn.Conv2d(3, 3, 3, stride=(3, 3), padding='valid')
@@ -244,7 +247,6 @@ class CNN2(nn.Module):
         self.fc1 = nn.Linear(192, 10)
         self.fc2 = nn.Linear(10, 10)
         self.m = nn.Dropout(p=0.75)
-        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
         # define forward pass
@@ -257,7 +259,6 @@ class CNN2(nn.Module):
         x = F.relu(self.fc1(x))
         x = self.m(x)
         x = self.fc2(x)
-        x = self.softmax(x)
         return x
 
 class CNN3(nn.Module):

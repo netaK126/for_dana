@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Generic experiment pipeline for any architecture:
-  1. Train model for N epochs, save checkpoints at epoch 18 and 19
+  1. Train model until two consecutive epochs reach 92%+ accuracy (max 80 epochs)
   2. Run VHAGaR standard (with perturbed intervals) for both models
-  3. Run VHAGaR transfer: N1=itr18, N2=itr19
+  3. Run VHAGaR transfer: N1=itr_i, N2=itr_{i+1}
 
 Usage examples:
   python utils/run_exp.py --arch 6x10
@@ -45,17 +45,48 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RUN_JL_DIR = os.path.join(SCRIPT_DIR, '..')
 
 
-def get_exp_dirs(arch):
-    """Return a dict of all experiment directories for the given architecture."""
+def get_exp_dirs(arch, itr_n1, itr_n2, create=False):
+    """Return a dict of all experiment directories for the given architecture.
+    If create=True, ensure all directories exist."""
     exp_dir = os.path.join(SCRIPT_DIR, '..', f'{arch}_exp')
-    return {
+    dirs = {
         'exp':         exp_dir,
-        'model_18':    os.path.join(exp_dir, 'model_18_itr'),
-        'model_19':    os.path.join(exp_dir, 'model_19_itr'),
-        'vaghar_18':   os.path.join(exp_dir, f'vagharWithPerturbed_{arch}_itr18'),
-        'vaghar_19':   os.path.join(exp_dir, f'vagharWithPerturbed_{arch}_itr19'),
-        'transfer':    os.path.join(exp_dir, f'transfer_{arch}_N1_is_itr18'),
+        'model_n1':    os.path.join(exp_dir, f'model_{itr_n1}_itr'),
+        'model_n2':    os.path.join(exp_dir, f'model_{itr_n2}_itr'),
+        'vaghar_n1':   os.path.join(exp_dir, f'vagharWithPerturbed_{arch}_itr{itr_n1}'),
+        'vaghar_n2':   os.path.join(exp_dir, f'vagharWithPerturbed_{arch}_itr{itr_n2}'),
+        'transfer':    os.path.join(exp_dir, f'transfer_{arch}_N1_is_itr{itr_n1}'),
     }
+    if create:
+        for d in dirs.values():
+            os.makedirs(d, exist_ok=True)
+    return dirs
+
+
+def detect_iterations(arch):
+    """Detect itr_n1 and itr_n2 from existing model_*_itr folders in the exp directory.
+    Returns (itr_n1, itr_n2) where itr_n2 == itr_n1 + 1."""
+    exp_dir = os.path.join(SCRIPT_DIR, '..', f'{arch}_exp')
+    if not os.path.exists(exp_dir):
+        print(f"ERROR: Experiment directory {exp_dir} not found.")
+        sys.exit(1)
+
+    pattern = re.compile(r'^model_(\d+)_itr$')
+    itrs = sorted(
+        int(m.group(1))
+        for name in os.listdir(exp_dir)
+        if (m := pattern.match(name)) and os.path.isdir(os.path.join(exp_dir, name))
+    )
+
+    # Find consecutive pair
+    for i in range(len(itrs) - 1):
+        if itrs[i + 1] == itrs[i] + 1:
+            print(f"  Detected model checkpoints: itr{itrs[i]} and itr{itrs[i+1]}")
+            return itrs[i], itrs[i + 1]
+
+    print(f"ERROR: Could not find two consecutive model_*_itr folders in {exp_dir}.")
+    print(f"  Found: {itrs}")
+    sys.exit(1)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -108,16 +139,21 @@ def run_julia(args_list, step_name):
 
 # ── step 1: train ────────────────────────────────────────────────────────
 
-def train_model(arch, epochs=19, batch_size=128, lr=1e-3):
+MIN_ACCURACY = 91.0
+MAX_EPOCHS = 100
+
+
+def train_model(arch, batch_size=128, lr=1e-3):
     """
-    Train a model for `epochs` epochs.
-    Save checkpoints at epoch 18 and epoch 19 (1-indexed).
+    Train until two consecutive epochs both reach MIN_ACCURACY (92%).
+    Save checkpoints for those two consecutive epochs.
+    Exit if MAX_EPOCHS (80) is exceeded without finding such a pair.
+    Returns (itr_n1, itr_n2) — the 1-indexed epoch numbers of the saved models.
     """
     model_cls, _ = ARCH_REGISTRY[arch]
-    dirs = get_exp_dirs(arch)
 
     print("=" * 60)
-    print(f"STEP 1: Training {arch} model for {epochs} epochs")
+    print(f"STEP 1: Training {arch} (until two consecutive epochs >= {MIN_ACCURACY}% acc, max {MAX_EPOCHS})")
     print("=" * 60)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -126,7 +162,10 @@ def train_model(arch, epochs=19, batch_size=128, lr=1e-3):
     criterion = nn.CrossEntropyLoss()
     train_loader, test_loader = get_data_loaders(batch_size)
 
-    for epoch in range(epochs):
+    prev_acc = 0.0
+    prev_state = None
+
+    for epoch in range(MAX_EPOCHS):
         model.train()
         running_loss = 0.0
         for i, (images, labels) in enumerate(train_loader):
@@ -140,16 +179,27 @@ def train_model(arch, epochs=19, batch_size=128, lr=1e-3):
 
         acc = evaluate(model, test_loader, device)
         epoch_num = epoch + 1
-        print(f"  Epoch {epoch_num}/{epochs} — loss: {running_loss/len(train_loader):.4f}, acc: {acc:.2f}%")
+        print(f"  Epoch {epoch_num}/{MAX_EPOCHS} — loss: {running_loss/len(train_loader):.4f}, acc: {acc:.2f}%")
 
-        if epoch_num == 18:
-            save_model(model, dirs['model_18'])
-            print(f"  >> Saved itr18 checkpoint (acc: {acc:.2f}%)")
-        if epoch_num == 19:
-            save_model(model, dirs['model_19'])
-            print(f"  >> Saved itr19 checkpoint (acc: {acc:.2f}%)")
+        if prev_acc >= MIN_ACCURACY and acc >= MIN_ACCURACY:
+            itr_n1 = epoch_num - 1
+            itr_n2 = epoch_num
+            dirs = get_exp_dirs(arch, itr_n1, itr_n2, create=True)
+            # Save previous epoch from cached state
+            prev_model = model_cls().to(device)
+            prev_model.load_state_dict(prev_state)
+            save_model(prev_model, dirs['model_n1'])
+            print(f"  >> Saved itr{itr_n1} checkpoint (acc: {prev_acc:.2f}%)")
+            # Save current epoch
+            save_model(model, dirs['model_n2'])
+            print(f"  >> Saved itr{itr_n2} checkpoint (acc: {acc:.2f}%)")
+            return itr_n1, itr_n2
 
-    return model
+        prev_acc = acc
+        prev_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    print(f"\n  ERROR: Failed to find two consecutive epochs with >= {MIN_ACCURACY}% accuracy within {MAX_EPOCHS} epochs.")
+    sys.exit(1)
 
 
 # ── step 2: run VHAGaR standard with perturbed intervals ────────────────
@@ -178,44 +228,44 @@ def run_vaghar_standard(arch, model_path, output_dir, ctag,
     return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag})')
 
 
-def step2_vaghar_standard(arch, perturbation_size, ctag, ct, timeout, perturbation):
-    dirs = get_exp_dirs(arch)
+def step2_vaghar_standard(arch, itr_n1, itr_n2, perturbation_size, ctag, ct, timeout, perturbation):
+    dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("=" * 60)
-    print(f"STEP 2: Running VHAGaR standard for {arch} itr18 and itr19")
+    print(f"STEP 2: Running VHAGaR standard for {arch} itr{itr_n1} and itr{itr_n2}")
     print("=" * 60)
 
-    model_18_path = os.path.join(dirs['model_18'], 'model.p')
-    model_19_path = os.path.join(dirs['model_19'], 'model.p')
+    model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
+    model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
-    print(f"\n  --- itr18 (ctag={ctag}) ---")
-    run_vaghar_standard(arch, model_18_path, dirs['vaghar_18'], ctag,
+    print(f"\n  --- itr{itr_n1} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, model_n1_path, dirs['vaghar_n1'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation)
 
-    print(f"\n  --- itr19 (ctag={ctag}) ---")
-    run_vaghar_standard(arch, model_19_path, dirs['vaghar_19'], ctag,
+    print(f"\n  --- itr{itr_n2} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, model_n2_path, dirs['vaghar_n2'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation)
 
 
-# ── step 3: run VHAGaR transfer (N1=itr18, N2=itr19) ────────────────────
+# ── step 3: run VHAGaR transfer ──────────────────────────────────────────
 
-def run_transfer_from_results(arch, vaghar_results_dir, output_dir, timeout, perturbation, ct):
+def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_dir, timeout, perturbation, ct):
     """
-    Iterate over VHAGaR results files for N1 (itr18).
+    Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
     Parse these from the filename and launch a transfer run.
     """
     _, model_name = ARCH_REGISTRY[arch]
-    dirs = get_exp_dirs(arch)
+    dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     pattern = re.compile(rf"_{perturbation}_(.*?)_ctag.*cTag(\d+)")
 
     if not os.path.exists(vaghar_results_dir):
         print(f"  Error: Directory {vaghar_results_dir} not found.")
         return
 
-    n1_path = os.path.join(dirs['model_18'], 'model.p')
-    n2_path = os.path.join(dirs['model_19'], 'model.p')
+    n1_path = os.path.join(dirs['model_n1'], 'model.p')
+    n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
     for filename in sorted(os.listdir(vaghar_results_dir)):
         if not filename.endswith('.txt'):
@@ -253,12 +303,12 @@ def run_transfer_from_results(arch, vaghar_results_dir, output_dir, timeout, per
         run_julia(command, f'transfer {arch} (ctag={c_tag_n})')
 
 
-def step3_transfer(arch, timeout, perturbation, ct):
-    dirs = get_exp_dirs(arch)
+def step3_transfer(arch, itr_n1, itr_n2, timeout, perturbation, ct):
+    dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("=" * 60)
-    print(f"STEP 3: Running VHAGaR transfer for {arch} (N1=itr18, N2=itr19)")
+    print(f"STEP 3: Running VHAGaR transfer for {arch} (N1=itr{itr_n1}, N2=itr{itr_n2})")
     print("=" * 60)
-    run_transfer_from_results(arch, dirs['vaghar_18'], dirs['transfer'], timeout, perturbation, ct)
+    run_transfer_from_results(arch, itr_n1, itr_n2, dirs['vaghar_n1'], dirs['transfer'], timeout, perturbation, ct)
 
 
 # ── main ─────────────────────────────────────────────────────────────────
@@ -266,16 +316,15 @@ def step3_transfer(arch, timeout, perturbation, ct):
 def main():
     arch_choices = list(ARCH_REGISTRY.keys())
     parser = argparse.ArgumentParser(
-        description='Generic experiment: train itr18/itr19, VHAGaR standard + transfer',
+        description='Generic experiment: train until consecutive 92%+ epochs, VHAGaR standard + transfer',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--arch', type=str, required=True, choices=arch_choices,
                         help=f'Architecture to run: {arch_choices}')
-    parser.add_argument('--epochs', type=int, default=19, help='Total training epochs (saves at 18 and 19)')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3, help='SGD learning rate')
     parser.add_argument('--perturbation_size', type=str, default='0.1')
     parser.add_argument('--perturbation', type=str, default='linf')
-    parser.add_argument('--ct', type=str, default='4,5,6,7', help='Target classes')
+    parser.add_argument('--ct', type=str, default='4,5,6', help='Target classes')
     parser.add_argument('--timeout', type=int, default=1500, help='MIP timeout per class pair')
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_vaghar', action='store_true', help='Skip standard VHAGaR, go to transfer')
@@ -287,29 +336,30 @@ def main():
 
     # Step 1: Train
     if not args.skip_training:
-        train_model(arch, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+        itr_n1, itr_n2 = train_model(arch, batch_size=args.batch_size, lr=args.lr)
     else:
         print("Skipping training (--skip_training)")
+        itr_n1, itr_n2 = detect_iterations(arch)
 
     # Step 2: VHAGaR standard for both models
     if not args.skip_vaghar:
         for ctag in range(1, 3):
-            step2_vaghar_standard(arch, args.perturbation_size, ctag, args.ct,
+            step2_vaghar_standard(arch, itr_n1, itr_n2, args.perturbation_size, ctag, args.ct,
                                   args.timeout, args.perturbation)
     else:
         print("Skipping standard VHAGaR (--skip_vaghar)")
 
-    # Step 3: Transfer (N1=itr18, N2=itr19)
-    step3_transfer(arch, args.timeout, args.perturbation, args.ct)
+    # Step 3: Transfer (N1=itr_n1, N2=itr_n2)
+    step3_transfer(arch, itr_n1, itr_n2, args.timeout, args.perturbation, args.ct)
 
-    dirs = get_exp_dirs(arch)
+    dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("\n" + "=" * 60)
     print(f"EXPERIMENT COMPLETE ({arch})")
     print("=" * 60)
-    print(f"  itr18 model:      {dirs['model_18']}/model.p")
-    print(f"  itr19 model:      {dirs['model_19']}/model.p")
-    print(f"  VHAGaR itr18:     {dirs['vaghar_18']}/")
-    print(f"  VHAGaR itr19:     {dirs['vaghar_19']}/")
+    print(f"  itr{itr_n1} model:      {dirs['model_n1']}/model.p")
+    print(f"  itr{itr_n2} model:      {dirs['model_n2']}/model.p")
+    print(f"  VHAGaR itr{itr_n1}:     {dirs['vaghar_n1']}/")
+    print(f"  VHAGaR itr{itr_n2}:     {dirs['vaghar_n2']}/")
     print(f"  Transfer results: {dirs['transfer']}/")
 
 

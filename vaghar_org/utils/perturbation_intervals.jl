@@ -96,6 +96,54 @@ function ensure_1d(x)
     ndims(x) > 1 ? vec(x) : x
 end
 
+"""
+    extract_neuron_index(var_name)
+
+Extract the structural neuron index (last integer) from a JuMP variable name.
+Variable names follow: {prefix}x_rect_layerCount{n}_neuronCount{n}_{layer}_{neuron}
+Returns the neuron index (1-based) used to index into interval bound arrays.
+"""
+function extract_neuron_index(var_name::String)
+    # The neuron index is the last integer after the last underscore
+    last_under = findlast('_', var_name)
+    return parse(Int, var_name[last_under+1:end])
+end
+
+"""
+    add_matched_interval_constraints!(m, av, vec_a, vec_b, I_up_flat, I_down_flat)
+
+Add interval constraints only for neurons that have x_rect variables in BOTH
+network copies. Neurons are matched by their structural neuron index (extracted
+from JuMP variable names). This handles the case where bound tightening produces
+different split/fixed decisions for the two copies (common in CNN layers).
+
+Constraints added:  av[b_idx] <= av[a_idx] + I_up_flat[neuron]
+                    av[b_idx] >= av[a_idx] + I_down_flat[neuron]
+"""
+function add_matched_interval_constraints!(m, av, vec_a, vec_b, I_up_flat, I_down_flat)
+    # Build neuron_index → av_index maps for both copies
+    map_a = Dict{Int,Int}()
+    for idx in vec_a
+        ni = extract_neuron_index(JuMP.name(av[idx]))
+        map_a[ni] = idx
+    end
+    map_b = Dict{Int,Int}()
+    for idx in vec_b
+        ni = extract_neuron_index(JuMP.name(av[idx]))
+        map_b[ni] = idx
+    end
+
+    # Find common neurons and add constraints
+    common = sort(collect(intersect(keys(map_a), keys(map_b))))
+    count = 0
+    for ni in common
+        @constraint(m, av[map_b[ni]] <= av[map_a[ni]] + I_up_flat[ni])
+        @constraint(m, av[map_b[ni]] >= av[map_a[ni]] + I_down_flat[ni])
+        count += 2
+    end
+    return count
+end
+
 # ── interval propagation (like HyperlinearDepsIn) ────────────────────────
 
 function propagate_intervals(nn1, nn2, version)
@@ -363,9 +411,8 @@ function add_interval_constraints(m, nn1, nn2, version, n1_prefix, n2_prefix)
             if length(vec_1) > 0 && length(vec_2) > 0
                 I_up_flat   = ensure_1d(I_z_prev_up_local)
                 I_down_flat = ensure_1d(I_z_prev_down_local)
-                @constraint(m, av[vec_2] .<= av[vec_1] .+ I_up_flat)
-                @constraint(m, av[vec_2] .>= av[vec_1] .+ I_down_flat)
-                constraints_added += 2 * length(vec_1)
+                constraints_added += add_matched_interval_constraints!(
+                    m, av, vec_1, vec_2, I_up_flat, I_down_flat)
             end
         end
     end
@@ -558,9 +605,8 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
             if length(vec_n1) > 0 && length(vec_n2p) > 0
                 I_C_up_flat   = ensure_1d(I_C_up_local)
                 I_C_down_flat = ensure_1d(I_C_down_local)
-                @constraint(m, av[vec_n2p] .<= av[vec_n1] .+ I_C_up_flat)
-                @constraint(m, av[vec_n2p] .>= av[vec_n1] .+ I_C_down_flat)
-                constraints_added += 2 * length(vec_n1)
+                constraints_added += add_matched_interval_constraints!(
+                    m, av, vec_n1, vec_n2p, I_C_up_flat, I_C_down_flat)
             end
         end
     end
@@ -637,9 +683,8 @@ function perturbed_interval_constraints(m, nn, clean_prefix, pert_prefix)
             if length(vec_clean) > 0 && length(vec_pert) > 0
                 I_up_flat   = ensure_1d(I_pert_up_local)
                 I_down_flat = ensure_1d(I_pert_down_local)
-                @constraint(m, av[vec_pert] .<= av[vec_clean] .+ I_up_flat)
-                @constraint(m, av[vec_pert] .>= av[vec_clean] .+ I_down_flat)
-                constraints_added += 2 * length(vec_clean)
+                constraints_added += add_matched_interval_constraints!(
+                    m, av, vec_clean, vec_pert, I_up_flat, I_down_flat)
             end
         end
     end
@@ -840,14 +885,14 @@ function add_interval_constraints_distilation(m, bounds_n1, bounds_n2, K1, K2, n
             end
         end
 
-        if length(vec_1) > 0 && length(vec_2) > 0 && length(vec_1) == length(vec_2)
+        if length(vec_1) > 0 && length(vec_2) > 0
             # Difference bounds: diff = N2_activation - N1_activation
             diff_up   = ensure_1d(bounds_n2[n2_layer][1]) .- ensure_1d(bounds_n1[k][2])    # N2_up - N1_down
             diff_down = ensure_1d(bounds_n2[n2_layer][2]) .- ensure_1d(bounds_n1[k][1])    # N2_down - N1_up
-            @constraint(m, av[vec_2] .<= av[vec_1] .+ diff_up)
-            @constraint(m, av[vec_2] .>= av[vec_1] .+ diff_down)
-            constraints_added += 2 * length(vec_1)
-            println("  Distillation interval: N1 layer $k ↔ N2 layer $n2_layer, $(length(vec_1)) neurons")
+            added = add_matched_interval_constraints!(
+                m, av, vec_1, vec_2, diff_up, diff_down)
+            constraints_added += added
+            println("  Distillation interval: N1 layer $k ↔ N2 layer $n2_layer, $(added ÷ 2) neurons")
         end
     end
 
@@ -914,13 +959,13 @@ function composed_interval_constraints_distilation(m, nn1, nn2)
             end
         end
 
-        if length(vec_n1) > 0 && length(vec_n2p) > 0 && length(vec_n1) == length(vec_n2p)
+        if length(vec_n1) > 0 && length(vec_n2p) > 0
             diff_up   = ensure_1d(bounds_n2_pert[n2_layer][1]) .- ensure_1d(bounds_n1[k][2])
             diff_down = ensure_1d(bounds_n2_pert[n2_layer][2]) .- ensure_1d(bounds_n1[k][1])
-            @constraint(m, av[vec_n2p] .<= av[vec_n1] .+ diff_up)
-            @constraint(m, av[vec_n2p] .>= av[vec_n1] .+ diff_down)
-            constraints_added += 2 * length(vec_n1)
-            println("  Composed distillation: N1(x) layer $k ↔ N2(x_p) layer $n2_layer, $(length(vec_n1)) neurons")
+            added = add_matched_interval_constraints!(
+                m, av, vec_n1, vec_n2p, diff_up, diff_down)
+            constraints_added += added
+            println("  Composed distillation: N1(x) layer $k ↔ N2(x_p) layer $n2_layer, $(added ÷ 2) neurons")
         end
     end
 
