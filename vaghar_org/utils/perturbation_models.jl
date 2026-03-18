@@ -95,13 +95,22 @@ function get_perturbation_specific_keys_privacy(w_, h_, k_, perturbation_size, n
 end
 
 function get_perturbation_specific_keys_brightness(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+    global layer_counter
+    global nueron_counter
+    global network_version
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 0, upper_bound = p_size)
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
     @constraint(m, v_x0 .== v_in .+ v_e)
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => v_e, :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end

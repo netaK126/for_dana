@@ -223,7 +223,7 @@ def run_vaghar_standard(arch, model_path, output_dir, ctag,
         '--c_tag_mode', 'false',
         '--use_hyper_attack', 'true',
         '--activate_vaghgar_deps', 'true',
-        '--use_perturbed_intervals', 'true',
+        '--use_perturbed_intervals', 'false',
     ]
     return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag})')
 
