@@ -87,7 +87,7 @@ def train_3x50(epochs=19, batch_size=128, lr=1e-3):
     print("=" * 60)
     print(f"STEP 1: Training 3x50 model for {epochs} epochs")
     print("=" * 60)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cpu")#torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = FNN_3_50().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()

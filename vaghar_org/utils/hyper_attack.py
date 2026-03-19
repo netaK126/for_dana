@@ -69,13 +69,13 @@ def create_attacked(X, eps, perturbation_type,size_,dims):
         Xout = torch.clamp(X+eps, 0, 1)
     elif perturbation_type == "filterv":
         f_coeff = [size_[1], size_[2], size_[3]]
-        filter = torch.tensor(f_coeff).reshape(1, 1, len(f_coeff), 1).to('cuda:0')
+        filter = torch.tensor(f_coeff).reshape(1, 1, len(f_coeff), 1).to(DEVICE)
         Xout = torch.nn.functional.conv2d(X, filter.view(1, 1, len(f_coeff), 1), padding=(1, 0))
     elif perturbation_type == "contrast":
         Xout = X*(1+eps)
     elif perturbation_type == "filterh":
         f_coeff = [size_[1], size_[2], size_[3]]
-        filter = torch.tensor(f_coeff).reshape(1, 1, 1, len(f_coeff)).to('cuda:0')
+        filter = torch.tensor(f_coeff).reshape(1, 1, 1, len(f_coeff)).to(DEVICE)
         Xout = torch.nn.functional.conv2d(X, filter.view(1, 1, 1, len(f_coeff)), padding=(0, 1))
     return Xout
 
@@ -387,7 +387,7 @@ if __name__ == '__main__':
     parser.add_argument('--perturbation_size', type=str, default="1", help='perturbation size')
     parser.add_argument('--gpu', type=int, default=0, help='dataset')
     parser.add_argument('--M', type=int, default=1000, help='Number of samples to attack')
-    parser.add_argument('--itr', type=int, default=500, help='Number of iterations')
+    parser.add_argument('--itr', type=int, default=100, help='Number of iterations')
     parser.add_argument('--alpha', type=float, default=0.01, help='Number of iterations')
 
     args = parser.parse_args()
@@ -412,7 +412,8 @@ if __name__ == '__main__':
         iterations = 50
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")#torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE = device
     print("source:", source, "target:", target, "model_arch:", model_arch, "perturbation type:", perturbation_type, \
           "perturbation size:", perturbation_size, "dataset:", dataset)
 

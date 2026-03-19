@@ -37,7 +37,7 @@ end
 function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
                                model_name, model_path, model_path2,
                                perturbation, perturbation_size,
-                               delta_1, c_tag_mode, n1_p_mode)
+                               delta_1, c_tag_mode, n1_p_mode, delta_diff_positive)
     best_feasible_via_optimization = 0
     pre_time = 0
     pre_time = @elapsed begin
@@ -53,7 +53,8 @@ function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
             "--perturbation_size", create_perturbation_string(perturbation_size),
             "--delta1", string(delta_1),
             "--c_tag_mode", string(c_tag_mode),
-            "--n1_p_mode", string(n1_p_mode)])
+            "--n1_p_mode", string(n1_p_mode),
+            "--delta_diff_positive", string(delta_diff_positive)])
         run(cmd)
         best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
     end

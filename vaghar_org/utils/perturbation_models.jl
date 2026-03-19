@@ -390,6 +390,13 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     network_version = "n1_org"
     v_out_n1 = v_in |> nn1
 
+    # Pre-compute diff/composed interval bounds for the conditional-triangle
+    # relaxation (used by core_ops.jl's relu() when use_relaxations=true).
+    # Must run BEFORE encoding n2_org/n2_pert so relu() can skip binaries.
+    if use_relaxations
+        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down)
+    end
+
     # Encode N2 on clean input x → layers K+1..2K
     println("Encoding N2(x)...")
     layer_counter = 0
@@ -479,6 +486,12 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     # Store input-layer perturbation interval for perturbed_interval_constraints()
     I_pert_prev_up   = I_pert_up
     I_pert_prev_down = I_pert_down
+
+    # Pre-compute diff/composed interval bounds for the conditional-triangle
+    # relaxation.  Must run BEFORE encoding n2_org/n2_pert.
+    if use_relaxations
+        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down)
+    end
 
     println("Encoding N1(x)...")
     layer_counter = 0; nueron_counter = 0; network_version = "n1_org"

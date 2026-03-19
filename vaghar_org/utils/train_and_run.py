@@ -55,7 +55,7 @@ def save_model_checkpoint(model, checkpoint_dir, itr):
 
 
 def train(model_name, output_dir, epochs=20, batch_size=128, loss_type="Cross", optimizer_type="Adam"):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")#torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     transform = transforms.Compose([transforms.ToTensor()])
     mnist_train = dsets.MNIST(root="./data/", train=True, transform=transform, download=True)
     mnist_test = dsets.MNIST(root="./data/", train=False, transform=transform, download=True)

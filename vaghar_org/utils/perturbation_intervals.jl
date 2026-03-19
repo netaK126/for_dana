@@ -3,8 +3,12 @@
 # Same approach as lucid_delta_diff_with_perturbation:
 # - Uses globals: I_z_prev_up/down, I_z_prev_up/down_perturbation,
 #   all_bounds_of_original/perturbation
+#
+# compute_diff_and_comp_bounds() also populates the relaxation globals
+# (relu_diff_*_bounds, relu_comp_*_bounds, n1_preact_*_bounds) used by
+# the conditional-triangle relaxation in core_ops.jl.
 # - Initialized in get_perturbation_specific_keys_linf_transfer()
-# - Propagation formula: I_w_up = W2^T - W1^T, I_w_down = 0, w1 = W1^T
+# - Propagation (paper eq. 3): W2·(z_org - z_pre) + ΔW·z_pre, where ΔW = W2 - W1
 # - Constraints: av[vec_n2] <= av[vec_n1] .+ I_z_prev_up_to_use
 #                av[vec_n2] >= av[vec_n1] .+ I_z_prev_down_to_use
 
@@ -173,13 +177,13 @@ function propagate_intervals(nn1, nn2, version)
         elseif occursin("Linear", string(typeof(l)))
             l2 = nn2.layers[layer_idx]
 
-            # Same formula as lucid HyperlinearDepsIn:
-            # I_w_up   = W2^T - W1^T  (weight difference)
-            # I_w_down = W1^T - W1^T = 0
-            # w1       = W1^T
-            I_w_up   = Float64.(transpose(l2.matrix)) - Float64.(transpose(l.matrix))
-            I_w_down = Float64.(transpose(l.matrix))  - Float64.(transpose(l.matrix))
+            # Decomposition (paper eq. 3):
+            #   W2·z_org - W1·z_pre = W2·(z_org - z_pre) + ΔW·z_pre
+            # Term 1: ΔW·z_pre  (ΔW is constant → point interval [ΔW, ΔW])
+            # Term 2: W2·diff   (W2 = W^N, diff = z_org - z_pre)
             w1       = Float64.(transpose(l.matrix))
+            w2       = Float64.(transpose(l2.matrix))
+            ΔW       = w2 - w1
 
             if version == "org"
                 z_prev_up   = all_bounds_of_original[layer_cnt+1][1]
@@ -193,8 +197,8 @@ function propagate_intervals(nn1, nn2, version)
                 I_z_prev_down_to_use = I_z_prev_down_perturbation
             end
 
-            result_min_1, result_max_1 = interval_matrix_vector_multiplication(I_w_down, I_w_up, z_prev_down, z_prev_up)
-            result_min_2, result_max_2 = interval_matrix_vector_multiplication(w1, w1, I_z_prev_down_to_use, I_z_prev_up_to_use)
+            result_min_1, result_max_1 = interval_matrix_vector_multiplication(ΔW, ΔW, z_prev_down, z_prev_up)
+            result_min_2, result_max_2 = interval_matrix_vector_multiplication(w2, w2, I_z_prev_down_to_use, I_z_prev_up_to_use)
             bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
             I_z_down_in = result_min_1 .+ result_min_2 .+ bias_diff
             I_z_up_in   = result_max_1 .+ result_max_2 .+ bias_diff
@@ -235,8 +239,7 @@ function propagate_intervals(nn1, nn2, version)
 
             F1 = Float64.(l.filter)
             F2 = Float64.(l2.filter)
-            I_F_up   = F2 - F1
-            I_F_down = zeros(Float64, size(F1))
+            ΔF = F2 - F1
             zero_bias = zeros(Float64, length(l.bias))
 
             if version == "org"
@@ -257,12 +260,12 @@ function propagate_intervals(nn1, nn2, version)
             I_up_4d   = ndims(I_z_prev_up_to_use) == 4 ? I_z_prev_up_to_use : reshape(I_z_prev_up_to_use, 1, :, 1, 1)
             I_down_4d = ndims(I_z_prev_down_to_use) == 4 ? I_z_prev_down_to_use : reshape(I_z_prev_down_to_use, 1, :, 1, 1)
 
-            # Term 1: weight difference * activation bounds (no bias)
+            # Term 1: ΔF·z_pre (ΔF is constant → point interval)
             result_min_1, result_max_1 = interval_conv2d_bounds(
-                I_F_down, I_F_up, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
-            # Term 2: reference weight * interval bounds (no bias)
+                ΔF, ΔF, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
+            # Term 2: F2·diff (F2 = W^N filter)
             result_min_2, result_max_2 = interval_conv2d_bounds(
-                F1, F1, I_down_4d, I_up_4d, zero_bias, l.stride, l.padding)
+                F2, F2, I_down_4d, I_up_4d, zero_bias, l.stride, l.padding)
 
             # Bias difference: constant offset on the interval
             bias_diff = Float64.(l2.bias) .- Float64.(l.bias)
@@ -347,9 +350,8 @@ function add_interval_constraints(m, nn1, nn2, version, n1_prefix, n2_prefix)
         elseif occursin("Linear", string(typeof(l)))
             l2 = nn2.layers[layer_idx]
 
-            I_w_up   = Float64.(transpose(l2.matrix)) - Float64.(transpose(l.matrix))
-            I_w_down = Float64.(transpose(l.matrix))  - Float64.(transpose(l.matrix))
-            w1       = Float64.(transpose(l.matrix))
+            ΔW = Float64.(transpose(l2.matrix)) - Float64.(transpose(l.matrix))
+            w2 = Float64.(transpose(l2.matrix))
 
             if version == "org"
                 z_prev_up   = all_bounds_of_original[layer_cnt+1][1]
@@ -359,8 +361,8 @@ function add_interval_constraints(m, nn1, nn2, version, n1_prefix, n2_prefix)
                 z_prev_down = all_bounds_of_perturbation[layer_cnt+1][2]
             end
 
-            result_min_1, result_max_1 = interval_matrix_vector_multiplication(I_w_down, I_w_up, z_prev_down, z_prev_up)
-            result_min_2, result_max_2 = interval_matrix_vector_multiplication(w1, w1, I_z_prev_down_local, I_z_prev_up_local)
+            result_min_1, result_max_1 = interval_matrix_vector_multiplication(ΔW, ΔW, z_prev_down, z_prev_up)
+            result_min_2, result_max_2 = interval_matrix_vector_multiplication(w2, w2, I_z_prev_down_local, I_z_prev_up_local)
             I_z_prev_down_local = result_min_1 .+ result_min_2
             I_z_prev_up_local   = result_max_1 .+ result_max_2
 
@@ -369,8 +371,7 @@ function add_interval_constraints(m, nn1, nn2, version, n1_prefix, n2_prefix)
 
             F1 = Float64.(l.filter)
             F2 = Float64.(l2.filter)
-            I_F_up   = F2 - F1
-            I_F_down = zeros(Float64, size(F1))
+            ΔF = F2 - F1
             zero_bias = zeros(Float64, length(l.bias))
 
             if version == "org"
@@ -387,9 +388,9 @@ function add_interval_constraints(m, nn1, nn2, version, n1_prefix, n2_prefix)
             I_down_4d = ndims(I_z_prev_down_local) == 4 ? I_z_prev_down_local : reshape(I_z_prev_down_local, 1, :, 1, 1)
 
             result_min_1, result_max_1 = interval_conv2d_bounds(
-                I_F_down, I_F_up, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
+                ΔF, ΔF, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
             result_min_2, result_max_2 = interval_conv2d_bounds(
-                F1, F1, I_down_4d, I_up_4d, zero_bias, l.stride, l.padding)
+                F2, F2, I_down_4d, I_up_4d, zero_bias, l.stride, l.padding)
 
             I_z_prev_down_local = result_min_1 .+ result_min_2
             I_z_prev_up_local   = result_max_1 .+ result_max_2
@@ -541,17 +542,16 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
             W1 = Float64.(transpose(l.matrix))
             W2 = Float64.(transpose(l2.matrix))
 
-            # Weight difference interval: [0, W2-W1]
-            I_w_up   = W2 - W1
-            I_w_down = zeros(Float64, size(W1))
+            # Weight difference (constant → point interval)
+            ΔW = W2 - W1
 
             # Activation bounds of N1(x) at this layer
             z_prev_up   = all_bounds_of_original[layer_cnt+1][1]
             z_prev_down = all_bounds_of_original[layer_cnt+1][2]
 
-            # Term 1: (W2-W1) * a^{N1}_{prev} — weight difference contribution
+            # Term 1: ΔW * a^{N1}_{prev} — weight difference contribution
             result_min_1, result_max_1 = interval_matrix_vector_multiplication(
-                I_w_down, I_w_up, z_prev_down, z_prev_up)
+                ΔW, ΔW, z_prev_down, z_prev_up)
 
             # Term 2: W2 * Δa^C_{prev} — composed interval through N2's weights
             # Key difference from transfer: uses W2, not W1
@@ -567,8 +567,7 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
 
             F1 = Float64.(l.filter)
             F2 = Float64.(l2.filter)
-            I_F_up   = F2 - F1
-            I_F_down = zeros(Float64, size(F1))
+            ΔF = F2 - F1
             zero_bias = zeros(Float64, length(l.bias))
 
             z_prev_up   = all_bounds_of_original[layer_cnt+1][1]
@@ -579,9 +578,9 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
             I_C_up_4d   = ndims(I_C_up_local) == 4 ? I_C_up_local : reshape(I_C_up_local, 1, :, 1, 1)
             I_C_down_4d = ndims(I_C_down_local) == 4 ? I_C_down_local : reshape(I_C_down_local, 1, :, 1, 1)
 
-            # Term 1: weight difference * activation bounds
+            # Term 1: ΔF * activation bounds (point interval)
             result_min_1, result_max_1 = interval_conv2d_bounds(
-                I_F_down, I_F_up, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
+                ΔF, ΔF, z_prev_down_4d, z_prev_up_4d, zero_bias, l.stride, l.padding)
             # Term 2: N2 weights * composed interval
             result_min_2, result_max_2 = interval_conv2d_bounds(
                 F2, F2, I_C_down_4d, I_C_up_4d, zero_bias, l.stride, l.padding)
@@ -987,4 +986,123 @@ function composed_interval_constraints_distilation(m, nn1, nn2)
 
     println("Composed distillation interval constraints (I^C) added: $constraints_added")
     return constraints_added
+end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# compute_diff_and_comp_bounds
+#
+# Analytically propagates, per ReLU layer:
+#   • diff bounds   [l_diff, u_diff]  =  z_n2_org - z_n1_org
+#   • pert bounds   [l_pert, u_pert]  =  z_n2_pert - z_n2_org
+#   • comp bounds   [l_comp, u_comp]  =  l_diff+l_pert, u_diff+u_pert
+#   • N1 pre-activation bounds        =  bounds on zˆ_n1 before ReLU
+#
+# Results are stored in the relaxation globals (see help_functions.jl) and
+# consumed by the conditional-triangle relaxation in core_ops.jl's relu().
+#
+# Must be called BEFORE encoding n2_org / n2_pert so that relu() can skip
+# binary variables for qualifying neurons.
+#
+# Requires all_bounds_of_original to be initialised (input-layer entry only
+# is sufficient; the rest is built here in parallel with propagate_intervals).
+# ═══════════════════════════════════════════════════════════════════════════
+function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init)
+    # ── Activation conditional-triangle relaxation (n2_org) ──────────────────
+    # diff bounds: z_n2_org - z_n1_org, used with a_n1_org + N1 preact bounds
+    global relu_diff_up_bounds, relu_diff_down_bounds
+    global n1_preact_up_bounds, n1_preact_down_bounds
+    # ── Perturbation conditional-triangle relaxation (n2_pert) ───────────────
+    # composed bounds: (z_n2_pert - z_n1_org) = diff + pert, used with a_n1_org + N1 preact bounds
+    global relu_comp_up_bounds, relu_comp_down_bounds
+
+    relu_diff_up_bounds   = Vector{Float64}[]
+    relu_diff_down_bounds = Vector{Float64}[]
+    n1_preact_up_bounds   = Vector{Float64}[]
+    n1_preact_down_bounds = Vector{Float64}[]
+    relu_comp_up_bounds   = Vector{Float64}[]
+    relu_comp_down_bounds = Vector{Float64}[]
+
+    # Running interval state (all flat vectors after Flatten)
+    diff_up   = zeros(Float64, length(I_pert_up_init))   # z_n2_org - z_n1_org
+    diff_down = zeros(Float64, length(I_pert_down_init))
+    pert_up   = copy(vec(Float64.(I_pert_up_init)))       # z_n2_pert - z_n2_org
+    pert_down = copy(vec(Float64.(I_pert_down_init)))
+
+    # N1 post-activation bounds (initialised to input domain [0,1])
+    n1_act_up   = ones(Float64,  length(I_pert_up_init))
+    n1_act_down = zeros(Float64, length(I_pert_down_init))
+
+    # Will be set at each Linear layer, read at the following ReLU layer
+    n1_pre_up_cur   = Float64[]
+    n1_pre_down_cur = Float64[]
+
+    for (layer_idx, l) in enumerate(nn1.layers)
+        l2 = nn2.layers[layer_idx]
+
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(diff_up) > 1
+                diff_up   = vec(diff_up   |> l)
+                diff_down = vec(diff_down |> l)
+                pert_up   = vec(pert_up   |> l)
+                pert_down = vec(pert_down |> l)
+                n1_act_up   = vec(n1_act_up   |> l)
+                n1_act_down = vec(n1_act_down |> l)
+            end
+
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            W2 = Float64.(transpose(l2.matrix))
+            b1 = Float64.(l.bias)
+            b2 = Float64.(l2.bias)
+            ΔW = W2 - W1
+            Δb = b2 - b1
+
+            # diff:  ΔW·z_n1 + W2·diff_prev + Δb  (paper eq. 3)
+            r1_min, r1_max = interval_matrix_vector_multiplication(
+                ΔW, ΔW, n1_act_down, n1_act_up)
+            r2_min, r2_max = interval_matrix_vector_multiplication(
+                W2, W2, diff_down, diff_up)
+            diff_down = r1_min .+ r2_min .+ Δb
+            diff_up   = r1_max .+ r2_max .+ Δb
+
+            # pert:  W2·pert_prev  (bias cancels in the difference)
+            rp_min, rp_max = interval_matrix_vector_multiplication(
+                W2, W2, pert_down, pert_up)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N1 pre-activation bounds (before ReLU)
+            rn_min, rn_max = interval_matrix_vector_multiplication(
+                W1, W1, n1_act_down, n1_act_up)
+            n1_pre_up_cur   = rn_max .+ b1
+            n1_pre_down_cur = rn_min .+ b1
+
+        elseif occursin("ReLU", string(typeof(l)))
+            # ── Activation conditional-triangle relaxation (n2_org) ──────────
+            # diff bounds: z_n2_org - z_n1_org (pre-activation, before clipping)
+            # N1 preact bounds: used to form conditional intervals in core_ops.jl
+            push!(relu_diff_up_bounds,   copy(diff_up))
+            push!(relu_diff_down_bounds, copy(diff_down))
+            push!(n1_preact_up_bounds,   copy(n1_pre_up_cur))
+            push!(n1_preact_down_bounds, copy(n1_pre_down_cur))
+
+            # ── Perturbation conditional-triangle relaxation (n2_pert) ───────
+            # composed bounds: z_n2_pert - z_n1_org = diff + pert (pre-activation)
+            # Same a_n1_org binary and N1 preact bounds are reused (see paper eq. 6)
+            push!(relu_comp_up_bounds,   diff_up   .+ pert_up)
+            push!(relu_comp_down_bounds, diff_down .+ pert_down)
+
+            # Clip intervals through ReLU (non-expansive)
+            diff_up   = max.(0.0, diff_up)
+            diff_down = .- max.(0.0, .- diff_down)
+            pert_up   = max.(0.0, pert_up)
+            pert_down = .- max.(0.0, .- pert_down)
+
+            # N1 post-activation bounds
+            n1_act_up   = max.(0.0, n1_pre_up_cur)
+            n1_act_down = max.(0.0, n1_pre_down_cur)
+        end
+    end
+
+    println("compute_diff_and_comp_bounds: populated $(length(relu_diff_up_bounds)) ReLU layers")
 end

@@ -3,7 +3,6 @@ ENV["PYTHON"]="/usr/bin/python3.8"
 using Gurobi
 using PyCall
 using PyPlot
-using Gurobi
 using Images
 using Printf
 using Dates
@@ -152,6 +151,22 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--use_relaxations"
+        help = "activate conditional-triangle relaxation for n2_org and n2_pert (transfer mode); eliminates binary variables for qualifying neurons"
+        arg_type = Bool
+        required = false
+        default = false
+        "--relaxation_threshold"
+        help = "interval-width threshold Trelax: relax neuron when width < Trelax (0.1=conservative, 0.5=default, 1.0=aggressive, Inf=all)"
+        arg_type = Float64
+        required = false
+        default = 0.5
+        "--delta_diff_positive"
+        help = "force delta_diff to be positive."
+        arg_type = Bool
+        required = false
+        default = true
+        
     end
     return parse_args(s)
 end
@@ -223,6 +238,10 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 println("Adding perturbed interval constraints...")
                 perturbed_interval_constraints(m, nn, "org", "perturbation")
             end
+            if args["use_relaxations"]
+                name_to_save = name_to_save*"_Relaxations"*string(args["relaxation_threshold"])
+                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"])...")
+            end
             mip_set_delta_property(m, perturbation, d)
             set_optimizer(m, optimizer)
             mip_set_attr(m, perturbation, d, timout)
@@ -247,6 +266,8 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     c_tag_list = [args["ctag"]]
     c_targets = parse_numbers_to_Int64(args["ct"])
     n1_p_mode = args["n1_p_mode"]
+    global use_relaxations = args["use_relaxations"]
+    global relaxation_threshold = args["relaxation_threshold"]
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
     w, h, k, c = get_dataset_params(dataset)
@@ -290,7 +311,8 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                 suboptimal_solution, suboptimal_time =hyper_attack_transfer(
                     dataset, c_tag, c_target, token_signature,
                     model_name, model_path, model_path2,
-                    perturbation, perturbation_size, delta_1, c_tag_mode, n1_p_mode)
+                    perturbation, perturbation_size, delta_1,
+                    c_tag_mode, n1_p_mode, args["delta_diff_positive"])
             end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
 
@@ -353,7 +375,9 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
 
             # Set transfer proof constraints and objective
-            mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
+            mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
+                c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
+                args["delta_diff_positive"])
             set_optimizer(m, optimizer)
             mip_set_attr_transfer(m, timout, suboptimal_solution)
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)

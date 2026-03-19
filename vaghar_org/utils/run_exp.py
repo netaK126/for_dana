@@ -156,7 +156,7 @@ def train_model(arch, batch_size=128, lr=1e-3):
     print(f"STEP 1: Training {arch} (until two consecutive epochs >= {MIN_ACCURACY}% acc, max {MAX_EPOCHS})")
     print("=" * 60)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cpu")#torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = model_cls().to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -223,7 +223,7 @@ def run_vaghar_standard(arch, model_path, output_dir, ctag,
         '--c_tag_mode', 'false',
         '--use_hyper_attack', 'true',
         '--activate_vaghgar_deps', 'true',
-        '--use_perturbed_intervals', 'false',
+        '--use_perturbed_intervals', 'true',
     ]
     return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag})')
 
@@ -250,7 +250,7 @@ def step2_vaghar_standard(arch, itr_n1, itr_n2, perturbation_size, ctag, ct, tim
 
 # ── step 3: run VHAGaR transfer ──────────────────────────────────────────
 
-def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_dir, timeout, perturbation, ct):
+def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_dir, timeout, perturbation, ct, transfer_relaxations):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -272,6 +272,8 @@ def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_d
             continue
         match = pattern.search(filename)
         if not match:
+            continue
+        if "0.25" not in filename:
             continue
 
         perturbation_size = match.group(1)
@@ -299,16 +301,17 @@ def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_d
             '--use_intervals', 'true',
             '--use_perturbed_intervals', 'true',
             '--n2_fewer_binars_encoding', 'true',
+            "--use_relaxations", transfer_relaxations
         ]
         run_julia(command, f'transfer {arch} (ctag={c_tag_n})')
 
 
-def step3_transfer(arch, itr_n1, itr_n2, timeout, perturbation, ct):
+def step3_transfer(arch, itr_n1, itr_n2, timeout, perturbation, ct, transfer_relaxations):
     dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("=" * 60)
     print(f"STEP 3: Running VHAGaR transfer for {arch} (N1=itr{itr_n1}, N2=itr{itr_n2})")
     print("=" * 60)
-    run_transfer_from_results(arch, itr_n1, itr_n2, dirs['vaghar_n1'], dirs['transfer'], timeout, perturbation, ct)
+    run_transfer_from_results(arch, itr_n1, itr_n2, dirs['vaghar_n1'], dirs['transfer'], timeout, perturbation, ct, transfer_relaxations)
 
 
 # ── main ─────────────────────────────────────────────────────────────────
@@ -322,12 +325,13 @@ def main():
                         help=f'Architecture to run: {arch_choices}')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3, help='SGD learning rate')
-    parser.add_argument('--perturbation_size', type=str, default='0.1')
+    parser.add_argument('--perturbation_size', type=str, default='0.25')
     parser.add_argument('--perturbation', type=str, default='linf')
-    parser.add_argument('--ct', type=str, default='4,5,6', help='Target classes')
-    parser.add_argument('--timeout', type=int, default=1500, help='MIP timeout per class pair')
+    parser.add_argument('--ct', type=str, default='4,5', help='Target classes')
+    parser.add_argument('--timeout', type=int, default=2000, help='MIP timeout per class pair')
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_vaghar', action='store_true', help='Skip standard VHAGaR, go to transfer')
+    parser.add_argument('--transfer_relaxations', type=str, default='false', help='running transfer with relaxations or not')
     args = parser.parse_args()
 
     arch = args.arch
@@ -350,7 +354,7 @@ def main():
         print("Skipping standard VHAGaR (--skip_vaghar)")
 
     # Step 3: Transfer (N1=itr_n1, N2=itr_n2)
-    step3_transfer(arch, itr_n1, itr_n2, args.timeout, args.perturbation, args.ct)
+    step3_transfer(arch, itr_n1, itr_n2, args.timeout, args.perturbation, args.ct, args.transfer_relaxations)
 
     dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("\n" + "=" * 60)

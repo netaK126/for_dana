@@ -7,6 +7,31 @@ global all_bounds_of_perturbation = []
 global I_pert_prev_up = []
 global I_pert_prev_down = []
 
+# ── Conditional-triangle relaxation globals ──────────────────────────────
+# Populated by compute_diff_and_comp_bounds() before encoding n2_org/n2_pert.
+# Each entry is a Float64 vector (one value per neuron), indexed by ReLU layer.
+global use_relaxations::Bool = false
+global relaxation_threshold::Float64 = 0.5
+
+# ── Activation conditional-triangle relaxation (n2_org pass) ─────────────
+# BRIDGE paper Section 5 / eq. (4):
+#   Replace a_n2_org binary by conditioning on a_n1_org (Npre's binary).
+#   Threshold and conditional intervals use diff bounds + Npre preact bounds.
+#   diff bounds: z_n2_org - z_n1_org  (inter-network pre-activation difference)
+global relu_diff_up_bounds::Vector   = []
+global relu_diff_down_bounds::Vector = []
+# Npre pre-activation bounds (before ReLU clipping), used for both relaxations
+global n1_preact_up_bounds::Vector   = []
+global n1_preact_down_bounds::Vector = []
+
+# ── Perturbation conditional-triangle relaxation (n2_pert pass) ──────────
+# BRIDGE paper Section 5 / eq. (6):
+#   Replace a_n2_pert binary by conditioning on a_n1_org (same Npre binary).
+#   Threshold and conditional intervals use COMPOSED bounds + Npre preact bounds.
+#   composed bounds: (z_n2_pert - z_n1_org) = diff + pert
+global relu_comp_up_bounds::Vector   = []
+global relu_comp_down_bounds::Vector = []
+
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
     reusable_indexes::Int

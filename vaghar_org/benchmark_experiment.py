@@ -207,7 +207,7 @@ def create_n2_from_n1(n1_model, eps=N2_WEIGHT_NOISE_EPS):
 
 def train_all_models():
     """Train N1 and N2 for each model type."""
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")#torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     transform = transforms.Compose([transforms.ToTensor()])

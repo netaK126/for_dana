@@ -102,7 +102,8 @@ end
 # c_tag_mode=true  → c_pert = c_tag  (untargeted)
 # c_tag_mode=false → c_pert = c_target (targeted)
 # ============================================================
-function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
+function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
+    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding, delta_diff_positive)
     # Confidence margins on clean input (both measured for source class c_tag)
     conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
@@ -126,7 +127,9 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n
     # Constraint (2)+(3): delta_diff = C(N2,x,c) - C(N1,x,c) >= 0
     delta_diff = @variable(m, base_name="delta_diff")
     @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
-    @constraint(m, delta_diff >= 0)
+    if delta_diff_positive
+        @constraint(m, delta_diff >= 0)
+    end
     margin = 1e-3
     # Constraint (4): confidence gap flips under perturbation
 
@@ -160,7 +163,9 @@ end
 
 function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
     set_optimizer_attribute(m, "MIPFocus", 3)
-    set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
+    if suboptimal_solution != 0
+        set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
+    end
     set_optimizer_attribute(m, "Threads", 32)
     set_optimizer_attribute(m, "TimeLimit", timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)

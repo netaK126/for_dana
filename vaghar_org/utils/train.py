@@ -8,7 +8,7 @@ from models import *
 import pickle
 import argparse
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cpu")#torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 transform = transforms.Compose([transforms.ToTensor()])
 mnist_train = dsets.MNIST(root='./data/', train=True, transform=transform, download=True)
 mnist_test = dsets.MNIST(root='./data/', train=False, transform=transform, download=True)

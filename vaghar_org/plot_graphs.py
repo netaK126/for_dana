@@ -99,5 +99,5 @@ def create_stt_bar_chart(directory_path,c_tag):
 # כאן יש להזין את הנתיב לתקייה שלך
 c_tag_list = ["1","2","3"]
 for c_tag in c_tag_list:
-    path_to_files = r"/root/Downloads/vaghar_org/results_PerturbationInterval/"
+    path_to_files = r"/root/Downloads/for_dana/vaghar_org/results_PerturbationInterval/"
     create_stt_bar_chart(path_to_files,c_tag)
