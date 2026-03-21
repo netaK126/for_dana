@@ -250,7 +250,8 @@ def step2_vaghar_standard(arch, itr_n1, itr_n2, perturbation_size, ctag, ct, tim
 
 # ── step 3: run VHAGaR transfer ──────────────────────────────────────────
 
-def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_dir, timeout, perturbation, ct, transfer_relaxations):
+def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir,
+    output_dir, timeout, perturbation, ct, transfer_relaxations, delta_diff_positive):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -301,17 +302,18 @@ def run_transfer_from_results(arch, itr_n1, itr_n2, vaghar_results_dir, output_d
             '--use_intervals', 'true',
             '--use_perturbed_intervals', 'true',
             '--n2_fewer_binars_encoding', 'true',
-            "--use_relaxations", transfer_relaxations
+            "--use_relaxations", transfer_relaxations,
+            "--delta_diff_positive", delta_diff_positive,
         ]
         run_julia(command, f'transfer {arch} (ctag={c_tag_n})')
 
 
-def step3_transfer(arch, itr_n1, itr_n2, timeout, perturbation, ct, transfer_relaxations):
+def step3_transfer(arch, itr_n1, itr_n2, timeout, perturbation, ct, transfer_relaxations, delta_diff_positive):
     dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("=" * 60)
     print(f"STEP 3: Running VHAGaR transfer for {arch} (N1=itr{itr_n1}, N2=itr{itr_n2})")
     print("=" * 60)
-    run_transfer_from_results(arch, itr_n1, itr_n2, dirs['vaghar_n1'], dirs['transfer'], timeout, perturbation, ct, transfer_relaxations)
+    run_transfer_from_results(arch, itr_n1, itr_n2, dirs['vaghar_n1'], dirs['transfer'], timeout, perturbation, ct, transfer_relaxations, delta_diff_positive)
 
 
 # ── main ─────────────────────────────────────────────────────────────────
@@ -332,6 +334,7 @@ def main():
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_vaghar', action='store_true', help='Skip standard VHAGaR, go to transfer')
     parser.add_argument('--transfer_relaxations', type=str, default='false', help='running transfer with relaxations or not')
+    parser.add_argument('--delta_diff_positive', type=str, default='true', help='setting cutoff for transfer to be strictly less than 0 (i.e. delta_diff > 0) instead of <= 0 (delta_diff >= 0)')
     args = parser.parse_args()
 
     arch = args.arch
@@ -353,8 +356,9 @@ def main():
     else:
         print("Skipping standard VHAGaR (--skip_vaghar)")
 
+    for transfer_relaxations in ["false","true"]:
     # Step 3: Transfer (N1=itr_n1, N2=itr_n2)
-    step3_transfer(arch, itr_n1, itr_n2, args.timeout, args.perturbation, args.ct, args.transfer_relaxations)
+        step3_transfer(arch, itr_n1, itr_n2, args.timeout, args.perturbation, args.ct, args.transfer_relaxations, args.delta_diff_positive)
 
     dirs = get_exp_dirs(arch, itr_n1, itr_n2)
     print("\n" + "=" * 60)

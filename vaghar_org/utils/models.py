@@ -2,14 +2,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class FNN_2_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
         self.h = h
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(self.k*self.w*self.h, 10)
-        self.fc2 = nn.Linear(10, 10)
+        self.fc2 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -19,7 +19,7 @@ class FNN_2_10(nn.Module):
         return x
 
 class FNN_3_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -27,7 +27,7 @@ class FNN_3_10(nn.Module):
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(self.k*self.w*self.h, 10)
         self.fc2 = nn.Linear(10, 10)
-        self.fc3 = nn.Linear(10, 10)
+        self.fc3 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -38,7 +38,7 @@ class FNN_3_10(nn.Module):
         return x
 
 class FNN_5_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -48,7 +48,7 @@ class FNN_5_10(nn.Module):
         self.fc2 = nn.Linear(10, 10)
         self.fc3 = nn.Linear(10, 10)
         self.fc4 = nn.Linear(10, 10)
-        self.fc5 = nn.Linear(10, 10)
+        self.fc5 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -61,7 +61,7 @@ class FNN_5_10(nn.Module):
         return x
 
 class FNN_6_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -72,7 +72,7 @@ class FNN_6_10(nn.Module):
         self.fc3 = nn.Linear(10, 10)
         self.fc4 = nn.Linear(10, 10)
         self.fc5 = nn.Linear(10, 10)
-        self.fc6 = nn.Linear(10, 10)
+        self.fc6 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -86,7 +86,7 @@ class FNN_6_10(nn.Module):
         return x
 
 class FNN_10_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -101,7 +101,7 @@ class FNN_10_10(nn.Module):
         self.fc7 = nn.Linear(10, 10)
         self.fc8 = nn.Linear(10, 10)
         self.fc9 = nn.Linear(10, 10)
-        self.fc10 = nn.Linear(10, 10)
+        self.fc10 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -120,7 +120,7 @@ class FNN_10_10(nn.Module):
 
 
 class FNN_3_50(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -128,7 +128,7 @@ class FNN_3_50(nn.Module):
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(self.k*self.w*self.h, 50)
         self.fc2 = nn.Linear(50, 50)
-        self.fc3 = nn.Linear(50, 10)
+        self.fc3 = nn.Linear(50, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -139,7 +139,7 @@ class FNN_3_50(nn.Module):
         return x
     
 class FNN_3_100(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -147,7 +147,7 @@ class FNN_3_100(nn.Module):
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(self.k*self.w*self.h, 100)
         self.fc2 = nn.Linear(100, 100)
-        self.fc3 = nn.Linear(100, 100)
+        self.fc3 = nn.Linear(100, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -158,7 +158,7 @@ class FNN_3_100(nn.Module):
         return x
 
 class FNN_5_50(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -168,7 +168,7 @@ class FNN_5_50(nn.Module):
         self.fc2 = nn.Linear(50, 50)
         self.fc3 = nn.Linear(50, 50)
         self.fc4 = nn.Linear(50, 50)
-        self.fc5 = nn.Linear(50, 50)
+        self.fc5 = nn.Linear(50, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):
@@ -182,7 +182,7 @@ class FNN_5_50(nn.Module):
 
 
 class CNN0(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         # call constructor from superclass
         super().__init__()
         self.k = k
@@ -192,7 +192,7 @@ class CNN0(nn.Module):
         self.conv1 = nn.Conv2d(self.k, 3, 4, stride=(4, 4), padding='valid')
         self.conv2 = nn.Conv2d(3, 3, 3, stride=(4, 4), padding='valid')
         self.flatten1 = nn.Flatten()
-        self.fc1 = nn.Linear(12, 10)
+        self.fc1 = nn.Linear(12, output_size)
         self.m = nn.Dropout(p=0.25)
         self.fc2 = nn.Linear(10, 10)
 
@@ -210,7 +210,7 @@ class CNN0(nn.Module):
         return x
 
 class CNN1(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         # call constructor from superclass
         super().__init__()
         self.k = k
@@ -221,7 +221,7 @@ class CNN1(nn.Module):
         self.conv2 = nn.Conv2d(6, 6, 3, stride=(3, 3), padding='valid')
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(54, 10)
-        self.fc2 = nn.Linear(10, 10)
+        self.fc2 = nn.Linear(10, output_size)
 
     def forward(self, x):
         # define forward pass
@@ -234,7 +234,7 @@ class CNN1(nn.Module):
         return x
 
 class CNN2(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         # call constructor from superclass
         super().__init__()
         self.k = k
@@ -245,7 +245,7 @@ class CNN2(nn.Module):
         self.conv2 = nn.Conv2d(3, 3, 3, stride=(3, 3), padding='valid')
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(192, 10)
-        self.fc2 = nn.Linear(10, 10)
+        self.fc2 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.75)
 
     def forward(self, x):
@@ -262,7 +262,7 @@ class CNN2(nn.Module):
         return x
 
 class CNN3(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         # call constructor from superclass
         super().__init__()
         self.k = k
@@ -277,7 +277,7 @@ class CNN3(nn.Module):
         self.flatten1 = nn.Flatten()
         self.fc1 = nn.Linear(54, 10)
         self.fc2 = nn.Linear(10, 10)
-        self.fc3 = nn.Linear(10, 10)
+        self.fc3 = nn.Linear(10, output_size)
 
     def forward(self, x):
         # define forward pass
@@ -295,7 +295,7 @@ class CNN3(nn.Module):
 
 
 class FNN_4_10(nn.Module):
-    def __init__(self, k=1, w=28, h=28):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()
         self.k = k
         self.w = w
@@ -304,7 +304,7 @@ class FNN_4_10(nn.Module):
         self.fc1 = nn.Linear(self.k*self.w*self.h, 10)
         self.fc2 = nn.Linear(10, 10)
         self.fc3 = nn.Linear(10, 10)
-        self.fc4 = nn.Linear(10, 10)
+        self.fc4 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.5)
 
     def forward(self, x):

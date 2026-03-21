@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+"""
+Experiment pipeline with relaxation_threshold sweep.
+
+Supports multiple datasets (MNIST, FashionMNIST, CIFAR10), all architectures,
+and sweeps over relaxation_threshold for transfer mode.
+
+Pipeline:
+  1. Train model until two consecutive epochs reach target accuracy (if needed)
+  2. Run VHAGaR standard with perturbed intervals for both models (if needed)
+  3. For each relaxation_threshold:
+       Run VHAGaR transfer with --use_relaxations true --relaxation_threshold <val>
+     Also run transfer with --use_relaxations false (baseline)
+
+Usage examples:
+  python utils/run_experiment.py --dataset mnist --arch 3x10
+  python utils/run_experiment.py --dataset mnist --arch cnn1 --perturbations "linf:0.02,0.05;brightness:0.1,0.2"
+  python utils/run_experiment.py --dataset cifar10 --arch 3x50 --relaxation_thresholds "0.0,0.25,0.5,1.0"
+  python utils/run_experiment.py --dataset mnist --arch 6x10 --skip_training --skip_standard
+"""
+import argparse
+import os
+import pickle
+import re
+import subprocess
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.datasets as dsets
+import torchvision.transforms as transforms
+
+from models import (
+    FNN_2_10, FNN_3_10, FNN_3_50, FNN_3_100,
+    FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_10_10,
+    CNN0, CNN1, CNN2, CNN3,
+)
+
+# ── architecture registry ────────────────────────────────────────────────
+# Maps arch name -> (model class, model_name for julia's --model_name)
+ARCH_REGISTRY = {
+    '2x10':  (FNN_2_10,  '2x10'),
+    '3x10':  (FNN_3_10,  '3x10'),
+    '3x50':  (FNN_3_50,  '3x50'),
+    '3x100': (FNN_3_100, '3x100'),
+    '4x10':  (FNN_4_10,  '4x10'),
+    '5x10':  (FNN_5_10,  '5x10'),
+    '5x50':  (FNN_5_50,  '5x50'),
+    '6x10':  (FNN_6_10,  '6x10'),
+    '10x10': (FNN_10_10, '10x10'),
+    'cnn0':  (CNN0,      'cnn0'),
+    'cnn1':  (CNN1,      'cnn1'),
+    'cnn2':  (CNN2,      'cnn2'),
+    'cnn3':  (CNN3,      'cnn3'),
+}
+
+# ── dataset config ───────────────────────────────────────────────────────
+# Maps dataset name -> (torchvision class, channels, width, height, julia dataset name)
+DATASET_CONFIG = {
+    'mnist':         (dsets.MNIST,        1, 28, 28, 'mnist'),
+    'fashion_mnist': (dsets.FashionMNIST, 1, 28, 28, 'fashion_mnist'),
+    'cifar10':       (dsets.CIFAR10,      3, 32, 32, 'cifar10'),
+}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUN_JL_DIR = os.path.join(SCRIPT_DIR, '..')
+
+
+def parse_perturbations(spec):
+    """Parse perturbation spec string into list of (perturbation, size) pairs.
+
+    Format: "type1:size1,size2;type2:size3,size4"
+    Example: "linf:0.02,0.05;brightness:0.1,0.2"
+      -> [("linf","0.02"), ("linf","0.05"), ("brightness","0.1"), ("brightness","0.2")]
+
+    Single perturbation shorthand: "linf:0.25" -> [("linf","0.25")]
+    """
+    pairs = []
+    for block in spec.split(';'):
+        block = block.strip()
+        if not block:
+            continue
+        if ':' not in block:
+            print(f"ERROR: Invalid perturbation spec '{block}'. Expected 'type:size1,size2,...'")
+            sys.exit(1)
+        ptype, sizes_str = block.split(':', 1)
+        ptype = ptype.strip()
+        for s in sizes_str.split(','):
+            s = s.strip()
+            if s:
+                pairs.append((ptype, s))
+    return pairs
+
+
+def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_size=None, create=False):
+    """Return a dict of all experiment directories for the given architecture and dataset.
+    Structure: .../arch_exp/perturbation/perturbation_size/..."""
+    exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
+    if perturbation and perturbation_size:
+        pert_dir = os.path.join(exp_dir, perturbation, f'eps_{perturbation_size}')
+    elif perturbation:
+        pert_dir = os.path.join(exp_dir, perturbation)
+    else:
+        pert_dir = exp_dir
+    dirs = {
+        'exp':              exp_dir,
+        'model_n1':         os.path.join(exp_dir, f'model_{itr_n1}_itr'),
+        'model_n2':         os.path.join(exp_dir, f'model_{itr_n2}_itr'),
+        'vaghar_n1':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_itr{itr_n1}'),
+        'vaghar_n2':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_itr{itr_n2}'),
+        'vaghar_n1_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_itr{itr_n1}'),
+        'vaghar_n2_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_itr{itr_n2}'),
+        'transfer':         os.path.join(pert_dir, f'transfer_{arch}_N1_is_itr{itr_n1}'),
+    }
+    if create:
+        for d in dirs.values():
+            os.makedirs(d, exist_ok=True)
+    return dirs
+
+
+def get_transfer_dir(base_dirs, threshold):
+    """Return the transfer output dir for a specific relaxation_threshold."""
+    base = base_dirs['transfer']
+    if threshold is None:
+        return base + '_norelax'
+    return base + f'_relax{threshold}'
+
+
+def detect_iterations(arch, dataset):
+    """Detect itr_n1 and itr_n2 from existing model_*_itr folders."""
+    exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
+    if not os.path.exists(exp_dir):
+        print(f"ERROR: Experiment directory {exp_dir} not found.")
+        sys.exit(1)
+
+    pattern = re.compile(r'^model_(\d+)_itr$')
+    itrs = sorted(
+        int(m.group(1))
+        for name in os.listdir(exp_dir)
+        if (m := pattern.match(name)) and os.path.isdir(os.path.join(exp_dir, name))
+    )
+
+    if len(itrs) >= 2:
+        itr_n1, itr_n2 = itrs[0], itrs[1]
+        print(f"  Detected model checkpoints: itr{itr_n1} and itr{itr_n2}")
+        return itr_n1, itr_n2
+
+    print(f"ERROR: Need at least two model_*_itr folders in {exp_dir}.")
+    print(f"  Found: {itrs}")
+    sys.exit(1)
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+def save_model(model, save_dir):
+    """Save model in both .p (pickle, for MIPVerify) and .pth (PyTorch) formats."""
+    os.makedirs(save_dir, exist_ok=True)
+    params = []
+    for p in model.parameters():
+        arr = p.cpu().detach().numpy()
+        params.append(np.transpose(arr))
+    with open(os.path.join(save_dir, 'model.p'), 'wb') as f:
+        pickle.dump(params, f)
+    torch.save(model.state_dict(), os.path.join(save_dir, 'model.pth'))
+    print(f"  Model saved to {save_dir}")
+
+
+def evaluate(model, test_loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return 100.0 * correct / total
+
+
+def get_data_loaders(dataset, batch_size=128):
+    """Return train and test loaders for the given dataset."""
+    if dataset not in DATASET_CONFIG:
+        print(f"ERROR: Unknown dataset '{dataset}'. Choose from: {list(DATASET_CONFIG.keys())}")
+        sys.exit(1)
+
+    ds_class, _, _, _, _ = DATASET_CONFIG[dataset]
+    transform = transforms.Compose([transforms.ToTensor()])
+    train_ds = ds_class(root='./data/', train=True, transform=transform, download=True)
+    test_ds = ds_class(root='./data/', train=False, transform=transform, download=True)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+
+def run_julia(args_list, step_name):
+    """Run julia run.jl with given arguments."""
+    cmd = ['julia', 'run.jl'] + args_list
+    print(f"\n  Running: {' '.join(cmd[:8])}...")
+    proc = subprocess.run(cmd, cwd=RUN_JL_DIR)
+    if proc.returncode != 0:
+        print(f"  WARNING: {step_name} exited with code {proc.returncode}")
+    return proc.returncode
+
+
+# ── step 1: train ────────────────────────────────────────────────────────
+
+MIN_ACCURACY = 91.0
+
+
+def train_model(arch, dataset, batch_size=128, lr=1e-3, max_epochs=100, itr_gap=1, force_cpu=False):
+    """
+    Train until two epochs separated by itr_gap both reach MIN_ACCURACY.
+    Save checkpoints for those two epochs (itr_n1 and itr_n2 = itr_n1 + itr_gap).
+    Returns (itr_n1, itr_n2).
+    """
+    model_cls, _ = ARCH_REGISTRY[arch]
+    _, k, w, h, _ = DATASET_CONFIG[dataset]
+
+    print("=" * 60)
+    print(f"STEP 1: Training {arch} on {dataset} (until two epochs {itr_gap} apart >= {MIN_ACCURACY}% acc, max {max_epochs})")
+    print("=" * 60)
+
+    device = torch.device("cpu")
+    print(f"  Using device: {device}")
+    model = model_cls(k=k, w=w, h=h).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    train_loader, test_loader = get_data_loaders(dataset, batch_size)
+
+    # Keep a history of (epoch_num, accuracy, state_dict) for the last itr_gap+1 epochs
+    from collections import deque
+    history = deque(maxlen=itr_gap + 1)
+
+    for epoch in range(max_epochs):
+        model.train()
+        running_loss = 0.0
+        for i, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        acc = evaluate(model, test_loader, device)
+        epoch_num = epoch + 1
+        print(f"  Epoch {epoch_num}/{max_epochs} — loss: {running_loss/len(train_loader):.4f}, acc: {acc:.2f}%")
+
+        history.append((epoch_num, acc, {k_: v.clone() for k_, v in model.state_dict().items()}))
+
+        # Check if the earliest entry in history is exactly itr_gap behind current
+        if len(history) == itr_gap + 1:
+            old_epoch, old_acc, old_state = history[0]
+            if old_acc >= MIN_ACCURACY and acc >= MIN_ACCURACY and epoch_num - old_epoch == itr_gap:
+                itr_n1 = old_epoch
+                itr_n2 = epoch_num
+                dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, create=True)
+                n1_model = model_cls(k=k, w=w, h=h).to(device)
+                n1_model.load_state_dict(old_state)
+                save_model(n1_model, dirs['model_n1'])
+                print(f"  >> Saved itr{itr_n1} checkpoint (acc: {old_acc:.2f}%)")
+                save_model(model, dirs['model_n2'])
+                print(f"  >> Saved itr{itr_n2} checkpoint (acc: {acc:.2f}%)")
+                return itr_n1, itr_n2
+
+    print(f"\n  ERROR: Failed to find two epochs {itr_gap} apart with >= {MIN_ACCURACY}% accuracy within {max_epochs} epochs.")
+    sys.exit(1)
+
+
+# ── step 2: run VHAGaR standard with perturbed intervals ────────────────
+
+def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
+                        perturbation_size='0.05', ct='1,2,3,4,5,6,7,8,9,10',
+                        timeout=10800, perturbation='linf', force_cpu=False,
+                        use_perturbed_intervals=True):
+    """Run VHAGaR in standard mode with hyper attack, vaghar deps, and optionally perturbed intervals."""
+    _, model_name = ARCH_REGISTRY[arch]
+    _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+    args = [
+        '--mode', 'standard',
+        '--dataset', julia_dataset,
+        '--model_name', model_name,
+        '--model_path', model_path,
+        '--perturbation', perturbation,
+        '--perturbation_size', perturbation_size,
+        '--ctag', str(ctag),
+        '--ct', ct,
+        '--timout', str(timeout),
+        '--output_dir', output_dir + '/',
+        '--c_tag_mode', 'false',
+        '--use_hyper_attack', 'true',
+        '--activate_vaghgar_deps', 'true',
+        '--use_perturbed_intervals', str(use_perturbed_intervals).lower(),
+        '--force_cpu', str(force_cpu).lower(),
+    ]
+    pi_label = "with" if use_perturbed_intervals else "without"
+    return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag}, {pi_label} perturbed intervals)')
+
+
+def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+    os.makedirs(dirs['vaghar_n1'], exist_ok=True)
+    os.makedirs(dirs['vaghar_n2'], exist_ok=True)
+    os.makedirs(dirs['vaghar_n1_noPI'], exist_ok=True)
+    os.makedirs(dirs['vaghar_n2_noPI'], exist_ok=True)
+
+    model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
+    model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
+
+    # Run WITH perturbed intervals
+    print("=" * 60)
+    print(f"STEP 2a: VHAGaR standard (WITH perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, itr{itr_n1}&itr{itr_n2}")
+    print("=" * 60)
+
+    print(f"\n  --- itr{itr_n1} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1'], ctag,
+                        perturbation_size=perturbation_size, ct=ct,
+                        timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                        use_perturbed_intervals=True)
+
+    print(f"\n  --- itr{itr_n2} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2'], ctag,
+                        perturbation_size=perturbation_size, ct=ct,
+                        timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                        use_perturbed_intervals=True)
+
+    # Run WITHOUT perturbed intervals
+    print("=" * 60)
+    print(f"STEP 2b: VHAGaR standard (WITHOUT perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, itr{itr_n1}&itr{itr_n2}")
+    print("=" * 60)
+
+    print(f"\n  --- itr{itr_n1} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1_noPI'], ctag,
+                        perturbation_size=perturbation_size, ct=ct,
+                        timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                        use_perturbed_intervals=False)
+
+    print(f"\n  --- itr{itr_n2} (ctag={ctag}) ---")
+    run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2_noPI'], ctag,
+                        perturbation_size=perturbation_size, ct=ct,
+                        timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                        use_perturbed_intervals=False)
+
+
+# ── step 3: run VHAGaR transfer ──────────────────────────────────────────
+
+def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
+                              output_dir, timeout, perturbation, ct,
+                              transfer_relaxations, delta_diff_positive,
+                              relaxation_threshold=None, force_cpu=False):
+    """
+    Iterate over VHAGaR results files for N1.
+    Each file contains delta_1 values for a specific perturbation_size and c_tag.
+    Parse these from the filename and launch a transfer run.
+
+    If relaxation_threshold is not None, pass --relaxation_threshold to Julia.
+    """
+    _, model_name = ARCH_REGISTRY[arch]
+    _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2)
+    pattern = re.compile(rf"_{perturbation}_(.*?)_ctag.*cTag(\d+)")
+
+    if not os.path.exists(vaghar_results_dir):
+        print(f"  Warning: Directory {vaghar_results_dir} not found, trying noPI dir...")
+        vaghar_results_dir = vaghar_results_dir.replace('vagharWithPerturbed_', 'vagharNoPerturbed_')
+        if not os.path.exists(vaghar_results_dir):
+            print(f"  Error: Fallback directory {vaghar_results_dir} also not found.")
+            return
+        print(f"  Using fallback: {vaghar_results_dir}")
+
+    n1_path = os.path.join(dirs['model_n1'], 'model.p')
+    n2_path = os.path.join(dirs['model_n2'], 'model.p')
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Collect matching files, falling back to noPI dir if none found
+    result_files = []
+    for filename in sorted(os.listdir(vaghar_results_dir)):
+        if not filename.endswith('.txt'):
+            continue
+        if '_PerturbedIntervals' in filename:
+            continue
+        match = pattern.search(filename)
+        if not match:
+            continue
+        result_files.append((filename, match))
+
+    if not result_files:
+        fallback_dir = vaghar_results_dir.replace('vagharWithPerturbed_', 'vagharNoPerturbed_')
+        if fallback_dir != vaghar_results_dir and os.path.exists(fallback_dir):
+            print(f"  No matching files in {vaghar_results_dir}, trying {fallback_dir}...")
+            for filename in sorted(os.listdir(fallback_dir)):
+                if not filename.endswith('.txt'):
+                    continue
+                match = pattern.search(filename)
+                if not match:
+                    continue
+                result_files.append((filename, match))
+            if result_files:
+                vaghar_results_dir = fallback_dir
+                print(f"  Found {len(result_files)} files in fallback dir")
+
+    if not result_files:
+        print(f"  Error: No matching VHAGaR result files found.")
+        return
+
+    for filename, match in result_files:
+
+        perturbation_size = match.group(1)
+        c_tag_n = match.group(2)
+        vaghar_results_path = os.path.join(vaghar_results_dir, filename)
+
+        print(f"  Processing: {filename}  (eps={perturbation_size}, ctag={c_tag_n})")
+
+        command = [
+            '--mode', 'transfer',
+            '--dataset', julia_dataset,
+            '--model_name', model_name,
+            '--model_path', n1_path,
+            '--model_path2', n2_path,
+            '--vaghar_results', vaghar_results_path,
+            '--perturbation', perturbation,
+            '--perturbation_size', perturbation_size,
+            '--ctag', c_tag_n,
+            '--ct', ct,
+            '--timout', str(timeout),
+            '--output_dir', output_dir + '/',
+            '--c_tag_mode', 'false',
+            '--use_hyper_attack', 'true',
+            '--activate_vaghgar_deps', 'true',
+            '--use_intervals', 'true',
+            '--use_perturbed_intervals', 'true',
+            '--n2_fewer_binars_encoding', 'true',
+            '--use_relaxations', transfer_relaxations,
+            '--delta_diff_positive', delta_diff_positive,
+            '--force_cpu', str(force_cpu).lower(),
+        ]
+        if relaxation_threshold is not None:
+            command += ['--relaxation_threshold', str(relaxation_threshold)]
+
+        run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
+
+
+def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturbation_size, ct,
+                   transfer_relaxations, delta_diff_positive, relaxation_threshold=None, force_cpu=False):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+    output_dir = get_transfer_dir(dirs, relaxation_threshold)
+    os.makedirs(output_dir, exist_ok=True)
+
+    thresh_label = f"threshold={relaxation_threshold}" if relaxation_threshold is not None else "no relaxation"
+    print("=" * 60)
+    print(f"STEP 3: VHAGaR transfer — {arch} on {dataset}, {perturbation} (N1=itr{itr_n1}, N2=itr{itr_n2}, {thresh_label})")
+    print("=" * 60)
+
+    run_transfer_from_results(
+        arch, dataset, itr_n1, itr_n2,
+        dirs['vaghar_n1'], output_dir, timeout, perturbation, ct,
+        transfer_relaxations, delta_diff_positive, relaxation_threshold, force_cpu=force_cpu,
+    )
+
+
+# ── main ─────────────────────────────────────────────────────────────────
+
+def main():
+    arch_choices = list(ARCH_REGISTRY.keys())
+    dataset_choices = list(DATASET_CONFIG.keys())
+
+    parser = argparse.ArgumentParser(
+        description='Experiment pipeline: train, VHAGaR standard, transfer with relaxation_threshold sweep',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--dataset', type=str, required=True, choices=dataset_choices,
+                        help=f'Dataset: {dataset_choices}')
+    parser.add_argument('--arch', type=str, required=False, default="3x10", choices=arch_choices,
+                        help=f'Architecture: {arch_choices}')
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=1e-3, help='SGD learning rate')
+    parser.add_argument('--max_epochs', type=int, default=200, help='Max training epochs')
+    parser.add_argument('--itr_gap', type=int, default=5,
+                        help='Gap between the two saved model checkpoints (e.g. 1=consecutive, 5=five epochs apart)')
+    parser.add_argument('--perturbations', type=str, default='linf:0.25',
+                        help='Perturbation spec: "type1:size1,size2;type2:size3,size4" '
+                             'e.g. "linf:0.02,0.05;brightness:0.1,0.2"')
+    parser.add_argument('--ct', type=str, default='4,5,6', help='Target classes')
+    parser.add_argument('--timeout', type=int, default=10800, help='MIP timeout per class pair (seconds)')
+    parser.add_argument('--transfer_relaxations', type=str, default='true',
+                        help='Run transfer with relaxations (true/false)')
+    parser.add_argument('--delta_diff_positive', type=str, default='false',
+                        help='Force delta_diff > 0 cutoff (true/false)')
+    parser.add_argument('--relaxation_thresholds', type=str, default='0.0,0.25,0.5,1.0',
+                        help='Comma-separated relaxation_threshold values to sweep')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force CPU-only mode (no GPU). By default, uses CUDA if available.')
+    parser.add_argument('--plot_conf', action='store_true',
+                        help='Plot confidence values for N2 on the test set, then exit')
+    parser.add_argument('--plot_conf_both', action='store_true',
+                        help='Plot confidence values for both N1 and N2 on the same figure, then exit')
+    parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
+    parser.add_argument('--skip_standard', action='store_true', help='Skip standard VHAGaR')
+    parser.add_argument('--skip_transfer', action='store_true', help='Skip transfer VHAGaR')
+
+    args = parser.parse_args()
+
+    arch = args.arch
+    dataset = args.dataset
+
+    # Parse relaxation thresholds
+    thresholds = []
+    for val in args.relaxation_thresholds.split(','):
+        val = val.strip()
+        if val.lower() == 'inf':
+            thresholds.append(float('inf'))
+        else:
+            thresholds.append(float(val))
+
+    # Parse perturbation spec
+    perturbation_pairs = parse_perturbations(args.perturbations)
+    print(f"\nPerturbation configs ({len(perturbation_pairs)}):")
+    for pt, ps in perturbation_pairs:
+        print(f"  {pt} eps={ps}")
+    print()
+
+    os.chdir(RUN_JL_DIR)
+
+    # Step 1: Train (once — training is perturbation-independent)
+    if not args.skip_training:
+        itr_n1, itr_n2 = train_model(arch, dataset, batch_size=args.batch_size,
+                                      lr=args.lr, max_epochs=args.max_epochs,
+                                      itr_gap=args.itr_gap, force_cpu=args.cpu)
+    else:
+        print("Skipping training (--skip_training)")
+        itr_n1, itr_n2 = detect_iterations(arch, dataset)
+
+    # Plot confidence and exit if requested
+    if args.plot_conf:
+        for ctag_val in [int(c) for c in args.ct.split(',')]:
+            for perturbation, perturbation_size in perturbation_pairs:
+                plot_confidence(arch, dataset, ctag_val, perturbation, perturbation_size,
+                                itr_n1, itr_n2)
+        sys.exit(0)
+
+    if args.plot_conf_both:
+        for ctag_val in [int(c) for c in args.ct.split(',')]:
+            for perturbation, perturbation_size in perturbation_pairs:
+                plot_confidence_both(arch, dataset, ctag_val, perturbation, perturbation_size,
+                                     itr_n1, itr_n2)
+        sys.exit(0)
+
+    # Steps 2 & 3: loop over each (perturbation, size) pair
+    for perturbation, perturbation_size in perturbation_pairs:
+        print("\n" + "#" * 60)
+        print(f"# Perturbation: {perturbation}  eps={perturbation_size}")
+        print("#" * 60)
+
+        # Step 2: VHAGaR standard (shared across thresholds, but per perturbation+size)
+        if not args.skip_standard:
+            for ctag in range(1, 3):
+                step2_vaghar_standard(arch, dataset, itr_n1, itr_n2,
+                                      perturbation, perturbation_size,
+                                      ctag, args.ct, args.timeout, force_cpu=args.cpu)
+        else:
+            print("  Skipping standard VHAGaR (--skip_standard)")
+
+        # Step 3: Transfer — baseline (no relaxation) + sweep over thresholds
+        if not args.skip_transfer:
+            # Sweep: transfer with relaxations enabled at each threshold
+            for thresh in thresholds:
+                step3_transfer(arch, dataset, itr_n1, itr_n2, args.timeout, perturbation, perturbation_size,
+                               args.ct, 'true', args.delta_diff_positive, relaxation_threshold=thresh,
+                               force_cpu=args.cpu)
+        else:
+            print("  Skipping transfer VHAGaR (--skip_transfer)")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print(f"EXPERIMENT COMPLETE ({arch} on {dataset})")
+    print("=" * 60)
+    dirs_base = get_exp_dirs(arch, dataset, itr_n1, itr_n2)
+    print(f"  itr{itr_n1} model:  {dirs_base['model_n1']}/model.p")
+    print(f"  itr{itr_n2} model:  {dirs_base['model_n2']}/model.p")
+    for perturbation, perturbation_size in perturbation_pairs:
+        dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+        print(f"\n  [{perturbation} eps={perturbation_size}]")
+        print(f"    VHAGaR itr{itr_n1} (PI):     {dirs['vaghar_n1']}/")
+        print(f"    VHAGaR itr{itr_n2} (PI):     {dirs['vaghar_n2']}/")
+        print(f"    VHAGaR itr{itr_n1} (no PI):  {dirs['vaghar_n1_noPI']}/")
+        print(f"    VHAGaR itr{itr_n2} (no PI):  {dirs['vaghar_n2_noPI']}/")
+        for thresh in thresholds:
+            print(f"    Transfer (t={thresh}):  {get_transfer_dir(dirs, thresh)}/")
+
+
+def parse_vaghar_results(results_dir, ctag, perturbation, field='upper_bound'):
+    """Parse VHAGaR result files for a given ctag.
+
+    Returns dict mapping c_target (0-indexed) -> value of the specified field.
+    """
+    bounds = {}
+    pattern = re.compile(rf"_{perturbation}_.*_ctag{ctag - 1}__.*_cTag{ctag}\.txt$")
+    if not os.path.exists(results_dir):
+        return bounds
+    for filename in os.listdir(results_dir):
+        if not pattern.search(filename):
+            continue
+        filepath = os.path.join(results_dir, filename)
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = dict(p.split('=') for p in line.split(','))
+                c_target = int(parts['c_target'])
+                bounds[c_target] = float(parts[field])
+    return bounds
+
+
+def parse_transfer_results(results_dir, ctag, perturbation):
+    """Parse transfer result files for a given ctag.
+
+    Returns dict mapping c_target (0-indexed) -> lower_bound.
+    """
+    bounds = {}
+    # Transfer files use ctag as 1-indexed in the filename
+    pattern = re.compile(rf"_transfer_{perturbation}_.*_ctag{ctag}.*\.txt$")
+    if not os.path.exists(results_dir):
+        return bounds
+    for filename in os.listdir(results_dir):
+        if not pattern.search(filename):
+            continue
+        filepath = os.path.join(results_dir, filename)
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = dict(p.split('=') for p in line.split(','))
+                c_target = int(parts['c_target'])
+                bounds[c_target] = float(parts['lower_bound'])
+    return bounds
+
+
+def plot_confidence(arch, dataset, ctag, perturbation, perturbation_size, itr_n1, itr_n2):
+    """Plot confidence per (ctag, c_target) with upper bound from VHAGaR standard for N2."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    model_cls, _ = ARCH_REGISTRY[arch]
+    _, k, w, h, _ = DATASET_CONFIG[dataset]
+    exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2,
+                        perturbation=perturbation, perturbation_size=perturbation_size)
+
+    if not os.path.exists(exp_dir):
+        print(f"ERROR: Experiment directory {exp_dir} not found.")
+        sys.exit(1)
+
+    # Get upper bounds from N2's VHAGaR standard results (try with PI, fall back to noPI)
+    n2_bounds = parse_vaghar_results(dirs['vaghar_n2'], ctag, perturbation)
+    if not n2_bounds:
+        n2_bounds = parse_vaghar_results(dirs['vaghar_n2_noPI'], ctag, perturbation)
+
+    if not n2_bounds:
+        print(f"WARNING: No VHAGaR results found for ctag={ctag}, {perturbation} eps={perturbation_size}")
+        return
+
+    # Get lower bounds from N1's VHAGaR standard results
+    n1_lower = parse_vaghar_results(dirs['vaghar_n1'], ctag, perturbation, field='lower_bound')
+    if not n1_lower:
+        n1_lower = parse_vaghar_results(dirs['vaghar_n1_noPI'], ctag, perturbation, field='lower_bound')
+
+    # Find transfer directory with relaxation threshold 0 only
+    # Check multiple possible locations and naming patterns
+    transfer_base = os.path.basename(dirs['transfer'])  # e.g. transfer_3x10_N1_is_itr50
+    pert_dir = os.path.dirname(dirs['transfer'])
+    ablation_dir = os.path.join(os.path.dirname(pert_dir), 'ablation_for_T_size')
+    candidate_dirs = []
+    for parent in [pert_dir, ablation_dir]:
+        if not os.path.isdir(parent):
+            continue
+        for name in os.listdir(parent):
+            full = os.path.join(parent, name)
+            if not os.path.isdir(full):
+                continue
+            # Match patterns like _relax0, _relax0.0, _linf_relax0, _linf_relax0.0
+            if name.startswith(transfer_base) and re.search(r'_relax0(\.0)?$', name):
+                candidate_dirs.append(full)
+    transfer_bounds = {}
+    for tdir in candidate_dirs:
+        transfer_bounds = parse_transfer_results(tdir, ctag, perturbation)
+        if transfer_bounds:
+            print(f"  Using transfer results from: {tdir}")
+            break
+
+    # Load N2 model
+    pth_path = os.path.join(dirs['model_n2'], 'model.pth')
+    if not os.path.exists(pth_path):
+        print(f"ERROR: Model not found at {pth_path}")
+        return
+
+    print(f"Plotting confidence for itr{itr_n2}, ctag={ctag}, {perturbation} eps={perturbation_size}")
+
+    _, test_loader = get_data_loaders(dataset, batch_size=256)
+    device = torch.device("cpu")
+    c = ctag - 1  # 0-indexed class
+
+    model = model_cls(k=k, w=w, h=h).to(device)
+    model.load_state_dict(torch.load(pth_path, map_location=device))
+    model.eval()
+
+    # Compute confidence C(N, x, c) = y_c(x) - max_{k != c} y_k(x)
+    all_confs = []
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            outputs = model(images)
+            score_c = outputs[:, c]
+            mask = torch.ones(outputs.size(1), dtype=torch.bool)
+            mask[c] = False
+            max_other = outputs[:, mask].max(dim=1).values
+            conf = score_c - max_other
+            all_confs.append(conf.cpu())
+
+    all_confs = torch.cat(all_confs).numpy()
+    # Keep only positive confidence values
+    all_confs = all_confs[all_confs > 0]
+    all_confs = np.round(all_confs, 2)
+
+    # One plot per c_target
+    colors = ['green', 'blue', 'purple', 'orange', 'cyan', 'magenta']
+    for c_target, upper_bound in sorted(n2_bounds.items()):
+        upper_bound = round(upper_bound, 2)
+        plt.figure(figsize=(14, 6))
+        plt.scatter(range(len(all_confs)), all_confs, alpha=0.8, s=10, label='confidence')
+        plt.axhline(y=upper_bound, color='red', linestyle='--', linewidth=1.5,
+                     label=f'delta vhagar(N2) = {upper_bound:.2f}')
+
+        # Add delta_vaghar(N1) + transfer line (relax0 only)
+        delta_n1 = n1_lower.get(c_target)
+        t_val = transfer_bounds.get(c_target)
+        if delta_n1 is not None and t_val is not None:
+            delta_n1 = round(delta_n1, 2)
+            t_val = round(t_val, 2)
+            combined = round(delta_n1 + t_val, 2)
+            plt.axhline(y=combined, color='green', linestyle='-.', linewidth=1.5,
+                        label=f'delta(N1)+transfer = {delta_n1:.2f}+{t_val:.2f} = {combined:.2f}')
+
+        plt.xlabel('Test samples')
+        plt.ylabel(f'Confidence C(N, x, class={ctag})')
+        plt.title(f'class {ctag} vs {c_target} — {arch} on {dataset}, itr{itr_n2}, '
+                   f'{perturbation} eps={perturbation_size}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        save_path = os.path.join(
+            exp_dir, f'confidence_c{ctag}_ct{c_target}_{perturbation}_{perturbation_size}_itr{itr_n2}.png')
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        print(f"Plot saved to {save_path}")
+
+
+def plot_confidence_both(arch, dataset, ctag, perturbation, perturbation_size, itr_n1, itr_n2):
+    """Plot confidence of both N1 and N2 on the same figure with delta_vaghars for both."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    model_cls, _ = ARCH_REGISTRY[arch]
+    _, k, w, h, _ = DATASET_CONFIG[dataset]
+    exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2,
+                        perturbation=perturbation, perturbation_size=perturbation_size)
+
+    if not os.path.exists(exp_dir):
+        print(f"ERROR: Experiment directory {exp_dir} not found.")
+        sys.exit(1)
+
+    # Get upper bounds from both models' VHAGaR standard results
+    n1_bounds = parse_vaghar_results(dirs['vaghar_n1'], ctag, perturbation)
+    if not n1_bounds:
+        n1_bounds = parse_vaghar_results(dirs['vaghar_n1_noPI'], ctag, perturbation)
+
+    n2_bounds = parse_vaghar_results(dirs['vaghar_n2'], ctag, perturbation)
+    if not n2_bounds:
+        n2_bounds = parse_vaghar_results(dirs['vaghar_n2_noPI'], ctag, perturbation)
+
+    all_c_targets = sorted(set(list(n1_bounds.keys()) + list(n2_bounds.keys())))
+    if not all_c_targets:
+        print(f"WARNING: No VHAGaR results found for ctag={ctag}, {perturbation} eps={perturbation_size}")
+        return
+
+    # Load test set
+    _, test_loader = get_data_loaders(dataset, batch_size=256)
+    device = torch.device("cpu")
+    c = ctag - 1  # 0-indexed class
+
+    # Compute confidence for both models
+    def compute_confs(pth_path):
+        model = model_cls(k=k, w=w, h=h).to(device)
+        model.load_state_dict(torch.load(pth_path, map_location=device))
+        model.eval()
+        confs = []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device)
+                outputs = model(images)
+                score_c = outputs[:, c]
+                mask = torch.ones(outputs.size(1), dtype=torch.bool)
+                mask[c] = False
+                max_other = outputs[:, mask].max(dim=1).values
+                conf = score_c - max_other
+                confs.append(conf.cpu())
+        confs = torch.cat(confs).numpy()
+        confs = confs[confs > 0]
+        return np.round(confs, 2)
+
+    pth_n1 = os.path.join(dirs['model_n1'], 'model.pth')
+    pth_n2 = os.path.join(dirs['model_n2'], 'model.pth')
+    if not os.path.exists(pth_n1) or not os.path.exists(pth_n2):
+        print(f"ERROR: Model not found at {pth_n1} or {pth_n2}")
+        return
+
+    print(f"Plotting confidence (both) for itr{itr_n1} & itr{itr_n2}, ctag={ctag}, "
+          f"{perturbation} eps={perturbation_size}")
+
+    confs_n1 = compute_confs(pth_n1)
+    confs_n2 = compute_confs(pth_n2)
+
+    # One plot per c_target
+    for c_target in all_c_targets:
+        plt.figure(figsize=(14, 6))
+
+        # Scatter confidence for both models
+        plt.scatter(range(len(confs_n1)), confs_n1, alpha=0.6, s=10,
+                    color='blue', label=f'confidence N1 (itr{itr_n1})')
+        plt.scatter(range(len(confs_n2)), confs_n2, alpha=0.6, s=10,
+                    color='orange', label=f'confidence N2 (itr{itr_n2})')
+
+        # delta_vaghar(N1) upper bound
+        ub_n1 = n1_bounds.get(c_target)
+        if ub_n1 is not None:
+            ub_n1 = round(ub_n1, 2)
+            plt.axhline(y=ub_n1, color='blue', linestyle='--', linewidth=1.5,
+                        label=f'delta vhagar(N1) = {ub_n1:.2f}')
+
+        # delta_vaghar(N2) upper bound
+        ub_n2 = n2_bounds.get(c_target)
+        if ub_n2 is not None:
+            ub_n2 = round(ub_n2, 2)
+            plt.axhline(y=ub_n2, color='red', linestyle='--', linewidth=1.5,
+                        label=f'delta vhagar(N2) = {ub_n2:.2f}')
+
+        plt.xlabel('Test samples')
+        plt.ylabel(f'Confidence C(N, x, class={ctag})')
+        plt.title(f'class {ctag} vs {c_target} — {arch} on {dataset}, '
+                   f'itr{itr_n1} & itr{itr_n2}, {perturbation} eps={perturbation_size}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        save_path = os.path.join(
+            exp_dir, f'confidence_both_c{ctag}_ct{c_target}_{perturbation}_{perturbation_size}.png')
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        print(f"Plot saved to {save_path}")
+
+
+if __name__ == '__main__':
+    main()

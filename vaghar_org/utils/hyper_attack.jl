@@ -37,11 +37,12 @@ end
 function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
                                model_name, model_path, model_path2,
                                perturbation, perturbation_size,
-                               delta_1, c_tag_mode, n1_p_mode, delta_diff_positive)
+                               delta_1, c_tag_mode, n1_p_mode, delta_diff_positive;
+                               force_cpu::Bool=false)
     best_feasible_via_optimization = 0
     pre_time = 0
     pre_time = @elapsed begin
-        cmd = Cmd(["python3", "./utils/hyper_attack_transfer.py",
+        cmd_args = ["python3", "./utils/hyper_attack_transfer.py",
             "--dataset", string(dataset),
             "--source", string(c_tag-1),
             "--target", string(c_target-1),
@@ -54,8 +55,11 @@ function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
             "--delta1", string(delta_1),
             "--c_tag_mode", string(c_tag_mode),
             "--n1_p_mode", string(n1_p_mode),
-            "--delta_diff_positive", string(delta_diff_positive)])
-        run(cmd)
+            "--delta_diff_positive", string(delta_diff_positive)]
+        if force_cpu
+            push!(cmd_args, "--cpu")
+        end
+        run(Cmd(cmd_args))
         best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
     end
     return best_feasible_via_optimization, pre_time
@@ -64,11 +68,12 @@ end
 function hyper_attack_transfer_distilation(dataset, c_tag, c_target, token_signature,
                                model_name, model_name2, model_path, model_path2,
                                perturbation, perturbation_size,
-                               delta_1, c_tag_mode, n1_p_mode)
+                               delta_1, c_tag_mode, n1_p_mode;
+                               force_cpu::Bool=false)
     best_feasible_via_optimization = 0
     pre_time = 0
     pre_time = @elapsed begin
-        cmd = Cmd(["python3", "./utils/hyper_attack_transfer.py",
+        cmd_args = ["python3", "./utils/hyper_attack_transfer.py",
             "--dataset", string(dataset),
             "--source", string(c_tag-1),
             "--target", string(c_target-1),
@@ -81,21 +86,28 @@ function hyper_attack_transfer_distilation(dataset, c_tag, c_target, token_signa
             "--perturbation_size", create_perturbation_string(perturbation_size),
             "--delta1", string(delta_1),
             "--c_tag_mode", string(c_tag_mode),
-            "--n1_p_mode", string(n1_p_mode)])
-        run(cmd)
+            "--n1_p_mode", string(n1_p_mode)]
+        if force_cpu
+            push!(cmd_args, "--cpu")
+        end
+        run(Cmd(cmd_args))
         best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
     end
     return best_feasible_via_optimization, pre_time
 end
 
-function hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
+function hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size;
+                      force_cpu::Bool=false)
     best_feasible_via_optimization = 0
     pre_time = 0
     pre_time = @elapsed begin
-        cmd = Cmd(["python3", "./utils/hyper_attack.py","--dataset", string(dataset), "--source", string(c_tag-1),
+        cmd_args = ["python3", "./utils/hyper_attack.py","--dataset", string(dataset), "--source", string(c_tag-1),
         "--target", string(c_target-1), "--token", token_signature, "--model", model_name, "--model_path", model_path*"th", "--perturbation", perturbation,
-         "--perturbation_size", create_perturbation_string(perturbation_size)])
-        run(cmd)
+         "--perturbation_size", create_perturbation_string(perturbation_size)]
+        if force_cpu
+            push!(cmd_args, "--cpu")
+        end
+        run(Cmd(cmd_args))
         best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
     end
     return best_feasible_via_optimization, pre_time

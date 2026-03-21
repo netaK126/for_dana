@@ -192,12 +192,20 @@ function parse_numbers_to_Int64(input_str::String)
 end
 
 function update_results_str(results, c_tag, c_target, d)
-    return results*string(c_tag-1)*","*string(c_target-1)*","*string(d[:incumbent_obj])*","*
-        string(d[:best_bound])*","*string(d[:solve_time])*"\n"
+    hyper_time = haskey(d, :suboptimal_time) ? d[:suboptimal_time] : 0.0
+    return results *
+        "c_source=" * string(c_tag-1) * "," *
+        "c_target=" * string(c_target-1) * "," *
+        "lower_bound=" * string(d[:incumbent_obj]) * "," *
+        "upper_bound=" * string(d[:best_bound]) * "," *
+        "optimization_time=" * string(d[:solve_time]) * "," *
+        "hyper_attack_time=" * string(hyper_time) * "\n"
 end
 
-# Read delta_1 (best_bound) from a VHAGaR results file for a given c_target.
-# VHAGaR results format per line: source,target,incumbent_obj,best_bound,solve_time
+# Read delta_1 (upper_bound) from a VHAGaR results file for a given c_target.
+# Supports both formats:
+#   New: c_source=0,c_target=3,lower_bound=...,upper_bound=...,optimization_time=...,hyper_attack_time=...
+#   Old: source,target,incumbent_obj,best_bound,solve_time
 function get_delta1_vaghar(results_path, c_target_index)
     open(results_path, "r") do io
         requested_line = ""
@@ -206,11 +214,22 @@ function get_delta1_vaghar(results_path, c_target_index)
             if isempty(strip(line_content))
                 continue
             end
-            tokens = Base.split(line_content, ',')
-            if length(tokens) >= 4
-                target_in_file = parse(Int, tokens[2])
-                if target_in_file == c_target_index - 1
+            # Detect format by checking for key=value pairs
+            if occursin("c_target=", line_content)
+                # New named format
+                kv = Dict(strip(k) => strip(v) for (k, v) in
+                    (Base.split(pair, '=') for pair in Base.split(line_content, ',') if occursin("=", pair)))
+                if haskey(kv, "c_target") && parse(Int, kv["c_target"]) == c_target_index - 1
                     requested_line = line_content
+                end
+            else
+                # Old positional format
+                tokens = Base.split(line_content, ',')
+                if length(tokens) >= 4
+                    target_in_file = parse(Int, tokens[2])
+                    if target_in_file == c_target_index - 1
+                        requested_line = line_content
+                    end
                 end
             end
         end
@@ -218,7 +237,14 @@ function get_delta1_vaghar(results_path, c_target_index)
             println("Warning: no delta_1 found for c_target=$c_target_index in $results_path")
             return -1.0
         end
-        parsed_tokens = Base.split(requested_line, ',')
-        return parse(Float64, parsed_tokens[4])
+        # Parse the matched line
+        if occursin("upper_bound=", requested_line)
+            kv = Dict(strip(k) => strip(v) for (k, v) in
+                (Base.split(pair, '=') for pair in Base.split(requested_line, ',') if occursin("=", pair)))
+            return parse(Float64, kv["upper_bound"])
+        else
+            parsed_tokens = Base.split(requested_line, ',')
+            return parse(Float64, parsed_tokens[4])
+        end
     end
 end

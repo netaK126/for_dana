@@ -386,8 +386,9 @@ if __name__ == '__main__':
     parser.add_argument('--perturbation', type=str, default="linf", help='perturbation')
     parser.add_argument('--perturbation_size', type=str, default="1", help='perturbation size')
     parser.add_argument('--gpu', type=int, default=0, help='dataset')
+    parser.add_argument('--cpu', action='store_true', help='Force CPU-only mode (no GPU)')
     parser.add_argument('--M', type=int, default=1000, help='Number of samples to attack')
-    parser.add_argument('--itr', type=int, default=100, help='Number of iterations')
+    parser.add_argument('--itr', type=int, default=500, help='Number of iterations')
     parser.add_argument('--alpha', type=float, default=0.01, help='Number of iterations')
 
     args = parser.parse_args()
@@ -411,8 +412,11 @@ if __name__ == '__main__':
         M = 10# TBD May 2024
         iterations = 50
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device("cpu")#torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.cpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    device = torch.device("cpu")
     DEVICE = device
     print("source:", source, "target:", target, "model_arch:", model_arch, "perturbation type:", perturbation_type, \
           "perturbation size:", perturbation_size, "dataset:", dataset)

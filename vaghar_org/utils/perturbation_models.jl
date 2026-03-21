@@ -116,22 +116,44 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
 end
 
 function get_perturbation_specific_keys_max(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+    global layer_counter, nueron_counter, network_version
     println("HERE")
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_output = v_in |> nn
     return Dict(:v_in_p => v_in, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_output)
 end
 
 #contrast
 function get_perturbation_specific_keys_contrast(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
+    global layer_counter, nueron_counter, network_version
+    global I_pert_prev_up, I_pert_prev_down
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 1.0, upper_bound = 1+p_size)
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
     @constraint(m, v_x0 .== v_e*v_in)
+
+    # Perturbation interval: Δ = x' - x = (e-1)*x, e-1 ∈ [0, ε], x ∈ [0,1] → Δ ∈ [0, ε]
+    if size(input)[4] > 1
+        I_pert_prev_up = p_size .* ones(Float64, size(input)[4], 1)
+        I_pert_prev_down = zeros(Float64, size(input)[4], 1)
+    else
+        I_pert_prev_up = p_size .* ones(Float64, size(input))
+        I_pert_prev_down = zeros(Float64, size(input))
+    end
+
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => v_e, :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
@@ -166,7 +188,14 @@ function get_perturbation_specific_keys_occ(w_, h_, k_, perturbation_size, nn::N
     end
     @constraint(m, c1[i=l],v_x0[i] == 0.0)
     @constraint(m, c2[i=res],v_x0[i] == v_in[i])
+    global layer_counter, nueron_counter, network_version
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
@@ -205,7 +234,14 @@ function get_perturbation_specific_keys_patch(w_, h_, k_, perturbation_size, nn:
     @constraint(m, c1[i=l],v_x0[i] >= v_in[i]-eps)
     @constraint(m, c2[i=res],v_x0[i] == v_in[i])
 
+    global layer_counter, nueron_counter, network_version
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
@@ -257,7 +293,14 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
             @constraint(m,[i=res*2+1+w*(j-1):1:res*2+w*j],v_x0[i] == 0)
         end
     end
+    global layer_counter, nueron_counter, network_version
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
@@ -272,7 +315,14 @@ function get_perturbation_specific_keys_filter_v(perturbation_size, nn::NeuralNe
     end
     @constraint(m,[i=28:28:784],v_x0[i]== 0.1*v_in[i-1]+0.8*v_in[i])
     @constraint(m,[i=1:28:756],v_x0[i]== 0.8*v_in[i]+0.1*v_in[i+1])
+    global layer_counter, nueron_counter, network_version
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
@@ -804,7 +854,14 @@ function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn
         end
         @constraint(m,v_x0[tt] == 0)
     end
+    global layer_counter, nueron_counter, network_version
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "org"
     v_in_output = v_in |> nn
+    layer_counter = 0
+    nueron_counter = 0
+    network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end

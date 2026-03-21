@@ -166,7 +166,12 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
-        
+        "--force_cpu"
+        help = "force CPU-only mode for hyper attack (no GPU)"
+        arg_type = Bool
+        required = false
+        default = false
+
     end
     return parse_args(s)
 end
@@ -210,7 +215,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             suboptimal_solution, suboptimal_time =  0,0
             if use_hyper_attack
-                suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size)
+                suboptimal_solution, suboptimal_time =  hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size; force_cpu=args["force_cpu"])
             end
             optimizer = Gurobi.Optimizer
             d = Dict()
@@ -312,7 +317,8 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                     dataset, c_tag, c_target, token_signature,
                     model_name, model_path, model_path2,
                     perturbation, perturbation_size, delta_1,
-                    c_tag_mode, n1_p_mode, args["delta_diff_positive"])
+                    c_tag_mode, n1_p_mode, args["delta_diff_positive"];
+                    force_cpu=args["force_cpu"])
             end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
 
@@ -321,6 +327,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             println("Encoding four-network MIP...")
             d = Dict()
+            d[:suboptimal_time] = suboptimal_time
             bounds_time = @elapsed begin
                 merge!(d, get_model_transfer(w, h, k, perturbation, perturbation_size,
                     nn1, nn2, zeros(Float64, 1, w, h, k), optimizer,
@@ -354,6 +361,10 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                 println("Adding interval constraints between N1 and N2...")
                 transfer_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
             end
+            if args["use_relaxations"]
+                name_to_save = name_to_save*"_Relaxations"*string(args["relaxation_threshold"])
+                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"])...")
+            end
 
             # Perturbation interval bounds (clean ↔ perturbed for each network)
             if args["use_perturbed_intervals"]
@@ -379,7 +390,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                 c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
                 args["delta_diff_positive"])
             set_optimizer(m, optimizer)
-            mip_set_attr_transfer(m, timout, suboptimal_solution)
+            mip_set_attr_transfer(m, timout, suboptimal_solution, args["delta_diff_positive"])
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)
 
             println("Optimizing...")
@@ -461,7 +472,8 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
                 suboptimal_solution, suboptimal_time = hyper_attack_transfer_distilation(
                     dataset, c_tag, c_target, token_signature,
                     model_name, model_name2, model_path, model_path2,
-                    perturbation, perturbation_size, delta_1, c_tag_mode, n1_p_mode)
+                    perturbation, perturbation_size, delta_1, c_tag_mode, n1_p_mode;
+                    force_cpu=args["force_cpu"])
             end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
 
@@ -470,6 +482,7 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
 
             println("Encoding MIP for distillation transfer...")
             d = Dict()
+            d[:suboptimal_time] = suboptimal_time
             bounds_time = @elapsed begin
                 merge!(d, get_model_transfer(w, h, k, perturbation, perturbation_size,
                     nn1, nn2, zeros(Float64, 1, w, h, k), optimizer,

@@ -318,9 +318,11 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
         n1_correct = (max_labels_n1 == source_)
 
         # Feasibility conditions
-        feasible = n1_correct & (c_n1_x >= delta1)
+        feasible = (c_n2_xp>=0) & (c_n1_x >= delta1)
         if delta_diff_positive:
             feasible = feasible & (delta_diff_final >= 0)
+        else:
+            feasible = feasible & (c_n2_xp > 0)
         if c_tag_mode:
             feasible = feasible & (gap_pert_final < 0)
         else:
@@ -409,8 +411,9 @@ if __name__ == '__main__':
     parser.add_argument('--delta1', type=float, default=0.0, help='delta_1 from VHAGaR')
     parser.add_argument('--c_tag_mode', type=str, default="true", help='true or false')
     parser.add_argument('--gpu', type=int, default=0, help='GPU id')
+    parser.add_argument('--cpu', action='store_true', help='Force CPU-only mode (no GPU)')
     parser.add_argument('--M', type=int, default=1000, help='Number of samples')
-    parser.add_argument('--itr', type=int, default=100, help='Number of PGD iterations')
+    parser.add_argument('--itr', type=int, default=500, help='Number of PGD iterations')
     parser.add_argument('--alpha', type=float, default=0.01, help='PGD step size')
     parser.add_argument('--n1_p_mode', type=bool, default=True, help='n1_p_mode')
     parser.add_argument('--delta_diff_positive', type=bool, default=True, help='force delta_diff to be positive')
@@ -434,8 +437,11 @@ if __name__ == '__main__':
     alpha = args.alpha
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device("cpu")#torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.cpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    device = torch.device("cpu")
 
     print("Transfer attack - source:", source, "target:", target,
           "model1:", model_arch, "model2:", model_arch2,

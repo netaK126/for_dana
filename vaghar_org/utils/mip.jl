@@ -129,6 +129,8 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
     @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
     if delta_diff_positive
         @constraint(m, delta_diff >= 0)
+    else
+        @constraint(m, conf_n2_x >= 0)
     end
     margin = 1e-3
     # Constraint (4): confidence gap flips under perturbation
@@ -161,9 +163,11 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
     @objective(m, Max, delta_diff)
 end
 
-function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
+function mip_set_attr_transfer(m, timout, suboptimal_solution=0, delta_diff_positive=false)
     set_optimizer_attribute(m, "MIPFocus", 3)
-    if suboptimal_solution != 0
+    if delta_diff_positive
+        set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
+    elseif suboptimal_solution != 0
         set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
     end
     set_optimizer_attribute(m, "Threads", 32)
