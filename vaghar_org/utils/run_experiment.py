@@ -17,6 +17,7 @@ Usage examples:
   python utils/run_experiment.py --dataset mnist --arch cnn1 --perturbations "linf:0.02,0.05;brightness:0.1,0.2"
   python utils/run_experiment.py --dataset cifar10 --arch 3x50 --relaxation_thresholds "0.0,0.25,0.5,1.0"
   python utils/run_experiment.py --dataset mnist --arch 6x10 --skip_training --skip_standard
+  python utils/run_experiment.py --dataset mnist --arch 3x10 --dual_seed --seeds "42,137"
 """
 import argparse
 import os
@@ -67,12 +68,33 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RUN_JL_DIR = os.path.join(SCRIPT_DIR, '..')
 
 
+def _get_device(force_cpu=False):
+    """Return cuda device if available and compatible, otherwise cpu."""
+    if force_cpu or not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        # Test that CUDA actually works (catches driver/arch mismatch)
+        torch.zeros(1, device="cuda:0")
+        return torch.device("cuda:0")
+    except RuntimeError:
+        print("  WARNING: CUDA available but not functional (driver/arch mismatch), falling back to CPU")
+        return torch.device("cpu")
+
+
 def parse_perturbations(spec):
     """Parse perturbation spec string into list of (perturbation, size) pairs.
 
-    Format: "type1:size1,size2;type2:size3,size4"
-    Example: "linf:0.02,0.05;brightness:0.1,0.2"
-      -> [("linf","0.02"), ("linf","0.05"), ("brightness","0.1"), ("brightness","0.2")]
+    Format: "type1:params/params;type2:params/params"
+    Uses '/' to separate different runs of the same perturbation type.
+    Commas within params are preserved (passed directly to Julia).
+
+    Examples:
+      "linf:0.02/0.05"
+        -> [("linf","0.02"), ("linf","0.05")]
+      "patch:1.0,14,14,1/1.0,14,14,3"
+        -> [("patch","1.0,14,14,1"), ("patch","1.0,14,14,3")]
+      "linf:0.1;patch:1.0,14,14,5"
+        -> [("linf","0.1"), ("patch","1.0,14,14,5")]
 
     Single perturbation shorthand: "linf:0.25" -> [("linf","0.25")]
     """
@@ -82,20 +104,25 @@ def parse_perturbations(spec):
         if not block:
             continue
         if ':' not in block:
-            print(f"ERROR: Invalid perturbation spec '{block}'. Expected 'type:size1,size2,...'")
+            print(f"ERROR: Invalid perturbation spec '{block}'. Expected 'type:params[/params]'")
             sys.exit(1)
         ptype, sizes_str = block.split(':', 1)
         ptype = ptype.strip()
-        for s in sizes_str.split(','):
+        for s in sizes_str.split('/'):
             s = s.strip()
             if s:
                 pairs.append((ptype, s))
     return pairs
 
 
-def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_size=None, create=False):
+def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_size=None,
+                 create=False, dual_seed=False, epochs=None):
     """Return a dict of all experiment directories for the given architecture and dataset.
-    Structure: .../arch_exp/perturbation/perturbation_size/..."""
+    Structure: .../arch_exp/perturbation/perturbation_size/...
+
+    When dual_seed=True, itr_n1/itr_n2 are seed values and epochs=(epoch_n1, epoch_n2)
+    gives the training epoch for each. Folder names use 'seed{S}_itr{E}' format.
+    """
     exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
     if perturbation and perturbation_size:
         pert_dir = os.path.join(exp_dir, perturbation, f'eps_{perturbation_size}')
@@ -103,15 +130,28 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
         pert_dir = os.path.join(exp_dir, perturbation)
     else:
         pert_dir = exp_dir
+
+    if dual_seed:
+        ep1 = epochs[0] if epochs else 0
+        ep2 = epochs[1] if epochs else 0
+        tag1 = f'seed{itr_n1}_itr{ep1}'
+        tag2 = f'seed{itr_n2}_itr{ep2}'
+        model_n1_name = f'model_seed{itr_n1}_itr{ep1}'
+        model_n2_name = f'model_seed{itr_n2}_itr{ep2}'
+    else:
+        tag1, tag2 = f'itr{itr_n1}', f'itr{itr_n2}'
+        model_n1_name = f'model_{itr_n1}_itr'
+        model_n2_name = f'model_{itr_n2}_itr'
+
     dirs = {
         'exp':              exp_dir,
-        'model_n1':         os.path.join(exp_dir, f'model_{itr_n1}_itr'),
-        'model_n2':         os.path.join(exp_dir, f'model_{itr_n2}_itr'),
-        'vaghar_n1':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_itr{itr_n1}'),
-        'vaghar_n2':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_itr{itr_n2}'),
-        'vaghar_n1_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_itr{itr_n1}'),
-        'vaghar_n2_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_itr{itr_n2}'),
-        'transfer':         os.path.join(pert_dir, f'transfer_{arch}_N1_is_itr{itr_n1}'),
+        'model_n1':         os.path.join(exp_dir, model_n1_name),
+        'model_n2':         os.path.join(exp_dir, model_n2_name),
+        'vaghar_n1':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_{tag1}'),
+        'vaghar_n2':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_{tag2}'),
+        'vaghar_n1_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_{tag1}'),
+        'vaghar_n2_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_{tag2}'),
+        'transfer':         os.path.join(pert_dir, f'transfer_{arch}_N1_is_{tag1}'),
     }
     if create:
         for d in dirs.values():
@@ -151,6 +191,31 @@ def detect_iterations(arch, dataset):
     sys.exit(1)
 
 
+def detect_seeds(arch, dataset):
+    """Detect seed_n1/seed_n2 and their epochs from existing model_seed*_itr* folders.
+    Returns (seed_n1, seed_n2, epoch_n1, epoch_n2)."""
+    exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
+    if not os.path.exists(exp_dir):
+        print(f"ERROR: Experiment directory {exp_dir} not found.")
+        sys.exit(1)
+
+    pattern = re.compile(r'^model_seed(\d+)_itr(\d+)$')
+    entries = sorted(
+        (int(m.group(1)), int(m.group(2)))
+        for name in os.listdir(exp_dir)
+        if (m := pattern.match(name)) and os.path.isdir(os.path.join(exp_dir, name))
+    )
+
+    if len(entries) >= 2:
+        (seed_n1, ep1), (seed_n2, ep2) = entries[0], entries[1]
+        print(f"  Detected dual-seed model checkpoints: seed{seed_n1}_itr{ep1} and seed{seed_n2}_itr{ep2}")
+        return seed_n1, seed_n2, ep1, ep2
+
+    print(f"ERROR: Need at least two model_seed*_itr* folders in {exp_dir}.")
+    print(f"  Found: {entries}")
+    sys.exit(1)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def save_model(model, save_dir):
@@ -174,6 +239,22 @@ def evaluate(model, test_loader, device):
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return 100.0 * correct / total
+
+
+def evaluate_robust(model, test_loader, device, epsilon, alpha=0.01, num_steps=20):
+    """Evaluate accuracy on PGD adversarial examples (robust accuracy)."""
+    model.eval()
+    correct = 0
+    total = 0
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        adv_images = pgd_attack(model, images, labels, epsilon, alpha, num_steps, device)
+        with torch.no_grad():
+            outputs = model(adv_images)
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
@@ -205,28 +286,80 @@ def run_julia(args_list, step_name):
     return proc.returncode
 
 
+# ── PGD adversarial training helpers ──────────────────────────────────────
+
+def pgd_attack(model, images, labels, epsilon, alpha, num_steps, device):
+    """Generate PGD adversarial examples (Madry et al. 2018).
+
+    Args:
+        model: network in eval mode
+        images: clean batch [B, C, H, W] in [0, 1]
+        labels: ground-truth labels [B]
+        epsilon: L∞ perturbation radius
+        alpha: PGD step size
+        num_steps: number of PGD iterations
+        device: torch device
+
+    Returns:
+        adv_images: adversarial batch clamped to [0, 1] and within ε-ball
+    """
+    adv = images.clone().detach()
+    # Random start within ε-ball
+    adv = adv + torch.empty_like(adv).uniform_(-epsilon, epsilon)
+    adv = torch.clamp(adv, 0.0, 1.0)
+
+    criterion = nn.CrossEntropyLoss()
+
+    for _ in range(num_steps):
+        adv.requires_grad_(True)
+        outputs = model(adv)
+        loss = criterion(outputs, labels)
+        grad = torch.autograd.grad(loss, adv)[0]
+        adv = adv.detach() + alpha * grad.sign()
+        # Project back to ε-ball around original image
+        delta = torch.clamp(adv - images, -epsilon, epsilon)
+        adv = torch.clamp(images + delta, 0.0, 1.0)
+
+    return adv.detach()
+
+
 # ── step 1: train ────────────────────────────────────────────────────────
 
 MIN_ACCURACY = 91.0
+# PGD adversarial training reduces clean accuracy; use a lower threshold
+MIN_ACCURACY_PGD = 80.0
 
 
-def train_model(arch, dataset, batch_size=128, lr=1e-3, max_epochs=100, itr_gap=1, force_cpu=False):
+def train_model(arch, dataset, batch_size=128, lr=1e-3, max_epochs=100, itr_gap=1, force_cpu=False,
+                pgd_training=False, pgd_epsilon=0.1, pgd_alpha=0.01, pgd_steps=7,
+                optimizer_name='sgd'):
     """
     Train until two epochs separated by itr_gap both reach MIN_ACCURACY.
     Save checkpoints for those two epochs (itr_n1 and itr_n2 = itr_n1 + itr_gap).
+
+    When pgd_training=True, uses PGD adversarial training (Madry et al. 2018):
+    each batch is replaced by adversarial examples before computing the loss.
     Returns (itr_n1, itr_n2).
     """
     model_cls, _ = ARCH_REGISTRY[arch]
     _, k, w, h, _ = DATASET_CONFIG[dataset]
 
+    mode_str = f"PGD (eps={pgd_epsilon}, alpha={pgd_alpha}, steps={pgd_steps})" if pgd_training else "standard"
     print("=" * 60)
-    print(f"STEP 1: Training {arch} on {dataset} (until two epochs {itr_gap} apart >= {MIN_ACCURACY}% acc, max {max_epochs})")
+    print(f"STEP 1: Training {arch} on {dataset} [{mode_str}]")
+    if pgd_training:
+        print(f"  (fixed {max_epochs} epochs, saving last two with gap {itr_gap})")
+    else:
+        print(f"  (until two epochs {itr_gap} apart >= {MIN_ACCURACY}% acc, max {max_epochs})")
     print("=" * 60)
 
-    device = torch.device("cpu")
+    device = _get_device(force_cpu)
     print(f"  Using device: {device}")
     model = model_cls(k=k, w=w, h=h).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
+    if optimizer_name == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     train_loader, test_loader = get_data_loaders(dataset, batch_size)
 
@@ -237,8 +370,15 @@ def train_model(arch, dataset, batch_size=128, lr=1e-3, max_epochs=100, itr_gap=
     for epoch in range(max_epochs):
         model.train()
         running_loss = 0.0
+
         for i, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
+
+            if pgd_training:
+                model.eval()
+                images = pgd_attack(model, images, labels, pgd_epsilon, pgd_alpha, pgd_steps, device)
+                model.train()
+
             outputs = model(images)
             loss = criterion(outputs, labels)
             optimizer.zero_grad()
@@ -252,23 +392,153 @@ def train_model(arch, dataset, batch_size=128, lr=1e-3, max_epochs=100, itr_gap=
 
         history.append((epoch_num, acc, {k_: v.clone() for k_, v in model.state_dict().items()}))
 
-        # Check if the earliest entry in history is exactly itr_gap behind current
-        if len(history) == itr_gap + 1:
+        if pgd_training:
+            # PGD training: always train for all max_epochs, save the last two
+            continue
+        else:
+            # Standard training: early-stop when two epochs itr_gap apart both reach MIN_ACCURACY
+            if len(history) == itr_gap + 1:
+                old_epoch, old_acc, old_state = history[0]
+                if old_acc >= MIN_ACCURACY and acc >= MIN_ACCURACY and epoch_num - old_epoch == itr_gap:
+                    itr_n1 = old_epoch
+                    itr_n2 = epoch_num
+                    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, create=True)
+                    n1_model = model_cls(k=k, w=w, h=h).to(device)
+                    n1_model.load_state_dict(old_state)
+                    save_model(n1_model, dirs['model_n1'])
+                    print(f"  >> Saved itr{itr_n1} checkpoint (acc: {old_acc:.2f}%)")
+                    save_model(model, dirs['model_n2'])
+                    print(f"  >> Saved itr{itr_n2} checkpoint (acc: {acc:.2f}%)")
+                    return itr_n1, itr_n2
+
+    if pgd_training:
+        # Save the last two checkpoints separated by itr_gap
+        if len(history) >= itr_gap + 1:
+            itr_n1 = max_epochs - itr_gap
+            itr_n2 = max_epochs
             old_epoch, old_acc, old_state = history[0]
-            if old_acc >= MIN_ACCURACY and acc >= MIN_ACCURACY and epoch_num - old_epoch == itr_gap:
-                itr_n1 = old_epoch
-                itr_n2 = epoch_num
-                dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, create=True)
-                n1_model = model_cls(k=k, w=w, h=h).to(device)
-                n1_model.load_state_dict(old_state)
-                save_model(n1_model, dirs['model_n1'])
-                print(f"  >> Saved itr{itr_n1} checkpoint (acc: {old_acc:.2f}%)")
-                save_model(model, dirs['model_n2'])
-                print(f"  >> Saved itr{itr_n2} checkpoint (acc: {acc:.2f}%)")
-                return itr_n1, itr_n2
+            dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, create=True)
+            n1_model = model_cls(k=k, w=w, h=h).to(device)
+            n1_model.load_state_dict(old_state)
+            save_model(n1_model, dirs['model_n1'])
+            print(f"  >> Saved itr{itr_n1} checkpoint (acc: {old_acc:.2f}%)")
+            save_model(model, dirs['model_n2'])
+            print(f"  >> Saved itr{itr_n2} checkpoint (acc: {acc:.2f}%)")
+            return itr_n1, itr_n2
 
     print(f"\n  ERROR: Failed to find two epochs {itr_gap} apart with >= {MIN_ACCURACY}% accuracy within {max_epochs} epochs.")
     sys.exit(1)
+
+
+def _train_single_seed(model_cls, k, w, h, seed, train_loader, test_loader, device,
+                       lr, max_epochs, min_accuracy, optimizer_name='sgd',
+                       pgd_training=False, pgd_epsilon=0.1, pgd_alpha=0.01, pgd_steps=7,
+                       fixed_epochs=False):
+    """Train one model with a specific seed. Returns (model, final_acc, epoch_num)."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    model = model_cls(k=k, w=w, h=h).to(device)
+    if optimizer_name == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(max_epochs):
+        model.train()
+        running_loss = 0.0
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+
+            if pgd_training:
+                model.eval()
+                images = pgd_attack(model, images, labels, pgd_epsilon, pgd_alpha, pgd_steps, device)
+                model.train()
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        acc = evaluate(model, test_loader, device)
+        epoch_num = epoch + 1
+        print(f"    Epoch {epoch_num}/{max_epochs} — loss: {running_loss/len(train_loader):.4f}, acc: {acc:.2f}%")
+
+        if pgd_training or fixed_epochs:
+            # Always train for all max_epochs
+            continue
+
+        if acc >= min_accuracy:
+            print(f"    >> Reached {min_accuracy}% accuracy at epoch {epoch_num}")
+            return model, acc, epoch_num
+
+    # Completed all epochs
+    if pgd_training or fixed_epochs:
+        print(f"    >> Completed {max_epochs} epochs (final acc: {acc:.2f}%)")
+    else:
+        print(f"    WARNING: Did not reach {min_accuracy}% in {max_epochs} epochs (best: {acc:.2f}%)")
+    return model, acc, max_epochs
+
+
+def train_dual_seed(arch, dataset, seeds, batch_size=128, lr=1e-3, max_epochs=200, force_cpu=False,
+                    pgd_training=False, pgd_epsilon=0.1, pgd_alpha=0.01, pgd_steps=7,
+                    optimizer_name='sgd', fixed_epochs=False):
+    """
+    Train two independent networks from different random seeds (same arch/hyperparams).
+    Returns (seed_n1, seed_n2, epoch_n1, epoch_n2).
+    """
+    model_cls, _ = ARCH_REGISTRY[arch]
+    _, k, w, h, _ = DATASET_CONFIG[dataset]
+    seed_n1, seed_n2 = seeds
+
+    min_acc = MIN_ACCURACY_PGD if pgd_training else MIN_ACCURACY
+    mode_str = f"PGD (eps={pgd_epsilon}, alpha={pgd_alpha}, steps={pgd_steps})" if pgd_training else "standard"
+    print("=" * 60)
+    print(f"STEP 1 (dual-seed): Training {arch} on {dataset} [{mode_str}] with seeds {seed_n1} and {seed_n2}")
+    print("=" * 60)
+
+    device = _get_device(force_cpu)
+    print(f"  Using device: {device}")
+    train_loader, test_loader = get_data_loaders(dataset, batch_size)
+
+    print(f"\n  --- Training N1 (seed={seed_n1}) ---")
+    model_n1, acc_n1, ep_n1 = _train_single_seed(model_cls, k, w, h, seed_n1,
+                                                   train_loader, test_loader, device,
+                                                   lr, max_epochs, min_acc,
+                                                   optimizer_name=optimizer_name,
+                                                   pgd_training=pgd_training,
+                                                   pgd_epsilon=pgd_epsilon,
+                                                   pgd_alpha=pgd_alpha,
+                                                   pgd_steps=pgd_steps,
+                                                   fixed_epochs=fixed_epochs)
+
+    print(f"\n  --- Training N2 (seed={seed_n2}) ---")
+    model_n2, acc_n2, ep_n2 = _train_single_seed(model_cls, k, w, h, seed_n2,
+                                                   train_loader, test_loader, device,
+                                                   lr, max_epochs, min_acc,
+                                                   optimizer_name=optimizer_name,
+                                                   pgd_training=pgd_training,
+                                                   pgd_epsilon=pgd_epsilon,
+                                                   pgd_alpha=pgd_alpha,
+                                                   pgd_steps=pgd_steps,
+                                                   fixed_epochs=fixed_epochs)
+
+    print(f"\n  N1 acc: {acc_n1:.2f}% (epoch {ep_n1}), N2 acc: {acc_n2:.2f}% (epoch {ep_n2})")
+
+    # Now that we know the epochs, create dirs and save
+    dirs = get_exp_dirs(arch, dataset, seed_n1, seed_n2, dual_seed=True,
+                        epochs=(ep_n1, ep_n2), create=True)
+
+    save_model(model_n1, dirs['model_n1'])
+    print(f"  >> Saved N1 seed{seed_n1}_itr{ep_n1} (acc: {acc_n1:.2f}%)")
+
+    save_model(model_n2, dirs['model_n2'])
+    print(f"  >> Saved N2 seed{seed_n2}_itr{ep_n2} (acc: {acc_n2:.2f}%)")
+
+    return seed_n1, seed_n2, ep_n1, ep_n2
 
 
 # ── step 2: run VHAGaR standard with perturbed intervals ────────────────
@@ -301,8 +571,8 @@ def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
     return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag}, {pi_label} perturbed intervals)')
 
 
-def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False):
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs)
     os.makedirs(dirs['vaghar_n1'], exist_ok=True)
     os.makedirs(dirs['vaghar_n2'], exist_ok=True)
     os.makedirs(dirs['vaghar_n1_noPI'], exist_ok=True)
@@ -311,18 +581,27 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
     model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
     model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
+    if dual_seed:
+        ep1 = epochs[0] if epochs else 0
+        ep2 = epochs[1] if epochs else 0
+        tag1 = f'seed{itr_n1}_itr{ep1}'
+        tag2 = f'seed{itr_n2}_itr{ep2}'
+    else:
+        tag1 = f'itr{itr_n1}'
+        tag2 = f'itr{itr_n2}'
+
     # Run WITH perturbed intervals
     print("=" * 60)
-    print(f"STEP 2a: VHAGaR standard (WITH perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, itr{itr_n1}&itr{itr_n2}")
+    print(f"STEP 2a: VHAGaR standard (WITH perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
     print("=" * 60)
 
-    print(f"\n  --- itr{itr_n1} (ctag={ctag}) ---")
+    print(f"\n  --- {tag1} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
                         use_perturbed_intervals=True)
 
-    print(f"\n  --- itr{itr_n2} (ctag={ctag}) ---")
+    print(f"\n  --- {tag2} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
@@ -330,16 +609,16 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
 
     # Run WITHOUT perturbed intervals
     print("=" * 60)
-    print(f"STEP 2b: VHAGaR standard (WITHOUT perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, itr{itr_n1}&itr{itr_n2}")
+    print(f"STEP 2b: VHAGaR standard (WITHOUT perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
     print("=" * 60)
 
-    print(f"\n  --- itr{itr_n1} (ctag={ctag}) ---")
+    print(f"\n  --- {tag1} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1_noPI'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
                         use_perturbed_intervals=False)
 
-    print(f"\n  --- itr{itr_n2} (ctag={ctag}) ---")
+    print(f"\n  --- {tag2} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2_noPI'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
@@ -351,7 +630,8 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
 def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               output_dir, timeout, perturbation, ct,
                               transfer_relaxations, delta_diff_positive,
-                              relaxation_threshold=None, force_cpu=False):
+                              relaxation_threshold=None, force_cpu=False,
+                              use_hyper_attack=True, dual_seed=False, epochs=None):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -361,7 +641,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
     """
     _, model_name = ARCH_REGISTRY[arch]
     _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2)
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, dual_seed=dual_seed, epochs=epochs)
     pattern = re.compile(rf"_{perturbation}_(.*?)_ctag.*cTag(\d+)")
 
     if not os.path.exists(vaghar_results_dir):
@@ -430,7 +710,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             '--timout', str(timeout),
             '--output_dir', output_dir + '/',
             '--c_tag_mode', 'false',
-            '--use_hyper_attack', 'true',
+            '--use_hyper_attack', str(use_hyper_attack).lower(),
             '--activate_vaghgar_deps', 'true',
             '--use_intervals', 'true',
             '--use_perturbed_intervals', 'true',
@@ -446,20 +726,30 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
 
 
 def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturbation_size, ct,
-                   transfer_relaxations, delta_diff_positive, relaxation_threshold=None, force_cpu=False):
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+                   transfer_relaxations, delta_diff_positive, relaxation_threshold=None, force_cpu=False,
+                   use_hyper_attack=True, dual_seed=False, epochs=None):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold)
     os.makedirs(output_dir, exist_ok=True)
 
+    if dual_seed:
+        ep1 = epochs[0] if epochs else 0
+        ep2 = epochs[1] if epochs else 0
+        tag1 = f'seed{itr_n1}_itr{ep1}'
+        tag2 = f'seed{itr_n2}_itr{ep2}'
+    else:
+        tag1 = f'itr{itr_n1}'
+        tag2 = f'itr{itr_n2}'
     thresh_label = f"threshold={relaxation_threshold}" if relaxation_threshold is not None else "no relaxation"
     print("=" * 60)
-    print(f"STEP 3: VHAGaR transfer — {arch} on {dataset}, {perturbation} (N1=itr{itr_n1}, N2=itr{itr_n2}, {thresh_label})")
+    print(f"STEP 3: VHAGaR transfer — {arch} on {dataset}, {perturbation} (N1={tag1}, N2={tag2}, {thresh_label})")
     print("=" * 60)
 
     run_transfer_from_results(
         arch, dataset, itr_n1, itr_n2,
         dirs['vaghar_n1'], output_dir, timeout, perturbation, ct,
         transfer_relaxations, delta_diff_positive, relaxation_threshold, force_cpu=force_cpu,
+        use_hyper_attack=use_hyper_attack, dual_seed=dual_seed, epochs=epochs,
     )
 
 
@@ -477,7 +767,9 @@ def main():
     parser.add_argument('--arch', type=str, required=False, default="3x10", choices=arch_choices,
                         help=f'Architecture: {arch_choices}')
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=1e-3, help='SGD learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='sgd', choices=['sgd', 'adam'],
+                        help='Optimizer to use for training')
     parser.add_argument('--max_epochs', type=int, default=200, help='Max training epochs')
     parser.add_argument('--itr_gap', type=int, default=5,
                         help='Gap between the two saved model checkpoints (e.g. 1=consecutive, 5=five epochs apart)')
@@ -501,11 +793,36 @@ def main():
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_standard', action='store_true', help='Skip standard VHAGaR')
     parser.add_argument('--skip_transfer', action='store_true', help='Skip transfer VHAGaR')
+    parser.add_argument('--skip_hyper_transfer_attack', action='store_true',
+                        help='Disable hyper attack (PGD warm-start) in transfer runs')
+    parser.add_argument('--dual_seed', action='store_true',
+                        help='Train two independent networks from different random seeds instead of '
+                             'using checkpoints from the same training run')
+    parser.add_argument('--seeds', type=str, default='42,137',
+                        help='Comma-separated pair of seeds for --dual_seed mode (e.g. "42,137")')
+    parser.add_argument('--fixed_epochs', action='store_true',
+                        help='Train for exactly max_epochs instead of early-stopping on accuracy')
+    parser.add_argument('--pgd_training', action='store_true',
+                        help='Use PGD adversarial training (Madry et al. 2018). '
+                             'Recommended for 3x50 to match paper results.')
+    parser.add_argument('--pgd_epsilon', type=float, default=0.1,
+                        help='PGD training: L∞ perturbation radius')
+    parser.add_argument('--pgd_alpha', type=float, default=0.01,
+                        help='PGD training: step size per iteration')
+    parser.add_argument('--pgd_steps', type=int, default=7,
+                        help='PGD training: number of attack iterations per batch')
 
     args = parser.parse_args()
 
     arch = args.arch
     dataset = args.dataset
+    dual_seed = args.dual_seed
+
+    # Parse seeds
+    seed_values = [int(s.strip()) for s in args.seeds.split(',')]
+    if dual_seed and len(seed_values) < 2:
+        print("ERROR: --dual_seed requires at least two values in --seeds (e.g. --seeds 42,137)")
+        sys.exit(1)
 
     # Parse relaxation thresholds
     thresholds = []
@@ -521,18 +838,40 @@ def main():
     print(f"\nPerturbation configs ({len(perturbation_pairs)}):")
     for pt, ps in perturbation_pairs:
         print(f"  {pt} eps={ps}")
+    if dual_seed:
+        print(f"\nDual-seed mode: seeds={seed_values[0]},{seed_values[1]}")
     print()
 
     os.chdir(RUN_JL_DIR)
 
     # Step 1: Train (once — training is perturbation-independent)
+    epochs = None  # only used in dual_seed mode
     if not args.skip_training:
-        itr_n1, itr_n2 = train_model(arch, dataset, batch_size=args.batch_size,
-                                      lr=args.lr, max_epochs=args.max_epochs,
-                                      itr_gap=args.itr_gap, force_cpu=args.cpu)
+        if dual_seed:
+            itr_n1, itr_n2, ep_n1, ep_n2 = train_dual_seed(
+                arch, dataset, seeds=(seed_values[0], seed_values[1]),
+                batch_size=args.batch_size, lr=args.lr,
+                max_epochs=args.max_epochs, force_cpu=args.cpu,
+                pgd_training=args.pgd_training, pgd_epsilon=args.pgd_epsilon,
+                pgd_alpha=args.pgd_alpha, pgd_steps=args.pgd_steps,
+                optimizer_name=args.optimizer, fixed_epochs=args.fixed_epochs)
+            epochs = (ep_n1, ep_n2)
+        else:
+            itr_n1, itr_n2 = train_model(arch, dataset, batch_size=args.batch_size,
+                                          lr=args.lr, max_epochs=args.max_epochs,
+                                          itr_gap=args.itr_gap, force_cpu=args.cpu,
+                                          pgd_training=args.pgd_training,
+                                          pgd_epsilon=args.pgd_epsilon,
+                                          pgd_alpha=args.pgd_alpha,
+                                          pgd_steps=args.pgd_steps,
+                                          optimizer_name=args.optimizer)
     else:
         print("Skipping training (--skip_training)")
-        itr_n1, itr_n2 = detect_iterations(arch, dataset)
+        if dual_seed:
+            itr_n1, itr_n2, ep_n1, ep_n2 = detect_seeds(arch, dataset)
+            epochs = (ep_n1, ep_n2)
+        else:
+            itr_n1, itr_n2 = detect_iterations(arch, dataset)
 
     # Plot confidence and exit if requested
     if args.plot_conf:
@@ -560,7 +899,8 @@ def main():
             for ctag in range(1, 3):
                 step2_vaghar_standard(arch, dataset, itr_n1, itr_n2,
                                       perturbation, perturbation_size,
-                                      ctag, args.ct, args.timeout, force_cpu=args.cpu)
+                                      ctag, args.ct, args.timeout, force_cpu=args.cpu,
+                                      dual_seed=dual_seed, epochs=epochs)
         else:
             print("  Skipping standard VHAGaR (--skip_standard)")
 
@@ -570,24 +910,34 @@ def main():
             for thresh in thresholds:
                 step3_transfer(arch, dataset, itr_n1, itr_n2, args.timeout, perturbation, perturbation_size,
                                args.ct, 'true', args.delta_diff_positive, relaxation_threshold=thresh,
-                               force_cpu=args.cpu)
+                               force_cpu=args.cpu,
+                               use_hyper_attack=not args.skip_hyper_transfer_attack,
+                               dual_seed=dual_seed, epochs=epochs)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 
     # Summary
+    if dual_seed:
+        ep1, ep2 = epochs
+        tag1 = f'seed{itr_n1}_itr{ep1}'
+        tag2 = f'seed{itr_n2}_itr{ep2}'
+    else:
+        tag1 = f'itr{itr_n1}'
+        tag2 = f'itr{itr_n2}'
+    mode_label = "dual-seed" if dual_seed else "itr-gap"
     print("\n" + "=" * 60)
-    print(f"EXPERIMENT COMPLETE ({arch} on {dataset})")
+    print(f"EXPERIMENT COMPLETE ({arch} on {dataset}, {mode_label})")
     print("=" * 60)
-    dirs_base = get_exp_dirs(arch, dataset, itr_n1, itr_n2)
-    print(f"  itr{itr_n1} model:  {dirs_base['model_n1']}/model.p")
-    print(f"  itr{itr_n2} model:  {dirs_base['model_n2']}/model.p")
+    dirs_base = get_exp_dirs(arch, dataset, itr_n1, itr_n2, dual_seed=dual_seed, epochs=epochs)
+    print(f"  {tag1} model:  {dirs_base['model_n1']}/model.p")
+    print(f"  {tag2} model:  {dirs_base['model_n2']}/model.p")
     for perturbation, perturbation_size in perturbation_pairs:
-        dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size)
+        dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs)
         print(f"\n  [{perturbation} eps={perturbation_size}]")
-        print(f"    VHAGaR itr{itr_n1} (PI):     {dirs['vaghar_n1']}/")
-        print(f"    VHAGaR itr{itr_n2} (PI):     {dirs['vaghar_n2']}/")
-        print(f"    VHAGaR itr{itr_n1} (no PI):  {dirs['vaghar_n1_noPI']}/")
-        print(f"    VHAGaR itr{itr_n2} (no PI):  {dirs['vaghar_n2_noPI']}/")
+        print(f"    VHAGaR {tag1} (PI):     {dirs['vaghar_n1']}/")
+        print(f"    VHAGaR {tag2} (PI):     {dirs['vaghar_n2']}/")
+        print(f"    VHAGaR {tag1} (no PI):  {dirs['vaghar_n1_noPI']}/")
+        print(f"    VHAGaR {tag2} (no PI):  {dirs['vaghar_n2_noPI']}/")
         for thresh in thresholds:
             print(f"    Transfer (t={thresh}):  {get_transfer_dir(dirs, thresh)}/")
 

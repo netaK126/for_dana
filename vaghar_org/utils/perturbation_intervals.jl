@@ -1015,22 +1015,22 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     # composed bounds: (z_n2_pert - z_n1_org) = diff + pert, used with a_n1_org + N1 preact bounds
     global relu_comp_up_bounds, relu_comp_down_bounds
 
-    relu_diff_up_bounds   = Vector{Float64}[]
-    relu_diff_down_bounds = Vector{Float64}[]
-    n1_preact_up_bounds   = Vector{Float64}[]
-    n1_preact_down_bounds = Vector{Float64}[]
-    relu_comp_up_bounds   = Vector{Float64}[]
-    relu_comp_down_bounds = Vector{Float64}[]
+    relu_diff_up_bounds   = Array{Float64}[]
+    relu_diff_down_bounds = Array{Float64}[]
+    n1_preact_up_bounds   = Array{Float64}[]
+    n1_preact_down_bounds = Array{Float64}[]
+    relu_comp_up_bounds   = Array{Float64}[]
+    relu_comp_down_bounds = Array{Float64}[]
 
-    # Running interval state (all flat vectors after Flatten)
-    diff_up   = zeros(Float64, length(I_pert_up_init))   # z_n2_org - z_n1_org
-    diff_down = zeros(Float64, length(I_pert_down_init))
-    pert_up   = copy(vec(Float64.(I_pert_up_init)))       # z_n2_pert - z_n2_org
-    pert_down = copy(vec(Float64.(I_pert_down_init)))
+    # Running interval state (4D for CNNs, flattened to 1D at Flatten layer)
+    diff_up   = zeros(Float64, size(I_pert_up_init))   # z_n2_org - z_n1_org
+    diff_down = zeros(Float64, size(I_pert_down_init))
+    pert_up   = copy(Float64.(I_pert_up_init))          # z_n2_pert - z_n2_org
+    pert_down = copy(Float64.(I_pert_down_init))
 
     # N1 post-activation bounds (initialised to input domain [0,1])
-    n1_act_up   = ones(Float64,  length(I_pert_up_init))
-    n1_act_down = zeros(Float64, length(I_pert_down_init))
+    n1_act_up   = ones(Float64,  size(I_pert_up_init))
+    n1_act_down = zeros(Float64, size(I_pert_down_init))
 
     # Will be set at each Linear layer, read at the following ReLU layer
     n1_pre_up_cur   = Float64[]
@@ -1076,6 +1076,42 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
                 W1, W1, n1_act_down, n1_act_up)
             n1_pre_up_cur   = rn_max .+ b1
             n1_pre_down_cur = rn_min .+ b1
+
+        elseif occursin("Conv", string(typeof(l)))
+            l2 = nn2.layers[layer_idx]
+            F1 = Float64.(l.filter);  F2 = Float64.(l2.filter)
+            b1 = Float64.(l.bias);    b2 = Float64.(l2.bias)
+            ΔF = F2 - F1;             Δb = b2 - b1
+            zero_bias = zeros(Float64, length(b1))
+
+            # Ensure 4D shape for conv operation
+            n1_4d_down  = ndims(n1_act_down) == 4 ? n1_act_down : reshape(n1_act_down, 1, :, 1, 1)
+            n1_4d_up    = ndims(n1_act_up)   == 4 ? n1_act_up   : reshape(n1_act_up,   1, :, 1, 1)
+            diff_4d_down = ndims(diff_down)  == 4 ? diff_down   : reshape(diff_down,   1, :, 1, 1)
+            diff_4d_up   = ndims(diff_up)    == 4 ? diff_up     : reshape(diff_up,     1, :, 1, 1)
+            pert_4d_down = ndims(pert_down)  == 4 ? pert_down   : reshape(pert_down,   1, :, 1, 1)
+            pert_4d_up   = ndims(pert_up)    == 4 ? pert_up     : reshape(pert_up,     1, :, 1, 1)
+
+            # diff = ΔF·a_n1 + F2·diff_prev + Δb
+            r1_min, r1_max = interval_conv2d_bounds(ΔF, ΔF, n1_4d_down, n1_4d_up, zero_bias, l.stride, l.padding)
+            r2_min, r2_max = interval_conv2d_bounds(F2, F2, diff_4d_down, diff_4d_up, zero_bias, l.stride, l.padding)
+            diff_down = r1_min .+ r2_min
+            diff_up   = r1_max .+ r2_max
+            # Broadcast Δb into the spatial dimensions (4th dim = out_channels)
+            for oc in 1:length(Δb)
+                diff_down[:, :, :, oc] .+= Δb[oc]
+                diff_up[:, :, :, oc]   .+= Δb[oc]
+            end
+
+            # pert = F2·pert_prev
+            rp_min, rp_max = interval_conv2d_bounds(F2, F2, pert_4d_down, pert_4d_up, zero_bias, l.stride, l.padding)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N1 preact bounds (F1·a_n1 + b1, bias handled inside interval_conv2d_bounds)
+            rn_min, rn_max = interval_conv2d_bounds(F1, F1, n1_4d_down, n1_4d_up, Float64.(b1), l.stride, l.padding)
+            n1_pre_up_cur   = rn_max
+            n1_pre_down_cur = rn_min
 
         elseif occursin("ReLU", string(typeof(l)))
             # ── Activation conditional-triangle relaxation (n2_org) ──────────

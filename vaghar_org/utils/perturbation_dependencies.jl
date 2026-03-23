@@ -70,17 +70,16 @@ function layers_number(nn)
     return cnt
 end
 
-function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt)
-    if (perturbation == "brightness") & (activation_cnt == 1)
+function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt, activation_start, perturbation_var)
+    if (perturbation == "brightness") & (activation_cnt == activation_start)
         b = perturbation_size[1]
-        ls =deepcopy(layer)
+        ls = deepcopy(layer)
         ls.bias = 0.0 .* (ls.bias)
-        phi_dep_c = sign.(fill(b, size(phi_dep)) |> layer)
-        phi_dep_l[phi_dep_l .==NaN] .= phi_dep_c[phi_dep_l .==NaN]
-    elseif (perturbation == "contrast") & (activation_cnt == 1) & all(layer.bias .== 0)
-        layers_n = layers_number(nn)
+        phi_dep_c = sign.(fill(b, size(phi_dep)) |> ls)
+        phi_dep_l[isnan.(phi_dep_l)] .= phi_dep_c[isnan.(phi_dep_l)]
+    elseif (perturbation == "contrast") & (activation_cnt == activation_start) & all(layer.bias .== 0)
         av = JuMP.all_variables(m)
-        c = perturbation_size[1]
+        v_e = perturbation_var
         if length(size(phi_dep)) == 4
             phi_dep_c = phi_dep |> Flatten([1, 2, 3, 4])
         else
@@ -89,9 +88,13 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
         for n in 1:size(phi_dep_c)[1]
             dep = phi_dep_c[n]
             if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
-                if (dep == NaN)
-                    @constraint(m,av[ind_o+1]==(1+av[1])*av[ind_p+1])
-                    @constraint(m,av[ind_o+2]==av[ind_p+2])
+                u_o, l_o, ind_o = layers_info_dict[activation_cnt,n]
+                u_p, l_p, ind_p = layers_info_dict[activation_cnt+layers_n,n]
+                if isnan(dep)
+                    # Contrast: x' = e*x, so z_pert = e*z_org (zero-bias layer).
+                    # Post-ReLU: relu(z_pert) = e*relu(z_org) since e>0.
+                    @constraint(m, av[ind_p+1] == v_e * av[ind_o+1])
+                    @constraint(m, av[ind_o+2] == av[ind_p+2])
                 end
             end
         end
@@ -172,7 +175,7 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
 end
 
 function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
-                                   activation_start=1, layers_offset=nothing)
+                                   activation_start=1, layers_offset=nothing, perturbation_var=nothing)
     layers_n = isnothing(layers_offset) ? layers_number(nn) : layers_offset
     phi_dep = fill(NaN, (1, w, h, k))
     perturbation_init_deps(phi_dep, perturbation, perturbation_size)
@@ -188,7 +191,7 @@ function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h,
                 phi_dep = phi_dep |> l
             elseif occursin("Linear", string(typeof(l))) || occursin("Conv", string(typeof(l)))
                 phi_dep_l = dep_propagation(l, phi_dep)
-                phi_dep = dep_additional(m, layers_n, l, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt)
+                phi_dep = dep_additional(m, layers_n, l, phi_dep, phi_dep_l, perturbation, perturbation_size, activation_cnt, activation_start, perturbation_var)
             elseif occursin("ReLU", string(typeof(l)))
                 phi_dep = encode_dependencies(m, layers_n, phi_dep, activation_cnt)
                 if activation_start == 1

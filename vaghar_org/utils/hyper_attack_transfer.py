@@ -116,8 +116,8 @@ def load_model(model_arch, model_path, device):
         model = CNN2()
     else:
         raise ValueError(f"Unknown model architecture: {model_arch}")
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path))
     return model
 
 
@@ -197,7 +197,7 @@ def build_str_transfer(layer_data, rel_layer, abs_layer, network_version, th=0.0
         else:
             bools += "-1,"
         strings += network_version + "a_layerCount" + str(rel_layer) + \
-                   "_neuronCount" + str(i_c + 1) + "_" + \
+                   "_neuronCount0_" + \
                    str(abs_layer) + "_" + str(i_c + 1) + ","
     return bools, strings
 
@@ -441,7 +441,10 @@ if __name__ == '__main__':
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device("cpu")
+    if args.cpu or not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
 
     print("Transfer attack - source:", source, "target:", target,
           "model1:", model_arch, "model2:", model_arch2,

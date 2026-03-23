@@ -97,9 +97,15 @@ def define_attack(perturbation_type, size_, M, dims, device):
     return eps_pgd
 
 
-def build_str(layer_data, layer_number, th=0.01):
+def build_str(layer_data, layer_number, num_relu_layers, th=0.01):
     bools = ""
     strings = ""
+    if layer_number <= num_relu_layers:
+        version = "org"
+        lc = layer_number
+    else:
+        version = "perturbation"
+        lc = layer_number - num_relu_layers
     for i_c, c in enumerate(layer_data):
         if c.item() > 1 - th:
             bools += "1,"
@@ -107,7 +113,7 @@ def build_str(layer_data, layer_number, th=0.01):
             bools += "0,"
         else:
             bools += "-1,"
-        strings += "a" + str(layer_number) + "_" + str(i_c + 1) + ","
+        strings += version + "a_layerCount" + str(lc) + "_neuronCount0_" + str(layer_number) + "_" + str(i_c + 1) + ","
     return bools, strings
 
 
@@ -274,8 +280,9 @@ def attack(model, X, source_, target_, device, token_signature,\
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.fc1(model.flatten1(F.relu(model.conv2((F.relu(model.conv1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1,  dims[0], dims[1], dims[2]))))))))))), dim=0))
         bools = ""
         strings = ""
+        num_relu_layers = len(layers_outputs) // 2
         for l_no,l_data in enumerate(layers_outputs):
-            b, s = build_str(l_data, l_no+1)
+            b, s = build_str(l_data, l_no+1, num_relu_layers)
             bools += b
             strings += s
         bools = bools[0:-1]
@@ -347,8 +354,8 @@ def load_model( model_arch, model_path):
     else:
         assert False, "New model arch has been detected, please expand models.py and this if condition."
 
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path))
     return model
 
 
@@ -416,7 +423,10 @@ if __name__ == '__main__':
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    device = torch.device("cpu")
+    if args.cpu or not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
     DEVICE = device
     print("source:", source, "target:", target, "model_arch:", model_arch, "perturbation type:", perturbation_type, \
           "perturbation size:", perturbation_size, "dataset:", dataset)

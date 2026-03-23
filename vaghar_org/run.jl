@@ -236,7 +236,8 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             if activate_vaghgar_deps
                 name_to_save = name_to_save*"_VagharDeps"
-                perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k)
+                perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
+                                          perturbation_var=d[:Perturbation])
             end
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save*"_PertruebedIntervals"
@@ -348,11 +349,13 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                 # NETA TODO - HAD TO REMOVE THE FOLLOWING SINCE WE NO LONGER ENCODE N1_P
                 # # Dependencies for N1: original layers 1..K ↔ perturbed layers 2K+1..3K
                 # perturbation_dependencies(m, nn1, perturbation, perturbation_size, w, h, k;
-                #                         activation_start=1, layers_offset=2*K)
+                #                         activation_start=1, layers_offset=2*K,
+                #                         perturbation_var=d[:Perturbation])
                 
                 # Dependencies for N2: original layers K+1..2K ↔ perturbed layers 3K+1..4K
                 perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
-                                        activation_start=K+1, layers_offset=2*K)
+                                        activation_start=K+1, layers_offset=2*K,
+                                        perturbation_var=d[:Perturbation])
             end
 
             # Interval bounds between N1 and N2
@@ -503,7 +506,8 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
                 # Dependencies for N2: original layers K1+1..K1+K2 ↔ perturbed layers
                 deps_offset = n1_p_mode ? K1 + K2 : K2
                 perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
-                                        activation_start=K1+1, layers_offset=deps_offset)
+                                        activation_start=K1+1, layers_offset=deps_offset,
+                                        perturbation_var=d[:Perturbation])
             end
 
             # Interval bounds between N1 and N2 (distillation: every 2nd layer of N2)

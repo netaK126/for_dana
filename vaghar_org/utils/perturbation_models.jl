@@ -98,12 +98,23 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
     global layer_counter
     global nueron_counter
     global network_version
+    global I_pert_prev_up, I_pert_prev_down
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 0, upper_bound = p_size)
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
     @constraint(m, v_x0 .== v_in .+ v_e)
+
+    # Perturbation interval: Δ = x' - x = e, e ∈ [0, ε] → Δ ∈ [0, ε]
+    if size(input)[4] > 1
+        I_pert_prev_up = p_size .* ones(Float64, size(input)[4], 1)
+        I_pert_prev_down = zeros(Float64, size(input)[4], 1)
+    else
+        I_pert_prev_up = p_size .* ones(Float64, size(input))
+        I_pert_prev_down = zeros(Float64, size(input))
+    end
+
     layer_counter = 0
     nueron_counter = 0
     network_version = "org"
