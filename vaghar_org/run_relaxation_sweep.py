@@ -244,10 +244,12 @@ def _extract_transfer_file_metadata(filename):
     }
 
 
-def find_transfer_faster_than_standard(perts, exp_base, output_csv):
-    """For each perturbation/eps, find transfer results faster than standard N2 (NoPerturbed).
+def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster):
+    """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
 
-    Writes matching rows to output_csv.
+    Writes two CSVs:
+      csv_transfer_faster — rows where transfer is faster than standard
+      csv_standard_faster — rows where standard is faster than transfer
     """
     import csv
 
@@ -277,10 +279,14 @@ def find_transfer_faster_than_standard(perts, exp_base, output_csv):
         "how_much_faster",
     ]
 
-    total_rows = 0
-    with open(output_csv, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    total_transfer_faster = 0
+    total_standard_faster = 0
+    with open(csv_transfer_faster, "w", newline="") as f_transfer, \
+         open(csv_standard_faster, "w", newline="") as f_standard:
+        writer_transfer = csv.DictWriter(f_transfer, fieldnames=fieldnames)
+        writer_standard = csv.DictWriter(f_standard, fieldnames=fieldnames)
+        writer_transfer.writeheader()
+        writer_standard.writeheader()
 
         for pert_name, pert_spec in perts:
             # e.g. pert_spec = "patch:1,14,14,3" -> dir = "patch", eps = "1,14,14,3"
@@ -334,28 +340,35 @@ def find_transfer_faster_than_standard(perts, exp_base, output_csv):
                         s_info = standard_results[key]
                         t_time = t_info["optimization_time"]
                         s_time = s_info["optimization_time"]
-                        if t_time < s_time * 0.99:  # at least 1% faster
-                            speedup = s_time / t_time
-                            writer.writerow({
-                                "perturbation": pert_type,
-                                "perturbation_size": eps_str,
-                                "c_source": cs,
-                                "c_target": ct,
-                                "time_standard": f"{s_time:.2f}",
-                                "time_transfer": f"{t_time:.2f}",
-                                "delta_standard_lower_bound": f"{s_info['lower_bound']:.6f}",
-                                "delta_standard_upper_bound": f"{s_info['upper_bound']:.6f}",
-                                "delta_diff_transfer_lower_bound": f"{t_info['lower_bound']:.6f}",
-                                "delta_diff_transfer_upper_bound": f"{t_info['upper_bound']:.6f}",
-                                "transfer_threads": meta["threads"],
-                                "T_relax": relax_val,
-                                "relax_count": meta["relax_count"],
-                                "optimizing_intervals": meta["optimizing_intervals"],
-                                "how_much_faster": f"{speedup:.2f}x",
-                            })
-                            total_rows += 1
 
-    print(f"  Wrote {total_rows} rows to {output_csv}")
+                        row = {
+                            "perturbation": pert_type,
+                            "perturbation_size": eps_str,
+                            "c_source": cs,
+                            "c_target": ct,
+                            "time_standard": f"{s_time:.2f}",
+                            "time_transfer": f"{t_time:.2f}",
+                            "delta_standard_lower_bound": f"{s_info['lower_bound']:.6f}",
+                            "delta_standard_upper_bound": f"{s_info['upper_bound']:.6f}",
+                            "delta_diff_transfer_lower_bound": f"{t_info['lower_bound']:.6f}",
+                            "delta_diff_transfer_upper_bound": f"{t_info['upper_bound']:.6f}",
+                            "transfer_threads": meta["threads"],
+                            "T_relax": relax_val,
+                            "relax_count": meta["relax_count"],
+                            "optimizing_intervals": meta["optimizing_intervals"],
+                        }
+
+                        if t_time < s_time * 0.99:  # transfer is faster
+                            row["how_much_faster"] = f"{s_time / t_time:.2f}x"
+                            writer_transfer.writerow(row)
+                            total_transfer_faster += 1
+                        elif s_time < t_time * 0.99:  # standard is faster
+                            row["how_much_faster"] = f"{t_time / s_time:.2f}x"
+                            writer_standard.writerow(row)
+                            total_standard_faster += 1
+
+    print(f"  Wrote {total_transfer_faster} rows to {csv_transfer_faster}")
+    print(f"  Wrote {total_standard_faster} rows to {csv_standard_faster}")
 
 
 def main():
@@ -408,9 +421,10 @@ def main():
     # ── Analysis mode: find transfer faster than standard ─────────
     if args.find_transfer_faster_than_standard:
         exp_base = os.path.join(cwd, "paper_experiments", "mnist", "cnn1_exp")
-        output_csv = os.path.join(exp_base, "transfer_faster_than_standard.csv")
+        csv_transfer_faster = os.path.join(exp_base, "transfer_faster_than_standard.csv")
+        csv_standard_faster = os.path.join(exp_base, "standard_faster_than_transfer.csv")
         print(f"\nScanning results in: {exp_base}")
-        find_transfer_faster_than_standard(perts, exp_base, output_csv)
+        find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster)
         return
 
     cores_per_job = CORES_PER_JOB
