@@ -116,12 +116,15 @@ def parse_perturbations(spec):
 
 
 def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_size=None,
-                 create=False, dual_seed=False, epochs=None):
+                 create=False, dual_seed=False, epochs=None, model_dirs=None):
     """Return a dict of all experiment directories for the given architecture and dataset.
     Structure: .../arch_exp/perturbation/perturbation_size/...
 
     When dual_seed=True, itr_n1/itr_n2 are seed values and epochs=(epoch_n1, epoch_n2)
     gives the training epoch for each. Folder names use 'seed{S}_itr{E}' format.
+
+    When model_dirs=(n1_dir, n2_dir), use explicit model directories and derive tags
+    from directory basenames by stripping the 'model_' prefix.
     """
     exp_dir = os.path.join(SCRIPT_DIR, '..', 'paper_experiments', dataset, f'{arch}_exp')
     if perturbation and perturbation_size:
@@ -131,7 +134,14 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
     else:
         pert_dir = exp_dir
 
-    if dual_seed:
+    if model_dirs:
+        n1_base = os.path.basename(os.path.normpath(model_dirs[0]))
+        n2_base = os.path.basename(os.path.normpath(model_dirs[1]))
+        tag1 = n1_base.replace('model_', '', 1)
+        tag2 = n2_base.replace('model_', '', 1)
+        model_n1_name = n1_base
+        model_n2_name = n2_base
+    elif dual_seed:
         ep1 = epochs[0] if epochs else 0
         ep2 = epochs[1] if epochs else 0
         tag1 = f'seed{itr_n1}_itr{ep1}'
@@ -546,7 +556,7 @@ def train_dual_seed(arch, dataset, seeds, batch_size=128, lr=1e-3, max_epochs=20
 def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
                         perturbation_size='0.05', ct='1,2,3,4,5,6,7,8,9,10',
                         timeout=10800, perturbation='linf', force_cpu=False,
-                        use_perturbed_intervals=True):
+                        use_perturbed_intervals=True, optimizing_intervals=None):
     """Run VHAGaR in standard mode with hyper attack, vaghar deps, and optionally perturbed intervals."""
     _, model_name = ARCH_REGISTRY[arch]
     _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
@@ -567,12 +577,14 @@ def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
         '--use_perturbed_intervals', str(use_perturbed_intervals).lower(),
         '--force_cpu', str(force_cpu).lower(),
     ]
+    if optimizing_intervals is not None:
+        args += ['--optimizing_intervals', str(optimizing_intervals).lower()]
     pi_label = "with" if use_perturbed_intervals else "without"
     return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag}, {pi_label} perturbed intervals)')
 
 
-def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None):
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs)
+def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     os.makedirs(dirs['vaghar_n1'], exist_ok=True)
     os.makedirs(dirs['vaghar_n2'], exist_ok=True)
     os.makedirs(dirs['vaghar_n1_noPI'], exist_ok=True)
@@ -581,7 +593,10 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
     model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
     model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
-    if dual_seed:
+    if model_dirs:
+        tag1 = os.path.basename(os.path.normpath(model_dirs[0])).replace('model_', '', 1)
+        tag2 = os.path.basename(os.path.normpath(model_dirs[1])).replace('model_', '', 1)
+    elif dual_seed:
         ep1 = epochs[0] if epochs else 0
         ep2 = epochs[1] if epochs else 0
         tag1 = f'seed{itr_n1}_itr{ep1}'
@@ -599,13 +614,13 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
     run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                        use_perturbed_intervals=True)
+                        use_perturbed_intervals=True, optimizing_intervals=optimizing_intervals)
 
     print(f"\n  --- {tag2} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                        use_perturbed_intervals=True)
+                        use_perturbed_intervals=True, optimizing_intervals=optimizing_intervals)
 
     # Run WITHOUT perturbed intervals
     print("=" * 60)
@@ -616,22 +631,23 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
     run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1_noPI'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                        use_perturbed_intervals=False)
+                        use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
 
     print(f"\n  --- {tag2} (ctag={ctag}) ---")
     run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2_noPI'], ctag,
                         perturbation_size=perturbation_size, ct=ct,
                         timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                        use_perturbed_intervals=False)
+                        use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
 
 
 # ── step 3: run VHAGaR transfer ──────────────────────────────────────────
 
 def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               output_dir, timeout, perturbation, ct,
-                              transfer_relaxations, delta_diff_positive,
+                              transfer_relaxations, delta_diff_positive, Threads_num =32,
                               relaxation_threshold=None, force_cpu=False,
-                              use_hyper_attack=True, dual_seed=False, epochs=None):
+                              use_hyper_attack=True, dual_seed=False, epochs=None,
+                              optimizing_intervals=None, model_dirs=None):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -641,7 +657,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
     """
     _, model_name = ARCH_REGISTRY[arch]
     _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, dual_seed=dual_seed, epochs=epochs)
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     pattern = re.compile(rf"_{perturbation}_(.*?)_ctag.*cTag(\d+)")
 
     if not os.path.exists(vaghar_results_dir):
@@ -718,21 +734,27 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             '--use_relaxations', transfer_relaxations,
             '--delta_diff_positive', delta_diff_positive,
             '--force_cpu', str(force_cpu).lower(),
+            '--Threads_num', str(Threads_num),
         ]
         if relaxation_threshold is not None:
             command += ['--relaxation_threshold', str(relaxation_threshold)]
+        if optimizing_intervals is not None:
+            command += ['--optimizing_intervals', str(optimizing_intervals).lower()]
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
 
 def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturbation_size, ct,
-                   transfer_relaxations, delta_diff_positive, relaxation_threshold=None, force_cpu=False,
-                   use_hyper_attack=True, dual_seed=False, epochs=None):
-    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs)
+                   transfer_relaxations, delta_diff_positive,Threads_num=32, relaxation_threshold=None, force_cpu=False,
+                   use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold)
     os.makedirs(output_dir, exist_ok=True)
 
-    if dual_seed:
+    if model_dirs:
+        tag1 = os.path.basename(os.path.normpath(model_dirs[0])).replace('model_', '', 1)
+        tag2 = os.path.basename(os.path.normpath(model_dirs[1])).replace('model_', '', 1)
+    elif dual_seed:
         ep1 = epochs[0] if epochs else 0
         ep2 = epochs[1] if epochs else 0
         tag1 = f'seed{itr_n1}_itr{ep1}'
@@ -748,8 +770,9 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
     run_transfer_from_results(
         arch, dataset, itr_n1, itr_n2,
         dirs['vaghar_n1'], output_dir, timeout, perturbation, ct,
-        transfer_relaxations, delta_diff_positive, relaxation_threshold, force_cpu=force_cpu,
+        transfer_relaxations, delta_diff_positive, Threads_num, relaxation_threshold, force_cpu=force_cpu,
         use_hyper_attack=use_hyper_attack, dual_seed=dual_seed, epochs=epochs,
+        optimizing_intervals=optimizing_intervals, model_dirs=model_dirs,
     )
 
 
@@ -790,6 +813,9 @@ def main():
                         help='Plot confidence values for N2 on the test set, then exit')
     parser.add_argument('--plot_conf_both', action='store_true',
                         help='Plot confidence values for both N1 and N2 on the same figure, then exit')
+    parser.add_argument('--optimizing_intervals', type=str, default=None,
+                        help='Override optimizing_intervals flag passed to Julia (true/false). '
+                             'Default: let Julia use its own default (true).')
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_standard', action='store_true', help='Skip standard VHAGaR')
     parser.add_argument('--skip_transfer', action='store_true', help='Skip transfer VHAGaR')
@@ -811,6 +837,14 @@ def main():
                         help='PGD training: step size per iteration')
     parser.add_argument('--pgd_steps', type=int, default=7,
                         help='PGD training: number of attack iterations per batch')
+    parser.add_argument('--model_n1_dir', type=str, default=None,
+                        help='Explicit model directory for N1 (e.g. model_seed42_itr20). '
+                             'Tags derived from basename. Skips auto-detection.')
+    parser.add_argument('--model_n2_dir', type=str, default=None,
+                        help='Explicit model directory for N2 (e.g. model_seed42_itr20_sgd_itr1). '
+                             'Tags derived from basename. Skips auto-detection.')
+    parser.add_argument('--Threads_num', type=int, default=32,
+                        help='Number of threads to use')
 
     args = parser.parse_args()
 
@@ -844,9 +878,21 @@ def main():
 
     os.chdir(RUN_JL_DIR)
 
+    # Explicit model directories mode (--model_n1_dir / --model_n2_dir)
+    model_dirs = None
+    if args.model_n1_dir and args.model_n2_dir:
+        model_dirs = (args.model_n1_dir, args.model_n2_dir)
+        itr_n1, itr_n2 = 0, 0  # dummy, not used when model_dirs is set
+        epochs = None
+        tag1 = os.path.basename(os.path.normpath(args.model_n1_dir)).replace('model_', '', 1)
+        tag2 = os.path.basename(os.path.normpath(args.model_n2_dir)).replace('model_', '', 1)
+        print(f"\nExplicit model dirs mode: N1={tag1}, N2={tag2}")
+
     # Step 1: Train (once — training is perturbation-independent)
     epochs = None  # only used in dual_seed mode
-    if not args.skip_training:
+    if model_dirs:
+        print("Using explicit model directories, skipping training/detection.")
+    elif not args.skip_training:
         if dual_seed:
             itr_n1, itr_n2, ep_n1, ep_n2 = train_dual_seed(
                 arch, dataset, seeds=(seed_values[0], seed_values[1]),
@@ -900,19 +946,33 @@ def main():
                 step2_vaghar_standard(arch, dataset, itr_n1, itr_n2,
                                       perturbation, perturbation_size,
                                       ctag, args.ct, args.timeout, force_cpu=args.cpu,
-                                      dual_seed=dual_seed, epochs=epochs)
+                                      dual_seed=dual_seed, epochs=epochs,
+                                      optimizing_intervals=args.optimizing_intervals,
+                                      model_dirs=model_dirs)
         else:
             print("  Skipping standard VHAGaR (--skip_standard)")
 
         # Step 3: Transfer — baseline (no relaxation) + sweep over thresholds
         if not args.skip_transfer:
+            # Pick N1 as the seed with fastest standard NoPerturbed optimization time
+            transfer_n1, transfer_n2 = itr_n1, itr_n2
+            transfer_epochs = epochs
+            transfer_model_dirs = model_dirs
+            if dual_seed and not model_dirs:
+                transfer_n1, transfer_n2, ep1_t, ep2_t = pick_n1_by_fastest_standard(
+                    arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size,
+                    dual_seed=True, epochs=epochs)
+                transfer_epochs = (ep1_t, ep2_t)
+
             # Sweep: transfer with relaxations enabled at each threshold
             for thresh in thresholds:
-                step3_transfer(arch, dataset, itr_n1, itr_n2, args.timeout, perturbation, perturbation_size,
-                               args.ct, 'true', args.delta_diff_positive, relaxation_threshold=thresh,
+                step3_transfer(arch, dataset, transfer_n1, transfer_n2, args.timeout, perturbation, perturbation_size,
+                               args.ct, 'true', args.delta_diff_positive, args.Threads_num, relaxation_threshold=thresh,
                                force_cpu=args.cpu,
                                use_hyper_attack=not args.skip_hyper_transfer_attack,
-                               dual_seed=dual_seed, epochs=epochs)
+                               dual_seed=dual_seed, epochs=transfer_epochs,
+                               optimizing_intervals=args.optimizing_intervals,
+                               model_dirs=transfer_model_dirs)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 
@@ -940,6 +1000,76 @@ def main():
         print(f"    VHAGaR {tag2} (no PI):  {dirs['vaghar_n2_noPI']}/")
         for thresh in thresholds:
             print(f"    Transfer (t={thresh}):  {get_transfer_dir(dirs, thresh)}/")
+
+
+def get_noPI_optimization_time(arch, dataset, seed, perturbation, perturbation_size,
+                               dual_seed=True, epochs=None, other_seed=None, other_epoch=None):
+    """Get the total optimization_time from standard NoPerturbed results for a given seed.
+
+    Returns the sum of optimization_time across all result files, or float('inf') if no results found.
+    """
+    # We need both seeds to construct the directory path (get_exp_dirs requires itr_n1/itr_n2)
+    if other_seed is None:
+        return float('inf')
+
+    # Try both orderings to find the directory
+    for s1, s2, e1, e2 in [(seed, other_seed, epochs[0] if epochs else 0, epochs[1] if epochs else 0),
+                            (other_seed, seed, epochs[1] if epochs else 0, epochs[0] if epochs else 0)]:
+        ep = (e1, e2) if epochs else None
+        dirs = get_exp_dirs(arch, dataset, s1, s2, perturbation=perturbation,
+                           perturbation_size=perturbation_size, dual_seed=dual_seed,
+                           epochs=ep)
+        # Figure out which noPI dir corresponds to our target seed
+        if s1 == seed:
+            noPI_dir = dirs['vaghar_n1_noPI']
+        else:
+            noPI_dir = dirs['vaghar_n2_noPI']
+
+        if os.path.exists(noPI_dir) and os.listdir(noPI_dir):
+            break
+    else:
+        return float('inf')
+
+    total_time = 0.0
+    found = False
+    for filename in os.listdir(noPI_dir):
+        if not filename.endswith('.txt'):
+            continue
+        filepath = os.path.join(noPI_dir, filename)
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = dict(p.split('=') for p in line.split(','))
+                if 'optimization_time' in parts:
+                    total_time += float(parts['optimization_time'])
+                    found = True
+    return total_time if found else float('inf')
+
+
+def pick_n1_by_fastest_standard(arch, dataset, seed_a, seed_b, perturbation, perturbation_size,
+                                dual_seed=True, epochs=None):
+    """Pick N1 as the seed with lowest standard NoPerturbed optimization time.
+
+    Returns (n1_seed, n2_seed, n1_epoch, n2_epoch) with the faster seed as N1.
+    """
+    ep_a = epochs[0] if epochs else None
+    ep_b = epochs[1] if epochs else None
+
+    time_a = get_noPI_optimization_time(arch, dataset, seed_a, perturbation, perturbation_size,
+                                        dual_seed=dual_seed, epochs=epochs,
+                                        other_seed=seed_b, other_epoch=ep_b)
+    time_b = get_noPI_optimization_time(arch, dataset, seed_b, perturbation, perturbation_size,
+                                        dual_seed=dual_seed, epochs=epochs,
+                                        other_seed=seed_a, other_epoch=ep_a)
+
+    if time_a <= time_b:
+        print(f"  N1=seed{seed_a} (time={time_a:.1f}s) <= N2=seed{seed_b} (time={time_b:.1f}s)")
+        return seed_a, seed_b, ep_a, ep_b
+    else:
+        print(f"  N1=seed{seed_b} (time={time_b:.1f}s) < N2=seed{seed_a} (time={time_a:.1f}s)")
+        return seed_b, seed_a, ep_b, ep_a
 
 
 def parse_vaghar_results(results_dir, ctag, perturbation, field='upper_bound'):

@@ -1006,7 +1006,7 @@ end
 # Requires all_bounds_of_original to be initialised (input-layer entry only
 # is sufficient; the rest is built here in parallel with propagate_intervals).
 # ═══════════════════════════════════════════════════════════════════════════
-function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init)
+function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals::Bool=true)
     # ── Activation conditional-triangle relaxation (n2_org) ──────────────────
     # diff bounds: z_n2_org - z_n1_org, used with a_n1_org + N1 preact bounds
     global relu_diff_up_bounds, relu_diff_down_bounds
@@ -1128,9 +1128,32 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
             push!(relu_comp_up_bounds,   diff_up   .+ pert_up)
             push!(relu_comp_down_bounds, diff_down .+ pert_down)
 
-            # Clip intervals through ReLU (non-expansive)
-            diff_up   = max.(0.0, diff_up)
-            diff_down = .- max.(0.0, .- diff_down)
+            # Clip intervals through ReLU
+            if optimizing_intervals
+                # Tighter per-neuron clipping using N1/N2 preact stability
+                for i in eachindex(diff_up)
+                    l_n1 = n1_pre_down_cur[i]
+                    u_n1 = n1_pre_up_cur[i]
+                    l_n2 = l_n1 + diff_down[i]
+                    u_n2 = u_n1 + diff_up[i]
+
+                    if l_n1 >= 0 && l_n2 >= 0
+                        # both active: post-ReLU diff = pre-ReLU diff, keep as-is
+                    elseif u_n1 <= 0 && u_n2 <= 0
+                        # both inactive: post-ReLU diff = 0
+                        diff_up[i] = 0.0
+                        diff_down[i] = 0.0
+                    else
+                        # mixed: use conservative non-expansive clipping
+                        diff_up[i] = max(0.0, diff_up[i])
+                        diff_down[i] = -max(0.0, -diff_down[i])
+                    end
+                end
+            else
+                # Original conservative clipping (non-expansive)
+                diff_up   = max.(0.0, diff_up)
+                diff_down = .- max.(0.0, .- diff_down)
+            end
             pert_up   = max.(0.0, pert_up)
             pert_down = .- max.(0.0, .- pert_down)
 

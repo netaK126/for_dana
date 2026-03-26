@@ -1,0 +1,279 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,array}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{xspace}
+\usepackage{hyperref}
+
+%% ── theorem environments ────────────────────────────────────────────────────
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+%% ── macros (consistent with BRIDGE paper) ───────────────────────────────────
+\newcommand{\tool}{\texttt{BRIDGE}\xspace}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\conf}[3]{\mathcal{C}(#1,#2,#3)}
+\newcommand{\xp}{x'}
+\newcommand{\ep}{\varepsilon}
+\newcommand{\dD}{\delta_{\mathrm{diff}}}
+\newcommand{\mI}{\mathcal{I}}
+\newcommand{\Npre}{N_{\mathrm{pre}}}
+\newcommand{\sgn}{\operatorname{sgn}}
+
+\title{Transfer Dependency Reuse:\\Inferring $N$'s Perturbation Dependencies\\from $\Npre$'s via Weight Differences}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Background}
+\label{sec:background}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+We briefly recall the dependency analysis from VHAGaR and how \tool uses it.
+
+\paragraph{Dependency analysis.}
+Given a network $N$ with weights $W_m$ at layer $m$, a perturbation type $P$ with bound~$\ep$, and the perturbation set $\mI_\ep(x)$, the dependency analysis computes a \emph{dependency vector} $\varphi_m \in \{0, +1, -1, \mathtt{NaN}\}^{k_m}$ at each layer $m$, where $k_m$ is the number of neurons in layer~$m$. The dependency $\varphi_{m,k}$ characterizes the relationship between the clean activation $z_{m,k}^{\mathrm{org}}$ (from input $x$) and the perturbed activation $z_{m,k}^{\mathrm{pert}}$ (from input $\xp \in \mI_\ep(x)$):
+\begin{itemize}
+  \item $\varphi_{m,k} = 0$: equal --- $z_{m,k}^{\mathrm{pert}} = z_{m,k}^{\mathrm{org}}$ for all $x, \xp$.
+  \item $\varphi_{m,k} = +1$: monotonically increasing --- $z_{m,k}^{\mathrm{pert}} \ge z_{m,k}^{\mathrm{org}}$ for all $x, \xp$.
+  \item $\varphi_{m,k} = -1$: monotonically decreasing --- $z_{m,k}^{\mathrm{pert}} \le z_{m,k}^{\mathrm{org}}$ for all $x, \xp$.
+  \item $\varphi_{m,k} = \mathtt{NaN}$: unknown --- no monotonicity can be established analytically.
+\end{itemize}
+For each neuron with $\varphi_{m,k} \in \{0, +1, -1\}$, the analysis adds the corresponding ordering constraint to the MIP. These constraints are \emph{tightening}: they prune the feasible region but are not required for the correctness of the MIP encoding.
+
+\paragraph{Dependency propagation.}
+The dependency vector is computed inductively. The base case $\varphi_0$ is determined by the perturbation type (e.g., for brightness with $\ep > 0$: $\varphi_{0,k} = +1$ for all pixels). For a linear layer with weight matrix~$W_m$, the propagation rule computes, for each output neuron~$k$:
+\begin{equation}
+  \label{eq:dep-prop}
+  o_k = \sum_{i} W_{m}[k,i] \cdot \varphi_{m-1,i}, \qquad
+  t_k = \sum_{i} |W_{m}[k,i]| \cdot |\varphi_{m-1,i}|,
+\end{equation}
+where the sums range over inputs $i$ with $\varphi_{m-1,i} \neq 0$ and $\varphi_{m-1,i} \neq \mathtt{NaN}$.
+The ratio $r_k = o_k / t_k$ determines the dependency:
+\begin{equation}
+  \label{eq:dep-ratio}
+  \varphi_{m,k} = \begin{cases}
+    +1 & \text{if } r_k = +1, \\
+    -1 & \text{if } r_k = -1, \\
+    0 & \text{if } t_k = 0 \text{ and } o_k = 0, \\
+    \mathtt{NaN} & \text{otherwise (i.e., } |r_k| < 1 \text{).}
+  \end{cases}
+\end{equation}
+Inputs $i$ with $\varphi_{m-1,i} = \mathtt{NaN}$ poison the computation: if any such input has $W_m[k,i] \neq 0$, then $\varphi_{m,k} = \mathtt{NaN}$. For neurons with $\varphi_{m,k} = \mathtt{NaN}$, VHAGaR optionally solves LP sub-problems to determine whether the ordering holds given the MIP bounds. These LP sub-problems are the expensive part of the dependency analysis.
+
+\paragraph{Key observation.}
+The ratio $r_k = \pm 1$ if and only if \emph{all} non-zero terms $W_m[k,i] \cdot \varphi_{m-1,i}$ share the same sign. Equivalently:
+\begin{equation}
+  \label{eq:same-sign}
+  \varphi_{m,k} \in \{+1, -1\} \iff \forall\, i \text{ with } \varphi_{m-1,i} \notin \{0, \mathtt{NaN}\}: \; \sgn(W_m[k,i]) \cdot \sgn(\varphi_{m-1,i}) \text{ is constant.}
+\end{equation}
+This means the dependency depends only on the \emph{signs} of the weights on relevant paths, not on their magnitudes.
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Transfer Dependency Reuse}
+\label{sec:reuse}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+\paragraph{Setting.}
+We are in \tool's transfer setting. We have a pretrained network $\Npre$ with weights $W_m^{\mathrm{pre}}$ and a target network $N$ with weights $W_m^{N} = W_m^{\mathrm{pre}} + \Delta W_m$. Standard mode has already computed the dependency vectors $\varphi_m^{\mathrm{pre}}$ for $\Npre$. We wish to compute the dependency vectors $\varphi_m^{N}$ for $N$ \emph{without solving any LP sub-problems}, by leveraging $\varphi_m^{\mathrm{pre}}$ and the weight differences $\Delta W_m$.
+
+\paragraph{Goal.}
+For each neuron $(m,k)$, either:
+\begin{enumerate}
+  \item Confirm that $\varphi_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}}$ (reuse the constraint), or
+  \item Conservatively set $\varphi_{m,k}^{N} = \mathtt{NaN}$ (add no constraint for this neuron).
+\end{enumerate}
+Since dependency constraints are tightening, option~(2) preserves soundness.
+
+\subsection{Sign-Flip Condition}
+
+\begin{definition}[Sign flip]
+  \label{def:sign-flip}
+  Weight $W_m[k,i]$ has a \emph{sign flip} between $\Npre$ and $N$ if
+  \[
+    \sgn(W_m^{N}[k,i]) \neq \sgn(W_m^{\mathrm{pre}}[k,i]),
+  \]
+  where $\sgn(0) = 0$. We define the sign-flip set at layer $m$ as:
+  \[
+    F_m = \{(k,i) : \sgn(W_m^{N}[k,i]) \neq \sgn(W_m^{\mathrm{pre}}[k,i])\}.
+  \]
+\end{definition}
+
+Note that $\Delta W_m$ alone is not sufficient to detect a sign flip --- we need $\sgn(W_m^{\mathrm{pre}}[k,i])$ and $\sgn(W_m^{\mathrm{pre}}[k,i] + \Delta W_m[k,i])$. A sign flip occurs when $|\Delta W_m[k,i]| > |W_m^{\mathrm{pre}}[k,i]|$ and the signs differ, or when a zero weight becomes non-zero (or vice versa).
+
+\begin{definition}[Relevant inputs]
+  \label{def:relevant}
+  For neuron $k$ at layer $m$, the \emph{relevant input set} with respect to dependency vector $\varphi_{m-1}$ is:
+  \[
+    R_{m,k}(\varphi_{m-1}) = \{i : \varphi_{m-1,i} \notin \{0, \mathtt{NaN}\} \text{ and } W_m[k,i] \neq 0\}.
+  \]
+\end{definition}
+
+\subsection{Layer-by-Layer Reuse Algorithm}
+
+We propagate the inferred dependency vector $\tilde{\varphi}_m^{N}$ layer by layer. The key insight is that at each layer, if $\tilde{\varphi}_{m-1}^{N} = \varphi_{m-1}^{\mathrm{pre}}$ for all inputs relevant to neuron $k$, and no weight feeding neuron $k$ has a sign flip, then $\varphi_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}}$.
+
+\begin{algorithm}[H]
+  \caption{TransferDependencyReuse($\Npre, N, P, \ep, \{\varphi_m^{\mathrm{pre}}\}_{m=0}^{L}$)}
+  \label{alg:reuse}
+  \small
+  \DontPrintSemicolon
+  \SetAlgoNoEnd
+  \KwIn{Networks $\Npre, N$ with weights $W_m^{\mathrm{pre}}, W_m^{N}$; perturbation $P$ with bound $\ep$; precomputed dependency vectors $\{\varphi_m^{\mathrm{pre}}\}_{m=0}^{L}$}
+  \KwOut{Inferred dependency vectors $\{\tilde{\varphi}_m^{N}\}_{m=0}^{L}$}
+  \BlankLine
+  $\tilde{\varphi}_0^{N} \gets \varphi_0^{\mathrm{pre}}$ \tcp*{Same perturbation $\Rightarrow$ same input deps}
+  \For{$m = 1, \ldots, L$}{
+    Compute $F_m = \{(k,i) : \sgn(W_m^{N}[k,i]) \neq \sgn(W_m^{\mathrm{pre}}[k,i])\}$\;
+    \For{each neuron $k \in \{1, \ldots, k_m\}$}{
+      $\mathit{poisoned} \gets \exists\, i \text{ s.t. } W_m^{N}[k,i] \neq 0 \text{ and } \tilde{\varphi}_{m-1,i}^{N} = \mathtt{NaN}$ \tcp*{NaN input?}
+      $\mathit{diverged} \gets \exists\, i \in R_{m,k}(\varphi_{m-1}^{\mathrm{pre}}) \text{ s.t. } \tilde{\varphi}_{m-1,i}^{N} \neq \varphi_{m-1,i}^{\mathrm{pre}}$ \tcp*{Input deps changed?}
+      $\mathit{flipped} \gets \exists\, i \in R_{m,k}(\tilde{\varphi}_{m-1}^{N}) \text{ s.t. } (k,i) \in F_m$ \tcp*{Weight sign flip?}
+      \BlankLine
+      \uIf{$\mathit{poisoned}$ \textbf{or} $\mathit{diverged}$ \textbf{or} $\mathit{flipped}$}{
+        $\tilde{\varphi}_{m,k}^{N} \gets \mathtt{NaN}$ \tcp*{Cannot confirm $\Rightarrow$ skip}
+      }
+      \Else{
+        $\tilde{\varphi}_{m,k}^{N} \gets \varphi_{m,k}^{\mathrm{pre}}$ \tcp*{Safe to reuse}
+      }
+    }
+  }
+  \Return $\{\tilde{\varphi}_m^{N}\}_{m=0}^{L}$\;
+\end{algorithm}
+
+\paragraph{Constraint encoding.}
+After Algorithm~\ref{alg:reuse}, for each neuron $(m,k)$ with $\tilde{\varphi}_{m,k}^{N} \in \{0, +1, -1\}$, we add the corresponding constraint to the transfer MIP:
+\begin{align*}
+  \tilde{\varphi}_{m,k}^{N} = 0 &\implies z_{m,k}^{\mathrm{pert}} = z_{m,k}^{\mathrm{org}}, \\
+  \tilde{\varphi}_{m,k}^{N} = +1 &\implies z_{m,k}^{\mathrm{pert}} \ge z_{m,k}^{\mathrm{org}}, \\
+  \tilde{\varphi}_{m,k}^{N} = -1 &\implies z_{m,k}^{\mathrm{pert}} \le z_{m,k}^{\mathrm{org}}.
+\end{align*}
+Neurons with $\tilde{\varphi}_{m,k}^{N} = \mathtt{NaN}$ receive no constraint.
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Soundness Proof}
+\label{sec:proof}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+We prove that the algorithm is sound in two steps: (1)~every reused dependency is correct, and (2)~skipping a dependency preserves soundness of $\dD$.
+
+\subsection{Correctness of Reused Dependencies}
+
+\begin{lemma}[Same-sign preservation]
+  \label{lem:sign}
+  Let $\varphi_{m-1}$ be a dependency vector, and let $W, W'$ be two weight matrices for layer~$m$ such that for all $i \in R_{m,k}(\varphi_{m-1})$:
+  \[
+    \sgn(W[k,i]) = \sgn(W'[k,i]).
+  \]
+  Then the dependency propagation~\eqref{eq:dep-ratio} yields the same result for neuron $k$ under both $W$ and $W'$.
+\end{lemma}
+
+\begin{proof}
+  Recall from~\eqref{eq:same-sign} that $\varphi_{m,k} \in \{+1, -1\}$ if and only if all non-zero terms $W[k,i] \cdot \varphi_{m-1,i}$ share the same sign. Since $\sgn(W[k,i]) = \sgn(W'[k,i])$ for all relevant $i$, the sign of each term $W[k,i] \cdot \varphi_{m-1,i}$ equals the sign of $W'[k,i] \cdot \varphi_{m-1,i}$. Therefore:
+  \begin{itemize}
+    \item If all terms share the same sign under $W$, they also share the same sign under $W'$, and both yield the same $\varphi_{m,k} \in \{+1, -1\}$.
+    \item If $t_k = 0$ under $W$ (no relevant inputs), then $t_k = 0$ under $W'$ as well, so both yield $\varphi_{m,k} = 0$.
+  \end{itemize}
+  In both cases, the propagation result is identical.
+\end{proof}
+
+\begin{theorem}[Correctness of reused dependencies]
+  \label{thm:correct}
+  For every neuron $(m,k)$ where Algorithm~\ref{alg:reuse} sets $\tilde{\varphi}_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}}$, the true dependency of $N$ satisfies $\varphi_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}}$. That is, the reused constraint is a valid ordering constraint for~$N$.
+\end{theorem}
+
+\begin{proof}
+  By induction on the layer index $m$.
+
+  \textbf{Base case} ($m = 0$): The input-layer dependency $\varphi_0$ is determined solely by the perturbation type $P$ and bound $\ep$, which are the same for both networks. Therefore $\varphi_0^{N} = \varphi_0^{\mathrm{pre}} = \tilde{\varphi}_0^{N}$.
+
+  \textbf{Inductive step}: Assume that for all neurons $i$ at layer $m{-}1$, if $\tilde{\varphi}_{m-1,i}^{N} \neq \mathtt{NaN}$ then $\tilde{\varphi}_{m-1,i}^{N} = \varphi_{m-1,i}^{N}$ (i.e., every non-$\mathtt{NaN}$ inferred dependency at the previous layer is correct).
+
+  Consider neuron $k$ at layer $m$ where the algorithm sets $\tilde{\varphi}_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}}$. By the algorithm's conditions, the following three properties hold:
+
+  \begin{enumerate}
+    \item \textbf{No poisoning}: For all $i$ with $W_m^{N}[k,i] \neq 0$, $\tilde{\varphi}_{m-1,i}^{N} \neq \mathtt{NaN}$. By the inductive hypothesis, $\tilde{\varphi}_{m-1,i}^{N} = \varphi_{m-1,i}^{N}$ for all such $i$.
+
+    \item \textbf{No divergence}: For all $i \in R_{m,k}(\varphi_{m-1}^{\mathrm{pre}})$, $\tilde{\varphi}_{m-1,i}^{N} = \varphi_{m-1,i}^{\mathrm{pre}}$. Combined with property~1, this gives $\varphi_{m-1,i}^{N} = \varphi_{m-1,i}^{\mathrm{pre}}$ for all relevant inputs.
+
+    \item \textbf{No sign flips}: For all $i \in R_{m,k}(\tilde{\varphi}_{m-1}^{N})$, $\sgn(W_m^{N}[k,i]) = \sgn(W_m^{\mathrm{pre}}[k,i])$.
+  \end{enumerate}
+
+  From properties~1 and~2, the input dependency vectors agree on all relevant inputs: $\varphi_{m-1,i}^{N} = \varphi_{m-1,i}^{\mathrm{pre}}$ for all $i \in R_{m,k}(\varphi_{m-1}^{\mathrm{pre}})$. Together with property~2, the relevant input sets are identical: $R_{m,k}(\varphi_{m-1}^{N}) = R_{m,k}(\varphi_{m-1}^{\mathrm{pre}})$.
+
+  From property~3 and Lemma~\ref{lem:sign}, the dependency propagation~\eqref{eq:dep-ratio} yields the same result for $W_m^{N}$ and $W_m^{\mathrm{pre}}$ on the shared input dependency vector. Therefore $\varphi_{m,k}^{N} = \varphi_{m,k}^{\mathrm{pre}} = \tilde{\varphi}_{m,k}^{N}$.
+\end{proof}
+
+\subsection{Soundness of the Transfer Margin}
+
+\begin{theorem}[Soundness of $\dD$ with reused dependencies]
+  \label{thm:sound}
+  Let $\dD^*$ be the true transfer margin (Definition~1 in the \tool paper), and let $\hat{\dD}$ be the value returned by the transfer MIP using the inferred dependencies $\tilde{\varphi}^{N}$ from Algorithm~\ref{alg:reuse} instead of the full dependency analysis. Then $\hat{\dD} \ge \dD^*$.
+\end{theorem}
+
+\begin{proof}
+  The transfer MIP computes an upper bound on $\dD^*$: $\hat{\dD} \ge \dD^*$. This holds because the MIP is a relaxation --- its feasible region contains all true feasible points $(x, \xp)$ satisfying the constraints of Definition~1.
+
+  Dependency constraints are \emph{valid inequalities}: they hold for every feasible point but are not part of the problem definition. Specifically:
+  \begin{itemize}
+    \item By Theorem~\ref{thm:correct}, every constraint added by Algorithm~\ref{alg:reuse} (where $\tilde{\varphi}_{m,k}^{N} \in \{0, +1, -1\}$) is a correct ordering constraint for~$N$. Adding a correct constraint does not remove any true feasible point, so the MIP remains a valid relaxation.
+    \item For neurons where $\tilde{\varphi}_{m,k}^{N} = \mathtt{NaN}$, no constraint is added. This only \emph{enlarges} the feasible region compared to adding the (unknown) true constraint, which can only \emph{increase} the objective value.
+  \end{itemize}
+
+  Therefore the feasible region of the MIP with reused dependencies \emph{contains} the feasible region of the MIP with full dependencies, which in turn contains all true feasible points. The objective value $\hat{\dD}$ is thus a valid upper bound: $\hat{\dD} \ge \dD^*$.
+
+  By Theorem~1 of the \tool paper, $\delta^*_{\mathrm{pre}} + \dD^* \le \delta^*$, and since $\hat{\dD} \ge \dD^*$, we have $\delta^*_{\mathrm{pre}} + \hat{\dD} \ge \delta^*_{\mathrm{pre}} + \dD^*$. The transfer property remains sound: any input certified robust using $\hat{\dD}$ (i.e., $\conf{N}{x}{c} - \conf{\Npre}{x}{c} > \hat{\dD}$) is truly robust, since $\hat{\dD} \ge \dD^*$ means the certification condition is strictly stronger.
+\end{proof}
+
+\begin{remark}[Relationship to the inference theorem]
+  The inference condition from the \tool paper (Theorem~2) states: if $\conf{N}{x}{c} - \conf{\Npre}{x}{c} > \dD$, then $N$ is robust on $x$. When using $\hat{\dD} \ge \dD^*$ from the reused-dependency MIP, the condition $\conf{N}{x}{c} - \conf{\Npre}{x}{c} > \hat{\dD}$ is \emph{more conservative} (harder to satisfy) than using $\dD^*$. Therefore, every input certified by the reused-dependency analysis is also certified by the full analysis. Soundness is preserved; only the certification rate may decrease (fewer inputs may satisfy the stricter condition).
+\end{remark}
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Complexity Analysis}
+\label{sec:complexity}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+\paragraph{Standard dependency analysis.}
+For each layer $m$ with $k_m$ neurons and $k_{m-1}$ inputs, the sign propagation costs $O(k_m \cdot k_{m-1})$ (matrix operations). For each neuron with $\varphi_{m,k} = \mathtt{NaN}$, an LP sub-problem is solved, costing $O(\mathrm{LP}(m))$ where $\mathrm{LP}(m)$ depends on the MIP size up to layer $m$. In the worst case, all neurons are $\mathtt{NaN}$, giving total cost $O(\sum_m k_m \cdot (k_{m-1} + \mathrm{LP}(m)))$.
+
+\paragraph{Transfer dependency reuse (Algorithm~\ref{alg:reuse}).}
+The sign-flip set $F_m$ is computed in $O(k_m \cdot k_{m-1})$ via element-wise sign comparison. The three checks per neuron (poisoned, diverged, flipped) each require $O(k_{m-1})$ in the worst case. Total cost: $O(\sum_m k_m \cdot k_{m-1})$ --- the same as the sign propagation alone, with \textbf{zero LP sub-problems}.
+
+\paragraph{Expected reuse rate.}
+For fine-tuned networks where $\|\Delta W_m\|$ is small relative to $\|W_m^{\mathrm{pre}}\|$, sign flips are rare (they require $|\Delta W_m[k,i]| > |W_m^{\mathrm{pre}}[k,i]|$). At layer~1, the input dependencies are identical and few weights flip sign, so nearly all dependencies are reused. At deeper layers, the cascade effect from $\mathtt{NaN}$ neurons at earlier layers reduces the reuse rate, but for typical fine-tuning scenarios the degradation is~gradual.
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+\paragraph{What is preserved.}
+Soundness and correctness of $\dD$ as an upper bound on the true transfer margin. Every reused constraint is proven correct (Theorem~\ref{thm:correct}). The transfer property and inference guarantees of \tool are fully preserved (Theorem~\ref{thm:sound}).
+
+\paragraph{What may change.}
+The tightness of the upper bound $\hat{\dD}$. Neurons where Algorithm~\ref{alg:reuse} conservatively outputs $\mathtt{NaN}$ may have had a non-$\mathtt{NaN}$ dependency under the full analysis (either from sign propagation or from the LP sub-problems). The absence of these constraints enlarges the feasible region, potentially increasing $\hat{\dD}$.
+
+\paragraph{When to use.}
+This optimization is most effective when:
+\begin{itemize}
+  \item $\Delta W$ is sparse or small (fine-tuning, pruning, noise injection),
+  \item The standard-mode dependencies $\varphi^{\mathrm{pre}}$ are already computed,
+  \item The LP sub-problems in the full analysis constitute a significant fraction of the dependency analysis runtime.
+\end{itemize}
+
+\paragraph{Possible extension.}
+For neurons where Algorithm~\ref{alg:reuse} sets $\tilde{\varphi}_{m,k}^{N} = \mathtt{NaN}$ due to a sign flip, one could optionally \emph{recompute} the dependency via the standard propagation rule~\eqref{eq:dep-prop} using $W_m^{N}$ and $\tilde{\varphi}_{m-1}^{N}$, without solving an LP. This recovers some dependencies at the cost of a per-neuron matrix-vector product, still avoiding LP sub-problems. This creates a three-tier strategy: (1)~reuse from $\Npre$ when safe, (2)~recompute analytically via sign propagation when the input dependencies are known, (3)~set to $\mathtt{NaN}$ otherwise.
+
+\end{document}

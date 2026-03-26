@@ -21,10 +21,14 @@ function perturbation_init_deps(phi_dep, perturbation, perturbation_size)
         phi_dep .= 0
         phi_dep[1, row_index:row_index+occlusion_width-1, column_index:column_index+occlusion_width-1, :] .= NaN
     elseif perturbation == "translation"
-        translation_down = perturbation_size[1]
-        translation_right = perturbation_size[2]
-        phi_dep[:,1:translation_down,:,:] .= -1
-        phi_dep[:,:,1:translation_right,:] .= -1
+        translation_down = Int(perturbation_size[1])
+        translation_right = Int(perturbation_size[2])
+        if translation_down > 0
+            phi_dep[:,1:translation_down,:,:] .= -1
+        end
+        if translation_right > 0
+            phi_dep[:,:,1:translation_right,:] .= -1
+        end
     elseif perturbation == "contrast"
         c = perturbation_size[1]
         if c>0

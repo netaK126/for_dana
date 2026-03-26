@@ -1,0 +1,25 @@
+ERROR: LoadError: AssertionError: Input size (4, 4, 1, 8) did not match expected size (4, 4, 1, 6).
+Stacktrace:
+  [1] check_size(input::Array{Float32, 4}, expected_size::NTuple{4, Int64})
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/MIPVerify.jl/src/net_components.jl:31
+  [2] check_size(params::Conv2d{Float32, Float32, Int64}, sizes::NTuple{4, Int64})
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/MIPVerify.jl/src/net_components/layers/conv2d.jl:84
+  [3] get_conv_params(param_dict::Dict{String, Any}, layer_name::String, expected_size::NTuple{4, Int64}; matrix_name::String, bias_name::String, expected_stride::Int64, padding::ValidPadding)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/MIPVerify.jl/src/utils/import_weights.jl:77
+  [4] get_conv_params
+    @ ~/Downloads/for_dana/vaghar_org/utils/MIPVerify.jl/src/utils/import_weights.jl:60 [inlined]
+  [5] get_nn(model_path::String, model_name::String, w::Int64, h::Int64, k::Int64, c::Int64, dataset::String)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/models.jl:165
+  [6] main_standard(args::Dict{String, Any}, dataset::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}, name_to_save::String, use_hyper_attack::Bool)
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:216
+  [7] main()
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:200
+  [8] top-level scope
+    @ ~/Downloads/for_dana/vaghar_org/run.jl:578
+  [9] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [10] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [11] _start()
+    @ Base ./client.jl:550
+in expression starting at /root/Downloads/for_dana/vaghar_org/run.jl:578

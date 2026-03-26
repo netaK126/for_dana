@@ -23,7 +23,8 @@ function mip_set_attr(m, perturbation, d, timout)
     end
     set_optimizer_attribute(m, "MIPFocus", 3)
     set_optimizer_attribute(m, "Cutoff", d[:suboptimal_solution])
-    set_optimizer_attribute(m, "Threads", 32)
+    global Threads_num
+    set_optimizer_attribute(m, "Threads", Threads_num)
     set_optimizer_attribute(m, "TimeLimit", timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)
 end

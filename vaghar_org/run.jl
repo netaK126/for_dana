@@ -161,6 +161,11 @@ function parse_commandline()
         arg_type = Float64
         required = false
         default = 0.5
+        "--optimizing_intervals"
+        help = "tighter per-neuron ReLU clipping in interval propagation (uses N1/N2 preact stability)"
+        arg_type = Bool
+        required = false
+        default = true
         "--delta_diff_positive"
         help = "force delta_diff to be positive."
         arg_type = Bool
@@ -171,6 +176,11 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--Threads_num"
+        help = "Number of threads to use"
+        arg_type = Int
+        required = false
+        default = 32
 
     end
     return parse_args(s)
@@ -184,6 +194,7 @@ function main()
     perturbation = args["perturbation"]
     name_to_save = args["name_to_save"]
     use_hyper_attack = args["use_hyper_attack"]
+    global Threads_num = args["Threads_num"]
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
 
@@ -210,6 +221,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
         for c_target in c_targets
             nn = get_nn(model_path, model_name, w, h, k, c, dataset)
             name_to_save = name_to_save_init
+            global relaxation_condition_count = 0
             if c_tag==c_target
                 continue
             end
@@ -257,6 +269,9 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             # mip_reuse_bounds()
             results.str = update_results_str(results.str, c_tag, c_target, d)
             println(results_path)
+            if args["use_relaxations"]
+                name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+            end
             save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save*"_cTag"*string(c_tag),token_signature)
         end
     end
@@ -274,6 +289,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     n1_p_mode = args["n1_p_mode"]
     global use_relaxations = args["use_relaxations"]
     global relaxation_threshold = args["relaxation_threshold"]
+    global optimizing_intervals = args["optimizing_intervals"]
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
     w, h, k, c = get_dataset_params(dataset)
@@ -304,12 +320,13 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             println("=== c_tag=$c_tag, c_target=$c_target ===")
             delta_1 = get_delta1_vaghar(vaghar_results, c_target)
             name_to_save = name_to_save_init
+            global relaxation_condition_count = 0
             println("delta_1 = $delta_1")
             if delta_1 <= 0
                 println("Skipping: delta_1 <= 0")
                 continue
             end
-            
+
             # PGD attack for warm-start lower bound
             suboptimal_solution, suboptimal_time = 0, 0
             if use_hyper_Attack_delta_diff
@@ -387,6 +404,9 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             if n2_fewer_binars_encoding
                 name_to_save = name_to_save * "_N2encodingWithFewerBinars"
             end
+            if optimizing_intervals
+                name_to_save = name_to_save * "_OptimizingIntervals"
+            end
 
             # Set transfer proof constraints and objective
             mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
@@ -405,6 +425,12 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             # Save results for this c_tag
             ct_str = c_tag_mode ? "cTagMode" : "cTargetMode"
             
+            if args["use_relaxations"]
+                name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+            end
+
+            name_to_save = name_to_save * "_Therads" * string(Threads_num)
+            global Threads_num
             file = open(results_path * token_signature * "_" * model_name * "_transfer_" *
                         perturbation * "_" * create_perturbation_string(perturbation_size) *
                         "_ctag" * string(c_tag) * "_" * ct_str * "_" * name_to_save * ".txt", "w")
@@ -412,7 +438,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             close(file)
         end
 
-        
+
     end
     println("Transfer proof computation complete.")
 end
@@ -462,6 +488,7 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
             println("=== c_tag=$c_tag, c_target=$c_target ===")
             delta_1 = get_delta1_vaghar(vaghar_results, c_target)
             name_to_save = name_to_save_init
+            global relaxation_condition_count = 0
             println("delta_1 = $delta_1")
             if delta_1 <= 0
                 println("Skipping: delta_1 <= 0")
@@ -534,6 +561,9 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
             if n2_fewer_binars_encoding
                 name_to_save = name_to_save * "_N2encodingWithFewerBinars"
             end
+            if optimizing_intervals
+                name_to_save = name_to_save * "_OptimizingIntervals"
+            end
 
             # Set transfer proof constraints and objective
             mip_set_transfer_property(m, d, delta_1, c_tag, c_target, c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
@@ -549,6 +579,10 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
             println(results.str)
             ct_str = c_tag_mode ? "cTagMode" : "cTargetMode"
 
+            if args["use_relaxations"]
+                name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+            end
+        
             file = open(results_path * token_signature * "_" * model_name * "_" * model_name2 *
                         "_transfer_distilation_" *
                         perturbation * "_" * create_perturbation_string(perturbation_size) *

@@ -12,6 +12,8 @@ global I_pert_prev_down = []
 # Each entry is a Float64 vector (one value per neuron), indexed by ReLU layer.
 global use_relaxations::Bool = false
 global relaxation_threshold::Float64 = 0.5
+global relaxation_condition_count = 0
+global optimizing_intervals::Bool = true
 
 # ── Activation conditional-triangle relaxation (n2_org pass) ─────────────
 # BRIDGE paper Section 5 / eq. (4):

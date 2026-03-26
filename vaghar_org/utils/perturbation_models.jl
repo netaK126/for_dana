@@ -199,6 +199,15 @@ function get_perturbation_specific_keys_occ(w_, h_, k_, perturbation_size, nn::N
     end
     @constraint(m, c1[i=l],v_x0[i] == 0.0)
     @constraint(m, c2[i=res],v_x0[i] == v_in[i])
+
+    # Perturbation interval bounds: occluded Δ ∈ [-1, 0], non-occluded Δ = 0
+    global I_pert_prev_up, I_pert_prev_down
+    I_pert_prev_up = zeros(Float64, size(input))
+    I_pert_prev_down = zeros(Float64, size(input))
+    for i in l
+        I_pert_prev_down[i] = -1.0
+    end
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
@@ -245,6 +254,15 @@ function get_perturbation_specific_keys_patch(w_, h_, k_, perturbation_size, nn:
     @constraint(m, c1[i=l],v_x0[i] >= v_in[i]-eps)
     @constraint(m, c2[i=res],v_x0[i] == v_in[i])
 
+    # Perturbation interval bounds: patch Δ ∈ [-eps, eps], non-patch Δ = 0
+    global I_pert_prev_up, I_pert_prev_down
+    I_pert_prev_up = zeros(Float64, size(input))
+    I_pert_prev_down = zeros(Float64, size(input))
+    for i in l
+        I_pert_prev_up[i] = eps
+        I_pert_prev_down[i] = -eps
+    end
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
@@ -269,8 +287,8 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-    t_down = perturbation_size[1]
-    t_right = perturbation_size[2]
+    t_down = Int(perturbation_size[1])
+    t_right = Int(perturbation_size[2])
     k = k_
     w = w_
     h = h_
@@ -304,6 +322,14 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
             @constraint(m,[i=res*2+1+w*(j-1):1:res*2+w*j],v_x0[i] == 0)
         end
     end
+
+    # Perturbation interval bounds:
+    #   border (zeroed) pixels: Δ ∈ [-1, 0]
+    #   interior (shifted) pixels: Δ = x[src] - x[dst] ∈ [-1, 1]
+    global I_pert_prev_up, I_pert_prev_down
+    I_pert_prev_up = ones(Float64, size(input))
+    I_pert_prev_down = -ones(Float64, size(input))
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
@@ -383,6 +409,8 @@ function get_model_transfer(w_, h_, k_,
         return merge(d_common, get_perturbation_specific_keys_patch_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
     elseif perturbation == "occ"
         return merge(d_common, get_perturbation_specific_keys_occ_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
+    elseif perturbation == "rotation"
+        return merge(d_common, get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation_size, nn1, nn2, input, m, n1_p_mode))
     else
         error("Transfer mode does not support perturbation type: $perturbation")
     end
@@ -455,7 +483,7 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     # relaxation (used by core_ops.jl's relu() when use_relaxations=true).
     # Must run BEFORE encoding n2_org/n2_pert so relu() can skip binaries.
     if use_relaxations
-        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down)
+        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
     end
 
     # Encode N2 on clean input x → layers K+1..2K
@@ -551,7 +579,7 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     # Pre-compute diff/composed interval bounds for the conditional-triangle
     # relaxation.  Must run BEFORE encoding n2_org/n2_pert.
     if use_relaxations
-        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down)
+        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
     end
 
     println("Encoding N1(x)...")
@@ -665,8 +693,8 @@ function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturb
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
     v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
-    t_down  = perturbation_size[1]
-    t_right = perturbation_size[2]
+    t_down  = Int(perturbation_size[1])
+    t_right = Int(perturbation_size[2])
     k = k_; w = w_; h = h_; res = w * h
     # Interior pixels: x'[j+offset] = x[j]
     for i2 = 1:w-t_right
@@ -822,6 +850,91 @@ function get_perturbation_specific_keys_occ_transfer(w_, h_, k_, perturbation_si
 end
 
 
+# ============================================================
+# Transfer: rotation  x' = rotate(x, angle)  using bilinear interpolation
+#
+# I_pert_prev_up/down explanation:
+#   Δ[i] = x'[i] - x[i]
+#
+#   Mapped pixels (rotation lands inside image):
+#     x'[i] is a bilinear combination of x values ∈ [0,1], and x[i] ∈ [0,1],
+#     so Δ[i] ∈ [-1, 1].  Conservative uniform bound.
+#
+#   Zero-padded pixels (rotation lands outside image):
+#     x'[i] = 0, x[i] ∈ [0,1], so Δ[i] = -x[i] ∈ [-1, 0].
+# ============================================================
+function get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation_size, nn1::NeuralNet, nn2::NeuralNet, input::Array{<:Real}, m::Model, n1_p_mode::Bool)::Dict{Symbol,Any}
+    input_range = CartesianIndices(size(input))
+    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    angle = perturbation_size[1]
+    k = k_
+    height = h_
+    width = w_
+    res_ = h_ * w_
+    center = [width / 2, height / 2]
+    mapped = Int[]  # flat pixel indices that map inside the image
+
+    for i = 1:height
+        for j = 1:width
+            j_c = j - center[1]
+            i_c = i - center[2]
+            j_r = j_c * cos(angle * pi / 180) - i_c * sin(angle * pi / 180) + center[1]
+            i_r = j_c * sin(angle * pi / 180) + i_c * cos(angle * pi / 180) + center[2]
+            if floor(Int, j_r) >= 1 && ceil(Int, j_r) <= width && floor(Int, i_r) >= 1 && ceil(Int, i_r) <= height
+                di = i_r - floor(i_r)
+                dj = j_r - floor(j_r)
+                # Bilinear interpolation constraint for channel 1
+                @constraint(m, v_x0[i+(j-1)*height] ==
+                    (1-di)*(1-dj)*v_in[floor(Int,i_r)+(floor(Int,j_r)-1)*height] +
+                    (di)*(1-dj)*v_in[ceil(Int,i_r)+(floor(Int,j_r)-1)*height] +
+                    (1-di)*(dj)*v_in[floor(Int,i_r)+(ceil(Int,j_r)-1)*height] +
+                    (di)*(dj)*v_in[ceil(Int,i_r)+(ceil(Int,j_r)-1)*height])
+                push!(mapped, i+(j-1)*height)
+                if k == 3
+                    @constraint(m, v_x0[i+(j-1)*height+res_] ==
+                        (1-di)*(1-dj)*v_in[floor(Int,i_r)+(floor(Int,j_r)-1)*height+res_] +
+                        (di)*(1-dj)*v_in[ceil(Int,i_r)+(floor(Int,j_r)-1)*height+res_] +
+                        (1-di)*(dj)*v_in[floor(Int,i_r)+(ceil(Int,j_r)-1)*height+res_] +
+                        (di)*(dj)*v_in[ceil(Int,i_r)+(ceil(Int,j_r)-1)*height+res_])
+                    push!(mapped, i+(j-1)*height+res_)
+                    @constraint(m, v_x0[i+(j-1)*height+2*res_] ==
+                        (1-di)*(1-dj)*v_in[floor(Int,i_r)+(floor(Int,j_r)-1)*height+2*res_] +
+                        (di)*(1-dj)*v_in[ceil(Int,i_r)+(floor(Int,j_r)-1)*height+2*res_] +
+                        (1-di)*(dj)*v_in[floor(Int,i_r)+(ceil(Int,j_r)-1)*height+2*res_] +
+                        (di)*(dj)*v_in[ceil(Int,i_r)+(ceil(Int,j_r)-1)*height+2*res_])
+                    push!(mapped, i+(j-1)*height+2*res_)
+                end
+            end
+        end
+    end
+    # Zero-pad pixels whose rotated source falls outside the image
+    for tt in 1:res_
+        if !(tt in mapped)
+            @constraint(m, v_x0[tt] == 0)
+        end
+    end
+
+    # Per-pixel perturbation intervals
+    flat_up   = ones(Float64, Int(w_*h_*k_))   # mapped pixels: Δ ∈ [-1, 1]
+    flat_down = -ones(Float64, Int(w_*h_*k_))
+    # Zero-padded pixels: x' = 0, so Δ = -x ∈ [-1, 0] (tighter upper bound)
+    for tt in 1:Int(w_*h_*k_)
+        if !(tt in mapped)
+            flat_up[tt] = 0.0    # Δ_up = 0 (x' is fixed at 0, can't exceed x)
+        end
+    end
+    I_pert_up   = reshape(flat_up,   size(input))
+    I_pert_down = reshape(flat_down, size(input))
+
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+        _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
+    return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
+                :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+end
+
+
 function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
@@ -865,6 +978,14 @@ function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn
         end
         @constraint(m,v_x0[tt] == 0)
     end
+
+    # Perturbation interval bounds:
+    #   rotated (interior) pixels: bilinear interp, Δ ∈ [-1, 1]
+    #   border (zeroed) pixels: Δ ∈ [-1, 0]
+    global I_pert_prev_up, I_pert_prev_down
+    I_pert_prev_up = ones(Float64, size(input))
+    I_pert_prev_down = -ones(Float64, size(input))
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
