@@ -14,6 +14,7 @@ global use_relaxations::Bool = false
 global relaxation_threshold::Float64 = 0.5
 global relaxation_condition_count = 0
 global optimizing_intervals::Bool = true
+global relaxation_gap_area::Bool = false
 
 # ── Activation conditional-triangle relaxation (n2_org pass) ─────────────
 # BRIDGE paper Section 5 / eq. (4):
@@ -201,7 +202,8 @@ function update_results_str(results, c_tag, c_target, d)
         "lower_bound=" * string(d[:incumbent_obj]) * "," *
         "upper_bound=" * string(d[:best_bound]) * "," *
         "optimization_time=" * string(d[:solve_time]) * "," *
-        "hyper_attack_time=" * string(hyper_time) * "\n"
+        "hyper_attack_time=" * string(hyper_time) * "," *
+        "solve_status=" * string(d[:SolveStatus]) * "\n"
 end
 
 # Read delta_1 (upper_bound) from a VHAGaR results file for a given c_target.

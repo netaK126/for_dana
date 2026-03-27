@@ -35,49 +35,95 @@ import glob
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
+    ("contrast(1.5)",      "contrast:1.5"),
+    ("occ(5,5,5)",      "occ:5,5,5"),
+    ("occ(3,3,5)",      "occ:3,3,5"),
+    # ("trans(1,1)",        "translation:1,1"),
+    # ("trans(1,3)",        "translation:1,3"),
+    # ("trans(3,1)",        "translation:3,1"),
+    # ("trans(3,3)",        "translation:3,3"),
+    # ("rotation(10)",      "rotation:10"),
+    ("occ(1,1,5)",      "occ:1,1,5"),
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-    ("occ(14,14,9)",      "occ:14,14,9"),
-    ("trans(1,1)",        "translation:1,1"),
-    ("trans(1,3)",        "translation:1,3"),
-    ("trans(3,1)",        "translation:3,1"),
-    ("trans(3,3)",        "translation:3,3"),
-    ("rotation(10)",      "rotation:10"),
+    ("linf(0.05)",        "linf:0.05"),
+    ("linf(0.1)",         "linf:0.1"),
+    # ("brightness(0.25)",   "brightness:0.25"),
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
-THRESHOLDS = [0.5, 1.2, 3.0, 8.0]
-OPT_INTERVALS = ["true", "false"]
+THRESHOLDS = [0.025, 0.05] # focused on best T_relax candidate
+OPT_INTERVALS = ["false"]#["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
 CORES_PER_JOB = 32
 CORE_START = 8  # first core to use (reserve 0-7)
-TOTAL_CORES = 200
+TOTAL_CORES = 255
 
 
-def run_pool(all_jobs, max_slots, cwd,cores_per_job, phase_name=""):
-    """Run a list of (label, cmd) jobs with CPU-pinned slot pooling."""
-    if not all_jobs:
+def standard_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist"):
+    """Check if standard N2 results (.txt files) already exist for this perturbation.
+
+    Returns True if at least one vagharNoPerturbed_*_sgd_itr* directory contains .txt
+    result files (these are the standard N2 results that transfer needs).
+    """
+    pert_type, eps_str = pert_spec.split(":", 1)
+    pert_dir_map = {
+        "patch": "patch", "occ": "occ", "translation": "translation",
+        "rotation": "rotation", "brightness": "brightness", "linf": "linf",
+    }
+    pert_dir = pert_dir_map.get(pert_type, pert_type)
+    eps_dir = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp",
+                           pert_dir, f"eps_{eps_str}")
+    if not os.path.isdir(eps_dir):
+        return False
+    # Look for vagharNoPerturbed_*_sgd_itr* dirs with .txt results
+    n2_dirs = glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*_sgd_itr*"))
+    for d in n2_dirs:
+        if glob.glob(os.path.join(d, "*.txt")):
+            return True
+    return False
+
+
+def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="", locked_jobs=None):
+    """Run jobs with CPU-pinned slot pooling.
+
+    ready_jobs:  list of (label, cmd) that can start immediately.
+    locked_jobs: dict of  standard_label -> [(label, cmd), ...]
+                 Transfer jobs that become eligible only after the standard job
+                 with the matching label finishes. Pass None (default) for no
+                 dependencies (original single-phase behaviour).
+    """
+    if locked_jobs is None:
+        locked_jobs = {}
+
+    # Make a mutable copy so we can pop entries as they are unlocked.
+    locked_jobs = {k: list(v) for k, v in locked_jobs.items()}
+
+    total_jobs = len(ready_jobs) + sum(len(v) for v in locked_jobs.values())
+    if total_jobs == 0:
         return
 
     print(f"\n{'=' * 60}")
-    print(f"{phase_name}: {len(all_jobs)} jobs, {str(max_slots)} concurrent slots "
+    print(f"{phase_name}: {total_jobs} jobs total  "
+          f"({len(ready_jobs)} ready now, {total_jobs - len(ready_jobs)} waiting on deps)  "
+          f"{max_slots} concurrent slots  "
           f"({cores_per_job} cores/job, cores {CORE_START}-{CORE_START + max_slots * cores_per_job - 1})")
     print(f"{'=' * 60}\n")
 
     slots = [None] * max_slots
-    job_queue = list(all_jobs)
+    job_queue = list(ready_jobs)
     finished = 0
 
     log_dir = os.path.join(cwd, "sweep_logs")
     os.makedirs(log_dir, exist_ok=True)
 
     def launch_in_slot(slot_idx, label, cmd):
-        nonlocal finished
         core_lo = CORE_START + slot_idx * cores_per_job
         core_hi = core_lo + cores_per_job - 1
         full_cmd = ["taskset", "-c", f"{core_lo}-{core_hi}"] + cmd
         print(f"  [{label:<50s}] cores {core_lo}-{core_hi}  "
-              f"({finished}/{len(all_jobs)} done, {len(job_queue)} queued)")
+              f"({finished}/{total_jobs} done, {len(job_queue)} queued, "
+              f"{sum(len(v) for v in locked_jobs.values())} locked)")
         safe_label = label.replace("/", "_").replace(" ", "_")
         log_file = open(os.path.join(log_dir, f"{phase_name}_{safe_label}.log"), "w")
         proc = subprocess.Popen(
@@ -86,14 +132,14 @@ def run_pool(all_jobs, max_slots, cwd,cores_per_job, phase_name=""):
         )
         slots[slot_idx] = (label, proc, log_file)
 
-    # Fill initial slots
+    # Fill initial slots from the ready queue.
     for i in range(max_slots):
         if job_queue:
             label, cmd = job_queue.pop(0)
             launch_in_slot(i, label, cmd)
 
-    # Poll for finished jobs, refill slots
-    while any(s is not None for s in slots):
+    # Poll for finished jobs, unlock transfer jobs, refill slots.
+    while any(s is not None for s in slots) or job_queue:
         for i in range(max_slots):
             if slots[i] is None:
                 continue
@@ -103,8 +149,18 @@ def run_pool(all_jobs, max_slots, cwd,cores_per_job, phase_name=""):
                 log_file.close()
                 status = "OK" if ret == 0 else f"EXIT {ret}"
                 finished += 1
-                print(f"  [{label:<50s}] finished ({status})  "
-                      f"[{finished}/{len(all_jobs)}]")
+
+                # Unlock transfer jobs that were waiting on this standard job.
+                if label in locked_jobs:
+                    unlocked = locked_jobs.pop(label)
+                    job_queue.extend(unlocked)
+                    print(f"  [{label:<50s}] finished ({status})  "
+                          f"[{finished}/{total_jobs}]  "
+                          f"-> unlocked {len(unlocked)} transfer job(s)")
+                else:
+                    print(f"  [{label:<50s}] finished ({status})  "
+                          f"[{finished}/{total_jobs}]")
+
                 if ret != 0:
                     print(f"    -> see log: {log_file.name}")
                 slots[i] = None
@@ -113,7 +169,7 @@ def run_pool(all_jobs, max_slots, cwd,cores_per_job, phase_name=""):
                     launch_in_slot(i, next_label, next_cmd)
         time.sleep(1)
 
-    print(f"\n{phase_name}: all {len(all_jobs)} jobs done.")
+    print(f"\n{phase_name}: all {total_jobs} jobs done.")
 
 
 def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_size=128):
@@ -222,10 +278,15 @@ def parse_result_file(filepath):
             try:
                 cs = int(fields["c_source"])
                 ct = int(fields["c_target"])
+                opt_time = float(fields["optimization_time"])
+                hyper_time = float(fields.get("hyper_attack_time", "0"))
                 results[(cs, ct)] = {
-                    "optimization_time": float(fields["optimization_time"]),
+                    "optimization_time": opt_time,
+                    "hyper_attack_time": hyper_time,
+                    "total_time": opt_time + hyper_time,
                     "lower_bound": float(fields.get("lower_bound", "nan")),
                     "upper_bound": float(fields.get("upper_bound", "nan")),
+                    "solve_status": fields.get("solve_status", ""),
                 }
             except (KeyError, ValueError):
                 continue
@@ -244,12 +305,15 @@ def _extract_transfer_file_metadata(filename):
     }
 
 
-def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster):
+def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster,
+                                       csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout):
     """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
 
-    Writes two CSVs:
-      csv_transfer_faster — rows where transfer is faster than standard
-      csv_standard_faster — rows where standard is faster than transfer
+    Writes four CSVs:
+      csv_transfer_faster  — rows where transfer is faster than standard
+      csv_standard_faster  — rows where standard is faster than transfer
+      csv_transfer_tighter_at_timeout — both timed out, transfer has tighter gap
+      csv_standard_tighter_at_timeout — both timed out, standard has tighter gap
     """
     import csv
 
@@ -259,6 +323,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "occ": "occ",
         "trans": "translation",
         "rotation": "rotation",
+        "brightness": "brightness",
+        "occ": "occ",
     }
 
     fieldnames = [
@@ -277,98 +343,160 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "relax_count",
         "optimizing_intervals",
         "how_much_faster",
+        "gap_standard",
+        "gap_transfer",
+        "solve_status_standard",
+        "solve_status_transfer",
     ]
 
-    total_transfer_faster = 0
-    total_standard_faster = 0
-    with open(csv_transfer_faster, "w", newline="") as f_transfer, \
-         open(csv_standard_faster, "w", newline="") as f_standard:
-        writer_transfer = csv.DictWriter(f_transfer, fieldnames=fieldnames)
-        writer_standard = csv.DictWriter(f_standard, fieldnames=fieldnames)
-        writer_transfer.writeheader()
-        writer_standard.writeheader()
+    rows_transfer_faster = []
+    rows_standard_faster = []
+    rows_transfer_tighter = []
+    rows_standard_tighter = []
 
-        for pert_name, pert_spec in perts:
-            # e.g. pert_spec = "patch:1,14,14,3" -> dir = "patch", eps = "1,14,14,3"
-            pert_type, eps_str = pert_spec.split(":", 1)
-            pert_dir = pert_dir_map.get(pert_type, pert_type)
-            eps_dir = os.path.join(exp_base, pert_dir, f"eps_{eps_str}")
+    for pert_name, pert_spec in perts:
+        # e.g. pert_spec = "patch:1,14,14,3" -> dir = "patch", eps = "1,14,14,3"
+        pert_type, eps_str = pert_spec.split(":", 1)
+        pert_dir = pert_dir_map.get(pert_type, pert_type)
+        eps_dir = os.path.join(exp_base, pert_dir, f"eps_{eps_str}")
 
-            if not os.path.isdir(eps_dir):
-                print(f"  [{pert_name}] No results directory: {eps_dir}")
-                continue
+        if not os.path.isdir(eps_dir):
+            print(f"  [{pert_name}] No results directory: {eps_dir}")
+            continue
 
-            # Find standard N2 directories (vagharNoPerturbed_*_sgd_itr*)
-            standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*_sgd_itr*")))
-            if not standard_n2_dirs:
-                print(f"  [{pert_name}] No standard N2 (vagharNoPerturbed_*_sgd_itr*) found in {eps_dir}")
-                continue
+        # Find standard N2 directories (vagharNoPerturbed_*_sgd_itr*)
+        standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*_sgd_itr*")))
+        if not standard_n2_dirs:
+            print(f"  [{pert_name}] No standard N2 (vagharNoPerturbed_*_sgd_itr*) found in {eps_dir}")
+            continue
 
-            # Load all standard N2 results: (c_source, c_target) -> result dict
-            standard_results = {}
-            for sd in standard_n2_dirs:
-                txt_files = glob.glob(os.path.join(sd, "*.txt"))
-                for tf in txt_files:
-                    parsed = parse_result_file(tf)
-                    standard_results.update(parsed)
+        # Load all standard N2 results: (c_source, c_target) -> result dict
+        standard_results = {}
+        for sd in standard_n2_dirs:
+            txt_files = glob.glob(os.path.join(sd, "*.txt"))
+            for tf in txt_files:
+                parsed = parse_result_file(tf)
+                standard_results.update(parsed)
 
-            if not standard_results:
-                print(f"  [{pert_name}] No results parsed from standard N2 directories")
-                continue
+        if not standard_results:
+            print(f"  [{pert_name}] No results parsed from standard N2 directories")
+            continue
 
-            # Find transfer directories
-            transfer_dirs = sorted(glob.glob(os.path.join(eps_dir, "transfer_*")))
-            if not transfer_dirs:
-                print(f"  [{pert_name}] No transfer directories found")
-                continue
+        # Find transfer directories
+        transfer_dirs = sorted(glob.glob(os.path.join(eps_dir, "transfer_*")))
+        if not transfer_dirs:
+            print(f"  [{pert_name}] No transfer directories found")
+            continue
 
-            for td in transfer_dirs:
-                td_name = os.path.basename(td)
-                relax_match = re.search(r"relax([\d.]+)", td_name)
-                relax_val = relax_match.group(1) if relax_match else ""
+        for td in transfer_dirs:
+            td_name = os.path.basename(td)
+            relax_match = re.search(r"relax([\d.]+|[Ii]nf)", td_name)
+            relax_val = relax_match.group(1) if relax_match else ""
+            if relax_val and "GapArea" in td_name:
+                relax_val = f"rga{relax_val}"
 
-                txt_files = sorted(glob.glob(os.path.join(td, "*.txt")))
-                for tf in txt_files:
-                    tf_name = os.path.basename(tf)
-                    meta = _extract_transfer_file_metadata(tf_name)
-                    transfer_results = parse_result_file(tf)
+            txt_files = sorted(glob.glob(os.path.join(td, "*.txt")))
+            for tf in txt_files:
+                tf_name = os.path.basename(tf)
+                meta = _extract_transfer_file_metadata(tf_name)
+                transfer_results = parse_result_file(tf)
 
-                    for (cs, ct), t_info in sorted(transfer_results.items()):
-                        key = (cs, ct)
-                        if key not in standard_results:
-                            continue
-                        s_info = standard_results[key]
-                        t_time = t_info["optimization_time"]
-                        s_time = s_info["optimization_time"]
+                for (cs, ct), t_info in sorted(transfer_results.items()):
+                    key = (cs, ct)
+                    if key not in standard_results:
+                        continue
+                    if meta["optimizing_intervals"] == "yes":
+                        continue
+                    s_info = standard_results[key]
+                    t_time = t_info["total_time"]
+                    s_time = s_info["total_time"]
 
-                        row = {
-                            "perturbation": pert_type,
-                            "perturbation_size": eps_str,
-                            "c_source": cs,
-                            "c_target": ct,
-                            "time_standard": f"{s_time:.2f}",
-                            "time_transfer": f"{t_time:.2f}",
-                            "delta_standard_lower_bound": f"{s_info['lower_bound']:.6f}",
-                            "delta_standard_upper_bound": f"{s_info['upper_bound']:.6f}",
-                            "delta_diff_transfer_lower_bound": f"{t_info['lower_bound']:.6f}",
-                            "delta_diff_transfer_upper_bound": f"{t_info['upper_bound']:.6f}",
-                            "transfer_threads": meta["threads"],
-                            "T_relax": relax_val,
-                            "relax_count": meta["relax_count"],
-                            "optimizing_intervals": meta["optimizing_intervals"],
-                        }
+                    row = {
+                        "perturbation": pert_type,
+                        "perturbation_size": eps_str,
+                        "c_source": cs,
+                        "c_target": ct,
+                        "time_standard": f"{s_time:.2f}",
+                        "time_transfer": f"{t_time:.2f}",
+                        "delta_standard_lower_bound": f"{s_info['lower_bound']:.6f}",
+                        "delta_standard_upper_bound": f"{s_info['upper_bound']:.6f}",
+                        "delta_diff_transfer_lower_bound": f"{t_info['lower_bound']:.6f}",
+                        "delta_diff_transfer_upper_bound": f"{t_info['upper_bound']:.6f}",
+                        "transfer_threads": meta["threads"],
+                        "T_relax": relax_val,
+                        "relax_count": meta["relax_count"],
+                        "optimizing_intervals": meta["optimizing_intervals"],
+                    }
 
-                        if t_time < s_time * 0.99:  # transfer is faster
-                            row["how_much_faster"] = f"{s_time / t_time:.2f}x"
-                            writer_transfer.writerow(row)
-                            total_transfer_faster += 1
-                        elif s_time < t_time * 0.99:  # standard is faster
-                            row["how_much_faster"] = f"{t_time / s_time:.2f}x"
-                            writer_standard.writerow(row)
-                            total_standard_faster += 1
+                    s_gap = s_info["upper_bound"] - s_info["lower_bound"]
+                    t_gap = t_info["upper_bound"] - t_info["lower_bound"]
+                    row["gap_standard"] = f"{s_gap:.6f}"
+                    row["gap_transfer"] = f"{t_gap:.6f}"
+                    row["solve_status_standard"] = s_info.get("solve_status", "")
+                    row["solve_status_transfer"] = t_info.get("solve_status", "")
 
-    print(f"  Wrote {total_transfer_faster} rows to {csv_transfer_faster}")
-    print(f"  Wrote {total_standard_faster} rows to {csv_standard_faster}")
+                    if t_time < s_time * 0.99:  # transfer is faster
+                        row["how_much_faster"] = f"{s_time / t_time:.2f}x"
+                        rows_transfer_faster.append(row)
+                    elif s_time < t_time * 0.99:  # standard is faster
+                        row["how_much_faster"] = f"{t_time / s_time:.2f}x"
+                        rows_standard_faster.append(row)
+                    else:  # both hit timeout (~same time)
+                        row["how_much_faster"] = ""
+                        if t_gap < s_gap * 0.99:  # transfer has tighter gap
+                            rows_transfer_tighter.append(row)
+                        elif s_gap < t_gap * 0.99:  # standard has tighter gap
+                            rows_standard_tighter.append(row)
+
+    # Sort helper: (perturbation, perturbation_size, c_source, c_target, numeric_key)
+    def _parse_speed(val):
+        """Parse '2.50x' -> 2.50, empty -> inf."""
+        if not val:
+            return float('inf')
+        return float(val.rstrip('x'))
+
+    def _sort_key_faster(row):
+        return (row["perturbation"], row["perturbation_size"],
+                int(row["c_source"]), int(row["c_target"]),
+                _parse_speed(row["how_much_faster"]))
+
+    def _sort_key_tighter(row):
+        return (row["perturbation"], row["perturbation_size"],
+                int(row["c_source"]), int(row["c_target"]),
+                float(row["gap_transfer"]))
+
+    rows_transfer_faster.sort(key=_sort_key_faster)
+    rows_standard_faster.sort(key=_sort_key_faster)
+    rows_transfer_tighter.sort(key=_sort_key_tighter)
+    rows_standard_tighter.sort(key=_sort_key_tighter)
+
+    def _group_key(row):
+        return (row["perturbation"], row["perturbation_size"],
+                row["c_source"], row["c_target"])
+
+    # Write sorted rows to CSVs, inserting a blank row between groups
+    empty_row = {fn: "" for fn in fieldnames}
+    for filepath, rows in [
+        (csv_transfer_faster, rows_transfer_faster),
+        (csv_standard_faster, rows_standard_faster),
+        (csv_transfer_tighter_at_timeout, rows_transfer_tighter),
+        (csv_standard_tighter_at_timeout, rows_standard_tighter),
+    ]:
+        with open(filepath, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            prev_key = None
+            for row in rows:
+                key = _group_key(row)
+                if prev_key is not None and key != prev_key:
+                    writer.writerow(empty_row)
+                writer.writerow(row)
+                prev_key = key
+
+    print(f"  Wrote {len(rows_transfer_faster)} rows to {csv_transfer_faster}")
+    print(f"  Wrote {len(rows_standard_faster)} rows to {csv_standard_faster}")
+    print(f"  Wrote {len(rows_transfer_tighter)} rows to {csv_transfer_tighter_at_timeout}")
+    print(f"  Wrote {len(rows_standard_tighter)} rows to {csv_standard_tighter_at_timeout}")
 
 
 def main():
@@ -384,6 +512,8 @@ def main():
                         help="Override relaxation thresholds for transfer phase (default: all)")
     parser.add_argument("--opt_intervals", nargs="*", default=None,
                         help="Override optimizing_intervals values for transfer phase (e.g. 'true' 'false')")
+    parser.add_argument("--relaxation_gap_area", type=str, default="true",
+                        help="Use triangle relaxation-gap area scoring instead of interval width (true/false)")
     parser.add_argument("--skip_standard", action="store_true",
                         help="Skip phase 1 (standard experiments)")
     parser.add_argument("--skip_transfer", action="store_true",
@@ -395,6 +525,14 @@ def main():
                         help="Number of extra SGD epochs for N2 when using --model_path (default: 1)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="SGD learning rate for extra training (default: 1e-3)")
+    parser.add_argument("--arch", type=str, default="cnn1",
+                        help="Network architecture (e.g. cnn1, cnn2, 3x10, 3x50, 4x10, 5x10, 5x50, 10x10, 3x100)")
+    parser.add_argument("--dataset", type=str, default="mnist",
+                        help="Dataset name (default: mnist)")
+    parser.add_argument("--arch_models", nargs="*", default=None,
+                        help="Run multiple architectures, each with its own model path. "
+                             "Format: arch=model_path (e.g. cnn1=/path/to/cnn1_model cnn2=/path/to/cnn2_model). "
+                             "Overrides --arch and --model_path when specified.")
     parser.add_argument("--find_transfer_faster_than_standard", action="store_true",
                         help="Scan existing results and report transfer experiments that are "
                              "faster than standard N2 (vagharNoPerturbed with sgd) for each "
@@ -404,7 +542,19 @@ def main():
     total_cores = args.max_cores
     thresholds = args.thresholds if args.thresholds else THRESHOLDS
     opt_intervals = args.opt_intervals if args.opt_intervals else OPT_INTERVALS
-    use_model_path = args.model_path is not None
+    dataset = args.dataset
+
+    # Build list of (arch, model_path|None) to run
+    if args.arch_models:
+        arch_runs = []
+        for pair in args.arch_models:
+            if "=" not in pair:
+                print(f"ERROR: --arch_models entry must be arch=model_path, got: {pair}")
+                sys.exit(1)
+            a, mp = pair.split("=", 1)
+            arch_runs.append((a, mp))
+    else:
+        arch_runs = [(args.arch, args.model_path)]
 
     # Filter perturbations if requested
     perts = PERTURBATIONS
@@ -420,77 +570,129 @@ def main():
 
     # ── Analysis mode: find transfer faster than standard ─────────
     if args.find_transfer_faster_than_standard:
-        exp_base = os.path.join(cwd, "paper_experiments", "mnist", "cnn1_exp")
-        csv_transfer_faster = os.path.join(exp_base, "transfer_faster_than_standard.csv")
-        csv_standard_faster = os.path.join(exp_base, "standard_faster_than_transfer.csv")
-        print(f"\nScanning results in: {exp_base}")
-        find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster)
+        # Always scan all perturbation types (not just the ones enabled for running)
+        all_perts = [
+            ("patch(1,14,14,3)",  "patch:1,14,14,3"),
+            ("occ(14,14,9)",      "occ:14,14,9"),
+            ("occ(1,1,5)",        "occ:1,1,5"),
+            ("brightness(0.25)",  "brightness:0.25"),
+            ("trans(1,1)",        "translation:1,1"),
+            ("trans(1,3)",        "translation:1,3"),
+            ("trans(3,1)",        "translation:3,1"),
+            ("trans(3,3)",        "translation:3,3"),
+            ("rotation(10)",      "rotation:10"),
+        ]
+        for arch, _ in arch_runs:
+            exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
+            csv_transfer_faster = os.path.join(exp_base, "transfer_faster_than_standard.csv")
+            csv_standard_faster = os.path.join(exp_base, "standard_faster_than_transfer.csv")
+            csv_transfer_tighter = os.path.join(exp_base, "transfer_tighter_at_timeout.csv")
+            csv_standard_tighter = os.path.join(exp_base, "standard_tighter_at_timeout.csv")
+            print(f"\nScanning results for {arch} in: {exp_base}")
+            find_transfer_faster_than_standard(all_perts, exp_base,
+                                               csv_transfer_faster, csv_standard_faster,
+                                               csv_transfer_tighter, csv_standard_tighter)
         return
 
     cores_per_job = CORES_PER_JOB
     max_slots = (total_cores - CORE_START) // cores_per_job
 
     try:
-        # ── Phase 0: Train +epoch (only in --model_path mode) ─────────
-        n1_dir, n2_dir = None, None
-        if use_model_path:
-            print(f"\n{'=' * 60}")
-            print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s)")
-            print(f"{'=' * 60}\n")
-            n1_dir, n2_dir = train_extra_epochs(
-                args.model_path, "cnn1", "mnist",
-                sgd_epochs=args.sgd_epochs, lr=args.lr)
+        # ── Build job lists across all arch runs ──────────────────────
+        Threads_num = 32
+        cores_per_job = Threads_num
+        max_slots = (total_cores - CORE_START) // cores_per_job
 
-        # Build the extra args for run_experiment.py depending on mode
-        def model_args():
+        standard_jobs = []   # (pert_name, label, cmd) — pert_name used as dep key
+        transfer_by_pert = {}  # pert_name -> [(label, cmd)]
+        skipped_standard = []  # pert_names where standard results already exist
+
+        for arch, model_path in arch_runs:
+            use_model_path = model_path is not None
+
+            # ── Phase 0: Train +epoch (only in --model_path mode) ─────
+            n1_dir, n2_dir = None, None
             if use_model_path:
-                return ["--model_n1_dir", n1_dir, "--model_n2_dir", n2_dir]
+                print(f"\n{'=' * 60}")
+                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
+                print(f"{'=' * 60}\n")
+                n1_dir, n2_dir = train_extra_epochs(
+                    model_path, arch, dataset,
+                    sgd_epochs=args.sgd_epochs, lr=args.lr)
+
+            # Build the extra args for run_experiment.py depending on mode
+            if use_model_path:
+                _model_args = ["--model_n1_dir", n1_dir, "--model_n2_dir", n2_dir]
             else:
-                return ["--dual_seed"]
+                _model_args = ["--dual_seed"]
 
-        # ── Phase 1: Standard experiments ─────────────────────────────
-        if not args.skip_standard:
-            standard_jobs = []
+            arch_prefix = f"[{arch}] "
+
             for pert_name, pert_spec in perts:
-                label = f"{pert_name}"
-                cmd = [
-                    "python3", "utils/run_experiment.py",
-                    "--skip_training",
-                    "--skip_transfer",
-                    "--perturbations", pert_spec,
-                    "--timeout", str(args.timeout),
-                    "--dataset", "mnist",
-                    "--arch", "cnn1",
-                ] + model_args()
-                standard_jobs.append((label, cmd))
-            run_pool(standard_jobs, max_slots, cwd, cores_per_job, "Phase 1 (standard)")
+                job_key = f"{arch}/{pert_name}"
+                if not args.skip_standard and standard_results_exist(pert_spec, cwd, arch, dataset):
+                    print(f"  {arch_prefix}{pert_name} Standard results already exist — skipping, "
+                          f"transfer jobs will start immediately.")
+                    skipped_standard.append(job_key)
+                else:
+                    std_label = f"{arch_prefix}{pert_name}"
+                    std_cmd = [
+                        "python3", "utils/run_experiment.py",
+                        "--skip_training",
+                        "--skip_transfer",
+                        "--perturbations", pert_spec,
+                        "--timeout", str(args.timeout),
+                        "--dataset", dataset,
+                        "--arch", arch,
+                    ] + _model_args
+                    standard_jobs.append((job_key, std_label, std_cmd))
 
-        # ── Phase 2: Transfer experiments ─────────────────────────────
-        if not args.skip_transfer:
-
-            Threads_num_list = [32,48]
-            transfer_jobs = []
-            for pert_name, pert_spec in perts:
+                t_jobs = []
                 for oi in opt_intervals:
-                    for t in thresholds:
-                        for Threads_num in Threads_num_list:
-                            cores_per_job = Threads_num 
-                            max_slots = (total_cores - cores_per_job) // cores_per_job
-                            label = f"{pert_name} T={t} oi={oi}"
-                            cmd = [
-                                "python3", "utils/run_experiment.py",
-                                "--skip_training",
-                                "--skip_standard",
-                                "--perturbations", pert_spec,
-                                "--timeout", str(args.timeout),
-                                "--dataset", "mnist",
-                                "--arch", "cnn1",
-                                "--relaxation_thresholds", str(t),
-                                "--optimizing_intervals", oi,
-                                "--Threads_num", str(Threads_num),
-                            ] + model_args()
-                            transfer_jobs.append((label, cmd))
-            run_pool(transfer_jobs, max_slots, cwd, cores_per_job, "Phase 2 (transfer)")
+                    for t in thresholds :
+                        rga_tag = "true" if args.relaxation_gap_area.lower() == "true" else "false"
+                        t_label = f"{arch_prefix}{pert_name} T={t} oi={oi} rga={rga_tag}"
+                        t_cmd = [
+                            "python3", "utils/run_experiment.py",
+                            "--skip_training",
+                            "--skip_standard",
+                            "--perturbations", pert_spec,
+                            "--timeout", str(args.timeout),
+                            "--dataset", dataset,
+                            "--arch", arch,
+                            "--relaxation_thresholds", str(t),
+                            "--optimizing_intervals", oi,
+                            "--Threads_num", str(Threads_num),
+                            "--relaxation_gap_area", args.relaxation_gap_area,
+                        ] + _model_args
+                        t_jobs.append((t_label, t_cmd))
+                transfer_by_pert[job_key] = t_jobs
+
+        # Transfer jobs for skipped-standard perturbations are immediately ready
+        skipped_transfer_ready = [
+            (lbl, cmd)
+            for pn in skipped_standard
+            if pn in transfer_by_pert
+            for (lbl, cmd) in transfer_by_pert[pn]
+        ]
+
+        # ── Phase 1 only ───────────────────────────────────────────────
+        if not args.skip_standard and args.skip_transfer:
+            ready = [(lbl, cmd) for (_, lbl, cmd) in standard_jobs]
+            run_pool(ready, max_slots, cwd, cores_per_job, "Phase 1 (standard)")
+
+        # ── Phase 2 only (all transfer jobs are immediately ready) ─────
+        elif args.skip_standard and not args.skip_transfer:
+            ready = [(lbl, cmd) for jobs in transfer_by_pert.values() for (lbl, cmd) in jobs]
+            run_pool(ready, max_slots, cwd, cores_per_job, "Phase 2 (transfer)")
+
+        # ── Both phases: transfer jobs unlock as each standard job finishes
+        elif not args.skip_standard and not args.skip_transfer:
+            ready = [(lbl, cmd) for (_, lbl, cmd) in standard_jobs] + skipped_transfer_ready
+            # locked_jobs key = standard job label; value = its transfer jobs
+            locked = {lbl: transfer_by_pert[pn] for (pn, lbl, _) in standard_jobs}
+            run_pool(ready, max_slots, cwd, cores_per_job,
+                     "Sweep", locked_jobs=locked)
 
     except KeyboardInterrupt:
         print("\nCtrl+C received — terminating all running jobs...")

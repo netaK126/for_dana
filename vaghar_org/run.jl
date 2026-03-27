@@ -166,6 +166,11 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
+        "--relaxation_gap_area"
+        help = "use triangle relaxation-gap area scoring instead of interval width for relaxation threshold decision (Method 2)"
+        arg_type = Bool
+        required = false
+        default = false
         "--delta_diff_positive"
         help = "force delta_diff to be positive."
         arg_type = Bool
@@ -290,6 +295,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global use_relaxations = args["use_relaxations"]
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
+    global relaxation_gap_area = args["relaxation_gap_area"]
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
     w, h, k, c = get_dataset_params(dataset)
@@ -383,7 +389,10 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
             if args["use_relaxations"]
                 name_to_save = name_to_save*"_Relaxations"*string(args["relaxation_threshold"])
-                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"])...")
+                if args["relaxation_gap_area"]
+                    name_to_save = name_to_save*"_GapArea"
+                end
+                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"]) (gap_area=$(args["relaxation_gap_area"]))...")
             end
 
             # Perturbation interval bounds (clean ↔ perturbed for each network)
