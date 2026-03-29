@@ -257,22 +257,22 @@ end
 # No-N1-encoding + encode N1's last layer:
 #   Creates interval-bounded variables for N1's last hidden layer,
 #   linked to N2's encoded hidden layer via diff bounds.
-#   Encodes N1's last linear layer exactly and uses binary max
-#   encoding for conf_n1_x → exact delta_diff.
 #
-#   NOTE: Per-class linear upper-bound constraints (without binaries)
-#   are NOT sound here — they compute conf_n2 - max_k m_k instead
-#   of conf_n2 - min_k m_k, giving a LOWER bound on delta_diff.
-#   The binary max encoding is required to correctly compute min_k m_k.
+#   Two modes:
+#   (a) no_binaries=false: binary max encoding for exact conf_n1_x
+#       (C-1 extra binaries, exact delta_diff)
+#   (b) no_binaries=true: pre-computed scalar lower bound on conf_n1
+#       from interval arithmetic on h_n1 bounds → zero extra binaries,
+#       sound upper bound on delta_diff.
 # ============================================================
 function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
-    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive, nn1)
+    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive, nn1, no_binaries::Bool=false)
 
     global n1_last_hidden_up, n1_last_hidden_down
     global last_hidden_diff_up, last_hidden_diff_down
 
     n_hidden = length(n1_last_hidden_up)
-    println("  encode_n1_last_layer: creating $n_hidden bounded hidden vars + C-1 binaries")
+    println("  encode_n1_last_layer: $n_hidden bounded hidden vars, no_binaries=$no_binaries")
     println("  N1 last hidden bounds width: max=$(maximum(n1_last_hidden_up .- n1_last_hidden_down))")
 
     # ── Create interval-bounded variables for N1's last hidden layer ──
@@ -293,41 +293,78 @@ function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
         println("  WARNING: v_n2_last_hidden not available, h_n1 is unlinked (loose bounds)")
     end
 
-    # ── Find N1's last Linear layer and compute N1 output exactly ──
+    # ── Get N1's last Linear layer weights ──
     last_linear = nothing
     for l in nn1.layers
         if occursin("Linear", string(typeof(l)))
             last_linear = l
         end
     end
-    W = Float64.(transpose(last_linear.matrix))  # (output_dim × input_dim)
+    W = Float64.(transpose(last_linear.matrix))  # (n_classes × n_hidden)
     b = Float64.(last_linear.bias)
     n_classes = length(b)
     println("  N1 last layer: $(size(last_linear.matrix,1)) -> $n_classes")
 
-    # N1 output: v_out_n1[k] = W[k,:] * h_n1 + b[k]
-    v_out_n1 = [@variable(m, base_name = "n1_out_$k") for k in 1:n_classes]
-    for k in 1:n_classes
-        @constraint(m, v_out_n1[k] == sum(W[k, j] * h_n1[j] for j in 1:n_hidden) + b[k])
-    end
-
-    # ── Confidence of N1 on clean input (exact, with binaries for max) ──
-    d[:v_out_n1_last] = v_out_n1
-    conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1_last, "conf_n1_x")
-
-    # ── N1 confidence >= delta_1 ──
-    @constraint(m, conf_n1_x >= delta_1 + 1e-3)
-
     # ── Confidence of N2 on clean input (uses binary encoding for max) ──
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
 
-    # ── delta_diff: exact (not just upper-bounded) ──
+    # ── delta_diff ──
     delta_diff = @variable(m, base_name="delta_diff")
-    @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
-    if delta_diff_positive
-        @constraint(m, delta_diff >= 0)
+
+    if no_binaries
+        # ── N1 confidence via per-class linear constraints on h_n1 ──
+        # m_k(h_n1) >= delta_1 for each k ≠ c is equivalent to conf_n1 >= delta_1
+        # (since conf_n1 = min_k m_k, and min >= delta_1 ⟺ all >= delta_1).
+        # These constrain h_n1 (and via linking, the input x), shrinking the
+        # feasible set compared to plain no_n1 which has no N1 constraints.
+        for k in 1:n_classes
+            if k == c_tag
+                continue
+            end
+            m_k = sum((W[c_tag, j] - W[k, j]) * h_n1[j] for j in 1:n_hidden) + (b[c_tag] - b[k])
+            @constraint(m, m_k >= delta_1 + 1e-3)
+        end
+
+        # ── delta_diff upper bounds: use output-level diff constants (same as plain no_n1) ──
+        # For each k ≠ c:
+        #   delta_diff <= conf_n2_x - ((N2[c]-N2[k]) + (d_lo[k] - d_up[c]))
+        # These use pre-computed scalar bounds, NOT h_n1 variables, so they
+        # correctly upper-bound delta_diff (unlike per-class h_n1 constraints
+        # which compute conf_n2 - max_k m_k, a lower bound).
+        global output_diff_up_bounds, output_diff_down_bounds
+        d_hi = output_diff_up_bounds
+        d_lo = output_diff_down_bounds
+        println("  no_binaries: using output-level diff bounds for delta_diff")
+        println("  output diff bounds: max width = $(maximum(d_hi .- d_lo))")
+        for k in 1:n_classes
+            if k == c_tag
+                continue
+            end
+            expr_k = (d[:v_out_n2][c_tag] - d[:v_out_n2][k]) + (d_lo[k] - d_hi[c_tag])
+            @constraint(m, delta_diff <= conf_n2_x - expr_k)
+        end
+        if delta_diff_positive
+            @constraint(m, delta_diff >= 0)
+        else
+            @constraint(m, conf_n2_x >= 0)
+        end
     else
-        @constraint(m, conf_n2_x >= 0)
+        # ── Binary max encoding: exact conf_n1_x and delta_diff ──
+        # N1 output: v_out_n1[k] = W[k,:] * h_n1 + b[k]
+        v_out_n1 = [@variable(m, base_name = "n1_out_$k") for k in 1:n_classes]
+        for k in 1:n_classes
+            @constraint(m, v_out_n1[k] == sum(W[k, j] * h_n1[j] for j in 1:n_hidden) + b[k])
+        end
+
+        d[:v_out_n1_last] = v_out_n1
+        conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1_last, "conf_n1_x")
+        @constraint(m, conf_n1_x >= delta_1 + 1e-3)
+        @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
+        if delta_diff_positive
+            @constraint(m, delta_diff >= 0)
+        else
+            @constraint(m, conf_n2_x >= 0)
+        end
     end
 
     # ── Constraint: N2 is fooled on perturbed input ──
@@ -351,8 +388,44 @@ function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
         end
     end
 
-    # Objective: maximize delta_diff (upper-bounded, no extra binaries)
     @objective(m, Max, delta_diff)
+end
+
+# ============================================================
+# Interval-based constraint: conf(N1, x', c_target) <= 0
+# i.e., N1 does not classify x' as c_target.
+# Sufficient condition: N1(x')[c_tag] >= N1(x')[c_target].
+#
+# Let δ_p[i] = N2(x')[i] - N1(x')[i] ∈ [dp_lo[i], dp_up[i]] where:
+#   dp_lo[i] = d_lo[i] + n2_pert_lo[i] - n1_pert_up[i]
+#   dp_up[i] = d_up[i] + n2_pert_up[i] - n1_pert_lo[i]
+#
+# N1(x')[c_tag] >= N1(x')[c_target]:
+#   N2(x')[c_tag] - δ_p[c_tag] >= N2(x')[c_target] - δ_p[c_target]
+#   N2(x')[c_target] - N2(x')[c_tag] <= δ_p[c_tag] - δ_p[c_target]
+#                                      <= dp_up[c_tag] - dp_lo[c_target]
+# ============================================================
+function add_n1_xp_confidence_constraint!(m, d, c_tag, c_target)
+    global output_diff_up_bounds, output_diff_down_bounds
+    global output_n2_pert_up, output_n2_pert_down
+    global output_n1_pert_up, output_n1_pert_down
+
+    # Bounds on N2(x')[k] - N1(x')[k]
+    dp_lo = output_diff_down_bounds .+ output_n2_pert_down .- output_n1_pert_up
+    dp_up = output_diff_up_bounds   .+ output_n2_pert_up   .- output_n1_pert_down
+
+    rhs = dp_up[c_tag] - dp_lo[c_target]
+    println("  constrain_n1_xp: N2(x')[$c_target] - N2(x')[$c_tag] <= $rhs")
+    println("    dp_up[$c_tag] = $(dp_up[c_tag]), dp_lo[$c_target] = $(dp_lo[c_target])")
+
+    if rhs < 0
+        println("    → rhs < 0: would conflict with N2-fooled constraint, skipping")
+    elseif rhs < 1e6
+        @constraint(m, d[:v_out_n2_p][c_target] - d[:v_out_n2_p][c_tag] <= rhs)
+        println("    → Active constraint added (rhs=$rhs)")
+    else
+        println("    → Constraint trivially satisfied (rhs=$rhs too large), skipping")
+    end
 end
 
 function mip_set_attr_transfer(m, timout, suboptimal_solution=0, delta_diff_positive=false)

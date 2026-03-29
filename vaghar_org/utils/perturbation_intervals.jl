@@ -1187,7 +1187,343 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
     println("compute_diff_and_comp_bounds: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
 
+    # Save output-level N2 perturbation bounds: N2(x')[k] - N2(x)[k]
+    global output_n2_pert_up   = vec(copy(Float64.(pert_up)))
+    global output_n2_pert_down = vec(copy(Float64.(pert_down)))
+
+    # Compute output-level N1 perturbation bounds: N1(x')[k] - N1(x)[k]
+    # Propagate I_pert through N1 alone using interval arithmetic.
+    n1_pert_up   = copy(Float64.(I_pert_up_init))
+    n1_pert_down = copy(Float64.(I_pert_down_init))
+    for (layer_idx, l) in enumerate(nn1.layers)
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(n1_pert_up) > 1
+                n1_pert_up   = vec(n1_pert_up |> l)
+                n1_pert_down = vec(n1_pert_down |> l)
+            end
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            rp_min, rp_max = interval_matrix_vector_multiplication(W1, W1, n1_pert_down, n1_pert_up)
+            n1_pert_down = rp_min
+            n1_pert_up   = rp_max
+        elseif occursin("Conv", string(typeof(l)))
+            F1 = Float64.(l.filter)
+            zero_bias = zeros(Float64, length(l.bias))
+            n1_p_4d_down = ndims(n1_pert_down) == 4 ? n1_pert_down : reshape(n1_pert_down, 1, :, 1, 1)
+            n1_p_4d_up   = ndims(n1_pert_up)   == 4 ? n1_pert_up   : reshape(n1_pert_up,   1, :, 1, 1)
+            rp_min, rp_max = interval_conv2d_bounds(F1, F1, n1_p_4d_down, n1_p_4d_up, zero_bias, l.stride, l.padding)
+            n1_pert_down = rp_min
+            n1_pert_up   = rp_max
+        elseif occursin("ReLU", string(typeof(l)))
+            n1_pert_up   = max.(0.0, n1_pert_up)
+            n1_pert_down = .- max.(0.0, .- n1_pert_down)
+        end
+    end
+    global output_n1_pert_up   = vec(copy(Float64.(n1_pert_up)))
+    global output_n1_pert_down = vec(copy(Float64.(n1_pert_down)))
+    println("compute_diff_and_comp_bounds: N1 pert bounds width = $(maximum(output_n1_pert_up .- output_n1_pert_down))")
+    println("compute_diff_and_comp_bounds: N2 pert bounds width = $(maximum(output_n2_pert_up .- output_n2_pert_down))")
+
     println("compute_diff_and_comp_bounds: populated $(length(relu_diff_up_bounds)) ReLU layers")
+end
+
+# ── Zonotope-based diff bound propagation ──────────────────────────────
+# Same interface as compute_diff_and_comp_bounds but uses zonotope (affine
+# arithmetic) for the diff propagation through FC layers. Conv layers and
+# pert/n1_act use interval arithmetic. Zonotope activates at Flatten.
+#
+# A zonotope represents each neuron as: z_i = c_i + Σ_j g_{i,j} * ε_j
+# where ε_j ∈ [-1,1]. Bounds: z_i ∈ [c_i - Σ|g_{i,j}|, c_i + Σ|g_{i,j}|].
+# Linear layers preserve correlations: W*z has generators W*G.
+# ReLU: stable neurons pass through; split neurons use DeepZ relaxation.
+function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals::Bool=true)
+    # Same globals as compute_diff_and_comp_bounds
+    global relu_diff_up_bounds, relu_diff_down_bounds
+    global n1_preact_up_bounds, n1_preact_down_bounds
+    global relu_comp_up_bounds, relu_comp_down_bounds
+
+    relu_diff_up_bounds   = Array{Float64}[]
+    relu_diff_down_bounds = Array{Float64}[]
+    n1_preact_up_bounds   = Array{Float64}[]
+    n1_preact_down_bounds = Array{Float64}[]
+    relu_comp_up_bounds   = Array{Float64}[]
+    relu_comp_down_bounds = Array{Float64}[]
+
+    # Interval state (used for conv layers, pert, n1_act)
+    diff_up   = zeros(Float64, size(I_pert_up_init))
+    diff_down = zeros(Float64, size(I_pert_down_init))
+    pert_up   = copy(Float64.(I_pert_up_init))
+    pert_down = copy(Float64.(I_pert_down_init))
+    n1_act_up   = ones(Float64,  size(I_pert_up_init))
+    n1_act_down = zeros(Float64, size(I_pert_down_init))
+    n1_pre_up_cur   = Float64[]
+    n1_pre_down_cur = Float64[]
+
+    # Zonotope state for diff (activated at Flatten or first Linear on 1D input)
+    zono_active = false
+    diff_center = Float64[]
+    diff_gens = Matrix{Float64}(undef, 0, 0)
+
+    last_relu_diff_up   = zeros(Float64, size(diff_up))
+    last_relu_diff_down = zeros(Float64, size(diff_down))
+
+    for (layer_idx, l) in enumerate(nn1.layers)
+        l2 = nn2.layers[layer_idx]
+
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(diff_up) > 1
+                diff_up   = vec(diff_up |> l)
+                diff_down = vec(diff_down |> l)
+                pert_up   = vec(pert_up |> l)
+                pert_down = vec(pert_down |> l)
+                n1_act_up   = vec(n1_act_up |> l)
+                n1_act_down = vec(n1_act_down |> l)
+            end
+            # Convert diff intervals to zonotope
+            if !zono_active
+                n = length(diff_up)
+                diff_center = (diff_up .+ diff_down) ./ 2
+                diff_radius = (diff_up .- diff_down) ./ 2
+                diff_gens = diagm(diff_radius)
+                zono_active = true
+                println("  Zonotope: activated at Flatten, $n dims, $n initial generators")
+            end
+
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            W2 = Float64.(transpose(l2.matrix))
+            b1 = Float64.(l.bias)
+            b2 = Float64.(l2.bias)
+            ΔW = W2 - W1
+            Δb = b2 - b1
+
+            if !zono_active && ndims(diff_up) == 1
+                # FC layer before any Flatten (pure FC network): activate zonotope
+                n = length(diff_up)
+                diff_center = (diff_up .+ diff_down) ./ 2
+                diff_radius = (diff_up .- diff_down) ./ 2
+                diff_gens = diagm(diff_radius)
+                zono_active = true
+                println("  Zonotope: activated at Linear (FC network), $n dims")
+            end
+
+            if zono_active
+                # Zonotope propagation: diff = ΔW * a_n1 + W2 * diff_prev + Δb
+                n1_center = (n1_act_up .+ n1_act_down) ./ 2
+                n1_radius = (n1_act_up .- n1_act_down) ./ 2
+
+                new_center = W2 * diff_center .+ ΔW * n1_center .+ Δb
+                # Correlated part: preserve existing generators
+                new_gens_corr = W2 * diff_gens
+                # Independent part: ΔW * n1_radius (new generators from n1 intervals)
+                new_gens_indep = ΔW * diagm(n1_radius)
+                diff_gens = hcat(new_gens_corr, new_gens_indep)
+                diff_center = new_center
+
+                # Update interval bounds from zonotope
+                abs_sum = vec(sum(abs.(diff_gens), dims=2))
+                diff_up   = diff_center .+ abs_sum
+                diff_down = diff_center .- abs_sum
+            else
+                # Interval propagation for conv layers
+                r1_min, r1_max = interval_matrix_vector_multiplication(ΔW, ΔW, n1_act_down, n1_act_up)
+                r2_min, r2_max = interval_matrix_vector_multiplication(W2, W2, diff_down, diff_up)
+                diff_down = r1_min .+ r2_min .+ Δb
+                diff_up   = r1_max .+ r2_max .+ Δb
+            end
+
+            # Pert always interval
+            rp_min, rp_max = interval_matrix_vector_multiplication(W2, W2, pert_down, pert_up)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N1 preact bounds
+            rn_min, rn_max = interval_matrix_vector_multiplication(W1, W1, n1_act_down, n1_act_up)
+            n1_pre_up_cur   = rn_max .+ b1
+            n1_pre_down_cur = rn_min .+ b1
+
+        elseif occursin("Conv", string(typeof(l)))
+            # Conv: always interval (zonotope not yet active)
+            F1 = Float64.(l.filter);  F2 = Float64.(l2.filter)
+            b1 = Float64.(l.bias);    b2 = Float64.(l2.bias)
+            ΔF = F2 - F1;             Δb = b2 - b1
+            zero_bias = zeros(Float64, length(b1))
+
+            n1_4d_down  = ndims(n1_act_down) == 4 ? n1_act_down : reshape(n1_act_down, 1, :, 1, 1)
+            n1_4d_up    = ndims(n1_act_up)   == 4 ? n1_act_up   : reshape(n1_act_up,   1, :, 1, 1)
+            diff_4d_down = ndims(diff_down)  == 4 ? diff_down   : reshape(diff_down,   1, :, 1, 1)
+            diff_4d_up   = ndims(diff_up)    == 4 ? diff_up     : reshape(diff_up,     1, :, 1, 1)
+            pert_4d_down = ndims(pert_down)  == 4 ? pert_down   : reshape(pert_down,   1, :, 1, 1)
+            pert_4d_up   = ndims(pert_up)    == 4 ? pert_up     : reshape(pert_up,     1, :, 1, 1)
+
+            r1_min, r1_max = interval_conv2d_bounds(ΔF, ΔF, n1_4d_down, n1_4d_up, zero_bias, l.stride, l.padding)
+            r2_min, r2_max = interval_conv2d_bounds(F2, F2, diff_4d_down, diff_4d_up, zero_bias, l.stride, l.padding)
+            diff_down = r1_min .+ r2_min
+            diff_up   = r1_max .+ r2_max
+            for oc in 1:length(Δb)
+                diff_down[:, :, :, oc] .+= Δb[oc]
+                diff_up[:, :, :, oc]   .+= Δb[oc]
+            end
+
+            rp_min, rp_max = interval_conv2d_bounds(F2, F2, pert_4d_down, pert_4d_up, zero_bias, l.stride, l.padding)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            rn_min, rn_max = interval_conv2d_bounds(F1, F1, n1_4d_down, n1_4d_up, Float64.(b1), l.stride, l.padding)
+            n1_pre_up_cur   = rn_max
+            n1_pre_down_cur = rn_min
+
+        elseif occursin("ReLU", string(typeof(l)))
+            # Store pre-ReLU bounds (same as compute_diff_and_comp_bounds)
+            push!(relu_diff_up_bounds,   copy(diff_up))
+            push!(relu_diff_down_bounds, copy(diff_down))
+            push!(n1_preact_up_bounds,   copy(n1_pre_up_cur))
+            push!(n1_preact_down_bounds, copy(n1_pre_down_cur))
+            push!(relu_comp_up_bounds,   diff_up   .+ pert_up)
+            push!(relu_comp_down_bounds, diff_down .+ pert_down)
+
+            if zono_active
+                n = length(diff_center)
+                new_gen_cols = Vector{Float64}[]
+
+                for i in 1:n
+                    l_d = diff_down[i]
+                    u_d = diff_up[i]
+
+                    if optimizing_intervals
+                        l_n1 = n1_pre_down_cur[i]
+                        u_n1 = n1_pre_up_cur[i]
+                        l_n2 = l_n1 + diff_down[i]
+                        u_n2 = u_n1 + diff_up[i]
+
+                        if l_n1 >= 0 && l_n2 >= 0
+                            # Both active: diff passes through
+                            continue
+                        elseif u_n1 <= 0 && u_n2 <= 0
+                            # Both inactive: diff = 0
+                            diff_center[i] = 0.0
+                            diff_gens[i, :] .= 0.0
+                            continue
+                        end
+                    end
+
+                    # Mixed case: apply DeepZ relaxation to diff
+                    if l_d >= 0
+                        # Diff always non-negative: pass through
+                    elseif u_d <= 0
+                        # Diff always non-positive: clip to 0
+                        diff_center[i] = 0.0
+                        diff_gens[i, :] .= 0.0
+                    else
+                        # Split: DeepZ — λ * z + μ ± μ * ε_new
+                        λ = u_d / (u_d - l_d)
+                        μ = -u_d * l_d / (2.0 * (u_d - l_d))
+                        diff_center[i] = λ * diff_center[i] + μ
+                        diff_gens[i, :] .*= λ
+                        # New generator for this neuron
+                        new_col = zeros(n)
+                        new_col[i] = μ
+                        push!(new_gen_cols, new_col)
+                    end
+                end
+
+                # Add new generator columns
+                if !isempty(new_gen_cols)
+                    new_gens_matrix = hcat(new_gen_cols...)
+                    diff_gens = hcat(diff_gens, new_gens_matrix)
+                end
+
+                # Update interval bounds from zonotope
+                abs_sum = vec(sum(abs.(diff_gens), dims=2))
+                diff_up   = diff_center .+ abs_sum
+                diff_down = diff_center .- abs_sum
+                println("  Zonotope ReLU: $(size(diff_gens, 2)) generators, max diff width = $(maximum(diff_up .- diff_down))")
+            else
+                # Interval clipping (same as compute_diff_and_comp_bounds)
+                if optimizing_intervals
+                    for i in eachindex(diff_up)
+                        l_n1 = n1_pre_down_cur[i]
+                        u_n1 = n1_pre_up_cur[i]
+                        l_n2 = l_n1 + diff_down[i]
+                        u_n2 = u_n1 + diff_up[i]
+                        if l_n1 >= 0 && l_n2 >= 0
+                            # pass
+                        elseif u_n1 <= 0 && u_n2 <= 0
+                            diff_up[i] = 0.0
+                            diff_down[i] = 0.0
+                        else
+                            diff_up[i] = max(0.0, diff_up[i])
+                            diff_down[i] = -max(0.0, -diff_down[i])
+                        end
+                    end
+                else
+                    diff_up   = max.(0.0, diff_up)
+                    diff_down = .- max.(0.0, .- diff_down)
+                end
+            end
+
+            pert_up   = max.(0.0, pert_up)
+            pert_down = .- max.(0.0, .- pert_down)
+            n1_act_up   = max.(0.0, n1_pre_up_cur)
+            n1_act_down = max.(0.0, n1_pre_down_cur)
+
+            last_relu_diff_up   = copy(diff_up)
+            last_relu_diff_down = copy(diff_down)
+        end
+    end
+
+    # Save all bounds (same globals as compute_diff_and_comp_bounds)
+    global n1_last_hidden_up     = vec(copy(Float64.(n1_act_up)))
+    global n1_last_hidden_down   = vec(copy(Float64.(n1_act_down)))
+    global last_hidden_diff_up   = vec(copy(Float64.(last_relu_diff_up)))
+    global last_hidden_diff_down = vec(copy(Float64.(last_relu_diff_down)))
+    println("compute_diff_bounds_zonotope: last hidden layer size = $(length(n1_last_hidden_up)), " *
+            "diff width = $(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
+
+    global output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
+    global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
+    println("compute_diff_bounds_zonotope: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
+
+    if zono_active
+        println("  Final zonotope: $(size(diff_gens, 2)) generators")
+    end
+
+    # Save N2 output pert bounds
+    global output_n2_pert_up   = vec(copy(Float64.(pert_up)))
+    global output_n2_pert_down = vec(copy(Float64.(pert_down)))
+
+    # Compute N1 output pert bounds (same as in compute_diff_and_comp_bounds)
+    n1_pert_up   = copy(Float64.(I_pert_up_init))
+    n1_pert_down = copy(Float64.(I_pert_down_init))
+    for (layer_idx, l) in enumerate(nn1.layers)
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(n1_pert_up) > 1
+                n1_pert_up   = vec(n1_pert_up |> l)
+                n1_pert_down = vec(n1_pert_down |> l)
+            end
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            rp_min, rp_max = interval_matrix_vector_multiplication(W1, W1, n1_pert_down, n1_pert_up)
+            n1_pert_down = rp_min
+            n1_pert_up   = rp_max
+        elseif occursin("Conv", string(typeof(l)))
+            F1 = Float64.(l.filter)
+            zero_bias = zeros(Float64, length(l.bias))
+            n1_p_4d_down = ndims(n1_pert_down) == 4 ? n1_pert_down : reshape(n1_pert_down, 1, :, 1, 1)
+            n1_p_4d_up   = ndims(n1_pert_up)   == 4 ? n1_pert_up   : reshape(n1_pert_up,   1, :, 1, 1)
+            rp_min, rp_max = interval_conv2d_bounds(F1, F1, n1_p_4d_down, n1_p_4d_up, zero_bias, l.stride, l.padding)
+            n1_pert_down = rp_min
+            n1_pert_up   = rp_max
+        elseif occursin("ReLU", string(typeof(l)))
+            n1_pert_up   = max.(0.0, n1_pert_up)
+            n1_pert_down = .- max.(0.0, .- n1_pert_down)
+        end
+    end
+    global output_n1_pert_up   = vec(copy(Float64.(n1_pert_up)))
+    global output_n1_pert_down = vec(copy(Float64.(n1_pert_down)))
+    println("compute_diff_bounds_zonotope: N1 pert bounds width = $(maximum(output_n1_pert_up .- output_n1_pert_down))")
+
+    println("compute_diff_bounds_zonotope: populated $(length(relu_diff_up_bounds)) ReLU layers")
 end
 
 # ── N2-only perturbation relaxation bounds ──────────────────────────────

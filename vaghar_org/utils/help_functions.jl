@@ -50,8 +50,16 @@ global n2_preact_down_bounds::Vector   = []
 # Used to replace the entire N1 encoding with interval-bounded constraints on N2 outputs.
 global no_n1_encoding_at_all::Bool = false
 global encode_n1_last_layer::Bool = false
+global n1_last_layer_no_binaries::Bool = false
+global use_zonotope::Bool = false
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
+# Output-level perturbation bounds: N2(x')[k] - N2(x)[k] and N1(x')[k] - N1(x)[k]
+# Used by --constrain_n1_xp to add conf(N1,x',c_target)<=0 constraint.
+global output_n2_pert_up::Vector{Float64}   = Float64[]
+global output_n2_pert_down::Vector{Float64} = Float64[]
+global output_n1_pert_up::Vector{Float64}   = Float64[]
+global output_n1_pert_down::Vector{Float64} = Float64[]
 
 # ── N1 last-hidden-layer bounds (--encode_n1_last_layer) ────────────────────
 # Post-ReLU bounds on N1's last hidden layer activations: a_n1_last[i] ∈ [down, up]

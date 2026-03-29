@@ -483,7 +483,11 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     # Pre-compute diff/composed interval bounds.
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
     if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
-        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        if use_zonotope
+            compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        else
+            compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        end
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active
@@ -614,7 +618,11 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
     # compute_diff_and_comp_bounds uses optimizing_intervals for tighter clipping and saves output-layer bounds.
     if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
-        compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        if use_zonotope
+            compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        else
+            compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+        end
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active

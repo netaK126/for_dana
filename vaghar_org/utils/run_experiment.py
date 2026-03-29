@@ -180,6 +180,8 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      no_n1_binaries_and_relaxtions_only_on_n2=False,
                      no_n1_encoding_at_all=False,
                      encode_n1_last_layer=False,
+                     constrain_n1_xp=False,
+                     use_zonotope=False,
                      optimizing_intervals=None):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
@@ -194,6 +196,10 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_NoN1Encoding'
     if encode_n1_last_layer:
         suffix += '_N1LastLayer'
+    if constrain_n1_xp:
+        suffix += '_N1xpConf'
+    if use_zonotope:
+        suffix += '_Zonotope'
     if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
         suffix += '_noOI'
     return base + suffix
@@ -801,7 +807,10 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               optimizing_intervals=None, model_dirs=None,
                               no_n1_binaries_and_relaxtions_only_on_n2=False,
                               no_n1_encoding_at_all=False,
-                              encode_n1_last_layer=False):
+                              encode_n1_last_layer=False,
+                              n1_last_layer_no_binaries=False,
+                              constrain_n1_xp=False,
+                              use_zonotope=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -901,6 +910,12 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--no_n1_encoding_at_all', 'true']
         if encode_n1_last_layer:
             command += ['--encode_n1_last_layer', 'true']
+        if n1_last_layer_no_binaries:
+            command += ['--n1_last_layer_no_binaries', 'true']
+        if constrain_n1_xp:
+            command += ['--constrain_n1_xp', 'true']
+        if use_zonotope:
+            command += ['--use_zonotope', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
@@ -910,12 +925,17 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None,
                    relaxation_gap_area='false', no_n1_binaries_and_relaxtions_only_on_n2=False,
                    no_n1_encoding_at_all=False,
-                   encode_n1_last_layer=False):
+                   encode_n1_last_layer=False,
+                   n1_last_layer_no_binaries=False,
+                   constrain_n1_xp=False,
+                   use_zonotope=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
                                    no_n1_encoding_at_all=no_n1_encoding_at_all,
                                    encode_n1_last_layer=encode_n1_last_layer,
+                                   constrain_n1_xp=constrain_n1_xp,
+                                   use_zonotope=use_zonotope,
                                    optimizing_intervals=optimizing_intervals)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -950,6 +970,9 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
         no_n1_encoding_at_all=no_n1_encoding_at_all,
         encode_n1_last_layer=encode_n1_last_layer,
+        n1_last_layer_no_binaries=n1_last_layer_no_binaries,
+        constrain_n1_xp=constrain_n1_xp,
+        use_zonotope=use_zonotope,
     )
 
 
@@ -1039,6 +1062,15 @@ def main():
     parser.add_argument('--encode_n1_last_layer', action='store_true',
                         help='When no_n1_encoding_at_all is active, encode N1 last linear layer '
                              'exactly using interval-bounded hidden variables; gives exact delta_diff.')
+    parser.add_argument('--n1_last_layer_no_binaries', action='store_true',
+                        help='When encode_n1_last_layer is active, use pre-computed scalar lower bound '
+                             'on conf_n1 instead of binary max encoding; zero extra binaries.')
+    parser.add_argument('--constrain_n1_xp', action='store_true',
+                        help='Add interval-based constraint that conf(N1,x\',c_target)<=0; '
+                             'no extra variables, uses pre-computed pert bounds through N1.')
+    parser.add_argument('--use_zonotope', action='store_true',
+                        help='Use zonotope (affine arithmetic) for diff bound propagation; '
+                             'tighter bounds by tracking correlations between neurons.')
 
     args = parser.parse_args()
 
@@ -1182,7 +1214,10 @@ def main():
                                relaxation_gap_area=args.relaxation_gap_area,
                                no_n1_binaries_and_relaxtions_only_on_n2=args.no_n1_binaries_and_relaxtions_only_on_n2,
                                no_n1_encoding_at_all=args.no_n1_encoding_at_all,
-                               encode_n1_last_layer=args.encode_n1_last_layer)
+                               encode_n1_last_layer=args.encode_n1_last_layer,
+                               n1_last_layer_no_binaries=args.n1_last_layer_no_binaries,
+                               constrain_n1_xp=args.constrain_n1_xp,
+                               use_zonotope=args.use_zonotope)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 

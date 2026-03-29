@@ -3,6 +3,7 @@ ENV["PYTHON"]="/usr/bin/python3.8"
 using Gurobi
 using PyCall
 using PyPlot
+using LinearAlgebra
 using Images
 using Printf
 using Dates
@@ -186,6 +187,21 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--n1_last_layer_no_binaries"
+        help = "When encode_n1_last_layer is active, use pre-computed scalar lower bound on conf_n1 instead of binary max encoding; zero extra binaries, sound upper bound on delta_diff"
+        arg_type = Bool
+        required = false
+        default = false
+        "--constrain_n1_xp"
+        help = "Add interval-based constraint that conf(N1,x',c_target)<=0 (N1 does not classify perturbed input as c_target); no extra variables, uses pre-computed pert bounds through N1"
+        arg_type = Bool
+        required = false
+        default = false
+        "--use_zonotope"
+        help = "Use zonotope (affine arithmetic) instead of interval arithmetic for diff bound propagation; tighter bounds by tracking correlations between neurons"
+        arg_type = Bool
+        required = false
+        default = false
         "--delta_diff_positive"
         help = "force delta_diff to be positive."
         arg_type = Bool
@@ -321,6 +337,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global no_n1_binaries_and_relaxtions_only_on_n2 = args["no_n1_binaries_and_relaxtions_only_on_n2"]
     global no_n1_encoding_at_all = args["no_n1_encoding_at_all"]
     global encode_n1_last_layer = args["encode_n1_last_layer"]
+    global use_zonotope = args["use_zonotope"]
     # no_n1_encoding_at_all implies no_n1_binaries_and_relaxtions_only_on_n2
     # (N1 isn't encoded, so N2(x') must be relaxed onto N2(x) instead of N1)
     if no_n1_encoding_at_all
@@ -331,6 +348,16 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     if encode_n1_last_layer && !no_n1_encoding_at_all
         println("WARNING: --encode_n1_last_layer ignored (requires --no_n1_encoding_at_all)")
         global encode_n1_last_layer = false
+    end
+    global n1_last_layer_no_binaries = args["n1_last_layer_no_binaries"]
+    if n1_last_layer_no_binaries && !encode_n1_last_layer
+        println("WARNING: --n1_last_layer_no_binaries ignored (requires --encode_n1_last_layer)")
+        global n1_last_layer_no_binaries = false
+    end
+    constrain_n1_xp = args["constrain_n1_xp"]
+    if constrain_n1_xp && !no_n1_encoding_at_all
+        println("WARNING: --constrain_n1_xp ignored (requires --no_n1_encoding_at_all)")
+        constrain_n1_xp = false
     end
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
@@ -456,21 +483,27 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             if optimizing_intervals
                 name_to_save = name_to_save * "_OptimizingIntervals"
             end
-            if no_n1_binaries_and_relaxtions_only_on_n2
-                name_to_save = name_to_save * "_NoN1BinRelaxOnN2only"
-            end
+            # if no_n1_binaries_and_relaxtions_only_on_n2
+            #     name_to_save = name_to_save * "_NoN1BinRelaxOnN2only"
+            # end
             if no_n1_encoding_at_all
                 name_to_save = name_to_save * "_NoN1Encoding"
             end
             if encode_n1_last_layer
                 name_to_save = name_to_save * "_N1LastLayer"
             end
+            if n1_last_layer_no_binaries
+                name_to_save = name_to_save * "_NoBin"
+            end
+            if use_zonotope
+                name_to_save = name_to_save * "_Zonotope"
+            end
 
             # Set transfer proof constraints and objective
             if no_n1_encoding_at_all && encode_n1_last_layer
                 mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
                     c_tag_mode, n2_fewer_binars_encoding,
-                    args["delta_diff_positive"], nn1)
+                    args["delta_diff_positive"], nn1, n1_last_layer_no_binaries)
             elseif no_n1_encoding_at_all
                 mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
                     c_tag_mode, n2_fewer_binars_encoding,
@@ -480,6 +513,12 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                     c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
                     args["delta_diff_positive"])
             end
+            # Add interval-based constraint: conf(N1, x', c_target) <= 0
+            if constrain_n1_xp && !c_tag_mode
+                name_to_save = name_to_save * "_N1xpConf"
+                add_n1_xp_confidence_constraint!(m, d, c_tag, c_target)
+            end
+
             set_optimizer(m, optimizer)
             mip_set_attr_transfer(m, timout, suboptimal_solution, args["delta_diff_positive"])
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)

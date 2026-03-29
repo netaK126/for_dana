@@ -51,8 +51,8 @@ PERTURBATIONS = [
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
-THRESHOLDS = [0, 0.025, 0.05] # focused on best T_relax candidate
-OPT_INTERVALS = ["true", "false"]
+THRESHOLDS = [0, 0.05] # focused on best T_relax candidate
+OPT_INTERVALS = ["true"]#["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
 CORES_PER_JOB = 32
@@ -324,12 +324,24 @@ def _extract_transfer_file_metadata(filename):
     relax_count_match = re.search(r"RelaxCount(\d+)", filename)
     opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
     no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
-    if "N1LastLayer" in filename:
+    has_last_layer = "N1LastLayer" in filename
+    has_no_bin = "NoBin" in filename
+    has_n1xp = "N1xpConf" in filename
+    has_zonotope = "Zonotope" in filename
+    if has_last_layer and has_no_bin:
+        no_n1_enc = "last_layer_no_bin"
+    elif has_last_layer and has_n1xp:
+        no_n1_enc = "last_layer+n1xp"
+    elif has_last_layer:
         no_n1_enc = "last_layer"
+    elif "NoN1Encoding" in filename and has_n1xp:
+        no_n1_enc = "yes+n1xp"
     elif "NoN1Encoding" in filename:
         no_n1_enc = "yes"
     else:
         no_n1_enc = "no"
+    if has_zonotope:
+        no_n1_enc += "+zono"
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
@@ -609,6 +621,15 @@ def main():
     parser.add_argument("--encode_n1_last_layer", action="store_true",
                         help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
                              "exactly using interval-bounded hidden variables; gives exact delta_diff.")
+    parser.add_argument("--n1_last_layer_no_binaries", action="store_true",
+                        help="When encode_n1_last_layer is active, use pre-computed scalar lower bound "
+                             "on conf_n1 instead of binary max encoding; zero extra binaries.")
+    parser.add_argument("--constrain_n1_xp", action="store_true",
+                        help="Add interval-based constraint that conf(N1,x',c_target)<=0; "
+                             "no extra variables, uses pre-computed pert bounds through N1.")
+    parser.add_argument("--use_zonotope", action="store_true",
+                        help="Use zonotope (affine arithmetic) for diff bound propagation; "
+                             "tighter bounds by tracking correlations between neurons.")
     parser.add_argument("--compare_to_with_perturbed", action="store_true",
                         help="Compare transfer results to vagharWithPerturbed (standard with perturbed "
                              "intervals) instead of vagharNoPerturbed.")
@@ -836,6 +857,12 @@ def main():
                             t_cmd.append("--no_n1_encoding_at_all")
                         if args.encode_n1_last_layer:
                             t_cmd.append("--encode_n1_last_layer")
+                        if args.n1_last_layer_no_binaries:
+                            t_cmd.append("--n1_last_layer_no_binaries")
+                        if args.constrain_n1_xp:
+                            t_cmd.append("--constrain_n1_xp")
+                        if args.use_zonotope:
+                            t_cmd.append("--use_zonotope")
                         t_jobs.append((t_label, t_cmd))
                 transfer_by_pert[job_key] = t_jobs
 
