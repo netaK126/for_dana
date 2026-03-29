@@ -324,21 +324,25 @@ def _extract_transfer_file_metadata(filename):
     relax_count_match = re.search(r"RelaxCount(\d+)", filename)
     opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
     no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
-    no_n1_enc = "yes" if "NoN1Encoding" in filename else "no"
-    n1_last_layer = "yes" if "N1LastLayer" in filename else "no"
+    if "N1LastLayer" in filename:
+        no_n1_enc = "last_layer"
+    elif "NoN1Encoding" in filename:
+        no_n1_enc = "yes"
+    else:
+        no_n1_enc = "no"
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
         "no_n1_bin_relax_on_n2": no_n1_bin,
         "no_n1_encoding": no_n1_enc,
-        "encode_n1_last_layer": n1_last_layer,
     }
 
 
 def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster,
                                        csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout,
-                                       arch="cnn1", double_check_standard=False):
+                                       arch="cnn1", double_check_standard=False,
+                                       compare_to_with_perturbed=False):
     """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
 
     Returns four lists of row dicts (transfer_faster, standard_faster,
@@ -375,13 +379,11 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "optimizing_intervals",
         "no_n1_bin_relax_on_n2",
         "no_n1_encoding",
-        "encode_n1_last_layer",
         "how_much_faster",
-        "gap_standard",
-        "gap_transfer",
-        "solve_status_standard",
-        "solve_status_transfer",
     ]
+    if not compare_to_with_perturbed:
+        fieldnames += ["gap_standard", "gap_transfer"]
+    fieldnames += ["solve_status_standard", "solve_status_transfer"]
 
     rows_transfer_faster = []
     rows_standard_faster = []
@@ -401,6 +403,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         # Find standard N2 directories
         if double_check_standard:
             std_pattern = "double_check_vhagarNoPertubed_*_sgd_itr*"
+        elif compare_to_with_perturbed:
+            std_pattern = "vagharWithPerturbed_*_sgd_itr*"
         else:
             std_pattern = "vagharNoPerturbed_*_sgd_itr*"
         standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, std_pattern)))
@@ -468,15 +472,18 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "optimizing_intervals": meta["optimizing_intervals"],
                         "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
                         "no_n1_encoding": meta["no_n1_encoding"],
-                        "encode_n1_last_layer": meta["encode_n1_last_layer"],
                     }
 
-                    s_gap = s_info["upper_bound"] - s_info["lower_bound"]
-                    t_gap = t_info["upper_bound"] - t_info["lower_bound"]
-                    row["gap_standard"] = f"{s_gap:.6f}"
-                    row["gap_transfer"] = f"{t_gap:.6f}"
+                    if not compare_to_with_perturbed:
+                        s_gap = s_info["upper_bound"] - s_info["lower_bound"]
+                        t_gap = t_info["upper_bound"] - t_info["lower_bound"]
+                        row["gap_standard"] = f"{s_gap:.6f}"
+                        row["gap_transfer"] = f"{t_gap:.6f}"
                     row["solve_status_standard"] = s_info.get("solve_status", "")
                     row["solve_status_transfer"] = t_info.get("solve_status", "")
+
+                    if s_info.get("solve_status", "") == "INTERRUPTED":
+                        continue
 
                     if t_time < s_time * 0.99:  # transfer is faster
                         row["how_much_faster"] = f"{s_time / t_time:.2f}x"
@@ -486,10 +493,11 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         rows_standard_faster.append(row)
                     else:  # both hit timeout (~same time)
                         row["how_much_faster"] = ""
-                        if t_gap < s_gap * 0.99:  # transfer has tighter gap
-                            rows_transfer_tighter.append(row)
-                        elif s_gap < t_gap * 0.99:  # standard has tighter gap
-                            rows_standard_tighter.append(row)
+                        if not compare_to_with_perturbed:
+                            if t_gap < s_gap * 0.99:  # transfer has tighter gap
+                                rows_transfer_tighter.append(row)
+                            elif s_gap < t_gap * 0.99:  # standard has tighter gap
+                                rows_standard_tighter.append(row)
 
     # Sort helper: (perturbation, perturbation_size, c_source, c_target, numeric_key)
     def _parse_speed(val):
@@ -601,6 +609,9 @@ def main():
     parser.add_argument("--encode_n1_last_layer", action="store_true",
                         help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
                              "exactly using interval-bounded hidden variables; gives exact delta_diff.")
+    parser.add_argument("--compare_to_with_perturbed", action="store_true",
+                        help="Compare transfer results to vagharWithPerturbed (standard with perturbed "
+                             "intervals) instead of vagharNoPerturbed.")
     args = parser.parse_args()
 
     total_cores = args.max_cores
@@ -652,6 +663,8 @@ def main():
         # Write combined CSVs to the dataset-level directory (not per-arch)
         dblchk = args.double_check_standard
         suffix = "_double_check_standard" if dblchk else ""
+        if args.compare_to_with_perturbed:
+            suffix += "_vs_withPerturbed"
         combined_base = os.path.join(cwd, "paper_experiments", dataset)
         os.makedirs(combined_base, exist_ok=True)
         csv_transfer_faster = os.path.join(combined_base, f"transfer_faster_than_standard{suffix}.csv")
@@ -667,7 +680,8 @@ def main():
             tf, sf, tt, st = find_transfer_faster_than_standard(
                 all_perts, exp_base, csv_transfer_faster, csv_standard_faster,
                 csv_transfer_tighter, csv_standard_tighter, arch=arch,
-                double_check_standard=dblchk)
+                double_check_standard=dblchk,
+                compare_to_with_perturbed=args.compare_to_with_perturbed)
             all_tf.extend(tf)
             all_sf.extend(sf)
             all_tt.extend(tt)
@@ -681,9 +695,11 @@ def main():
             "time_standard", "time_transfer", "delta_standard_lower_bound",
             "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
             "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "encode_n1_last_layer", "how_much_faster",
-            "gap_standard", "gap_transfer", "solve_status_standard", "solve_status_transfer",
+            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "how_much_faster",
         ]
+        if not args.compare_to_with_perturbed:
+            _fieldnames += ["gap_standard", "gap_transfer"]
+        _fieldnames += ["solve_status_standard", "solve_status_transfer"]
 
         def _parse_speed(val):
             if not val:
