@@ -34,7 +34,8 @@ import torchvision.transforms as transforms
 
 from models import (
     FNN_2_10, FNN_3_10, FNN_3_50, FNN_3_100,
-    FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_10_10,
+    FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_6_100,
+    FNN_9_200, FNN_10_10,
     CNN0, CNN1, CNN2, CNN3,
 )
 
@@ -49,6 +50,8 @@ ARCH_REGISTRY = {
     '5x10':  (FNN_5_10,  '5x10'),
     '5x50':  (FNN_5_50,  '5x50'),
     '6x10':  (FNN_6_10,  '6x10'),
+    '6x100': (FNN_6_100, '6x100'),
+    '9x200': (FNN_9_200, '9x200'),
     '10x10': (FNN_10_10, '10x10'),
     'cnn0':  (CNN0,      'cnn0'),
     'cnn1':  (CNN1,      'cnn1'),
@@ -161,6 +164,10 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
         'vaghar_n2':        os.path.join(pert_dir, f'vagharWithPerturbed_{arch}_{tag2}'),
         'vaghar_n1_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_{tag1}'),
         'vaghar_n2_noPI':   os.path.join(pert_dir, f'vagharNoPerturbed_{arch}_{tag2}'),
+        'dblchk_n1':        os.path.join(pert_dir, f'double_check_vhagarNoPertubed_{arch}_{tag1}'),
+        'dblchk_n2':        os.path.join(pert_dir, f'double_check_vhagarNoPertubed_{arch}_{tag2}'),
+        'vaghar_n1_relax_base': os.path.join(pert_dir, f'vagharWithPerturbedRelax_{arch}_{tag1}'),
+        'vaghar_n2_relax_base': os.path.join(pert_dir, f'vagharWithPerturbedRelax_{arch}_{tag2}'),
         'transfer':         os.path.join(pert_dir, f'transfer_{arch}_N1_is_{tag1}'),
     }
     if create:
@@ -169,7 +176,10 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
     return dirs
 
 
-def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false'):
+def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
+                     no_n1_binaries_and_relaxtions_only_on_n2=False,
+                     no_n1_encoding_at_all=False,
+                     optimizing_intervals=None):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
     if threshold is None:
@@ -177,6 +187,12 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false'):
     suffix = f'_relax{threshold}'
     if relaxation_gap_area.lower() == 'true':
         suffix += '_GapArea'
+    if no_n1_binaries_and_relaxtions_only_on_n2:
+        suffix += '_NoN1BinRelaxOnN2only'
+    if no_n1_encoding_at_all:
+        suffix += '_NoN1Encoding'
+    if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
+        suffix += '_noOI'
     return base + suffix
 
 
@@ -289,11 +305,24 @@ def get_data_loaders(dataset, batch_size=128):
     return train_loader, test_loader
 
 
+DOUBLE_CHECK_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', 'code'))
+
+
 def run_julia(args_list, step_name):
     """Run julia run.jl with given arguments."""
     cmd = ['julia', 'run.jl'] + args_list
     print(f"\n  Running: {' '.join(cmd[:8])}...")
     proc = subprocess.run(cmd, cwd=RUN_JL_DIR)
+    if proc.returncode != 0:
+        print(f"  WARNING: {step_name} exited with code {proc.returncode}")
+    return proc.returncode
+
+
+def run_julia_double_check(args_list, step_name):
+    """Run julia run.jl from the double-check codebase (/root/Downloads/for_dana/code/)."""
+    cmd = ['julia', 'run.jl'] + args_list
+    print(f"\n  Running (double-check): {' '.join(cmd[:8])}...")
+    proc = subprocess.run(cmd, cwd=DOUBLE_CHECK_DIR)
     if proc.returncode != 0:
         print(f"  WARNING: {step_name} exited with code {proc.returncode}")
     return proc.returncode
@@ -559,8 +588,9 @@ def train_dual_seed(arch, dataset, seeds, batch_size=128, lr=1e-3, max_epochs=20
 def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
                         perturbation_size='0.05', ct='1,2,3,4,5,6,7,8,9,10',
                         timeout=10800, perturbation='linf', force_cpu=False,
-                        use_perturbed_intervals=True, optimizing_intervals=None):
-    """Run VHAGaR in standard mode with hyper attack, vaghar deps, and optionally perturbed intervals."""
+                        use_perturbed_intervals=True, optimizing_intervals=None,
+                        use_relaxations=False, relaxation_threshold=None):
+    """Run VHAGaR in standard mode with hyper attack, vaghar deps, and optionally perturbed intervals and relaxations."""
     _, model_name = ARCH_REGISTRY[arch]
     _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
     args = [
@@ -578,12 +608,36 @@ def run_vaghar_standard(arch, dataset, model_path, output_dir, ctag,
         '--use_hyper_attack', 'true',
         '--activate_vaghgar_deps', 'true',
         '--use_perturbed_intervals', str(use_perturbed_intervals).lower(),
+        '--use_relaxations', str(use_relaxations).lower(),
         '--force_cpu', str(force_cpu).lower(),
     ]
     if optimizing_intervals is not None:
         args += ['--optimizing_intervals', str(optimizing_intervals).lower()]
+    if relaxation_threshold is not None:
+        args += ['--relaxation_threshold', str(relaxation_threshold)]
     pi_label = "with" if use_perturbed_intervals else "without"
-    return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag}, {pi_label} perturbed intervals)')
+    relax_label = f", relaxations T={relaxation_threshold}" if use_relaxations else ""
+    return run_julia(args, f'VHAGaR standard {arch} (ctag={ctag}, {pi_label} perturbed intervals{relax_label})')
+
+
+def run_double_check_standard(arch, dataset, model_path, output_dir, ctag,
+                              perturbation_size='0.05', ct='1,2,3,4,5,6,7,8,9,10',
+                              timeout=10800, perturbation='linf'):
+    """Run the double-check verifier (/root/Downloads/for_dana/code/run.jl) in standard mode."""
+    _, model_name = ARCH_REGISTRY[arch]
+    _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+    args = [
+        '--dataset', julia_dataset,
+        '--model_name', model_name,
+        '--model_path', model_path,
+        '--perturbation', perturbation,
+        '--perturbation_size', perturbation_size,
+        '--ctag', str(ctag),
+        '--ct', ct,
+        '--timout', str(timeout),
+        '--output_dir', output_dir + '/',
+    ]
+    return run_julia_double_check(args, f'double-check standard {arch} (ctag={ctag})')
 
 
 def _dir_has_results(d):
@@ -591,7 +645,48 @@ def _dir_has_results(d):
     return os.path.isdir(d) and any(f.endswith('.txt') for f in os.listdir(d))
 
 
-def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None):
+def step_double_check_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, dual_seed=False, epochs=None, model_dirs=None):
+    dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
+    os.makedirs(dirs['dblchk_n1'], exist_ok=True)
+    os.makedirs(dirs['dblchk_n2'], exist_ok=True)
+
+    model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
+    model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
+
+    if model_dirs:
+        tag1 = os.path.basename(os.path.normpath(model_dirs[0])).replace('model_', '', 1)
+        tag2 = os.path.basename(os.path.normpath(model_dirs[1])).replace('model_', '', 1)
+    elif dual_seed:
+        ep1 = epochs[0] if epochs else 0
+        ep2 = epochs[1] if epochs else 0
+        tag1 = f'seed{itr_n1}_itr{ep1}'
+        tag2 = f'seed{itr_n2}_itr{ep2}'
+    else:
+        tag1 = f'itr{itr_n1}'
+        tag2 = f'itr{itr_n2}'
+
+    print("=" * 60)
+    print(f"DOUBLE-CHECK: standard (NoPerturbed) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
+    print("=" * 60)
+
+    if _dir_has_results(dirs['dblchk_n1']):
+        print(f"\n  --- {tag1} (ctag={ctag}) --- SKIPPED (results exist in {dirs['dblchk_n1']})")
+    else:
+        print(f"\n  --- {tag1} (ctag={ctag}) ---")
+        run_double_check_standard(arch, dataset, model_n1_path, dirs['dblchk_n1'], ctag,
+                                  perturbation_size=perturbation_size, ct=ct,
+                                  timeout=timeout, perturbation=perturbation)
+
+    if _dir_has_results(dirs['dblchk_n2']):
+        print(f"\n  --- {tag2} (ctag={ctag}) --- SKIPPED (results exist in {dirs['dblchk_n2']})")
+    else:
+        print(f"\n  --- {tag2} (ctag={ctag}) ---")
+        run_double_check_standard(arch, dataset, model_n2_path, dirs['dblchk_n2'], ctag,
+                                  perturbation_size=perturbation_size, ct=ct,
+                                  timeout=timeout, perturbation=perturbation)
+
+
+def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None, standard_relaxation_thresholds=None):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     os.makedirs(dirs['vaghar_n1'], exist_ok=True)
     os.makedirs(dirs['vaghar_n2'], exist_ok=True)
@@ -659,6 +754,38 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
                             timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
                             use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
 
+    # Run WITH perturbed intervals + relaxations (sweep over thresholds)
+    if standard_relaxation_thresholds:
+        for std_thresh in standard_relaxation_thresholds:
+            relax_n1_dir = dirs['vaghar_n1_relax_base'] + f'_T{std_thresh}'
+            relax_n2_dir = dirs['vaghar_n2_relax_base'] + f'_T{std_thresh}'
+            os.makedirs(relax_n1_dir, exist_ok=True)
+            os.makedirs(relax_n2_dir, exist_ok=True)
+
+            print("=" * 60)
+            print(f"STEP 2c: VHAGaR standard (WITH perturbed intervals + relaxations T={std_thresh}) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
+            print("=" * 60)
+
+            if _dir_has_results(relax_n1_dir):
+                print(f"\n  --- {tag1} (ctag={ctag}) --- SKIPPED (results exist in {relax_n1_dir})")
+            else:
+                print(f"\n  --- {tag1} (ctag={ctag}) ---")
+                run_vaghar_standard(arch, dataset, model_n1_path, relax_n1_dir, ctag,
+                                    perturbation_size=perturbation_size, ct=ct,
+                                    timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                                    use_perturbed_intervals=True, optimizing_intervals=optimizing_intervals,
+                                    use_relaxations=True, relaxation_threshold=std_thresh)
+
+            if _dir_has_results(relax_n2_dir):
+                print(f"\n  --- {tag2} (ctag={ctag}) --- SKIPPED (results exist in {relax_n2_dir})")
+            else:
+                print(f"\n  --- {tag2} (ctag={ctag}) ---")
+                run_vaghar_standard(arch, dataset, model_n2_path, relax_n2_dir, ctag,
+                                    perturbation_size=perturbation_size, ct=ct,
+                                    timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                                    use_perturbed_intervals=True, optimizing_intervals=optimizing_intervals,
+                                    use_relaxations=True, relaxation_threshold=std_thresh)
+
 
 # ── step 3: run VHAGaR transfer ──────────────────────────────────────────
 
@@ -668,7 +795,9 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               relaxation_threshold=None, force_cpu=False,
                               use_hyper_attack=True, dual_seed=False, epochs=None,
                               relaxation_gap_area='false',
-                              optimizing_intervals=None, model_dirs=None):
+                              optimizing_intervals=None, model_dirs=None,
+                              no_n1_binaries_and_relaxtions_only_on_n2=False,
+                              no_n1_encoding_at_all=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -762,6 +891,10 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
         if optimizing_intervals is not None:
             command += ['--optimizing_intervals', str(optimizing_intervals).lower()]
         command += ['--relaxation_gap_area', str(relaxation_gap_area).lower()]
+        if no_n1_binaries_and_relaxtions_only_on_n2:
+            command += ['--no_n1_binaries_and_relaxtions_only_on_n2', 'true']
+        if no_n1_encoding_at_all:
+            command += ['--no_n1_encoding_at_all', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
@@ -769,9 +902,13 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
 def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturbation_size, ct,
                    transfer_relaxations, delta_diff_positive,Threads_num=32, relaxation_threshold=None, force_cpu=False,
                    use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None,
-                   relaxation_gap_area='false'):
+                   relaxation_gap_area='false', no_n1_binaries_and_relaxtions_only_on_n2=False,
+                   no_n1_encoding_at_all=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
-    output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area)
+    output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
+                                   no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
+                                   no_n1_encoding_at_all=no_n1_encoding_at_all,
+                                   optimizing_intervals=optimizing_intervals)
     os.makedirs(output_dir, exist_ok=True)
 
     if _dir_has_results(output_dir):
@@ -802,6 +939,8 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         use_hyper_attack=use_hyper_attack, dual_seed=dual_seed, epochs=epochs,
         optimizing_intervals=optimizing_intervals, model_dirs=model_dirs,
         relaxation_gap_area=relaxation_gap_area,
+        no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
+        no_n1_encoding_at_all=no_n1_encoding_at_all,
     )
 
 
@@ -850,6 +989,8 @@ def main():
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_standard', action='store_true', help='Skip standard VHAGaR')
     parser.add_argument('--skip_transfer', action='store_true', help='Skip transfer VHAGaR')
+    parser.add_argument('--double_check_standard', action='store_true',
+                        help='Run double-check standard using /root/Downloads/for_dana/code/run.jl')
     parser.add_argument('--skip_hyper_transfer_attack', action='store_true',
                         help='Disable hyper attack (PGD warm-start) in transfer runs')
     parser.add_argument('--dual_seed', action='store_true',
@@ -876,6 +1017,16 @@ def main():
                              'Tags derived from basename. Skips auto-detection.')
     parser.add_argument('--Threads_num', type=int, default=32,
                         help='Number of threads to use')
+    parser.add_argument('--standard_relaxation_thresholds', type=str, default=None,
+                        help='Comma-separated relaxation thresholds for standard mode '
+                             '(use_perturbed_intervals=true + use_relaxations=true). '
+                             'e.g. "0.05,0.1,0.5". If not set, standard relaxation step is skipped.')
+    parser.add_argument('--no_n1_binaries_and_relaxtions_only_on_n2', action='store_true',
+                        help='LP-relax all N1 binaries and relax N2(x_p) by conditioning on N2(x) '
+                             'instead of N1(x). Keeps N2(x) exact as anchor.')
+    parser.add_argument('--no_n1_encoding_at_all', action='store_true',
+                        help='Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with '
+                             'interval-bounded constraints on N2 outputs using weight diff bounds.')
 
     args = parser.parse_args()
 
@@ -897,6 +1048,17 @@ def main():
             thresholds.append(float('inf'))
         else:
             thresholds.append(float(val))
+
+    # Parse standard relaxation thresholds
+    std_relax_thresholds = None
+    if args.standard_relaxation_thresholds:
+        std_relax_thresholds = []
+        for val in args.standard_relaxation_thresholds.split(','):
+            val = val.strip()
+            if val.lower() == 'inf':
+                std_relax_thresholds.append(float('inf'))
+            else:
+                std_relax_thresholds.append(float(val))
 
     # Parse perturbation spec
     perturbation_pairs = parse_perturbations(args.perturbations)
@@ -979,7 +1141,8 @@ def main():
                                       ctag, args.ct, args.timeout, force_cpu=args.cpu,
                                       dual_seed=dual_seed, epochs=epochs,
                                       optimizing_intervals=args.optimizing_intervals,
-                                      model_dirs=model_dirs)
+                                      model_dirs=model_dirs,
+                                      standard_relaxation_thresholds=std_relax_thresholds)
         else:
             print("  Skipping standard VHAGaR (--skip_standard)")
 
@@ -1004,9 +1167,20 @@ def main():
                                dual_seed=dual_seed, epochs=transfer_epochs,
                                optimizing_intervals=args.optimizing_intervals,
                                model_dirs=transfer_model_dirs,
-                               relaxation_gap_area=args.relaxation_gap_area)
+                               relaxation_gap_area=args.relaxation_gap_area,
+                               no_n1_binaries_and_relaxtions_only_on_n2=args.no_n1_binaries_and_relaxtions_only_on_n2,
+                               no_n1_encoding_at_all=args.no_n1_encoding_at_all)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
+
+        # Double-check standard using alternative codebase
+        if args.double_check_standard:
+            for ctag in range(1, 3):
+                step_double_check_standard(arch, dataset, itr_n1, itr_n2,
+                                           perturbation, perturbation_size,
+                                           ctag, args.ct, args.timeout,
+                                           dual_seed=dual_seed, epochs=epochs,
+                                           model_dirs=model_dirs)
 
     # Summary
     if dual_seed:

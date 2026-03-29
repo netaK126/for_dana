@@ -1163,5 +1163,231 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
         end
     end
 
+    # Save final diff bounds (after the last Linear layer, before any output activation).
+    # These are the output-layer bounds: N2(x)[k] - N1(x)[k] ∈ [diff_down[k], diff_up[k]].
+    # Used by --no_n1_encoding_at_all to replace the entire N1 encoding.
+    global output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
+    global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
+    println("compute_diff_and_comp_bounds: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
+
     println("compute_diff_and_comp_bounds: populated $(length(relu_diff_up_bounds)) ReLU layers")
+end
+
+# ── N2-only perturbation relaxation bounds ──────────────────────────────
+# Computes perturbation intervals through N2 alone (z_n2_pert - z_n2_org)
+# and N2 pre-activation bounds, for conditioning N2(x_p) on N2(x).
+# Used when --no_n1_binaries_and_relaxtions_only_on_n2 is active.
+function compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
+    global relu_n2pert_up_bounds, relu_n2pert_down_bounds
+    global n2_preact_up_bounds, n2_preact_down_bounds
+
+    relu_n2pert_up_bounds   = Array{Float64}[]
+    relu_n2pert_down_bounds = Array{Float64}[]
+    n2_preact_up_bounds     = Array{Float64}[]
+    n2_preact_down_bounds   = Array{Float64}[]
+
+    # Running perturbation interval: z_n2_pert - z_n2_org
+    pert_up   = copy(Float64.(I_pert_up_init))
+    pert_down = copy(Float64.(I_pert_down_init))
+
+    # N2 post-activation bounds (initialised to input domain [0,1])
+    n2_act_up   = ones(Float64,  size(I_pert_up_init))
+    n2_act_down = zeros(Float64, size(I_pert_down_init))
+
+    n2_pre_up_cur   = Float64[]
+    n2_pre_down_cur = Float64[]
+
+    for (layer_idx, l) in enumerate(nn2.layers)
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(pert_up) > 1
+                pert_up     = vec(pert_up   |> l)
+                pert_down   = vec(pert_down |> l)
+                n2_act_up   = vec(n2_act_up   |> l)
+                n2_act_down = vec(n2_act_down |> l)
+            end
+
+        elseif occursin("Linear", string(typeof(l)))
+            W2 = Float64.(transpose(l.matrix))
+            b2 = Float64.(l.bias)
+
+            # pert: W2 * pert_prev  (bias cancels in the difference)
+            rp_min, rp_max = interval_matrix_vector_multiplication(W2, W2, pert_down, pert_up)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N2 pre-activation bounds: W2 * a_n2 + b2
+            rn_min, rn_max = interval_matrix_vector_multiplication(W2, W2, n2_act_down, n2_act_up)
+            n2_pre_up_cur   = rn_max .+ b2
+            n2_pre_down_cur = rn_min .+ b2
+
+        elseif occursin("Conv", string(typeof(l)))
+            F2 = Float64.(l.filter)
+            b2 = Float64.(l.bias)
+            zero_bias = zeros(Float64, length(b2))
+
+            pert_4d_down = ndims(pert_down) == 4 ? pert_down : reshape(pert_down, 1, :, 1, 1)
+            pert_4d_up   = ndims(pert_up)   == 4 ? pert_up   : reshape(pert_up,   1, :, 1, 1)
+            n2_4d_down   = ndims(n2_act_down) == 4 ? n2_act_down : reshape(n2_act_down, 1, :, 1, 1)
+            n2_4d_up     = ndims(n2_act_up)   == 4 ? n2_act_up   : reshape(n2_act_up,   1, :, 1, 1)
+
+            # pert = F2 * pert_prev
+            rp_min, rp_max = interval_conv2d_bounds(F2, F2, pert_4d_down, pert_4d_up, zero_bias, l.stride, l.padding)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N2 preact bounds
+            rn_min, rn_max = interval_conv2d_bounds(F2, F2, n2_4d_down, n2_4d_up, Float64.(b2), l.stride, l.padding)
+            n2_pre_up_cur   = rn_max
+            n2_pre_down_cur = rn_min
+
+        elseif occursin("ReLU", string(typeof(l)))
+            # Save pre-ReLU bounds for relaxation decisions in core_ops.jl
+            push!(relu_n2pert_up_bounds,   copy(pert_up))
+            push!(relu_n2pert_down_bounds, copy(pert_down))
+            push!(n2_preact_up_bounds,     copy(n2_pre_up_cur))
+            push!(n2_preact_down_bounds,   copy(n2_pre_down_cur))
+
+            # Clip perturbation intervals through ReLU
+            if optimizing_intervals
+                # Tighter per-neuron clipping: if both N2(x) and N2(x') neurons
+                # are in the same activation state, we can preserve or zero the pert interval.
+                for i in eachindex(pert_up)
+                    l_n2     = n2_pre_down_cur[i]             # N2(x) preact lower
+                    u_n2     = n2_pre_up_cur[i]               # N2(x) preact upper
+                    l_n2_p   = l_n2 + pert_down[i]            # N2(x') preact lower
+                    u_n2_p   = u_n2 + pert_up[i]              # N2(x') preact upper
+
+                    if l_n2 >= 0 && l_n2_p >= 0
+                        # both active: post-ReLU pert = pre-ReLU pert, keep as-is
+                    elseif u_n2 <= 0 && u_n2_p <= 0
+                        # both inactive: post-ReLU pert = 0
+                        pert_up[i]   = 0.0
+                        pert_down[i] = 0.0
+                    else
+                        # mixed: conservative non-expansive clipping
+                        pert_up[i]   = max(0.0, pert_up[i])
+                        pert_down[i] = -max(0.0, -pert_down[i])
+                    end
+                end
+            else
+                # Original conservative clipping (non-expansive)
+                pert_up   = max.(0.0, pert_up)
+                pert_down = .- max.(0.0, .- pert_down)
+            end
+
+            # N2 post-activation bounds
+            n2_act_up   = max.(0.0, n2_pre_up_cur)
+            n2_act_down = max.(0.0, n2_pre_down_cur)
+        end
+    end
+
+    println("compute_n2_pert_relaxation_bounds: populated $(length(relu_n2pert_up_bounds)) ReLU layers")
+end
+
+# ── Output-layer diff bounds only (lightweight) ─────────────────────────
+# Computes N2(x)[k] - N1(x)[k] bounds at the output layer using interval
+# arithmetic on weight differences. Does NOT compute per-ReLU bounds.
+# Used by --no_n1_encoding_at_all when compute_diff_and_comp_bounds is not called.
+function compute_output_diff_bounds_only(nn1, nn2)
+    global output_diff_up_bounds, output_diff_down_bounds
+
+    # Determine input shape from I_pert_prev_up (set by perturbation-specific function),
+    # falling back to layer-based detection for standalone use.
+    global I_pert_prev_up
+    if length(I_pert_prev_up) > 0
+        input_shape = size(I_pert_prev_up)
+    else
+        # Fallback: detect from first non-Flatten layer
+        sample_layer = nn1.layers[1]
+        if occursin("Flatten", string(typeof(sample_layer)))
+            sample_layer = nn1.layers[2]
+        end
+        if occursin("Linear", string(typeof(sample_layer)))
+            n_in = size(sample_layer.matrix, 1)
+            input_shape = (n_in,)
+        else
+            # Conv: need (1, w, h, k) — estimate from filter's input channels
+            # and assume square input (MNIST: 28x28, CIFAR: 32x32)
+            F = sample_layer.filter
+            k_in = size(F, 3)
+            # Use common dataset sizes; for robustness, caller should set I_pert_prev_up
+            w_guess = k_in == 1 ? 28 : 32
+            input_shape = (1, w_guess, w_guess, k_in)
+        end
+    end
+
+    act_up   = ones(Float64, input_shape)
+    act_down = zeros(Float64, input_shape)
+    diff_up   = zeros(Float64, input_shape)
+    diff_down = zeros(Float64, input_shape)
+
+    pre_up   = copy(act_up)
+    pre_down = copy(act_down)
+
+    for (layer_idx, l) in enumerate(nn1.layers)
+        l2 = nn2.layers[layer_idx]
+
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(diff_up) > 1
+                diff_up   = vec(diff_up   |> l)
+                diff_down = vec(diff_down |> l)
+                act_up    = vec(act_up    |> l)
+                act_down  = vec(act_down  |> l)
+            end
+
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            W2 = Float64.(transpose(l2.matrix))
+            b1 = Float64.(l.bias)
+            b2 = Float64.(l2.bias)
+            ΔW = W2 - W1
+            Δb = b2 - b1
+
+            r1_min, r1_max = interval_matrix_vector_multiplication(ΔW, ΔW, act_down, act_up)
+            r2_min, r2_max = interval_matrix_vector_multiplication(W2, W2, diff_down, diff_up)
+            diff_down = r1_min .+ r2_min .+ Δb
+            diff_up   = r1_max .+ r2_max .+ Δb
+
+            # N1 preact for post-activation bounds
+            rn_min, rn_max = interval_matrix_vector_multiplication(W1, W1, act_down, act_up)
+            pre_up   = rn_max .+ b1
+            pre_down = rn_min .+ b1
+
+        elseif occursin("Conv", string(typeof(l)))
+            F1 = Float64.(l.filter);  F2 = Float64.(l2.filter)
+            b1 = Float64.(l.bias);    b2 = Float64.(l2.bias)
+            ΔF = F2 - F1;             Δb = b2 - b1
+            zero_bias = zeros(Float64, length(b1))
+
+            d4_down = ndims(diff_down) == 4 ? diff_down : reshape(diff_down, 1, :, 1, 1)
+            d4_up   = ndims(diff_up)   == 4 ? diff_up   : reshape(diff_up,   1, :, 1, 1)
+            a4_down = ndims(act_down)  == 4 ? act_down  : reshape(act_down,  1, :, 1, 1)
+            a4_up   = ndims(act_up)    == 4 ? act_up    : reshape(act_up,    1, :, 1, 1)
+
+            r1_min, r1_max = interval_conv2d_bounds(ΔF, ΔF, a4_down, a4_up, zero_bias, l.stride, l.padding)
+            r2_min, r2_max = interval_conv2d_bounds(F2, F2, d4_down, d4_up, zero_bias, l.stride, l.padding)
+            diff_down = r1_min .+ r2_min
+            diff_up   = r1_max .+ r2_max
+            for oc in 1:length(Δb)
+                diff_down[:, :, :, oc] .+= Δb[oc]
+                diff_up[:, :, :, oc]   .+= Δb[oc]
+            end
+
+            rn_min, rn_max = interval_conv2d_bounds(F1, F1, a4_down, a4_up, Float64.(b1), l.stride, l.padding)
+            pre_up   = rn_max
+            pre_down = rn_min
+
+        elseif occursin("ReLU", string(typeof(l)))
+            # Clip diff through ReLU (non-expansive)
+            diff_up   = max.(0.0, diff_up)
+            diff_down = .- max.(0.0, .- diff_down)
+            # N1 post-activation bounds
+            act_up   = max.(0.0, pre_up)
+            act_down = max.(0.0, pre_down)
+        end
+    end
+
+    output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
+    output_diff_down_bounds = vec(copy(Float64.(diff_down)))
+    println("compute_output_diff_bounds_only: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
 end

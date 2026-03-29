@@ -44,7 +44,7 @@ function parse_commandline()
         required = false
         default = "mnist"
         "--model_name", "-n"
-        help = "3x10, 3x50, 6x10, cnn0, cnn1, cnn2, or cnn3"
+        help = "3x10, 3x50, 6x10, 6x100, 9x200, cnn0, cnn1, cnn2, or cnn3"
         arg_type = String
         required = false
         default = "4x10"
@@ -152,7 +152,7 @@ function parse_commandline()
         required = false
         default = false
         "--use_relaxations"
-        help = "activate conditional-triangle relaxation for n2_org and n2_pert (transfer mode); eliminates binary variables for qualifying neurons"
+        help = "activate conditional-triangle relaxation; in standard mode relaxes perturbation copy based on perturbed intervals, in transfer mode relaxes n2_org and n2_pert; eliminates binary variables for qualifying neurons"
         arg_type = Bool
         required = false
         default = false
@@ -168,6 +168,16 @@ function parse_commandline()
         default = true
         "--relaxation_gap_area"
         help = "use triangle relaxation-gap area scoring instead of interval width for relaxation threshold decision (Method 2)"
+        arg_type = Bool
+        required = false
+        default = false
+        "--no_n1_binaries_and_relaxtions_only_on_n2"
+        help = "LP-relax all N1 binaries (a ∈ [0,1]) and relax N2(x_p) by conditioning on N2(x) instead of N1(x); keeps N2(x) exact as anchor"
+        arg_type = Bool
+        required = false
+        default = false
+        "--no_n1_encoding_at_all"
+        help = "Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with interval-bounded constraints on N2 outputs using weight diff bounds"
         arg_type = Bool
         required = false
         default = false
@@ -215,6 +225,10 @@ end
 function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
+    global use_relaxations = args["use_relaxations"]
+    global relaxation_threshold = args["relaxation_threshold"]
+    global optimizing_intervals = args["optimizing_intervals"]
+    global relaxation_gap_area = args["relaxation_gap_area"]
     name_to_save_init = name_to_save
     for c_tag in c_tag_list
         results.str = ""
@@ -223,8 +237,8 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
         timout = args["timout"]
         w, h, k, c = get_dataset_params( dataset )
         token_signature = string(now().instant.periods.value)
+        nn = get_nn(model_path, model_name, w, h, k, c, dataset)
         for c_target in c_targets
-            nn = get_nn(model_path, model_name, w, h, k, c, dataset)
             name_to_save = name_to_save_init
             global relaxation_condition_count = 0
             if c_tag==c_target
@@ -263,7 +277,10 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             if args["use_relaxations"]
                 name_to_save = name_to_save*"_Relaxations"*string(args["relaxation_threshold"])
-                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"])...")
+                if args["relaxation_gap_area"]
+                    name_to_save = name_to_save*"_GapArea"
+                end
+                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"]) (gap_area=$(args["relaxation_gap_area"]))...")
             end
             mip_set_delta_property(m, perturbation, d)
             set_optimizer(m, optimizer)
@@ -271,7 +288,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)
             optimize!(m)
             mip_log(m, d)
-            # mip_reuse_bounds()
+            mip_reuse_bounds()
             results.str = update_results_str(results.str, c_tag, c_target, d)
             println(results_path)
             if args["use_relaxations"]
@@ -296,6 +313,14 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
     global relaxation_gap_area = args["relaxation_gap_area"]
+    global no_n1_binaries_and_relaxtions_only_on_n2 = args["no_n1_binaries_and_relaxtions_only_on_n2"]
+    global no_n1_encoding_at_all = args["no_n1_encoding_at_all"]
+    # no_n1_encoding_at_all implies no_n1_binaries_and_relaxtions_only_on_n2
+    # (N1 isn't encoded, so N2(x') must be relaxed onto N2(x) instead of N1)
+    if no_n1_encoding_at_all
+        global no_n1_binaries_and_relaxtions_only_on_n2 = true
+        n1_p_mode = false  # can't encode N1(x') without N1
+    end
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
     w, h, k, c = get_dataset_params(dataset)
@@ -369,20 +394,22 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             if use_vaghgarDeps
                 name_to_save = name_to_save * "_VaghgarDeps"
-                # NETA TODO - HAD TO REMOVE THE FOLLOWING SINCE WE NO LONGER ENCODE N1_P
-                # # Dependencies for N1: original layers 1..K ↔ perturbed layers 2K+1..3K
-                # perturbation_dependencies(m, nn1, perturbation, perturbation_size, w, h, k;
-                #                         activation_start=1, layers_offset=2*K,
-                #                         perturbation_var=d[:Perturbation])
-                
-                # Dependencies for N2: original layers K+1..2K ↔ perturbed layers 3K+1..4K
-                perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
-                                        activation_start=K+1, layers_offset=2*K,
-                                        perturbation_var=d[:Perturbation])
+                # Dependencies for N2: original vs perturbed
+                if no_n1_encoding_at_all
+                    # N1 not encoded → N2(x) starts at layer 1, N2(x') at K+1
+                    perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
+                                            activation_start=1, layers_offset=K,
+                                            perturbation_var=d[:Perturbation])
+                else
+                    # N1 encoded → N2(x) at layers K+1..2K, N2(x') at 3K+1..4K
+                    perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
+                                            activation_start=K+1, layers_offset=2*K,
+                                            perturbation_var=d[:Perturbation])
+                end
             end
 
-            # Interval bounds between N1 and N2
-            if use_intervals
+            # Interval bounds between N1 and N2 (requires N1 encoding)
+            if use_intervals && !no_n1_encoding_at_all
                 name_to_save = name_to_save * "_LucidIntervals"
                 println("Adding interval constraints between N1 and N2...")
                 transfer_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
@@ -398,13 +425,15 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             # Perturbation interval bounds (clean ↔ perturbed for each network)
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save * "_PerturbedIntervals"
-                println("Adding perturbed interval constraints for N1 and N2...")
-                perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
+                println("Adding perturbed interval constraints...")
+                if !no_n1_encoding_at_all
+                    perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
+                end
                 perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
             end
-            
-            # Composed interval constraints: I^C linking N1(x) ↔ N2(x_p) directly
-            if args["composed_interval"]
+
+            # Composed interval constraints: I^C linking N1(x) ↔ N2(x_p) directly (requires N1)
+            if args["composed_interval"] && !no_n1_encoding_at_all
                 name_to_save = name_to_save * "_ComposedIntervals"
                 println("Adding composed interval constraints (I^C) between N1(x) and N2(x_p)...")
                 composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
@@ -416,11 +445,23 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             if optimizing_intervals
                 name_to_save = name_to_save * "_OptimizingIntervals"
             end
+            if no_n1_binaries_and_relaxtions_only_on_n2
+                name_to_save = name_to_save * "_NoN1BinRelaxOnN2only"
+            end
+            if no_n1_encoding_at_all
+                name_to_save = name_to_save * "_NoN1Encoding"
+            end
 
             # Set transfer proof constraints and objective
-            mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
-                c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
-                args["delta_diff_positive"])
+            if no_n1_encoding_at_all
+                mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
+                    c_tag_mode, n2_fewer_binars_encoding,
+                    args["delta_diff_positive"])
+            else
+                mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
+                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
+                    args["delta_diff_positive"])
+            end
             set_optimizer(m, optimizer)
             mip_set_attr_transfer(m, timout, suboptimal_solution, args["delta_diff_positive"])
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)
@@ -434,7 +475,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             # Save results for this c_tag
             ct_str = c_tag_mode ? "cTagMode" : "cTargetMode"
             
-            if args["use_relaxations"]
+            if args["use_relaxations"] || no_n1_binaries_and_relaxtions_only_on_n2
                 name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
             end
 

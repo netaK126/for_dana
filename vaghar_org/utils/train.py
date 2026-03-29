@@ -8,7 +8,7 @@ from models import *
 import pickle
 import argparse
 
-device = torch.device("cpu")#torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 transform = transforms.Compose([transforms.ToTensor()])
 mnist_train = dsets.MNIST(root='./data/', train=True, transform=transform, download=True)
 mnist_test = dsets.MNIST(root='./data/', train=False, transform=transform, download=True)
@@ -22,8 +22,8 @@ def save_model(model, itr,output):
     for i in a:
         print(i.shape)
     model_name = "model"
-    model_path = "./"+output+"/"+str(itr)+"/"
-    os.system("mkdir " + model_path)
+    model_path = os.path.join(output, str(itr)) + "/"
+    os.makedirs(model_path, exist_ok=True)
     pickle.dump(a, open(model_path + model_name + ".p", "wb"))
     torch.save(model.state_dict(), model_path + model_name + '.pth')
 
@@ -49,6 +49,10 @@ if __name__ == '__main__':
         model = FNN_3_10()
     elif model_type == "3x50":
         model = FNN_3_50()
+    elif model_type == "6x100":
+        model = FNN_6_100()
+    elif model_type == "9x200":
+        model = FNN_9_200()
     elif model_type == "cnn0":
         model = CNN0()
     elif model_type == "cnn1":
@@ -73,7 +77,7 @@ if __name__ == '__main__':
         optimizer = torch.optim.SGD( model.parameters(), lr = 0.05)
     else:
         assert ("New optimizer has been detected, please expand this if condition to support it.")
-    os.system("mkdir "+output_dir)
+    os.makedirs(output_dir, exist_ok=True)
     model = model.to(device)
     print(model)
 

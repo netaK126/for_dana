@@ -79,6 +79,14 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     network_version = "org"
     v_in_output = v_in |> nn
 
+    # Pre-compute perturbation interval bounds for the conditional-triangle
+    # relaxation (used by core_ops.jl's relu() when use_relaxations=true).
+    # With nn1==nn2 (same network), diff=0 and composed=pert, so
+    # relu_comp_up/down_bounds will hold the perturbation interval bounds.
+    if use_relaxations
+        compute_diff_and_comp_bounds(nn, nn, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+    end
+
     layer_counter = 0
     nueron_counter = 0
     network_version = "perturbation"
@@ -472,18 +480,22 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         I_pert_prev_down = -p_size .* ones(Float64, size(input))
     end
 
-    # Encode N1 on clean input x → layers 1..K in layers_info_dict
-    println("Encoding N1(x)...")
-    layer_counter = 0
-    nueron_counter = 0
-    network_version = "n1_org"
-    v_out_n1 = v_in |> nn1
-
-    # Pre-compute diff/composed interval bounds for the conditional-triangle
-    # relaxation (used by core_ops.jl's relu() when use_relaxations=true).
-    # Must run BEFORE encoding n2_org/n2_pert so relu() can skip binaries.
-    if use_relaxations
+    # Pre-compute diff/composed interval bounds.
+    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
         compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+    end
+
+    # Skip N1(x) encoding when no_n1_encoding_at_all is active
+    if !no_n1_encoding_at_all
+        println("Encoding N1(x)...")
+        layer_counter = 0
+        nueron_counter = 0
+        network_version = "n1_org"
+        v_out_n1 = v_in |> nn1
+    else
+        println("Skipping N1(x) encoding (--no_n1_encoding_at_all)")
+        v_out_n1 = nothing
     end
 
     # Encode N2 on clean input x → layers K+1..2K
@@ -493,8 +505,8 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     network_version = "n2_org"
     v_out_n2 = v_in |> nn2
 
-    # Only encode N1(x') when n1_p_mode is on (see _four_network_passes_transfer! for rationale)
-    if n1_p_mode
+    # Only encode N1(x') when n1_p_mode is on and N1 is encoded
+    if n1_p_mode && !no_n1_encoding_at_all
         println("Encoding N1(x_p)...")
         layer_counter = 0
         nueron_counter = 0
@@ -502,6 +514,11 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         v_out_n1_p = v_x0 |> nn1
     else
         v_out_n1_p = nothing
+    end
+
+    # Pre-compute N2 perturbation bounds for N2(x_p)->N2(x) relaxation
+    if no_n1_binaries_and_relaxtions_only_on_n2
+        compute_n2_pert_relaxation_bounds(nn2, I_pert_prev_up, I_pert_prev_down)
     end
 
     # Encode N2 on perturbed input x_p → layers 3K+1..4K
@@ -576,30 +593,39 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     I_pert_prev_up   = I_pert_up
     I_pert_prev_down = I_pert_down
 
-    # Pre-compute diff/composed interval bounds for the conditional-triangle
-    # relaxation.  Must run BEFORE encoding n2_org/n2_pert.
-    if use_relaxations
+    # Pre-compute diff/composed interval bounds.
+    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
+    # compute_diff_and_comp_bounds uses optimizing_intervals for tighter clipping and saves output-layer bounds.
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
         compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
     end
 
-    println("Encoding N1(x)...")
-    layer_counter = 0; nueron_counter = 0; network_version = "n1_org"
-    v_out_n1 = v_in |> nn1
+    # Skip N1(x) encoding when no_n1_encoding_at_all is active
+    if !no_n1_encoding_at_all
+        println("Encoding N1(x)...")
+        layer_counter = 0; nueron_counter = 0; network_version = "n1_org"
+        v_out_n1 = v_in |> nn1
+    else
+        println("Skipping N1(x) encoding (--no_n1_encoding_at_all)")
+        v_out_n1 = nothing
+    end
 
     println("Encoding N2(x)...")
     layer_counter = 0; nueron_counter = 0; network_version = "n2_org"
     v_out_n2 = v_in |> nn2
 
-    # Only encode N1(x') when n1_p_mode is on — its output d[:v_out_n1_p] is only
-    # used by mip_set_transfer_property to form conf_n1_xp (the relative attack
-    # constraint).  Skipping it when n1_p_mode=false saves all of N1's binary
-    # ReLU variables for the perturbed pass.
-    if n1_p_mode
+    # Only encode N1(x') when n1_p_mode is on and N1 is encoded
+    if n1_p_mode && !no_n1_encoding_at_all
         println("Encoding N1(x_p)...")
         layer_counter = 0; nueron_counter = 0; network_version = "n1_pert"
         v_out_n1_p = v_x0 |> nn1
     else
         v_out_n1_p = nothing
+    end
+
+    # Pre-compute N2 perturbation bounds for N2(x_p)->N2(x) relaxation
+    if no_n1_binaries_and_relaxtions_only_on_n2
+        compute_n2_pert_relaxation_bounds(nn2, I_pert_prev_up, I_pert_prev_down)
     end
 
     println("Encoding N2(x_p)...")

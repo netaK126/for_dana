@@ -165,14 +165,90 @@ def attack(model, X, source_, target_, device, token_signature,\
         eps_to = eps_pgd[indices, :]
         
         layers_outputs = []
-        if "3x" in model_name:
-            layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
-            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2((F.relu(model.fc1(images_to.reshape(-1, 784))))))), dim=0))
-            layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, 784))))), dim=0))
-            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, 784))))))), dim=0))
-        elif "2x" in model_name:
-            layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
-            layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, 784))))), dim=0))
+        flat_dim = dims[0] * dims[1] * dims[2]
+        if "2x" in model_name:
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc1(images_to.reshape(-1, flat_dim)))), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, flat_dim)))), dim=0))
+        elif "3x" in model_name:
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc1(images_to.reshape(-1, flat_dim)))), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2(F.relu(model.fc1(images_to.reshape(-1, flat_dim)))))), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, flat_dim)))), dim=0))
+            layers_outputs.append(torch.mean(torch.sign(F.relu(model.fc2(F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, flat_dim)))))), dim=0))
+        elif "4x" in model_name:
+            x_org = images_to.reshape(-1, flat_dim)
+            x_att = (create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, flat_dim)
+            for x_in in [x_org, x_att]:
+                h1 = F.relu(model.fc1(x_in))
+                layers_outputs.append(torch.mean(torch.sign(h1), dim=0))
+                h2 = F.relu(model.fc2(h1))
+                layers_outputs.append(torch.mean(torch.sign(h2), dim=0))
+                h3 = F.relu(model.fc3(h2))
+                layers_outputs.append(torch.mean(torch.sign(h3), dim=0))
+        elif "5x" in model_name:
+            x_org = images_to.reshape(-1, flat_dim)
+            x_att = (create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, flat_dim)
+            for x_in in [x_org, x_att]:
+                h1 = F.relu(model.fc1(x_in))
+                layers_outputs.append(torch.mean(torch.sign(h1), dim=0))
+                h2 = F.relu(model.fc2(h1))
+                layers_outputs.append(torch.mean(torch.sign(h2), dim=0))
+                h3 = F.relu(model.fc3(h2))
+                layers_outputs.append(torch.mean(torch.sign(h3), dim=0))
+                h4 = F.relu(model.fc4(h3))
+                layers_outputs.append(torch.mean(torch.sign(h4), dim=0))
+        elif "6x" in model_name:
+            x_org = images_to.reshape(-1, flat_dim)
+            x_att = (create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, flat_dim)
+            for x_in in [x_org, x_att]:
+                h1 = F.relu(model.fc1(x_in))
+                layers_outputs.append(torch.mean(torch.sign(h1), dim=0))
+                h2 = F.relu(model.fc2(h1))
+                layers_outputs.append(torch.mean(torch.sign(h2), dim=0))
+                h3 = F.relu(model.fc3(h2))
+                layers_outputs.append(torch.mean(torch.sign(h3), dim=0))
+                h4 = F.relu(model.fc4(h3))
+                layers_outputs.append(torch.mean(torch.sign(h4), dim=0))
+                h5 = F.relu(model.fc5(h4))
+                layers_outputs.append(torch.mean(torch.sign(h5), dim=0))
+        elif "10x" in model_name:
+            x_org = images_to.reshape(-1, flat_dim)
+            x_att = (create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, flat_dim)
+            for x_in in [x_org, x_att]:
+                h1 = F.relu(model.fc1(x_in))
+                layers_outputs.append(torch.mean(torch.sign(h1), dim=0))
+                h2 = F.relu(model.fc2(h1))
+                layers_outputs.append(torch.mean(torch.sign(h2), dim=0))
+                h3 = F.relu(model.fc3(h2))
+                layers_outputs.append(torch.mean(torch.sign(h3), dim=0))
+                h4 = F.relu(model.fc4(h3))
+                layers_outputs.append(torch.mean(torch.sign(h4), dim=0))
+                h5 = F.relu(model.fc5(h4))
+                layers_outputs.append(torch.mean(torch.sign(h5), dim=0))
+                h6 = F.relu(model.fc6(h5))
+                layers_outputs.append(torch.mean(torch.sign(h6), dim=0))
+                h7 = F.relu(model.fc7(h6))
+                layers_outputs.append(torch.mean(torch.sign(h7), dim=0))
+                h8 = F.relu(model.fc8(h7))
+                layers_outputs.append(torch.mean(torch.sign(h8), dim=0))
+                h9 = F.relu(model.fc9(h8))
+                layers_outputs.append(torch.mean(torch.sign(h9), dim=0))
+        elif model_name == "cnn3":
+            img_shape = (-1, dims[0], dims[1], dims[2])
+            for x_in in [images_to.reshape(*img_shape), (create_attacked(images_to, eps_to, type_, size_, dims)).reshape(*img_shape)]:
+                h1 = F.relu(model.conv1(x_in))
+                layers_outputs.append(torch.mean(torch.sign(model.flatten1(h1)), dim=0))
+                h2 = F.relu(model.conv2(h1))
+                layers_outputs.append(torch.mean(torch.sign(model.flatten1(h2)), dim=0))
+                h3 = F.relu(model.conv3(h2))
+                layers_outputs.append(torch.mean(torch.sign(model.flatten1(h3)), dim=0))
+                h4 = F.relu(model.conv4(h3))
+                layers_outputs.append(torch.mean(torch.sign(model.flatten1(h4)), dim=0))
+                h5 = F.relu(model.conv5(h4))
+                layers_outputs.append(torch.mean(torch.sign(model.flatten1(h5)), dim=0))
+                h6 = F.relu(model.fc1(model.flatten1(h5)))
+                layers_outputs.append(torch.mean(torch.sign(h6), dim=0))
+                h7 = F.relu(model.fc2(h6))
+                layers_outputs.append(torch.mean(torch.sign(h7), dim=0))
         elif "cnn" in model_name:
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.conv1(images_to.reshape(-1, dims[0], dims[1], dims[2]))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.conv2((F.relu(model.conv1(images_to.reshape(-1, dims[0], dims[1], dims[2])))))))), dim=0))
@@ -230,18 +306,30 @@ def load_dataset( dataset ):
     return trainset, testset, (k_dim, h_dim, w_dim)
 
 def load_model( model_arch, model_path):
-    if model_arch == "3x10":
+    if model_arch == "2x10":
+        model = FNN_2_10()
+    elif model_arch == "3x10":
         model = FNN_3_10()
     elif model_arch == "3x50":
         model = FNN_3_50()
+    elif model_arch == "4x10":
+        model = FNN_4_10()
+    elif model_arch == "5x10":
+        model = FNN_5_10()
+    elif model_arch == "6x10":
+        model = FNN_6_10()
+    elif model_arch == "10x10":
+        model = FNN_10_10()
     elif model_arch == "cnn0":
         model = CNN0()
     elif model_arch == "cnn1":
         model = CNN1()
     elif model_arch == "cnn2":
         model = CNN2()
+    elif model_arch == "cnn3":
+        model = CNN3()
     else:
-        assert ("New model arch has been detected, please expand models.py and this if condition.")
+        assert False, "New model arch has been detected, please expand models.py and this if condition."
 
     model = model.to(device)
     model.load_state_dict(torch.load(model_path))

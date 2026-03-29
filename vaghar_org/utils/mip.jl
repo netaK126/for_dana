@@ -39,7 +39,13 @@ function mip_log(m, d)
         println("no incumbent_obj")
     end
     d[:incumbent_obj] = incumbent_obj
-    d[:best_bound] = JuMP.objective_bound(m)
+    best_bound = 0
+    try
+        best_bound = JuMP.objective_bound(m)
+    catch e
+        println("WARNING: could not query objective_bound (status: $(d[:SolveStatus]))")
+    end
+    d[:best_bound] = best_bound
     d[:solve_time] = JuMP.solve_time(m)
     d[:first_mip_solution] = first_mip_solution.solution
     d[:time_for_first_mip_solution] = first_mip_solution.time
@@ -161,6 +167,89 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
     end
 
     # Objective: maximize delta_diff
+    @objective(m, Max, delta_diff)
+end
+
+# ============================================================
+# Transfer proof WITHOUT encoding N1 (--no_n1_encoding_at_all)
+#
+# Replaces conf(N1,x,c) >= delta_1 with interval-bounded
+# constraints on N2 outputs, and uses a lower bound on
+# conf(N1,x,c) for the delta_diff objective.
+#
+# Output diff bounds: N2(x)[k] - N1(x)[k] ∈ [d_lo[k], d_hi[k]]
+# stored in global output_diff_down_bounds / output_diff_up_bounds.
+# ============================================================
+function mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
+    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive)
+
+    global output_diff_up_bounds, output_diff_down_bounds
+    d_hi = output_diff_up_bounds    # N2(x)[k] - N1(x)[k] upper bound
+    d_lo = output_diff_down_bounds  # N2(x)[k] - N1(x)[k] lower bound
+
+    n_classes = length(d[:v_out_n2])
+    println("  output diff bounds: max width = $(maximum(d_hi .- d_lo))")
+    println("  output diff bounds per class:")
+    for k in 1:n_classes
+        println("    class $k: d_lo=$(d_lo[k]), d_hi=$(d_hi[k]), width=$(d_hi[k]-d_lo[k])")
+    end
+
+    # ── Constraint (1): N1 confidence via interval bounds on N2 outputs ──
+    # For all k ≠ c_tag:
+    #   N2(x)[c_tag] - N2(x)[k] >= delta_1 - d_hi[k] + d_lo[c_tag]
+    for k in 1:n_classes
+        if k == c_tag
+            continue
+        end
+        rhs = delta_1 + 1e-3 - d_hi[k] + d_lo[c_tag]
+        println("    N1 conf constraint k=$k: N2[$c_tag]-N2[$k] >= $rhs")
+        @constraint(m, d[:v_out_n2][c_tag] - d[:v_out_n2][k] >= rhs)
+    end
+
+    # ── Confidence of N2 on clean input (uses binary encoding for max) ──
+    conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
+
+    # ── delta_diff upper-bounded by interval-derived constraints ──
+    # For each k ≠ c_tag, conf_n1_x >= expr_k where
+    #   expr_k = (N2(x)[c_tag] - N2(x)[k]) + (d_lo[k] - d_hi[c_tag])
+    # So delta_diff = conf_n2_x - conf_n1_x <= conf_n2_x - expr_k for each k.
+    # These UPPER BOUND constraints prevent unboundedness.
+    delta_diff = @variable(m, base_name="delta_diff")
+    for k in 1:n_classes
+        if k == c_tag
+            continue
+        end
+        expr_k = (d[:v_out_n2][c_tag] - d[:v_out_n2][k]) + (d_lo[k] - d_hi[c_tag])
+        @constraint(m, delta_diff <= conf_n2_x - expr_k)
+    end
+    if delta_diff_positive
+        @constraint(m, delta_diff >= 0)
+    else
+        @constraint(m, conf_n2_x >= 0)
+    end
+
+    # ── Constraint (4): N2 is fooled on perturbed input ──
+    c_pert = c_tag_mode ? c_tag : c_target
+    margin = 1e-3
+
+    if c_tag_mode
+        conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+        @constraint(m, conf_n2_xp <= -margin)
+    else
+        if n2_fewer_binars_encoding
+            for i in eachindex(d[:v_out_n2_p])
+                if i == c_target
+                    continue
+                end
+                @constraint(m, d[:v_out_n2_p][c_target] - d[:v_out_n2_p][i] >= margin)
+            end
+        else
+            conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+            @constraint(m, conf_n2_xp >= margin)
+        end
+    end
+
+    # Objective: maximize delta_diff (upper bound on true delta_diff)
     @objective(m, Max, delta_diff)
 end
 

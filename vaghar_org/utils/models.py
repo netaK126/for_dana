@@ -157,6 +157,62 @@ class FNN_3_100(nn.Module):
         x = self.fc3(x)
         return x
 
+class FNN_6_100(nn.Module):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
+        super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
+        self.flatten1 = nn.Flatten()
+        self.fc1 = nn.Linear(self.k*self.w*self.h, 100)
+        self.fc2 = nn.Linear(100, 100)
+        self.fc3 = nn.Linear(100, 100)
+        self.fc4 = nn.Linear(100, 100)
+        self.fc5 = nn.Linear(100, 100)
+        self.fc6 = nn.Linear(100, output_size)
+        self.m = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.k*self.w*self.h)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = self.fc6(x)
+        return x
+
+class FNN_9_200(nn.Module):
+    def __init__(self, k=1, w=28, h=28, output_size=10):
+        super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
+        self.flatten1 = nn.Flatten()
+        self.fc1 = nn.Linear(self.k*self.w*self.h, 200)
+        self.fc2 = nn.Linear(200, 200)
+        self.fc3 = nn.Linear(200, 200)
+        self.fc4 = nn.Linear(200, 200)
+        self.fc5 = nn.Linear(200, 200)
+        self.fc6 = nn.Linear(200, 200)
+        self.fc7 = nn.Linear(200, 200)
+        self.fc8 = nn.Linear(200, 200)
+        self.fc9 = nn.Linear(200, output_size)
+        self.m = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.k*self.w*self.h)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = F.relu(self.fc6(x))
+        x = F.relu(self.fc7(x))
+        x = F.relu(self.fc8(x))
+        x = self.fc9(x)
+        return x
+
 class FNN_5_50(nn.Module):
     def __init__(self, k=1, w=28, h=28, output_size=10):
         super().__init__()

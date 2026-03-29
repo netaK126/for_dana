@@ -121,15 +121,32 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
         if haskey(layers_info_dict,(activation_cnt,n)) && haskey(layers_info_dict,(activation_cnt+layers_n,n))
             u_o, l_o, ind_o = layers_info_dict[activation_cnt,n]
             u_p, l_p, ind_p = layers_info_dict[activation_cnt+layers_n,n]
+            # Verify that av[ind+2] is actually the binary variable for this neuron.
+            # Relaxed neurons (conditional-triangle) only have x_rect at av[ind+1];
+            # av[ind+2] would point to an unrelated variable → wrong constraints.
+            # Check by matching the expected variable name pattern:
+            #   {network_version}a_...__{layer}_{neuron}
+            expected_a_o_suffix = "_$(activation_cnt)_$(n)"
+            expected_a_p_suffix = "_$(activation_cnt+layers_n)_$(n)"
+            name_o = (ind_o+2 <= length(av)) ? JuMP.name(av[ind_o+2]) : ""
+            name_p = (ind_p+2 <= length(av)) ? JuMP.name(av[ind_p+2]) : ""
+            has_a_o = endswith(name_o, expected_a_o_suffix) && occursin("a_layerCount", name_o)
+            has_a_p = endswith(name_p, expected_a_p_suffix) && occursin("a_layerCount", name_p)
             if dep == 0
                 @constraint(m,av[ind_o+1]==av[ind_p+1])
-                @constraint(m,av[ind_o+2]==av[ind_p+2])
+                if has_a_o && has_a_p
+                    @constraint(m,av[ind_o+2]==av[ind_p+2])
+                end
             elseif dep == 1
                 @constraint(m,av[ind_o+1]<=av[ind_p+1])
-                @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                if has_a_o && has_a_p
+                    @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                end
             elseif dep == -1
                 @constraint(m,av[ind_o+1]>=av[ind_p+1])
-                @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                if has_a_o && has_a_p
+                    @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                end
             else
                 if reuse_bounds_conf.is_reuse_bounds_and_deps == false
                     if l_o >=u_p
@@ -149,7 +166,9 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
                             @objective(m, Min, v_obj)
                             set_optimizer_attribute(m, "Cutoff", 0)
                             optimize!(m)
-                            l_diff = JuMP.objective_value(m)
+                            if result_count(m) > 0
+                                l_diff = JuMP.objective_value(m)
+                            end
                         end
                         if (u_p>=u_o) .& (l_p>=l_o)
                             v_obj = @variable(m)
@@ -157,7 +176,9 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
                             @objective(m, Max, v_obj)
                             set_optimizer_attribute(m, "Cutoff", 0)
                             optimize!(m)
-                            u_diff = JuMP.objective_value(m)
+                            if result_count(m) > 0
+                                u_diff = JuMP.objective_value(m)
+                            end
                         end
                         if (l_diff != Inf) & (l_diff>-non_equality_tolerance)
                             @constraint(m,av[ind_o+1]>=av[ind_p+1])

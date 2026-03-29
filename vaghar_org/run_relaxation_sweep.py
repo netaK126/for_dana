@@ -35,7 +35,8 @@ import glob
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
-    ("contrast(1.5)",      "contrast:1.5"),
+    # ("contrast(1.5)",      "contrast:1.5"),
+    ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("occ(5,5,5)",      "occ:5,5,5"),
     ("occ(3,3,5)",      "occ:3,3,5"),
     # ("trans(1,1)",        "translation:1,1"),
@@ -44,15 +45,14 @@ PERTURBATIONS = [
     # ("trans(3,3)",        "translation:3,3"),
     # ("rotation(10)",      "rotation:10"),
     ("occ(1,1,5)",      "occ:1,1,5"),
-    ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-    ("linf(0.05)",        "linf:0.05"),
-    ("linf(0.1)",         "linf:0.1"),
+    # ("linf(0.05)",        "linf:0.05"),
+    # ("linf(0.1)",         "linf:0.1"),
     # ("brightness(0.25)",   "brightness:0.25"),
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
-THRESHOLDS = [0.025, 0.05] # focused on best T_relax candidate
-OPT_INTERVALS = ["false"]#["true", "false"]
+THRESHOLDS = [0, 0.025, 0.05] # focused on best T_relax candidate
+OPT_INTERVALS = ["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
 CORES_PER_JOB = 32
@@ -258,6 +258,10 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
 def parse_result_file(filepath):
     """Parse a result .txt file.
 
+    Supports two formats:
+      New (key=value): c_source=0,c_target=3,lower_bound=...,upper_bound=...,optimization_time=...,hyper_attack_time=...
+      Old (positional CSV): source,target,incumbent_obj,best_bound,solve_time
+
     Returns dict of (c_source, c_target) -> {
         'optimization_time': float,
         'lower_bound': float,
@@ -270,50 +274,74 @@ def parse_result_file(filepath):
             line = line.strip()
             if not line:
                 continue
+            # Try new key=value format first
             fields = {}
             for pair in line.split(","):
                 if "=" in pair:
                     key, val = pair.split("=", 1)
                     fields[key] = val
-            try:
-                cs = int(fields["c_source"])
-                ct = int(fields["c_target"])
-                opt_time = float(fields["optimization_time"])
-                hyper_time = float(fields.get("hyper_attack_time", "0"))
-                results[(cs, ct)] = {
-                    "optimization_time": opt_time,
-                    "hyper_attack_time": hyper_time,
-                    "total_time": opt_time + hyper_time,
-                    "lower_bound": float(fields.get("lower_bound", "nan")),
-                    "upper_bound": float(fields.get("upper_bound", "nan")),
-                    "solve_status": fields.get("solve_status", ""),
-                }
-            except (KeyError, ValueError):
-                continue
+            if fields:
+                try:
+                    cs = int(fields["c_source"])
+                    ct = int(fields["c_target"])
+                    opt_time = float(fields["optimization_time"])
+                    hyper_time = float(fields.get("hyper_attack_time", "0"))
+                    results[(cs, ct)] = {
+                        "optimization_time": opt_time,
+                        "hyper_attack_time": hyper_time,
+                        "total_time": opt_time + hyper_time,
+                        "lower_bound": float(fields.get("lower_bound", "nan")),
+                        "upper_bound": float(fields.get("upper_bound", "nan")),
+                        "solve_status": fields.get("solve_status", ""),
+                    }
+                except (KeyError, ValueError):
+                    continue
+            else:
+                # Old positional CSV format: source,target,incumbent_obj,best_bound,solve_time
+                try:
+                    parts = line.split(",")
+                    cs = int(parts[0])
+                    ct = int(parts[1])
+                    incumbent = float(parts[2])
+                    best_bound = float(parts[3])
+                    solve_time = float(parts[4])
+                    results[(cs, ct)] = {
+                        "optimization_time": solve_time,
+                        "hyper_attack_time": 0,
+                        "total_time": solve_time,
+                        "lower_bound": incumbent,
+                        "upper_bound": best_bound,
+                        "solve_status": "",
+                    }
+                except (IndexError, ValueError):
+                    continue
     return results
 
 
 def _extract_transfer_file_metadata(filename):
-    """Extract threads, relax_count, and optimizing_intervals from a transfer result filename."""
+    """Extract threads, relax_count, optimizing_intervals, and no_n1_bin from a transfer result filename."""
     threads_match = re.search(r"Therads(\d+)", filename)
     relax_count_match = re.search(r"RelaxCount(\d+)", filename)
     opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
+    no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
+    no_n1_enc = "yes" if "NoN1Encoding" in filename else "no"
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
+        "no_n1_bin_relax_on_n2": no_n1_bin,
+        "no_n1_encoding": no_n1_enc,
     }
 
 
 def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster,
-                                       csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout):
+                                       csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout,
+                                       arch="cnn1", double_check_standard=False):
     """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
 
-    Writes four CSVs:
-      csv_transfer_faster  — rows where transfer is faster than standard
-      csv_standard_faster  — rows where standard is faster than transfer
-      csv_transfer_tighter_at_timeout — both timed out, transfer has tighter gap
-      csv_standard_tighter_at_timeout — both timed out, standard has tighter gap
+    Returns four lists of row dicts (transfer_faster, standard_faster,
+    transfer_tighter, standard_tighter). If csv paths are provided,
+    also writes them to CSVs.
     """
     import csv
 
@@ -328,6 +356,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
     }
 
     fieldnames = [
+        "arch",
         "perturbation",
         "perturbation_size",
         "c_source",
@@ -342,6 +371,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "T_relax",
         "relax_count",
         "optimizing_intervals",
+        "no_n1_bin_relax_on_n2",
+        "no_n1_encoding",
         "how_much_faster",
         "gap_standard",
         "gap_transfer",
@@ -364,10 +395,14 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
             print(f"  [{pert_name}] No results directory: {eps_dir}")
             continue
 
-        # Find standard N2 directories (vagharNoPerturbed_*_sgd_itr*)
-        standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*_sgd_itr*")))
+        # Find standard N2 directories
+        if double_check_standard:
+            std_pattern = "double_check_vhagarNoPertubed_*_sgd_itr*"
+        else:
+            std_pattern = "vagharNoPerturbed_*_sgd_itr*"
+        standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, std_pattern)))
         if not standard_n2_dirs:
-            print(f"  [{pert_name}] No standard N2 (vagharNoPerturbed_*_sgd_itr*) found in {eps_dir}")
+            print(f"  [{pert_name}] No standard N2 ({std_pattern}) found in {eps_dir}")
             continue
 
         # Load all standard N2 results: (c_source, c_target) -> result dict
@@ -405,13 +440,15 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                     key = (cs, ct)
                     if key not in standard_results:
                         continue
-                    if meta["optimizing_intervals"] == "yes":
+                    # Skip old-style optimizing_intervals runs (but allow NoN1BinRelaxOnN2only and NoN1Encoding)
+                    if meta["optimizing_intervals"] == "yes" and meta["no_n1_bin_relax_on_n2"] == "no" and meta["no_n1_encoding"] == "no":
                         continue
                     s_info = standard_results[key]
                     t_time = t_info["total_time"]
                     s_time = s_info["total_time"]
 
                     row = {
+                        "arch": arch,
                         "perturbation": pert_type,
                         "perturbation_size": eps_str,
                         "c_source": cs,
@@ -426,6 +463,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "T_relax": relax_val,
                         "relax_count": meta["relax_count"],
                         "optimizing_intervals": meta["optimizing_intervals"],
+                        "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
+                        "no_n1_encoding": meta["no_n1_encoding"],
                     }
 
                     s_gap = s_info["upper_bound"] - s_info["lower_bound"]
@@ -456,12 +495,12 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         return float(val.rstrip('x'))
 
     def _sort_key_faster(row):
-        return (row["perturbation"], row["perturbation_size"],
+        return (row["arch"], row["perturbation"], row["perturbation_size"],
                 int(row["c_source"]), int(row["c_target"]),
                 _parse_speed(row["how_much_faster"]))
 
     def _sort_key_tighter(row):
-        return (row["perturbation"], row["perturbation_size"],
+        return (row["arch"], row["perturbation"], row["perturbation_size"],
                 int(row["c_source"]), int(row["c_target"]),
                 float(row["gap_transfer"]))
 
@@ -471,7 +510,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
     rows_standard_tighter.sort(key=_sort_key_tighter)
 
     def _group_key(row):
-        return (row["perturbation"], row["perturbation_size"],
+        return (row["arch"], row["perturbation"], row["perturbation_size"],
                 row["c_source"], row["c_target"])
 
     # Write sorted rows to CSVs, inserting a blank row between groups
@@ -498,6 +537,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
     print(f"  Wrote {len(rows_transfer_tighter)} rows to {csv_transfer_tighter_at_timeout}")
     print(f"  Wrote {len(rows_standard_tighter)} rows to {csv_standard_tighter_at_timeout}")
 
+    return rows_transfer_faster, rows_standard_faster, rows_transfer_tighter, rows_standard_tighter
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -518,6 +559,8 @@ def main():
                         help="Skip phase 1 (standard experiments)")
     parser.add_argument("--skip_transfer", action="store_true",
                         help="Skip phase 2 (transfer experiments)")
+    parser.add_argument("--double_check_standard", action="store_true",
+                        help="Also run double-check standard using /root/Downloads/for_dana/code/run.jl")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to existing model directory (containing model.pth). "
                              "N1 = this model, N2 = N1 + extra SGD epoch(s). Replaces dual-seed mode.")
@@ -537,12 +580,29 @@ def main():
                         help="Scan existing results and report transfer experiments that are "
                              "faster than standard N2 (vagharNoPerturbed with sgd) for each "
                              "perturbation and (c_source, c_target) pair.")
+    parser.add_argument("--standard_only", action="store_true",
+                        help="Run standard verification only on the given model(s), without "
+                             "extra SGD training or creating N2. Implies --skip_transfer.")
+    parser.add_argument("--standard_relaxation_thresholds", type=str, default=None,
+                        help="Comma-separated relaxation thresholds for standard mode "
+                             "(use_perturbed_intervals=true + use_relaxations=true). "
+                             "e.g. '0.05,0.1,0.5'. Passed to run_experiment.py. "
+                             "If not set, standard relaxation step is skipped.")
+    parser.add_argument("--no_n1_binaries_and_relaxtions_only_on_n2", action="store_true",
+                        help="LP-relax all N1 binaries and relax N2(x_p) by conditioning on N2(x) "
+                             "instead of N1(x). Keeps N2(x) exact as anchor.")
+    parser.add_argument("--no_n1_encoding_at_all", action="store_true",
+                        help="Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with "
+                             "interval-bounded constraints on N2 outputs using weight diff bounds.")
     args = parser.parse_args()
 
     total_cores = args.max_cores
     thresholds = args.thresholds if args.thresholds else THRESHOLDS
     opt_intervals = args.opt_intervals if args.opt_intervals else OPT_INTERVALS
     dataset = args.dataset
+
+    if args.standard_only:
+        args.skip_transfer = True
 
     # Build list of (arch, model_path|None) to run
     if args.arch_models:
@@ -582,16 +642,87 @@ def main():
             ("trans(3,3)",        "translation:3,3"),
             ("rotation(10)",      "rotation:10"),
         ]
+        # Write combined CSVs to the dataset-level directory (not per-arch)
+        dblchk = args.double_check_standard
+        suffix = "_double_check_standard" if dblchk else ""
+        combined_base = os.path.join(cwd, "paper_experiments", dataset)
+        os.makedirs(combined_base, exist_ok=True)
+        csv_transfer_faster = os.path.join(combined_base, f"transfer_faster_than_standard{suffix}.csv")
+        csv_standard_faster = os.path.join(combined_base, f"standard_faster_than_transfer{suffix}.csv")
+        csv_transfer_tighter = os.path.join(combined_base, f"transfer_tighter_at_timeout{suffix}.csv")
+        csv_standard_tighter = os.path.join(combined_base, f"standard_tighter_at_timeout{suffix}.csv")
+
+        # Collect rows across all archs, write CSVs once with no per-arch files
+        all_tf, all_sf, all_tt, all_st = [], [], [], []
         for arch, _ in arch_runs:
             exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
-            csv_transfer_faster = os.path.join(exp_base, "transfer_faster_than_standard.csv")
-            csv_standard_faster = os.path.join(exp_base, "standard_faster_than_transfer.csv")
-            csv_transfer_tighter = os.path.join(exp_base, "transfer_tighter_at_timeout.csv")
-            csv_standard_tighter = os.path.join(exp_base, "standard_tighter_at_timeout.csv")
             print(f"\nScanning results for {arch} in: {exp_base}")
-            find_transfer_faster_than_standard(all_perts, exp_base,
-                                               csv_transfer_faster, csv_standard_faster,
-                                               csv_transfer_tighter, csv_standard_tighter)
+            tf, sf, tt, st = find_transfer_faster_than_standard(
+                all_perts, exp_base, csv_transfer_faster, csv_standard_faster,
+                csv_transfer_tighter, csv_standard_tighter, arch=arch,
+                double_check_standard=dblchk)
+            all_tf.extend(tf)
+            all_sf.extend(sf)
+            all_tt.extend(tt)
+            all_st.extend(st)
+
+        # Re-write combined CSVs with all archs together
+        find_transfer_faster_than_standard.__doc__  # just to access fieldnames
+        import csv as _csv
+        _fieldnames = [
+            "arch", "perturbation", "perturbation_size", "c_source", "c_target",
+            "time_standard", "time_transfer", "delta_standard_lower_bound",
+            "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
+            "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
+            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "how_much_faster",
+            "gap_standard", "gap_transfer", "solve_status_standard", "solve_status_transfer",
+        ]
+
+        def _parse_speed(val):
+            if not val:
+                return float('inf')
+            return float(val.rstrip('x'))
+
+        def _sort_faster(row):
+            return (row["arch"], row["perturbation"], row["perturbation_size"],
+                    int(row["c_source"]), int(row["c_target"]),
+                    _parse_speed(row["how_much_faster"]))
+
+        def _sort_tighter(row):
+            return (row["arch"], row["perturbation"], row["perturbation_size"],
+                    int(row["c_source"]), int(row["c_target"]),
+                    float(row["gap_transfer"]))
+
+        def _group_key(row):
+            return (row["arch"], row["perturbation"], row["perturbation_size"],
+                    row["c_source"], row["c_target"])
+
+        all_tf.sort(key=_sort_faster)
+        all_sf.sort(key=_sort_faster)
+        all_tt.sort(key=_sort_tighter)
+        all_st.sort(key=_sort_tighter)
+
+        empty_row = {fn: "" for fn in _fieldnames}
+        for filepath, rows in [
+            (csv_transfer_faster, all_tf), (csv_standard_faster, all_sf),
+            (csv_transfer_tighter, all_tt), (csv_standard_tighter, all_st),
+        ]:
+            with open(filepath, "w", newline="") as f:
+                writer = _csv.DictWriter(f, fieldnames=_fieldnames)
+                writer.writeheader()
+                prev_key = None
+                for row in rows:
+                    key = _group_key(row)
+                    if prev_key is not None and key != prev_key:
+                        writer.writerow(empty_row)
+                    writer.writerow(row)
+                    prev_key = key
+
+        print(f"\nCombined CSVs ({len(arch_runs)} arch(s)):")
+        print(f"  {len(all_tf)} rows -> {csv_transfer_faster}")
+        print(f"  {len(all_sf)} rows -> {csv_standard_faster}")
+        print(f"  {len(all_tt)} rows -> {csv_transfer_tighter}")
+        print(f"  {len(all_st)} rows -> {csv_standard_tighter}")
         return
 
     cores_per_job = CORES_PER_JOB
@@ -610,15 +741,21 @@ def main():
         for arch, model_path in arch_runs:
             use_model_path = model_path is not None
 
-            # ── Phase 0: Train +epoch (only in --model_path mode) ─────
+            # ── Phase 0: Train +epoch (only in --model_path mode, skipped in --standard_only) ─────
             n1_dir, n2_dir = None, None
-            if use_model_path:
+            if use_model_path and not args.standard_only:
                 print(f"\n{'=' * 60}")
                 print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
                 print(f"{'=' * 60}\n")
                 n1_dir, n2_dir = train_extra_epochs(
                     model_path, arch, dataset,
                     sgd_epochs=args.sgd_epochs, lr=args.lr)
+            elif use_model_path and args.standard_only:
+                # standard_only: use the given model as both N1 and N2 (no extra training)
+                n1_dir = os.path.normpath(model_path)
+                if os.path.isfile(n1_dir):
+                    n1_dir = os.path.dirname(n1_dir)
+                n2_dir = n1_dir
 
             # Build the extra args for run_experiment.py depending on mode
             if use_model_path:
@@ -630,7 +767,8 @@ def main():
 
             for pert_name, pert_spec in perts:
                 job_key = f"{arch}/{pert_name}"
-                if not args.skip_standard and standard_results_exist(pert_spec, cwd, arch, dataset):
+                std_exists = not args.skip_standard and standard_results_exist(pert_spec, cwd, arch, dataset)
+                if std_exists and not args.double_check_standard:
                     print(f"  {arch_prefix}{pert_name} Standard results already exist — skipping, "
                           f"transfer jobs will start immediately.")
                     skipped_standard.append(job_key)
@@ -645,6 +783,10 @@ def main():
                         "--dataset", dataset,
                         "--arch", arch,
                     ] + _model_args
+                    if args.double_check_standard:
+                        std_cmd.append("--double_check_standard")
+                    if args.standard_relaxation_thresholds is not None:
+                        std_cmd += ["--standard_relaxation_thresholds", args.standard_relaxation_thresholds]
                     standard_jobs.append((job_key, std_label, std_cmd))
 
                 t_jobs = []
@@ -665,6 +807,10 @@ def main():
                             "--Threads_num", str(Threads_num),
                             "--relaxation_gap_area", args.relaxation_gap_area,
                         ] + _model_args
+                        if args.no_n1_binaries_and_relaxtions_only_on_n2:
+                            t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
+                        if args.no_n1_encoding_at_all:
+                            t_cmd.append("--no_n1_encoding_at_all")
                         t_jobs.append((t_label, t_cmd))
                 transfer_by_pert[job_key] = t_jobs
 

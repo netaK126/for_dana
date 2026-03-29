@@ -35,6 +35,23 @@ global n1_preact_down_bounds::Vector = []
 global relu_comp_up_bounds::Vector   = []
 global relu_comp_down_bounds::Vector = []
 
+# ── N2-only perturbation relaxation (--no_n1_binaries_and_relaxtions_only_on_n2) ─
+# Relax N2(x_p) by conditioning on N2(x) binary instead of N1(x).
+# Uses perturbation bounds through N2: z_n2_pert - z_n2_org
+# and N2 pre-activation bounds for conditional intervals.
+global no_n1_binaries_and_relaxtions_only_on_n2::Bool = false
+global relu_n2pert_up_bounds::Vector   = []
+global relu_n2pert_down_bounds::Vector = []
+global n2_preact_up_bounds::Vector     = []
+global n2_preact_down_bounds::Vector   = []
+
+# ── No-N1-encoding mode (--no_n1_encoding_at_all) ───────────────────────────
+# Output-layer diff bounds: N2(x)[k] - N1(x)[k] ∈ [output_diff_down[k], output_diff_up[k]]
+# Used to replace the entire N1 encoding with interval-bounded constraints on N2 outputs.
+global no_n1_encoding_at_all::Bool = false
+global output_diff_up_bounds::Vector{Float64}   = Float64[]
+global output_diff_down_bounds::Vector{Float64} = Float64[]
+
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
     reusable_indexes::Int
