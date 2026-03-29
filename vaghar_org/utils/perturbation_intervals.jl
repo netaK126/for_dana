@@ -1036,6 +1036,10 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     n1_pre_up_cur   = Float64[]
     n1_pre_down_cur = Float64[]
 
+    # Track post-ReLU diff bounds; after the loop, holds the last hidden layer's values
+    last_relu_diff_up   = zeros(Float64, size(diff_up))
+    last_relu_diff_down = zeros(Float64, size(diff_down))
+
     for (layer_idx, l) in enumerate(nn1.layers)
         l2 = nn2.layers[layer_idx]
 
@@ -1160,8 +1164,21 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
             # N1 post-activation bounds
             n1_act_up   = max.(0.0, n1_pre_up_cur)
             n1_act_down = max.(0.0, n1_pre_down_cur)
+
+            # Save post-ReLU diff bounds (overwritten each ReLU; last one survives)
+            last_relu_diff_up   = copy(diff_up)
+            last_relu_diff_down = copy(diff_down)
         end
     end
+
+    # Save post-ReLU bounds at the last hidden layer (before the final Linear layer).
+    # Used by --encode_n1_last_layer to create interval-bounded N1 hidden variables.
+    global n1_last_hidden_up     = vec(copy(Float64.(n1_act_up)))
+    global n1_last_hidden_down   = vec(copy(Float64.(n1_act_down)))
+    global last_hidden_diff_up   = vec(copy(Float64.(last_relu_diff_up)))
+    global last_hidden_diff_down = vec(copy(Float64.(last_relu_diff_down)))
+    println("compute_diff_and_comp_bounds: last hidden layer size = $(length(n1_last_hidden_up)), " *
+            "diff width = $(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
 
     # Save final diff bounds (after the last Linear layer, before any output activation).
     # These are the output-layer bounds: N2(x)[k] - N1(x)[k] ∈ [diff_down[k], diff_up[k]].

@@ -181,6 +181,11 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--encode_n1_last_layer"
+        help = "When no_n1_encoding_at_all is active, encode N1's last linear layer exactly using interval-bounded hidden variables; gives exact delta_diff instead of upper bound"
+        arg_type = Bool
+        required = false
+        default = false
         "--delta_diff_positive"
         help = "force delta_diff to be positive."
         arg_type = Bool
@@ -315,11 +320,17 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global relaxation_gap_area = args["relaxation_gap_area"]
     global no_n1_binaries_and_relaxtions_only_on_n2 = args["no_n1_binaries_and_relaxtions_only_on_n2"]
     global no_n1_encoding_at_all = args["no_n1_encoding_at_all"]
+    global encode_n1_last_layer = args["encode_n1_last_layer"]
     # no_n1_encoding_at_all implies no_n1_binaries_and_relaxtions_only_on_n2
     # (N1 isn't encoded, so N2(x') must be relaxed onto N2(x) instead of N1)
     if no_n1_encoding_at_all
         global no_n1_binaries_and_relaxtions_only_on_n2 = true
         n1_p_mode = false  # can't encode N1(x') without N1
+    end
+    # encode_n1_last_layer only makes sense with no_n1_encoding_at_all
+    if encode_n1_last_layer && !no_n1_encoding_at_all
+        println("WARNING: --encode_n1_last_layer ignored (requires --no_n1_encoding_at_all)")
+        global encode_n1_last_layer = false
     end
     use_vaghgarDeps = args["activate_vaghgar_deps"]
     n2_fewer_binars_encoding = args["n2_fewer_binars_encoding"]
@@ -451,9 +462,16 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             if no_n1_encoding_at_all
                 name_to_save = name_to_save * "_NoN1Encoding"
             end
+            if encode_n1_last_layer
+                name_to_save = name_to_save * "_N1LastLayer"
+            end
 
             # Set transfer proof constraints and objective
-            if no_n1_encoding_at_all
+            if no_n1_encoding_at_all && encode_n1_last_layer
+                mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
+                    c_tag_mode, n2_fewer_binars_encoding,
+                    args["delta_diff_positive"], nn1)
+            elseif no_n1_encoding_at_all
                 mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
                     c_tag_mode, n2_fewer_binars_encoding,
                     args["delta_diff_positive"])

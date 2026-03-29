@@ -503,7 +503,23 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     layer_counter = 0
     nueron_counter = 0
     network_version = "n2_org"
-    v_out_n2 = v_in |> nn2
+    v_n2_last_hidden = nothing
+    if encode_n1_last_layer
+        # Split forward pass to capture N2's last hidden layer variables.
+        # Pipe through all layers up to (but not including) the last Linear,
+        # save the intermediate result, then apply the last Linear.
+        # This produces identical MIP variables/constraints as the full pipe.
+        n2_layers = nn2.layers
+        last_linear_idx = findlast(l -> occursin("Linear", string(typeof(l))), n2_layers)
+        v_temp = v_in
+        for i in 1:(last_linear_idx - 1)
+            v_temp = v_temp |> n2_layers[i]
+        end
+        v_n2_last_hidden = v_temp
+        v_out_n2 = v_temp |> n2_layers[last_linear_idx]
+    else
+        v_out_n2 = v_in |> nn2
+    end
 
     # Only encode N1(x') when n1_p_mode is on and N1 is encoded
     if n1_p_mode && !no_n1_encoding_at_all
@@ -536,6 +552,7 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         :v_out_n2 => v_out_n2,
         :v_out_n1_p => v_out_n1_p,
         :v_out_n2_p => v_out_n2_p,
+        :v_n2_last_hidden => v_n2_last_hidden,
     )
 end
 
@@ -612,7 +629,19 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
 
     println("Encoding N2(x)...")
     layer_counter = 0; nueron_counter = 0; network_version = "n2_org"
-    v_out_n2 = v_in |> nn2
+    v_n2_last_hidden = nothing
+    if encode_n1_last_layer
+        n2_layers = nn2.layers
+        last_linear_idx = findlast(l -> occursin("Linear", string(typeof(l))), n2_layers)
+        v_temp = v_in
+        for i in 1:(last_linear_idx - 1)
+            v_temp = v_temp |> n2_layers[i]
+        end
+        v_n2_last_hidden = v_temp
+        v_out_n2 = v_temp |> n2_layers[last_linear_idx]
+    else
+        v_out_n2 = v_in |> nn2
+    end
 
     # Only encode N1(x') when n1_p_mode is on and N1 is encoded
     if n1_p_mode && !no_n1_encoding_at_all
@@ -632,7 +661,7 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     layer_counter = 0; nueron_counter = 0; network_version = "n2_pert"
     v_out_n2_p = v_x0 |> nn2
 
-    return v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p
+    return v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden
 end
 
 # ============================================================
@@ -656,11 +685,12 @@ function get_perturbation_specific_keys_brightness_transfer(perturbation_size, n
     I_pert_up   = p_size .* ones(Float64, size(input))
     I_pert_down = zeros(Float64, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => v_e,
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 # ============================================================
@@ -687,11 +717,12 @@ function get_perturbation_specific_keys_contrast_transfer(perturbation_size, nn1
     I_pert_up   = p_size .* ones(Float64, size(input))
     I_pert_down = zeros(Float64, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => v_e,
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 # ============================================================
@@ -753,11 +784,12 @@ function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturb
     I_pert_up   =  ones(Float64, size(input))
     I_pert_down = -ones(Float64, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 # ============================================================
@@ -811,11 +843,12 @@ function get_perturbation_specific_keys_patch_transfer(w_, h_, k_, perturbation_
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 # ============================================================
@@ -868,11 +901,12 @@ function get_perturbation_specific_keys_occ_transfer(w_, h_, k_, perturbation_si
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 
@@ -953,11 +987,12 @@ function get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
-    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p =
+    v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
                 :v_out_n1 => v_out_n1, :v_out_n2 => v_out_n2,
-                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p)
+                :v_out_n1_p => v_out_n1_p, :v_out_n2_p => v_out_n2_p,
+                :v_n2_last_hidden => v_n2_last_hidden)
 end
 
 

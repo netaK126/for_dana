@@ -325,12 +325,14 @@ def _extract_transfer_file_metadata(filename):
     opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
     no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
     no_n1_enc = "yes" if "NoN1Encoding" in filename else "no"
+    n1_last_layer = "yes" if "N1LastLayer" in filename else "no"
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
         "no_n1_bin_relax_on_n2": no_n1_bin,
         "no_n1_encoding": no_n1_enc,
+        "encode_n1_last_layer": n1_last_layer,
     }
 
 
@@ -373,6 +375,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "optimizing_intervals",
         "no_n1_bin_relax_on_n2",
         "no_n1_encoding",
+        "encode_n1_last_layer",
         "how_much_faster",
         "gap_standard",
         "gap_transfer",
@@ -465,6 +468,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "optimizing_intervals": meta["optimizing_intervals"],
                         "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
                         "no_n1_encoding": meta["no_n1_encoding"],
+                        "encode_n1_last_layer": meta["encode_n1_last_layer"],
                     }
 
                     s_gap = s_info["upper_bound"] - s_info["lower_bound"]
@@ -594,6 +598,9 @@ def main():
     parser.add_argument("--no_n1_encoding_at_all", action="store_true",
                         help="Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with "
                              "interval-bounded constraints on N2 outputs using weight diff bounds.")
+    parser.add_argument("--encode_n1_last_layer", action="store_true",
+                        help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
+                             "exactly using interval-bounded hidden variables; gives exact delta_diff.")
     args = parser.parse_args()
 
     total_cores = args.max_cores
@@ -674,7 +681,7 @@ def main():
             "time_standard", "time_transfer", "delta_standard_lower_bound",
             "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
             "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "how_much_faster",
+            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "encode_n1_last_layer", "how_much_faster",
             "gap_standard", "gap_transfer", "solve_status_standard", "solve_status_transfer",
         ]
 
@@ -811,6 +818,8 @@ def main():
                             t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
                         if args.no_n1_encoding_at_all:
                             t_cmd.append("--no_n1_encoding_at_all")
+                        if args.encode_n1_last_layer:
+                            t_cmd.append("--encode_n1_last_layer")
                         t_jobs.append((t_label, t_cmd))
                 transfer_by_pert[job_key] = t_jobs
 

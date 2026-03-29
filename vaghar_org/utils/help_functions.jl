@@ -49,8 +49,19 @@ global n2_preact_down_bounds::Vector   = []
 # Output-layer diff bounds: N2(x)[k] - N1(x)[k] ∈ [output_diff_down[k], output_diff_up[k]]
 # Used to replace the entire N1 encoding with interval-bounded constraints on N2 outputs.
 global no_n1_encoding_at_all::Bool = false
+global encode_n1_last_layer::Bool = false
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
+
+# ── N1 last-hidden-layer bounds (--encode_n1_last_layer) ────────────────────
+# Post-ReLU bounds on N1's last hidden layer activations: a_n1_last[i] ∈ [down, up]
+# Post-ReLU diff bounds at last hidden layer: a_n2_last[i] - a_n1_last[i] ∈ [down, up]
+# Used to create interval-bounded MIP variables for N1's last hidden layer,
+# then encode the final linear layer exactly → exact conf_n1_x and delta_diff.
+global n1_last_hidden_up::Vector{Float64}       = Float64[]
+global n1_last_hidden_down::Vector{Float64}     = Float64[]
+global last_hidden_diff_up::Vector{Float64}     = Float64[]
+global last_hidden_diff_down::Vector{Float64}   = Float64[]
 
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool

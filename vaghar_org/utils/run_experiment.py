@@ -179,6 +179,7 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
 def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      no_n1_binaries_and_relaxtions_only_on_n2=False,
                      no_n1_encoding_at_all=False,
+                     encode_n1_last_layer=False,
                      optimizing_intervals=None):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
@@ -191,6 +192,8 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_NoN1BinRelaxOnN2only'
     if no_n1_encoding_at_all:
         suffix += '_NoN1Encoding'
+    if encode_n1_last_layer:
+        suffix += '_N1LastLayer'
     if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
         suffix += '_noOI'
     return base + suffix
@@ -797,7 +800,8 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               relaxation_gap_area='false',
                               optimizing_intervals=None, model_dirs=None,
                               no_n1_binaries_and_relaxtions_only_on_n2=False,
-                              no_n1_encoding_at_all=False):
+                              no_n1_encoding_at_all=False,
+                              encode_n1_last_layer=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -895,6 +899,8 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--no_n1_binaries_and_relaxtions_only_on_n2', 'true']
         if no_n1_encoding_at_all:
             command += ['--no_n1_encoding_at_all', 'true']
+        if encode_n1_last_layer:
+            command += ['--encode_n1_last_layer', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
@@ -903,11 +909,13 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    transfer_relaxations, delta_diff_positive,Threads_num=32, relaxation_threshold=None, force_cpu=False,
                    use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None,
                    relaxation_gap_area='false', no_n1_binaries_and_relaxtions_only_on_n2=False,
-                   no_n1_encoding_at_all=False):
+                   no_n1_encoding_at_all=False,
+                   encode_n1_last_layer=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
                                    no_n1_encoding_at_all=no_n1_encoding_at_all,
+                                   encode_n1_last_layer=encode_n1_last_layer,
                                    optimizing_intervals=optimizing_intervals)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -941,6 +949,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         relaxation_gap_area=relaxation_gap_area,
         no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
         no_n1_encoding_at_all=no_n1_encoding_at_all,
+        encode_n1_last_layer=encode_n1_last_layer,
     )
 
 
@@ -1027,6 +1036,9 @@ def main():
     parser.add_argument('--no_n1_encoding_at_all', action='store_true',
                         help='Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with '
                              'interval-bounded constraints on N2 outputs using weight diff bounds.')
+    parser.add_argument('--encode_n1_last_layer', action='store_true',
+                        help='When no_n1_encoding_at_all is active, encode N1 last linear layer '
+                             'exactly using interval-bounded hidden variables; gives exact delta_diff.')
 
     args = parser.parse_args()
 
@@ -1169,7 +1181,8 @@ def main():
                                model_dirs=transfer_model_dirs,
                                relaxation_gap_area=args.relaxation_gap_area,
                                no_n1_binaries_and_relaxtions_only_on_n2=args.no_n1_binaries_and_relaxtions_only_on_n2,
-                               no_n1_encoding_at_all=args.no_n1_encoding_at_all)
+                               no_n1_encoding_at_all=args.no_n1_encoding_at_all,
+                               encode_n1_last_layer=args.encode_n1_last_layer)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 

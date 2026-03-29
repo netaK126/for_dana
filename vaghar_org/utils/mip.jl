@@ -253,6 +253,105 @@ function mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
     @objective(m, Max, delta_diff)
 end
 
+# ============================================================
+# No-N1-encoding + encode N1's last layer:
+#   Same as no_n1 mode, but creates interval-bounded variables
+#   for N1's last hidden layer and encodes the final linear
+#   layer exactly → exact conf_n1_x and delta_diff.
+# ============================================================
+function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
+    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive, nn1)
+
+    global n1_last_hidden_up, n1_last_hidden_down
+    global last_hidden_diff_up, last_hidden_diff_down
+
+    n_hidden = length(n1_last_hidden_up)
+    println("  encode_n1_last_layer: creating $n_hidden bounded hidden vars")
+    println("  N1 last hidden bounds width: max=$(maximum(n1_last_hidden_up .- n1_last_hidden_down))")
+
+    # ── Create interval-bounded variables for N1's last hidden layer ──
+    h_n1 = [@variable(m, lower_bound = n1_last_hidden_down[i],
+                          upper_bound = n1_last_hidden_up[i],
+                          base_name = "h_n1_last_$i") for i in 1:n_hidden]
+
+    # ── Link h_n1 to N2's last hidden layer via difference bounds ──
+    # Prevents h_n1 from being chosen independently of the input x.
+    # For all i: Δh_down[i] <= h_n2[i] - h_n1[i] <= Δh_up[i]
+    v_n2_hidden = d[:v_n2_last_hidden]
+    if v_n2_hidden !== nothing
+        println("  Adding $n_hidden linking constraints (h_n2 - h_n1 ∈ [Δh_dn, Δh_up])")
+        println("  Hidden diff width: max=$(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
+        for i in 1:n_hidden
+            @constraint(m, v_n2_hidden[i] - h_n1[i] >= last_hidden_diff_down[i])
+            @constraint(m, v_n2_hidden[i] - h_n1[i] <= last_hidden_diff_up[i])
+        end
+    else
+        println("  WARNING: v_n2_last_hidden not available, h_n1 is unlinked (loose bounds)")
+    end
+
+    # ── Find N1's last Linear layer and compute N1 output exactly ──
+    last_linear = nothing
+    for l in nn1.layers
+        if occursin("Linear", string(typeof(l)))
+            last_linear = l
+        end
+    end
+    W = Float64.(transpose(last_linear.matrix))  # (output_dim × input_dim)
+    b = Float64.(last_linear.bias)
+    n_classes = length(b)
+    println("  N1 last layer: $(size(last_linear.matrix,1)) -> $n_classes")
+
+    # N1 output: v_out_n1[k] = W[k,:] * h_n1 + b[k]
+    v_out_n1 = [@variable(m, base_name = "n1_out_$k") for k in 1:n_classes]
+    for k in 1:n_classes
+        @constraint(m, v_out_n1[k] == sum(W[k, j] * h_n1[j] for j in 1:n_hidden) + b[k])
+    end
+
+    # ── Confidence of N1 on clean input (exact, with binaries for max) ──
+    # Store in d temporarily so define_conf! can access it
+    d[:v_out_n1_last] = v_out_n1
+    conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1_last, "conf_n1_x")
+
+    # ── N1 confidence >= delta_1 ──
+    @constraint(m, conf_n1_x >= delta_1 + 1e-3)
+
+    # ── Confidence of N2 on clean input (uses binary encoding for max) ──
+    conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
+
+    # ── delta_diff: exact (not just upper-bounded) ──
+    delta_diff = @variable(m, base_name="delta_diff")
+    @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
+    if delta_diff_positive
+        @constraint(m, delta_diff >= 0)
+    else
+        @constraint(m, conf_n2_x >= 0)
+    end
+
+    # ── Constraint: N2 is fooled on perturbed input ──
+    c_pert = c_tag_mode ? c_tag : c_target
+    margin = 1e-3
+
+    if c_tag_mode
+        conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+        @constraint(m, conf_n2_xp <= -margin)
+    else
+        if n2_fewer_binars_encoding
+            for i in eachindex(d[:v_out_n2_p])
+                if i == c_target
+                    continue
+                end
+                @constraint(m, d[:v_out_n2_p][c_target] - d[:v_out_n2_p][i] >= margin)
+            end
+        else
+            conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p, "conf_n2_xp")
+            @constraint(m, conf_n2_xp >= margin)
+        end
+    end
+
+    # Objective: maximize delta_diff (now exact, not upper-bounded)
+    @objective(m, Max, delta_diff)
+end
+
 function mip_set_attr_transfer(m, timout, suboptimal_solution=0, delta_diff_positive=false)
     set_optimizer_attribute(m, "MIPFocus", 3)
     if delta_diff_positive
