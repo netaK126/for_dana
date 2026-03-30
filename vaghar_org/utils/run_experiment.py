@@ -182,6 +182,11 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      encode_n1_last_layer=False,
                      constrain_n1_xp=False,
                      use_zonotope=False,
+                     refined_relu_zonotope=False,
+                     sparse_zonotope=False,
+                     zonotope_gen_budget=0,
+                     zonotope_conv=False,
+                     tighten_n2_bounds=False,
                      optimizing_intervals=None):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
@@ -200,6 +205,16 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_N1xpConf'
     if use_zonotope:
         suffix += '_Zonotope'
+    if refined_relu_zonotope:
+        suffix += '_RefinedReLU'
+    if sparse_zonotope:
+        suffix += '_SparseZono'
+    if zonotope_gen_budget > 0:
+        suffix += f'_GenBudget{zonotope_gen_budget}'
+    if zonotope_conv:
+        suffix += '_ZonoConv'
+    if tighten_n2_bounds:
+        suffix += '_TightenN2'
     if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
         suffix += '_noOI'
     return base + suffix
@@ -665,6 +680,8 @@ def step_double_check_standard(arch, dataset, itr_n1, itr_n2, perturbation, pert
     if model_dirs:
         tag1 = os.path.basename(os.path.normpath(model_dirs[0])).replace('model_', '', 1)
         tag2 = os.path.basename(os.path.normpath(model_dirs[1])).replace('model_', '', 1)
+        model_n1_path = os.path.join(model_dirs[0], 'model.p')
+        model_n2_path = os.path.join(model_dirs[1], 'model.p')
     elif dual_seed:
         ep1 = epochs[0] if epochs else 0
         ep2 = epochs[1] if epochs else 0
@@ -695,12 +712,13 @@ def step_double_check_standard(arch, dataset, itr_n1, itr_n2, perturbation, pert
                                   timeout=timeout, perturbation=perturbation)
 
 
-def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None, standard_relaxation_thresholds=None):
+def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbation_size, ctag, ct, timeout, force_cpu=False, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None, standard_relaxation_thresholds=None, skip_vaghar_no_perturbed=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     os.makedirs(dirs['vaghar_n1'], exist_ok=True)
     os.makedirs(dirs['vaghar_n2'], exist_ok=True)
-    os.makedirs(dirs['vaghar_n1_noPI'], exist_ok=True)
-    os.makedirs(dirs['vaghar_n2_noPI'], exist_ok=True)
+    if not skip_vaghar_no_perturbed:
+        os.makedirs(dirs['vaghar_n1_noPI'], exist_ok=True)
+        os.makedirs(dirs['vaghar_n2_noPI'], exist_ok=True)
 
     model_n1_path = os.path.join(dirs['model_n1'], 'model.p')
     model_n2_path = os.path.join(dirs['model_n2'], 'model.p')
@@ -708,6 +726,8 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
     if model_dirs:
         tag1 = os.path.basename(os.path.normpath(model_dirs[0])).replace('model_', '', 1)
         tag2 = os.path.basename(os.path.normpath(model_dirs[1])).replace('model_', '', 1)
+        model_n1_path = os.path.join(model_dirs[0], 'model.p')
+        model_n2_path = os.path.join(model_dirs[1], 'model.p')
     elif dual_seed:
         ep1 = epochs[0] if epochs else 0
         ep2 = epochs[1] if epochs else 0
@@ -741,27 +761,30 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
                             use_perturbed_intervals=True, optimizing_intervals=optimizing_intervals)
 
     # Run WITHOUT perturbed intervals
-    print("=" * 60)
-    print(f"STEP 2b: VHAGaR standard (WITHOUT perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
-    print("=" * 60)
-
-    if _dir_has_results(dirs['vaghar_n1_noPI']):
-        print(f"\n  --- {tag1} (ctag={ctag}) --- SKIPPED (results exist in {dirs['vaghar_n1_noPI']})")
+    if skip_vaghar_no_perturbed:
+        print("  Skipping vagharNoPerturbed (--skip_vaghar_no_perturbed)")
     else:
-        print(f"\n  --- {tag1} (ctag={ctag}) ---")
-        run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1_noPI'], ctag,
-                            perturbation_size=perturbation_size, ct=ct,
-                            timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                            use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
+        print("=" * 60)
+        print(f"STEP 2b: VHAGaR standard (WITHOUT perturbed intervals) — {arch} on {dataset}, {perturbation} eps={perturbation_size}, {tag1}&{tag2}")
+        print("=" * 60)
 
-    if _dir_has_results(dirs['vaghar_n2_noPI']):
-        print(f"\n  --- {tag2} (ctag={ctag}) --- SKIPPED (results exist in {dirs['vaghar_n2_noPI']})")
-    else:
-        print(f"\n  --- {tag2} (ctag={ctag}) ---")
-        run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2_noPI'], ctag,
-                            perturbation_size=perturbation_size, ct=ct,
-                            timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
-                            use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
+        if _dir_has_results(dirs['vaghar_n1_noPI']):
+            print(f"\n  --- {tag1} (ctag={ctag}) --- SKIPPED (results exist in {dirs['vaghar_n1_noPI']})")
+        else:
+            print(f"\n  --- {tag1} (ctag={ctag}) ---")
+            run_vaghar_standard(arch, dataset, model_n1_path, dirs['vaghar_n1_noPI'], ctag,
+                                perturbation_size=perturbation_size, ct=ct,
+                                timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                                use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
+
+        if _dir_has_results(dirs['vaghar_n2_noPI']):
+            print(f"\n  --- {tag2} (ctag={ctag}) --- SKIPPED (results exist in {dirs['vaghar_n2_noPI']})")
+        else:
+            print(f"\n  --- {tag2} (ctag={ctag}) ---")
+            run_vaghar_standard(arch, dataset, model_n2_path, dirs['vaghar_n2_noPI'], ctag,
+                                perturbation_size=perturbation_size, ct=ct,
+                                timeout=timeout, perturbation=perturbation, force_cpu=force_cpu,
+                                use_perturbed_intervals=False, optimizing_intervals=optimizing_intervals)
 
     # Run WITH perturbed intervals + relaxations (sweep over thresholds)
     if standard_relaxation_thresholds:
@@ -810,7 +833,12 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               encode_n1_last_layer=False,
                               n1_last_layer_no_binaries=False,
                               constrain_n1_xp=False,
-                              use_zonotope=False):
+                              use_zonotope=False,
+                              refined_relu_zonotope=False,
+                              sparse_zonotope=False,
+                              zonotope_gen_budget=0,
+                              zonotope_conv=False,
+                              tighten_n2_bounds=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -916,6 +944,16 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--constrain_n1_xp', 'true']
         if use_zonotope:
             command += ['--use_zonotope', 'true']
+        if refined_relu_zonotope:
+            command += ['--refined_relu_zonotope', 'true']
+        if sparse_zonotope:
+            command += ['--sparse_zonotope', 'true']
+        if zonotope_gen_budget > 0:
+            command += ['--zonotope_gen_budget', str(zonotope_gen_budget)]
+        if zonotope_conv:
+            command += ['--zonotope_conv', 'true']
+        if tighten_n2_bounds:
+            command += ['--tighten_n2_bounds', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
@@ -928,7 +966,12 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    encode_n1_last_layer=False,
                    n1_last_layer_no_binaries=False,
                    constrain_n1_xp=False,
-                   use_zonotope=False):
+                   use_zonotope=False,
+                   refined_relu_zonotope=False,
+                   sparse_zonotope=False,
+                   zonotope_gen_budget=0,
+                   zonotope_conv=False,
+                   tighten_n2_bounds=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
@@ -936,6 +979,11 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                                    encode_n1_last_layer=encode_n1_last_layer,
                                    constrain_n1_xp=constrain_n1_xp,
                                    use_zonotope=use_zonotope,
+                                   refined_relu_zonotope=refined_relu_zonotope,
+                                   sparse_zonotope=sparse_zonotope,
+                                   zonotope_gen_budget=zonotope_gen_budget,
+                                   zonotope_conv=zonotope_conv,
+                                   tighten_n2_bounds=tighten_n2_bounds,
                                    optimizing_intervals=optimizing_intervals)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -973,6 +1021,11 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         n1_last_layer_no_binaries=n1_last_layer_no_binaries,
         constrain_n1_xp=constrain_n1_xp,
         use_zonotope=use_zonotope,
+        refined_relu_zonotope=refined_relu_zonotope,
+        sparse_zonotope=sparse_zonotope,
+        zonotope_gen_budget=zonotope_gen_budget,
+        zonotope_conv=zonotope_conv,
+        tighten_n2_bounds=tighten_n2_bounds,
     )
 
 
@@ -1021,6 +1074,9 @@ def main():
     parser.add_argument('--skip_training', action='store_true', help='Skip training, use existing models')
     parser.add_argument('--skip_standard', action='store_true', help='Skip standard VHAGaR')
     parser.add_argument('--skip_transfer', action='store_true', help='Skip transfer VHAGaR')
+    parser.add_argument('--skip_vaghar_no_perturbed', action='store_true',
+                        help='Skip vagharNoPerturbed (standard without perturbed intervals), '
+                             'only run vagharWithPerturbed')
     parser.add_argument('--double_check_standard', action='store_true',
                         help='Run double-check standard using /root/Downloads/for_dana/code/run.jl')
     parser.add_argument('--skip_hyper_transfer_attack', action='store_true',
@@ -1071,6 +1127,21 @@ def main():
     parser.add_argument('--use_zonotope', action='store_true',
                         help='Use zonotope (affine arithmetic) for diff bound propagation; '
                              'tighter bounds by tracking correlations between neurons.')
+    parser.add_argument('--refined_relu_zonotope', action='store_true',
+                        help='Refined ReLU case analysis in zonotope: tighter bounds when one '
+                             'network is stable-active and the other is split (requires --use_zonotope).')
+    parser.add_argument('--sparse_zonotope', action='store_true',
+                        help='Sparse generator representation: split into dense correlated + diagonal '
+                             'independent; same bounds, less computation (requires --use_zonotope).')
+    parser.add_argument('--zonotope_gen_budget', type=int, default=0,
+                        help='Generator reduction budget K: keep top K generators, merge rest; '
+                             '0 = disabled (requires --use_zonotope).')
+    parser.add_argument('--zonotope_conv', action='store_true',
+                        help='Propagate zonotope through conv layers instead of interval '
+                             'arithmetic (requires --use_zonotope).')
+    parser.add_argument('--tighten_n2_bounds', action='store_true',
+                        help='Derive tighter N2 preact bounds from N1 + diff to eliminate '
+                             'binary variables.')
 
     args = parser.parse_args()
 
@@ -1186,7 +1257,8 @@ def main():
                                       dual_seed=dual_seed, epochs=epochs,
                                       optimizing_intervals=args.optimizing_intervals,
                                       model_dirs=model_dirs,
-                                      standard_relaxation_thresholds=std_relax_thresholds)
+                                      standard_relaxation_thresholds=std_relax_thresholds,
+                                      skip_vaghar_no_perturbed=args.skip_vaghar_no_perturbed)
         else:
             print("  Skipping standard VHAGaR (--skip_standard)")
 
@@ -1217,7 +1289,12 @@ def main():
                                encode_n1_last_layer=args.encode_n1_last_layer,
                                n1_last_layer_no_binaries=args.n1_last_layer_no_binaries,
                                constrain_n1_xp=args.constrain_n1_xp,
-                               use_zonotope=args.use_zonotope)
+                               use_zonotope=args.use_zonotope,
+                               refined_relu_zonotope=args.refined_relu_zonotope,
+                               sparse_zonotope=args.sparse_zonotope,
+                               zonotope_gen_budget=args.zonotope_gen_budget,
+                               zonotope_conv=args.zonotope_conv,
+                               tighten_n2_bounds=args.tighten_n2_bounds)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 

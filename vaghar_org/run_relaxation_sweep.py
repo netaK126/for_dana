@@ -35,15 +35,15 @@ import glob
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
-    # ("contrast(1.5)",      "contrast:1.5"),
+    ("contrast(1.5)",      "contrast:1.5"),
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("occ(5,5,5)",      "occ:5,5,5"),
     ("occ(3,3,5)",      "occ:3,3,5"),
-    # ("trans(1,1)",        "translation:1,1"),
-    # ("trans(1,3)",        "translation:1,3"),
-    # ("trans(3,1)",        "translation:3,1"),
-    # ("trans(3,3)",        "translation:3,3"),
-    # ("rotation(10)",      "rotation:10"),
+    ("trans(1,1)",        "translation:1,1"),
+    ("trans(1,3)",        "translation:1,3"),
+    ("trans(3,1)",        "translation:3,1"),
+    ("trans(3,3)",        "translation:3,3"),
+    ("rotation(10)",      "rotation:10"),
     ("occ(1,1,5)",      "occ:1,1,5"),
     # ("linf(0.05)",        "linf:0.05"),
     # ("linf(0.1)",         "linf:0.1"),
@@ -328,6 +328,9 @@ def _extract_transfer_file_metadata(filename):
     has_no_bin = "NoBin" in filename
     has_n1xp = "N1xpConf" in filename
     has_zonotope = "Zonotope" in filename
+    has_refined_relu = "RefinedReLU" in filename
+    has_sparse_zono = "SparseZono" in filename
+    gen_budget_match = re.search(r"GenBudget(\d+)", filename)
     if has_last_layer and has_no_bin:
         no_n1_enc = "last_layer_no_bin"
     elif has_last_layer and has_n1xp:
@@ -342,19 +345,30 @@ def _extract_transfer_file_metadata(filename):
         no_n1_enc = "no"
     if has_zonotope:
         no_n1_enc += "+zono"
+    if has_refined_relu:
+        no_n1_enc += "+refinedReLU"
+    if has_sparse_zono:
+        no_n1_enc += "+sparseZono"
+    if gen_budget_match:
+        no_n1_enc += "+genK" + gen_budget_match.group(1)
+    if "ZonoConv" in filename:
+        no_n1_enc += "+zonoConv"
+    has_tighten_n2 = "TightenN2" in filename
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
         "no_n1_bin_relax_on_n2": no_n1_bin,
         "no_n1_encoding": no_n1_enc,
+        "tighten_n2": "yes" if has_tighten_n2 else "no",
     }
 
 
 def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster,
                                        csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout,
                                        arch="cnn1", double_check_standard=False,
-                                       compare_to_with_perturbed=False):
+                                       compare_to_with_perturbed=False,
+                                       transfer_opt_time_only=False):
     """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
 
     Returns four lists of row dicts (transfer_faster, standard_faster,
@@ -391,6 +405,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "optimizing_intervals",
         "no_n1_bin_relax_on_n2",
         "no_n1_encoding",
+        "tighten_n2",
         "how_much_faster",
     ]
     if not compare_to_with_perturbed:
@@ -463,7 +478,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                     if meta["optimizing_intervals"] == "yes" and meta["no_n1_bin_relax_on_n2"] == "no" and meta["no_n1_encoding"] == "no":
                         continue
                     s_info = standard_results[key]
-                    t_time = t_info["total_time"]
+                    t_time = t_info["optimization_time"] if transfer_opt_time_only else t_info["total_time"]
                     s_time = s_info["total_time"]
 
                     row = {
@@ -484,6 +499,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "optimizing_intervals": meta["optimizing_intervals"],
                         "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
                         "no_n1_encoding": meta["no_n1_encoding"],
+                        "tighten_n2": meta["tighten_n2"],
                     }
 
                     if not compare_to_with_perturbed:
@@ -604,6 +620,9 @@ def main():
                         help="Scan existing results and report transfer experiments that are "
                              "faster than standard N2 (vagharNoPerturbed with sgd) for each "
                              "perturbation and (c_source, c_target) pair.")
+    parser.add_argument("--skip_vaghar_no_perturbed", action="store_true",
+                        help="When running standard, skip vagharNoPerturbed (without perturbed intervals) "
+                             "and only run vagharWithPerturbed.")
     parser.add_argument("--standard_only", action="store_true",
                         help="Run standard verification only on the given model(s), without "
                              "extra SGD training or creating N2. Implies --skip_transfer.")
@@ -630,9 +649,29 @@ def main():
     parser.add_argument("--use_zonotope", action="store_true",
                         help="Use zonotope (affine arithmetic) for diff bound propagation; "
                              "tighter bounds by tracking correlations between neurons.")
+    parser.add_argument("--refined_relu_zonotope", action="store_true",
+                        help="Refined ReLU case analysis in zonotope: tighter bounds when one "
+                             "network is stable-active and the other is split (requires --use_zonotope).")
+    parser.add_argument("--sparse_zonotope", action="store_true",
+                        help="Sparse generator representation: split into dense correlated + diagonal "
+                             "independent; same bounds, less computation (requires --use_zonotope).")
+    parser.add_argument("--zonotope_gen_budget", type=int, default=0,
+                        help="Generator reduction budget K: keep top K generators, merge rest; "
+                             "0 = disabled (requires --use_zonotope).")
+    parser.add_argument("--zonotope_conv", action="store_true",
+                        help="Propagate zonotope through conv layers instead of using interval "
+                             "arithmetic (requires --use_zonotope).")
+    parser.add_argument("--tighten_n2_bounds", action="store_true",
+                        help="Derive tighter N2 preact bounds from N1 + diff to eliminate "
+                             "binary variables.")
     parser.add_argument("--compare_to_with_perturbed", action="store_true",
                         help="Compare transfer results to vagharWithPerturbed (standard with perturbed "
                              "intervals) instead of vagharNoPerturbed.")
+    parser.add_argument("--transfer_opt_time_only", action="store_true",
+                        help="When comparing times, use only optimization_time for transfer "
+                             "(no hyper_attack_time) while standard still uses total_time.")
+    parser.add_argument("--skip_hyper_transfer_attack", action="store_true",
+                        help="Disable hyper attack (PGD warm-start) in transfer runs.")
     args = parser.parse_args()
 
     total_cores = args.max_cores
@@ -686,6 +725,8 @@ def main():
         suffix = "_double_check_standard" if dblchk else ""
         if args.compare_to_with_perturbed:
             suffix += "_vs_withPerturbed"
+        if args.transfer_opt_time_only:
+            suffix += "_transferOptOnly"
         combined_base = os.path.join(cwd, "paper_experiments", dataset)
         os.makedirs(combined_base, exist_ok=True)
         csv_transfer_faster = os.path.join(combined_base, f"transfer_faster_than_standard{suffix}.csv")
@@ -702,7 +743,8 @@ def main():
                 all_perts, exp_base, csv_transfer_faster, csv_standard_faster,
                 csv_transfer_tighter, csv_standard_tighter, arch=arch,
                 double_check_standard=dblchk,
-                compare_to_with_perturbed=args.compare_to_with_perturbed)
+                compare_to_with_perturbed=args.compare_to_with_perturbed,
+                transfer_opt_time_only=args.transfer_opt_time_only)
             all_tf.extend(tf)
             all_sf.extend(sf)
             all_tt.extend(tt)
@@ -716,7 +758,7 @@ def main():
             "time_standard", "time_transfer", "delta_standard_lower_bound",
             "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
             "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "how_much_faster",
+            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "tighten_n2", "how_much_faster",
         ]
         if not args.compare_to_with_perturbed:
             _fieldnames += ["gap_standard", "gap_transfer"]
@@ -829,6 +871,8 @@ def main():
                     ] + _model_args
                     if args.double_check_standard:
                         std_cmd.append("--double_check_standard")
+                    if args.skip_vaghar_no_perturbed:
+                        std_cmd.append("--skip_vaghar_no_perturbed")
                     if args.standard_relaxation_thresholds is not None:
                         std_cmd += ["--standard_relaxation_thresholds", args.standard_relaxation_thresholds]
                     standard_jobs.append((job_key, std_label, std_cmd))
@@ -863,6 +907,18 @@ def main():
                             t_cmd.append("--constrain_n1_xp")
                         if args.use_zonotope:
                             t_cmd.append("--use_zonotope")
+                        if args.refined_relu_zonotope:
+                            t_cmd.append("--refined_relu_zonotope")
+                        if args.sparse_zonotope:
+                            t_cmd.append("--sparse_zonotope")
+                        if args.zonotope_gen_budget > 0:
+                            t_cmd += ["--zonotope_gen_budget", str(args.zonotope_gen_budget)]
+                        if args.zonotope_conv:
+                            t_cmd.append("--zonotope_conv")
+                        if args.tighten_n2_bounds:
+                            t_cmd.append("--tighten_n2_bounds")
+                        if args.skip_hyper_transfer_attack:
+                            t_cmd.append("--skip_hyper_transfer_attack")
                         t_jobs.append((t_label, t_cmd))
                 transfer_by_pert[job_key] = t_jobs
 

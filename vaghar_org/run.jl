@@ -202,6 +202,31 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--refined_relu_zonotope"
+        help = "Refined ReLU case analysis in zonotope propagation: when one network is stable-active and the other is split, use tighter sub-case bounds instead of generic DeepZ; reduces generator count and bound width at zero extra cost (requires --use_zonotope true)"
+        arg_type = Bool
+        required = false
+        default = false
+        "--sparse_zonotope"
+        help = "Sparse generator representation: split generators into dense correlated matrix and diagonal independent vector; same bounds, less computation (requires --use_zonotope true)"
+        arg_type = Bool
+        required = false
+        default = false
+        "--zonotope_gen_budget"
+        help = "Generator reduction budget K: after each layer, keep top K generators by L1 norm and merge the rest into one bounding-box generator; 0 = disabled (requires --use_zonotope true)"
+        arg_type = Int
+        required = false
+        default = 0
+        "--zonotope_conv"
+        help = "Propagate zonotope through convolutional layers (exact for linear conv, DeepZ for ReLU); activates zonotope at first Conv instead of Flatten (requires --use_zonotope true)"
+        arg_type = Bool
+        required = false
+        default = false
+        "--tighten_n2_bounds"
+        help = "Derive tighter N2 pre-activation bounds from N1 + diff bounds; can flip split neurons to stable, eliminating binary variables (requires diff bounds to be computed)"
+        arg_type = Bool
+        required = false
+        default = false
         "--delta_diff_positive"
         help = "force delta_diff to be positive."
         arg_type = Bool
@@ -338,6 +363,11 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global no_n1_encoding_at_all = args["no_n1_encoding_at_all"]
     global encode_n1_last_layer = args["encode_n1_last_layer"]
     global use_zonotope = args["use_zonotope"]
+    global refined_relu_zonotope = args["refined_relu_zonotope"]
+    global sparse_zonotope = args["sparse_zonotope"]
+    global zonotope_gen_budget = args["zonotope_gen_budget"]
+    global zonotope_conv = args["zonotope_conv"]
+    global tighten_n2_bounds = args["tighten_n2_bounds"]
     # no_n1_encoding_at_all implies no_n1_binaries_and_relaxtions_only_on_n2
     # (N1 isn't encoded, so N2(x') must be relaxed onto N2(x) instead of N1)
     if no_n1_encoding_at_all
@@ -497,6 +527,21 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
             if use_zonotope
                 name_to_save = name_to_save * "_Zonotope"
+            end
+            if refined_relu_zonotope
+                name_to_save = name_to_save * "_RefinedReLU"
+            end
+            if sparse_zonotope
+                name_to_save = name_to_save * "_SparseZono"
+            end
+            if zonotope_gen_budget > 0
+                name_to_save = name_to_save * "_GenBudget" * string(zonotope_gen_budget)
+            end
+            if zonotope_conv
+                name_to_save = name_to_save * "_ZonoConv"
+            end
+            if tighten_n2_bounds
+                name_to_save = name_to_save * "_TightenN2"
             end
 
             # Set transfer proof constraints and objective

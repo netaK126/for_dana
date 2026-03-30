@@ -36,7 +36,12 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=20, help='number of epochs')
     parser.add_argument('--loss', type=str, default="Cross", help='Cross, MSE, or L1')
     parser.add_argument('--optimizer', type=str, default="Adam", help='Adam, or SGD')
+    parser.add_argument('--seed', type=int, default=None, help='random seed')
     args = parser.parse_args()
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
 
     batch_size = args.batch_size
     num_epochs = args.epochs
@@ -49,6 +54,8 @@ if __name__ == '__main__':
         model = FNN_3_10()
     elif model_type == "3x50":
         model = FNN_3_50()
+    elif model_type == "3x100":
+        model = FNN_3_100()
     elif model_type == "6x100":
         model = FNN_6_100()
     elif model_type == "9x200":

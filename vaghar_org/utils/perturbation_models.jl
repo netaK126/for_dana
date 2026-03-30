@@ -481,13 +481,43 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     end
 
     # Pre-compute diff/composed interval bounds.
-    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
-        if use_zonotope
-            compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
+    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff).
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds
+        if diff_bounds_cache.valid
+            restore_diff_bounds_from_cache!()
         else
-            compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            if use_zonotope
+                compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            else
+                compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            end
+            save_diff_bounds_to_cache!()
         end
+    end
+
+    # Derive tighter N2 pre-activation bounds from N1 + diff
+    if tighten_n2_bounds && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+        global n2_derived_preact_up_bounds   = Array{Float64}[]
+        global n2_derived_preact_down_bounds = Array{Float64}[]
+        n_tightened = 0
+        n_total_split = 0
+        for r in 1:length(n1_preact_up_bounds)
+            derived_up   = vec(n1_preact_up_bounds[r])   .+ vec(relu_diff_up_bounds[r])
+            derived_down = vec(n1_preact_down_bounds[r]) .+ vec(relu_diff_down_bounds[r])
+            push!(n2_derived_preact_up_bounds, derived_up)
+            push!(n2_derived_preact_down_bounds, derived_down)
+            # Count how many neurons would flip from split to stable
+            for i in eachindex(derived_up)
+                if derived_up[i] > 0 && derived_down[i] < 0
+                    n_total_split += 1
+                end
+                if derived_up[i] <= 0 || derived_down[i] >= 0
+                    n_tightened += 1
+                end
+            end
+        end
+        println("tighten_n2_bounds: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active
@@ -615,14 +645,38 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     I_pert_prev_down = I_pert_down
 
     # Pre-compute diff/composed interval bounds.
-    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds).
-    # compute_diff_and_comp_bounds uses optimizing_intervals for tighter clipping and saves output-layer bounds.
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all
-        if use_zonotope
-            compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+    # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
+    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff).
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds
+        if diff_bounds_cache.valid
+            restore_diff_bounds_from_cache!()
         else
-            compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            if use_zonotope
+                compute_diff_bounds_zonotope(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            else
+                compute_diff_and_comp_bounds(nn1, nn2, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
+            end
+            save_diff_bounds_to_cache!()
         end
+    end
+
+    # Derive tighter N2 pre-activation bounds from N1 + diff
+    if tighten_n2_bounds && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+        global n2_derived_preact_up_bounds   = Array{Float64}[]
+        global n2_derived_preact_down_bounds = Array{Float64}[]
+        n_tightened = 0
+        for r in 1:length(n1_preact_up_bounds)
+            derived_up   = vec(n1_preact_up_bounds[r])   .+ vec(relu_diff_up_bounds[r])
+            derived_down = vec(n1_preact_down_bounds[r]) .+ vec(relu_diff_down_bounds[r])
+            push!(n2_derived_preact_up_bounds, derived_up)
+            push!(n2_derived_preact_down_bounds, derived_down)
+            for i in eachindex(derived_up)
+                if derived_up[i] <= 0 || derived_down[i] >= 0
+                    n_tightened += 1
+                end
+            end
+        end
+        println("tighten_n2_bounds: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active

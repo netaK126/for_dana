@@ -52,6 +52,13 @@ global no_n1_encoding_at_all::Bool = false
 global encode_n1_last_layer::Bool = false
 global n1_last_layer_no_binaries::Bool = false
 global use_zonotope::Bool = false
+global refined_relu_zonotope::Bool = false
+global sparse_zonotope::Bool = false
+global zonotope_gen_budget::Int = 0  # 0 = disabled; K > 0 = keep top K generators, merge rest
+global zonotope_conv::Bool = false   # activate zonotope propagation through conv layers
+global tighten_n2_bounds::Bool = false  # derive tighter N2 preact bounds from N1 + diff
+global n2_derived_preact_up_bounds   = []
+global n2_derived_preact_down_bounds = []
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
 # Output-level perturbation bounds: N2(x')[k] - N2(x)[k] and N1(x')[k] - N1(x)[k]
@@ -70,6 +77,85 @@ global n1_last_hidden_up::Vector{Float64}       = Float64[]
 global n1_last_hidden_down::Vector{Float64}     = Float64[]
 global last_hidden_diff_up::Vector{Float64}     = Float64[]
 global last_hidden_diff_down::Vector{Float64}   = Float64[]
+
+# ── Diff-bounds cache (avoid recomputing zonotope/interval across class pairs) ──
+# The diff bounds depend only on (nn1, nn2, perturbation) — NOT on (c_tag, c_target).
+# Cache after first computation, restore on subsequent class pairs.
+mutable struct DiffBoundsCache
+    valid::Bool
+    relu_diff_up::Vector{Array{Float64}}
+    relu_diff_down::Vector{Array{Float64}}
+    n1_preact_up::Vector{Array{Float64}}
+    n1_preact_down::Vector{Array{Float64}}
+    relu_comp_up::Vector{Array{Float64}}
+    relu_comp_down::Vector{Array{Float64}}
+    output_diff_up::Vector{Float64}
+    output_diff_down::Vector{Float64}
+    output_n2_pert_up::Vector{Float64}
+    output_n2_pert_down::Vector{Float64}
+    output_n1_pert_up::Vector{Float64}
+    output_n1_pert_down::Vector{Float64}
+    n1_last_hidden_up::Vector{Float64}
+    n1_last_hidden_down::Vector{Float64}
+    last_hidden_diff_up::Vector{Float64}
+    last_hidden_diff_down::Vector{Float64}
+end
+global diff_bounds_cache = DiffBoundsCache(false,
+    Array{Float64}[], Array{Float64}[], Array{Float64}[], Array{Float64}[],
+    Array{Float64}[], Array{Float64}[],
+    Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
+    Float64[], Float64[], Float64[], Float64[])
+
+function save_diff_bounds_to_cache!()
+    global diff_bounds_cache
+    diff_bounds_cache.relu_diff_up        = [copy(v) for v in relu_diff_up_bounds]
+    diff_bounds_cache.relu_diff_down      = [copy(v) for v in relu_diff_down_bounds]
+    diff_bounds_cache.n1_preact_up        = [copy(v) for v in n1_preact_up_bounds]
+    diff_bounds_cache.n1_preact_down      = [copy(v) for v in n1_preact_down_bounds]
+    diff_bounds_cache.relu_comp_up        = [copy(v) for v in relu_comp_up_bounds]
+    diff_bounds_cache.relu_comp_down      = [copy(v) for v in relu_comp_down_bounds]
+    diff_bounds_cache.output_diff_up      = copy(output_diff_up_bounds)
+    diff_bounds_cache.output_diff_down    = copy(output_diff_down_bounds)
+    diff_bounds_cache.output_n2_pert_up   = copy(output_n2_pert_up)
+    diff_bounds_cache.output_n2_pert_down = copy(output_n2_pert_down)
+    diff_bounds_cache.output_n1_pert_up   = copy(output_n1_pert_up)
+    diff_bounds_cache.output_n1_pert_down = copy(output_n1_pert_down)
+    diff_bounds_cache.n1_last_hidden_up   = copy(n1_last_hidden_up)
+    diff_bounds_cache.n1_last_hidden_down = copy(n1_last_hidden_down)
+    diff_bounds_cache.last_hidden_diff_up   = copy(last_hidden_diff_up)
+    diff_bounds_cache.last_hidden_diff_down = copy(last_hidden_diff_down)
+    diff_bounds_cache.valid = true
+    println("diff_bounds_cache: saved ($(length(diff_bounds_cache.relu_diff_up)) ReLU layers)")
+end
+
+function restore_diff_bounds_from_cache!()
+    global diff_bounds_cache
+    global relu_diff_up_bounds, relu_diff_down_bounds
+    global n1_preact_up_bounds, n1_preact_down_bounds
+    global relu_comp_up_bounds, relu_comp_down_bounds
+    global output_diff_up_bounds, output_diff_down_bounds
+    global output_n2_pert_up, output_n2_pert_down
+    global output_n1_pert_up, output_n1_pert_down
+    global n1_last_hidden_up, n1_last_hidden_down
+    global last_hidden_diff_up, last_hidden_diff_down
+    relu_diff_up_bounds   = [copy(v) for v in diff_bounds_cache.relu_diff_up]
+    relu_diff_down_bounds = [copy(v) for v in diff_bounds_cache.relu_diff_down]
+    n1_preact_up_bounds   = [copy(v) for v in diff_bounds_cache.n1_preact_up]
+    n1_preact_down_bounds = [copy(v) for v in diff_bounds_cache.n1_preact_down]
+    relu_comp_up_bounds   = [copy(v) for v in diff_bounds_cache.relu_comp_up]
+    relu_comp_down_bounds = [copy(v) for v in diff_bounds_cache.relu_comp_down]
+    output_diff_up_bounds   = copy(diff_bounds_cache.output_diff_up)
+    output_diff_down_bounds = copy(diff_bounds_cache.output_diff_down)
+    output_n2_pert_up       = copy(diff_bounds_cache.output_n2_pert_up)
+    output_n2_pert_down     = copy(diff_bounds_cache.output_n2_pert_down)
+    output_n1_pert_up       = copy(diff_bounds_cache.output_n1_pert_up)
+    output_n1_pert_down     = copy(diff_bounds_cache.output_n1_pert_down)
+    n1_last_hidden_up       = copy(diff_bounds_cache.n1_last_hidden_up)
+    n1_last_hidden_down     = copy(diff_bounds_cache.n1_last_hidden_down)
+    last_hidden_diff_up     = copy(diff_bounds_cache.last_hidden_diff_up)
+    last_hidden_diff_down   = copy(diff_bounds_cache.last_hidden_diff_down)
+    println("diff_bounds_cache: restored from cache ($(length(relu_diff_up_bounds)) ReLU layers)")
+end
 
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool

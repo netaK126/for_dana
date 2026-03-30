@@ -13,7 +13,7 @@ import torchvision.datasets as dsets
 import torchvision.transforms as transforms
 
 # Import all network definitions from models.py
-from models import FNN_3_10, FNN_3_50, FNN_4_10, FNN_10_10, CNN0, CNN1, CNN2
+from models import FNN_3_10, FNN_3_50, FNN_3_100, FNN_4_10, FNN_10_10, CNN0, CNN1, CNN2
 
 
 def build_model(model_name, k=1, w=28, h=28):
@@ -21,6 +21,8 @@ def build_model(model_name, k=1, w=28, h=28):
         return FNN_3_10(k=k, w=w, h=h)
     if model_name == "3x50":
         return FNN_3_50(k=k, w=w, h=h)
+    if model_name == "3x100":
+        return FNN_3_100(k=k, w=w, h=h)
     if model_name == "4x10":
         return FNN_4_10(k=k, w=w, h=h)
     if model_name == "10x10":
