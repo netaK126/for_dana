@@ -72,7 +72,7 @@ function parse_commandline()
         help = "MIP timeout"
         arg_type = Int
         required = false
-        default = 2000
+        default = 100
         "--ct", "-t"
         help = "target classes" #not needed
         arg_type = String

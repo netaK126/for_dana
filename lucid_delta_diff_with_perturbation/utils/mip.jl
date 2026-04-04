@@ -103,6 +103,7 @@ function mip_set_delta_diff_property_neta(m, d,delta1_vaghar, c_tag, c_target, c
     
     margin = 0.01
     # the objective and problem definition
+    # delta1_vaghar = 0
     diff = @variable(m, base_name="diff_obj")
     @constraint(m, conf1>=delta1_vaghar + margin)
     @constraint(m, conf2 - conf1==diff)

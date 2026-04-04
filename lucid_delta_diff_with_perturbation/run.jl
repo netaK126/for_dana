@@ -52,7 +52,7 @@ function parse_commandline()
         help = "model path"
         arg_type = String
         required = false
-        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr18.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--hypers_dir_path"
         help = "hypers model path"
         arg_type = String
@@ -62,7 +62,7 @@ function parse_commandline()
         help = "ctag, source class"
         arg_type = String
         required = false
-        default = "1"
+        default = "2"
         "--ct", "-t"
         help = "target classes"
         arg_type = String
@@ -105,7 +105,7 @@ function parse_commandline()
         help = "occ: i,j,width , patch: eps,i,j,width, brightness: eps, linf: eps, contrast: eps, translation: tx,ty, rotation: angle"
         arg_type = String
         required = false
-        default = "0.05"
+        default = "0.008"
         "--model_path_vaghar_results"
         help = "model_path_vaghar_results"
         arg_type = String
@@ -137,7 +137,6 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
         current_line_number = 0
         requested_line = ""
         while !eof(io)
-            current_line_number += 1
             line_content = readline(io)
             println(line_content)
             c_target = Base.split(line_content, ',')[2]
@@ -145,6 +144,7 @@ function get_delta1_vaghar(model_path_vaghar_results, line_index)
                 requested_line = line_content
                 println("FOUND")
             end
+            current_line_number += 1
         end
         if requested_line==""
             println("Error with requested_line")
@@ -261,7 +261,7 @@ function main()
             end
         end
     end
-    println("---------------------------")
+
     
 end
 

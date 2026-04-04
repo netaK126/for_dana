@@ -52,7 +52,7 @@ function parse_commandline()
         help = "model name"
         arg_type = String
         required = false
-        default = "./models/3x10/model.p"
+        default = "/root/Downloads/lucid_delta_diff_with_perturbation/models_4x10_mnist/model_itr17.p"
         "--perturbation", "-p"
         help = "perturbation type: occ, patch, brightness, linf, contrast, translation, rotation, or max"
         arg_type = String
