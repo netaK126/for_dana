@@ -179,6 +179,7 @@ def get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=None, perturbation_
 def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      no_n1_binaries_and_relaxtions_only_on_n2=False,
                      no_n1_encoding_at_all=False,
+                     no_n2_xp_encoding=False,
                      encode_n1_last_layer=False,
                      constrain_n1_xp=False,
                      use_zonotope=False,
@@ -198,7 +199,9 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
     if no_n1_binaries_and_relaxtions_only_on_n2:
         suffix += '_NoN1BinRelaxOnN2only'
     if no_n1_encoding_at_all:
-        suffix += '_NoN1Encoding'
+        suffix += '_NoN1Enc'
+    if no_n2_xp_encoding:
+        suffix += '_NoN2xpEnc'
     if encode_n1_last_layer:
         suffix += '_N1LastLayer'
     if constrain_n1_xp:
@@ -830,6 +833,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               optimizing_intervals=None, model_dirs=None,
                               no_n1_binaries_and_relaxtions_only_on_n2=False,
                               no_n1_encoding_at_all=False,
+                              no_n2_xp_encoding=False,
                               encode_n1_last_layer=False,
                               n1_last_layer_no_binaries=False,
                               constrain_n1_xp=False,
@@ -859,8 +863,12 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             return
         print(f"  Using fallback: {vaghar_results_dir}")
 
-    n1_path = os.path.join(dirs['model_n1'], 'model.p')
-    n2_path = os.path.join(dirs['model_n2'], 'model.p')
+    if model_dirs:
+        n1_path = os.path.join(model_dirs[0], 'model.p')
+        n2_path = os.path.join(model_dirs[1], 'model.p')
+    else:
+        n1_path = os.path.join(dirs['model_n1'], 'model.p')
+        n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -936,6 +944,8 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--no_n1_binaries_and_relaxtions_only_on_n2', 'true']
         if no_n1_encoding_at_all:
             command += ['--no_n1_encoding_at_all', 'true']
+        if no_n2_xp_encoding:
+            command += ['--no_n2_xp_encoding', 'true']
         if encode_n1_last_layer:
             command += ['--encode_n1_last_layer', 'true']
         if n1_last_layer_no_binaries:
@@ -963,6 +973,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None,
                    relaxation_gap_area='false', no_n1_binaries_and_relaxtions_only_on_n2=False,
                    no_n1_encoding_at_all=False,
+                   no_n2_xp_encoding=False,
                    encode_n1_last_layer=False,
                    n1_last_layer_no_binaries=False,
                    constrain_n1_xp=False,
@@ -976,6 +987,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
                                    no_n1_encoding_at_all=no_n1_encoding_at_all,
+                                   no_n2_xp_encoding=no_n2_xp_encoding,
                                    encode_n1_last_layer=encode_n1_last_layer,
                                    constrain_n1_xp=constrain_n1_xp,
                                    use_zonotope=use_zonotope,
@@ -1017,6 +1029,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         relaxation_gap_area=relaxation_gap_area,
         no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
         no_n1_encoding_at_all=no_n1_encoding_at_all,
+        no_n2_xp_encoding=no_n2_xp_encoding,
         encode_n1_last_layer=encode_n1_last_layer,
         n1_last_layer_no_binaries=n1_last_layer_no_binaries,
         constrain_n1_xp=constrain_n1_xp,
@@ -1115,6 +1128,10 @@ def main():
     parser.add_argument('--no_n1_encoding_at_all', action='store_true',
                         help='Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with '
                              'interval-bounded constraints on N2 outputs using weight diff bounds.')
+    parser.add_argument('--no_n2_xp_encoding', action='store_true',
+                        help='Skip N2(x\') encoding entirely; replace conf(N2,x\',c) with '
+                             'interval-bounded output variables using perturbation bounds through N2. '
+                             'Assumes no_n1_encoding_at_all=false.')
     parser.add_argument('--encode_n1_last_layer', action='store_true',
                         help='When no_n1_encoding_at_all is active, encode N1 last linear layer '
                              'exactly using interval-bounded hidden variables; gives exact delta_diff.')
@@ -1286,6 +1303,7 @@ def main():
                                relaxation_gap_area=args.relaxation_gap_area,
                                no_n1_binaries_and_relaxtions_only_on_n2=args.no_n1_binaries_and_relaxtions_only_on_n2,
                                no_n1_encoding_at_all=args.no_n1_encoding_at_all,
+                               no_n2_xp_encoding=args.no_n2_xp_encoding,
                                encode_n1_last_layer=args.encode_n1_last_layer,
                                n1_last_layer_no_binaries=args.n1_last_layer_no_binaries,
                                constrain_n1_xp=args.constrain_n1_xp,

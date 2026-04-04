@@ -483,7 +483,7 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     # Pre-compute diff/composed interval bounds.
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
     #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff).
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds || no_n2_xp_encoding
         if diff_bounds_cache.valid
             restore_diff_bounds_from_cache!()
         else
@@ -572,11 +572,16 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     end
 
     # Encode N2 on perturbed input x_p → layers 3K+1..4K
-    println("Encoding N2(x_p)...")
-    layer_counter = 0
-    nueron_counter = 0
-    network_version = "n2_pert"
-    v_out_n2_p = v_x0 |> nn2
+    if !no_n2_xp_encoding
+        println("Encoding N2(x_p)...")
+        layer_counter = 0
+        nueron_counter = 0
+        network_version = "n2_pert"
+        v_out_n2_p = v_x0 |> nn2
+    else
+        println("Skipping N2(x_p) encoding (--no_n2_xp_encoding)")
+        v_out_n2_p = nothing
+    end
 
     return Dict(
         :v_in => v_in,
@@ -646,8 +651,9 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
 
     # Pre-compute diff/composed interval bounds.
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
-    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff).
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds
+    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff),
+    #          (d) no_n2_xp_encoding (output-layer pert bounds for N2(x')).
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds || no_n2_xp_encoding
         if diff_bounds_cache.valid
             restore_diff_bounds_from_cache!()
         else
@@ -719,9 +725,15 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
         compute_n2_pert_relaxation_bounds(nn2, I_pert_prev_up, I_pert_prev_down)
     end
 
-    println("Encoding N2(x_p)...")
-    layer_counter = 0; nueron_counter = 0; network_version = "n2_pert"
-    v_out_n2_p = v_x0 |> nn2
+    # Encode N2 on perturbed input x_p
+    if !no_n2_xp_encoding
+        println("Encoding N2(x_p)...")
+        layer_counter = 0; nueron_counter = 0; network_version = "n2_pert"
+        v_out_n2_p = v_x0 |> nn2
+    else
+        println("Skipping N2(x_p) encoding (--no_n2_xp_encoding)")
+        v_out_n2_p = nothing
+    end
 
     return v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden
 end

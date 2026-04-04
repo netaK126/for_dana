@@ -331,35 +331,41 @@ def _extract_transfer_file_metadata(filename):
     has_refined_relu = "RefinedReLU" in filename
     has_sparse_zono = "SparseZono" in filename
     gen_budget_match = re.search(r"GenBudget(\d+)", filename)
-    if has_last_layer and has_no_bin:
-        no_n1_enc = "last_layer_no_bin"
+    has_no_n2_xp = "NoN2xpEncoding" in filename
+    # Combine no_n1_encoding and no_n2_xp_encoding into a single field:
+    #   "no" = all networks encoded, "no_n1_encoding+..." = N1(x) skipped,
+    #   "no_n2_xp_encoding+..." = N2(x') skipped
+    if has_no_n2_xp:
+        encoding_skip = "no_n2_xp_encoding"
+    elif has_last_layer and has_no_bin:
+        encoding_skip = "no_n1_encoding+last_layer_no_bin"
     elif has_last_layer and has_n1xp:
-        no_n1_enc = "last_layer+n1xp"
+        encoding_skip = "no_n1_encoding+last_layer+n1xp"
     elif has_last_layer:
-        no_n1_enc = "last_layer"
+        encoding_skip = "no_n1_encoding+last_layer"
     elif "NoN1Encoding" in filename and has_n1xp:
-        no_n1_enc = "yes+n1xp"
+        encoding_skip = "no_n1_encoding+n1xp"
     elif "NoN1Encoding" in filename:
-        no_n1_enc = "yes"
+        encoding_skip = "no_n1_encoding"
     else:
-        no_n1_enc = "no"
+        encoding_skip = "no"
     if has_zonotope:
-        no_n1_enc += "+zono"
+        encoding_skip += "+zono"
     if has_refined_relu:
-        no_n1_enc += "+refinedReLU"
+        encoding_skip += "+refinedReLU"
     if has_sparse_zono:
-        no_n1_enc += "+sparseZono"
+        encoding_skip += "+sparseZono"
     if gen_budget_match:
-        no_n1_enc += "+genK" + gen_budget_match.group(1)
+        encoding_skip += "+genK" + gen_budget_match.group(1)
     if "ZonoConv" in filename:
-        no_n1_enc += "+zonoConv"
+        encoding_skip += "+zonoConv"
     has_tighten_n2 = "TightenN2" in filename
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
         "no_n1_bin_relax_on_n2": no_n1_bin,
-        "no_n1_encoding": no_n1_enc,
+        "encoding_skip": encoding_skip,
         "tighten_n2": "yes" if has_tighten_n2 else "no",
     }
 
@@ -404,7 +410,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "relax_count",
         "optimizing_intervals",
         "no_n1_bin_relax_on_n2",
-        "no_n1_encoding",
+        "encoding_skip",
         "tighten_n2",
         "how_much_faster",
     ]
@@ -474,8 +480,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                     key = (cs, ct)
                     if key not in standard_results:
                         continue
-                    # Skip old-style optimizing_intervals runs (but allow NoN1BinRelaxOnN2only and NoN1Encoding)
-                    if meta["optimizing_intervals"] == "yes" and meta["no_n1_bin_relax_on_n2"] == "no" and meta["no_n1_encoding"] == "no":
+                    # Skip old-style optimizing_intervals runs (but allow NoN1BinRelaxOnN2only, NoN1Encoding, NoN2xpEncoding)
+                    if meta["optimizing_intervals"] == "yes" and meta["no_n1_bin_relax_on_n2"] == "no" and meta["encoding_skip"] == "no":
                         continue
                     s_info = standard_results[key]
                     t_time = t_info["optimization_time"] if transfer_opt_time_only else t_info["total_time"]
@@ -498,7 +504,7 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "relax_count": meta["relax_count"],
                         "optimizing_intervals": meta["optimizing_intervals"],
                         "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
-                        "no_n1_encoding": meta["no_n1_encoding"],
+                        "encoding_skip": meta["encoding_skip"],
                         "tighten_n2": meta["tighten_n2"],
                     }
 
@@ -637,6 +643,10 @@ def main():
     parser.add_argument("--no_n1_encoding_at_all", action="store_true",
                         help="Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with "
                              "interval-bounded constraints on N2 outputs using weight diff bounds.")
+    parser.add_argument("--no_n2_xp_encoding", action="store_true",
+                        help="Skip N2(x') encoding entirely; replace conf(N2,x',c) with "
+                             "interval-bounded output variables using perturbation bounds through N2. "
+                             "Assumes no_n1_encoding_at_all=false.")
     parser.add_argument("--encode_n1_last_layer", action="store_true",
                         help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
                              "exactly using interval-bounded hidden variables; gives exact delta_diff.")
@@ -758,7 +768,7 @@ def main():
             "time_standard", "time_transfer", "delta_standard_lower_bound",
             "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
             "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "no_n1_encoding", "tighten_n2", "how_much_faster",
+            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "encoding_skip", "tighten_n2", "how_much_faster",
         ]
         if not args.compare_to_with_perturbed:
             _fieldnames += ["gap_standard", "gap_transfer"]
@@ -899,6 +909,8 @@ def main():
                             t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
                         if args.no_n1_encoding_at_all:
                             t_cmd.append("--no_n1_encoding_at_all")
+                        if args.no_n2_xp_encoding:
+                            t_cmd.append("--no_n2_xp_encoding")
                         if args.encode_n1_last_layer:
                             t_cmd.append("--encode_n1_last_layer")
                         if args.n1_last_layer_no_binaries:

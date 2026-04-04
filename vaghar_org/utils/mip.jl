@@ -254,6 +254,100 @@ function mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
 end
 
 # ============================================================
+# Transfer proof WITHOUT encoding N2(x') (--no_n2_xp_encoding)
+#
+# N1(x) and N2(x) are encoded exactly → exact conf_n1_x,
+# conf_n2_x, and delta_diff.
+# N2(x') is replaced by interval-bounded output variables:
+#   N2(x')[k] ∈ [N2(x)[k] + p_lo[k], N2(x)[k] + p_up[k]]
+# where p_lo/p_up are perturbation bounds through N2:
+#   N2(x')[k] - N2(x)[k] ∈ [p_lo[k], p_up[k]]
+# stored in global output_n2_pert_down / output_n2_pert_up.
+#
+# These bounds are computed by compute_diff_and_comp_bounds()
+# or compute_diff_bounds_zonotope() (when --use_zonotope).
+# ============================================================
+function mip_set_transfer_property_no_n2_xp(m, d, delta_1, c_tag, c_target,
+    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding, delta_diff_positive)
+
+    global output_n2_pert_up, output_n2_pert_down
+    p_up = output_n2_pert_up    # N2(x')[k] - N2(x)[k] upper bound
+    p_lo = output_n2_pert_down  # N2(x')[k] - N2(x)[k] lower bound
+
+    n_classes = length(d[:v_out_n2])
+    println("  N2 pert bounds: max width = $(maximum(p_up .- p_lo))")
+    println("  N2 pert bounds per class:")
+    for k in 1:n_classes
+        println("    class $k: p_lo=$(p_lo[k]), p_up=$(p_up[k]), width=$(p_up[k]-p_lo[k])")
+    end
+
+    # ── Confidence margins on clean input (exact binary encoding) ──
+    conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
+    conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
+
+    # ── N1 confident on clean input ──
+    @constraint(m, conf_n1_x >= delta_1 + 1e-3)
+
+    # ── Exact delta_diff = C(N2,x,c) - C(N1,x,c) ──
+    delta_diff = @variable(m, base_name="delta_diff")
+    @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
+    if delta_diff_positive
+        @constraint(m, delta_diff >= 0)
+    else
+        @constraint(m, conf_n2_x >= 0)
+    end
+
+    # ── N1(x') confidence (only when n1_p_mode is on) ──
+    c_pert = c_tag_mode ? c_tag : c_target
+    margin = 1e-3
+
+    if n1_p_mode
+        conf_n1_xp = define_conf!(m, d, c_pert, :v_out_n1_p, "conf_n1_xp")
+    end
+
+    # ── Create interval-bounded output variables for N2(x') ──
+    # N2(x')[k] ∈ [N2(x)[k] + p_lo[k], N2(x)[k] + p_up[k]]
+    v_n2_xp_out = [@variable(m, base_name="n2_xp_out_$k") for k in 1:n_classes]
+    for k in 1:n_classes
+        @constraint(m, v_n2_xp_out[k] >= d[:v_out_n2][k] + p_lo[k])
+        @constraint(m, v_n2_xp_out[k] <= d[:v_out_n2][k] + p_up[k])
+    end
+    d[:v_out_n2_p_interval] = v_n2_xp_out
+
+    # ── Confidence margin of N2 on perturbed input (using interval-bounded outputs) ──
+    if !n2_fewer_binars_encoding || n1_p_mode || c_tag_mode
+        conf_n2_xp = define_conf!(m, d, c_pert, :v_out_n2_p_interval, "conf_n2_xp")
+    end
+
+    # ── Constraint: confidence gap flips under perturbation ──
+    if c_tag_mode
+        if n1_p_mode
+            @constraint(m, conf_n2_xp - conf_n1_xp <= -margin)
+        else
+            @constraint(m, conf_n2_xp <= -margin)
+        end
+    else
+        if n1_p_mode
+            @constraint(m, conf_n2_xp - conf_n1_xp >= margin)
+        else
+            if n2_fewer_binars_encoding
+                for i in eachindex(v_n2_xp_out)
+                    if i == c_target
+                        continue
+                    end
+                    @constraint(m, v_n2_xp_out[c_target] - v_n2_xp_out[i] >= margin)
+                end
+            else
+                @constraint(m, conf_n2_xp >= margin)
+            end
+        end
+    end
+
+    # Objective: maximize delta_diff
+    @objective(m, Max, delta_diff)
+end
+
+# ============================================================
 # No-N1-encoding + encode N1's last layer:
 #   Creates interval-bounded variables for N1's last hidden layer,
 #   linked to N2's encoded hidden layer via diff bounds.

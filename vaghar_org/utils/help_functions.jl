@@ -49,6 +49,7 @@ global n2_preact_down_bounds::Vector   = []
 # Output-layer diff bounds: N2(x)[k] - N1(x)[k] ∈ [output_diff_down[k], output_diff_up[k]]
 # Used to replace the entire N1 encoding with interval-bounded constraints on N2 outputs.
 global no_n1_encoding_at_all::Bool = false
+global no_n2_xp_encoding::Bool = false
 global encode_n1_last_layer::Bool = false
 global n1_last_layer_no_binaries::Bool = false
 global use_zonotope::Bool = false
@@ -226,9 +227,36 @@ function read_best_val_via_optimization(ss, tt, token_signature)
     return value
 end
 
+"""
+    safe_filepath(dir, basename, ext=".txt") -> String
+
+Build a file path ensuring the filename (basename + ext) stays within the
+255-byte Linux filename limit.  When the name is too long, the filename is
+shortened to a hash, and a `<dir>/_filename_legend.txt` file is created
+that maps the hash back to the full original name (so flags are recoverable).
+"""
+function safe_filepath(dir::AbstractString, basename::AbstractString, ext::AbstractString=".txt")
+    max_name = 255 - length(ext)
+    if length(basename) <= max_name
+        return dir * basename * ext
+    end
+    h = string(hash(basename), base=16)  # 16-char hex hash
+    # Keep a recognisable prefix (token + model + mode) then append the hash
+    trunc_len = max_name - length(h) - 1  # 1 for underscore separator
+    short_name = basename[1:trunc_len] * "_" * h
+    # Append to legend file so the full flag string is always recoverable
+    mkpath(dir)
+    legend_path = dir * "_filename_legend.txt"
+    open(legend_path, "a") do f
+        println(f, short_name * ext, " => ", basename * ext)
+    end
+    return dir * short_name * ext
+end
+
 function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_,name_to_save,token_signature)
 
-    file = open(results_path * token_signature*"_"*model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_"*name_to_save*".txt", "w")
+    basename = token_signature*"_"*model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_"*name_to_save
+    file = open(safe_filepath(results_path, basename), "w")
     write(file, results_str)
     close(file)
     try

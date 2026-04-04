@@ -182,6 +182,11 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--no_n2_xp_encoding"
+        help = "Skip N2(x') encoding entirely; replace conf(N2,x',c) with interval-bounded output variables using perturbation bounds through N2. Assumes no_n1_encoding_at_all=false (N1 is fully encoded). Supports --use_zonotope, --refined_relu_zonotope, --zonotope_conv for tighter bounds."
+        arg_type = Bool
+        required = false
+        default = false
         "--encode_n1_last_layer"
         help = "When no_n1_encoding_at_all is active, encode N1's last linear layer exactly using interval-bounded hidden variables; gives exact delta_diff instead of upper bound"
         arg_type = Bool
@@ -361,6 +366,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global relaxation_gap_area = args["relaxation_gap_area"]
     global no_n1_binaries_and_relaxtions_only_on_n2 = args["no_n1_binaries_and_relaxtions_only_on_n2"]
     global no_n1_encoding_at_all = args["no_n1_encoding_at_all"]
+    global no_n2_xp_encoding = args["no_n2_xp_encoding"]
     global encode_n1_last_layer = args["encode_n1_last_layer"]
     global use_zonotope = args["use_zonotope"]
     global refined_relu_zonotope = args["refined_relu_zonotope"]
@@ -373,6 +379,11 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     if no_n1_encoding_at_all
         global no_n1_binaries_and_relaxtions_only_on_n2 = true
         n1_p_mode = false  # can't encode N1(x') without N1
+    end
+    # no_n2_xp_encoding assumes no_n1_encoding_at_all is OFF (N1 fully encoded)
+    if no_n2_xp_encoding && no_n1_encoding_at_all
+        println("WARNING: --no_n2_xp_encoding requires --no_n1_encoding_at_all=false, disabling no_n1_encoding_at_all")
+        global no_n1_encoding_at_all = false
     end
     # encode_n1_last_layer only makes sense with no_n1_encoding_at_all
     if encode_n1_last_layer && !no_n1_encoding_at_all
@@ -462,8 +473,10 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             if use_vaghgarDeps
                 name_to_save = name_to_save * "_VaghgarDeps"
-                # Dependencies for N2: original vs perturbed
-                if no_n1_encoding_at_all
+                # Dependencies for N2: original vs perturbed (requires N2(xp) encoding)
+                if no_n2_xp_encoding
+                    println("Skipping N2 dependencies (--no_n2_xp_encoding, no N2(x') variables)")
+                elseif no_n1_encoding_at_all
                     # N1 not encoded → N2(x) starts at layer 1, N2(x') at K+1
                     perturbation_dependencies(m, nn2, perturbation, perturbation_size, w, h, k;
                                             activation_start=1, layers_offset=K,
@@ -497,11 +510,15 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                 if !no_n1_encoding_at_all
                     perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
                 end
-                perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
+                if !no_n2_xp_encoding
+                    perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
+                else
+                    println("Skipping N2 perturbed interval constraints (--no_n2_xp_encoding)")
+                end
             end
 
-            # Composed interval constraints: I^C linking N1(x) ↔ N2(x_p) directly (requires N1)
-            if args["composed_interval"] && !no_n1_encoding_at_all
+            # Composed interval constraints: I^C linking N1(x) ↔ N2(x_p) directly (requires N1 and N2(xp))
+            if args["composed_interval"] && !no_n1_encoding_at_all && !no_n2_xp_encoding
                 name_to_save = name_to_save * "_ComposedIntervals"
                 println("Adding composed interval constraints (I^C) between N1(x) and N2(x_p)...")
                 composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_size, w, h, k)
@@ -517,7 +534,10 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             #     name_to_save = name_to_save * "_NoN1BinRelaxOnN2only"
             # end
             if no_n1_encoding_at_all
-                name_to_save = name_to_save * "_NoN1Encoding"
+                name_to_save = name_to_save * "_NoN1Enc"
+            end
+            if no_n2_xp_encoding
+                name_to_save = name_to_save * "_NoN2xpEnc"
             end
             if encode_n1_last_layer
                 name_to_save = name_to_save * "_N1LastLayer"
@@ -545,7 +565,11 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
 
             # Set transfer proof constraints and objective
-            if no_n1_encoding_at_all && encode_n1_last_layer
+            if no_n2_xp_encoding
+                mip_set_transfer_property_no_n2_xp(m, d, delta_1, c_tag, c_target,
+                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
+                    args["delta_diff_positive"])
+            elseif no_n1_encoding_at_all && encode_n1_last_layer
                 mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
                     c_tag_mode, n2_fewer_binars_encoding,
                     args["delta_diff_positive"], nn1, n1_last_layer_no_binaries)
@@ -583,9 +607,10 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
 
             name_to_save = name_to_save * "_Therads" * string(Threads_num)
             global Threads_num
-            file = open(results_path * token_signature * "_" * model_name * "_transfer_" *
+            basename = token_signature * "_" * model_name * "_transfer_" *
                         perturbation * "_" * create_perturbation_string(perturbation_size) *
-                        "_ctag" * string(c_tag) * "_" * ct_str * "_" * name_to_save * ".txt", "w")
+                        "_ctag" * string(c_tag) * "_" * ct_str * "_" * name_to_save
+            file = open(safe_filepath(results_path, basename), "w")
             write(file, results.str)
             close(file)
         end
@@ -735,10 +760,11 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
                 name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
             end
         
-            file = open(results_path * token_signature * "_" * model_name * "_" * model_name2 *
+            basename = token_signature * "_" * model_name * "_" * model_name2 *
                         "_transfer_distilation_" *
                         perturbation * "_" * create_perturbation_string(perturbation_size) *
-                        "_ctag" * string(c_tag) * "_" * ct_str * "_" * name_to_save * ".txt", "w")
+                        "_ctag" * string(c_tag) * "_" * ct_str * "_" * name_to_save
+            file = open(safe_filepath(results_path, basename), "w")
             write(file, results.str)
             close(file)
         end
