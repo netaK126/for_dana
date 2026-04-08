@@ -287,7 +287,6 @@ def run_vaghar_transfer(arch, dataset, n1_dir, n2_dir, vaghar_results_file,
         "--use_perturbed_intervals", use_pert_int,
         "--n2_fewer_binars_encoding", "true",
         "--use_relaxations", "true",
-        "--delta_diff_positive", "false",
         "--force_cpu", "true",
         "--relaxation_threshold", str(relaxation_threshold),
     ]

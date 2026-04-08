@@ -51,17 +51,32 @@ global n2_preact_down_bounds::Vector   = []
 global no_n1_encoding_at_all::Bool = false
 global no_n2_xp_encoding::Bool = false
 global encode_n1_last_layer::Bool = false
-global n1_last_layer_no_binaries::Bool = false
+global n1_last_layer_use_box_scalar::Bool = false
+global n1_last_layer_prune_tol::Float64 = 0.0  # threshold: drop h_n1 vars with interval width <= this; 0 = only exact singletons
+global n1_adaptive_prune_budget::Float64 = 0.0  # sensitivity-based pruning budget; 0 = disabled
+global hybrid_solve::Bool = false  # two-phase solve: start with scalar bound, lazily add argmax constraints
 global use_zonotope::Bool = false
 global refined_relu_zonotope::Bool = false
-global sparse_zonotope::Bool = false
-global zonotope_gen_budget::Int = 0  # 0 = disabled; K > 0 = keep top K generators, merge rest
 global zonotope_conv::Bool = false   # activate zonotope propagation through conv layers
-global tighten_n2_bounds::Bool = false  # derive tighter N2 preact bounds from N1 + diff
+global zonotope_max_order::Int = 0   # max zonotope order (generators / neurons); 0 = unlimited
+global bound_n2_relu_using_zonotope::Bool = false  # tighten ReLU preact bounds of N2 by intersecting with N1 preact + zonotope diff
+global n1_stability_relax_threshold::Float64 = -1.0  # transfer-aware: replace N2 binary with triangle LP relaxation when N1 neuron is stable and gap <= threshold; <0 = disabled
+global bound_by_zonotope_n2_hidden_neurons_which_are_not_relu::Bool = false  # add constraints on N2 final-layer logits using N1 output + zonotope diff
 global n2_derived_preact_up_bounds   = []
 global n2_derived_preact_down_bounds = []
+global bound_n2_xp_using_composed::Bool = false  # tighten N2(x') preact bounds using N1 preact + composed bounds to eliminate binaries
+global constrain_n2_xp_via_n1_zonotope::Bool = false  # add conditional constraints linking N2(x') post-ReLU to N2(x)'s binary using perturbation bounds via N1
+global branch_priority_n2x_first::Bool = false  # set Gurobi BranchPriority: N2(x) binaries high, N2(x') low → resolve N2(x) first
+global bound_n2_xp_output_using_composed::Bool = false  # bound N2(x') output logits using N1 output + composed (diff+pert) bounds
+global n2_xp_derived_preact_up_bounds   = []
+global n2_xp_derived_preact_down_bounds = []
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
+# N1 output-layer logit bounds (final linear layer of N1 over admissible inputs).
+# Used by --bound_by_zonotope_n2_hidden_neurons_which_are_not_relu to bound
+# N2's output logits as [n1_out_down + d_lo, n1_out_up + d_hi].
+global n1_output_up_bounds::Vector{Float64}   = Float64[]
+global n1_output_down_bounds::Vector{Float64} = Float64[]
 # Output-level perturbation bounds: N2(x')[k] - N2(x)[k] and N1(x')[k] - N1(x)[k]
 # Used by --constrain_n1_xp to add conf(N1,x',c_target)<=0 constraint.
 global output_n2_pert_up::Vector{Float64}   = Float64[]
@@ -177,6 +192,23 @@ mutable struct FirstMIPSolution
     time::Float64
 end
 first_mip_solution = FirstMIPSolution(-1.0, 0.0)
+
+# ── Hybrid Solve state (lazy argmax for N1 confidence) ─────────────────
+# When hybrid_solve=true, the MIP starts with a scalar lower bound on
+# conf_n1 and no argmax binaries. The callback inspects integer-feasible
+# solutions: if the scalar bound is too loose (actual min-margin >> L),
+# it adds a lazy constraint tightening delta_diff.
+mutable struct HybridSolveState
+    active::Bool
+    v_margin::Vector{Any}       # per-class margin variables (JuMP)
+    delta_diff::Any             # JuMP variable
+    conf_n2_x::Any              # JuMP variable
+    c_tag::Int
+    n_classes::Int
+    L::Float64                  # scalar lower bound (delta_1 + 1e-3)
+    n_cuts_added::Int
+end
+hybrid_solve_state = HybridSolveState(false, [], nothing, nothing, 0, 0, 0.0, 0)
 
 layers_info_dict = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
 
@@ -313,6 +345,24 @@ function get_default_tightening_options(optimizer)::Dict
     end
 end
 
+function set_branch_priority_n2x_first!(m)
+    n_org = 0
+    n_pert = 0
+    for v in JuMP.all_variables(m)
+        if JuMP.is_binary(v)
+            vname = JuMP.name(v)
+            if startswith(vname, "n2_orga")
+                MOI.set(m, Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), 10)
+                n_org += 1
+            elseif startswith(vname, "n2_perta")
+                MOI.set(m, Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), 1)
+                n_pert += 1
+            end
+        end
+    end
+    println("  branch_priority: N2(x) binaries=$n_org (priority=10), N2(x') binaries=$n_pert (priority=1)")
+end
+
 function my_callback(cb_data::Gurobi.CallbackData, where::Int32)
     if where == GRB_CB_MIPSOL
         resultP = Ref{Float64}()
@@ -323,6 +373,8 @@ function my_callback(cb_data::Gurobi.CallbackData, where::Int32)
             first_mip_solution.solution = resultP[]
             first_mip_solution.time = run_time[]
         end
+
+        # (hybrid_solve tightening happens after optimize! in hybrid_solve_phase2!)
     end
 end
 

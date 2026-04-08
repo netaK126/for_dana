@@ -241,7 +241,7 @@ def create_hyper_input(model1, source, trainset, testset, M, dims, device, delta
 def attack_transfer(model1, model2, X, source_, target_, device, token_signature,
                     model_name, dims, delta1, c_tag_mode,
                     type_="linf", size_=[0.05], iterations=500, alpha=0.01,
-                    lambda_0=1.01, K_max=500, model_name2=None, delta_diff_positive=True):
+                    lambda_0=1.01, K_max=500, model_name2=None):
     model1.eval()
     model2.eval()
     M = len(X)
@@ -325,10 +325,7 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
 
         # Feasibility conditions
         feasible = (c_n2_xp>=0) & (c_n1_x >= delta1)
-        if delta_diff_positive:
-            feasible = feasible & (delta_diff_final >= 0)
-        else:
-            feasible = feasible & (c_n2_xp > 0)
+        feasible = feasible & (delta_diff_final >= 0)
         if c_tag_mode:
             feasible = feasible & (gap_pert_final < 0)
         else:
@@ -422,7 +419,6 @@ if __name__ == '__main__':
     parser.add_argument('--itr', type=int, default=500, help='Number of PGD iterations')
     parser.add_argument('--alpha', type=float, default=0.01, help='PGD step size')
     parser.add_argument('--n1_p_mode', type=bool, default=True, help='n1_p_mode')
-    parser.add_argument('--delta_diff_positive', type=bool, default=True, help='force delta_diff to be positive')
     args = parser.parse_args()
     N1_P_VERSION = args.n1_p_mode
     source = int(args.source)
@@ -465,7 +461,7 @@ if __name__ == '__main__':
     best_val = attack_transfer(model1, model2, X, source, target, device,
                                token_signature, model_arch, dims, delta1, c_tag_mode,
                                perturbation_type, perturbation_size, iterations, alpha,
-                               model_name2=model_arch2, delta_diff_positive=args.delta_diff_positive)
+                               model_name2=model_arch2)
 
     print("best_val", best_val.item())
     with open("/tmp/best_val_" + str(source) + "_" + str(target) + "_" + str(token_signature) + ".txt", "w") as f:

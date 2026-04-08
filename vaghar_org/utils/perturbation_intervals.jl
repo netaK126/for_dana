@@ -1186,6 +1186,8 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     global output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
     global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
     println("compute_diff_and_comp_bounds: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
+    global n1_output_up_bounds   = vec(copy(Float64.(n1_pre_up_cur)))
+    global n1_output_down_bounds = vec(copy(Float64.(n1_pre_down_cur)))
 
     # Save output-level N2 perturbation bounds: N2(x')[k] - N2(x)[k]
     global output_n2_pert_up   = vec(copy(Float64.(pert_up)))
@@ -1225,24 +1227,6 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     println("compute_diff_and_comp_bounds: N2 pert bounds width = $(maximum(output_n2_pert_up .- output_n2_pert_down))")
 
     println("compute_diff_and_comp_bounds: populated $(length(relu_diff_up_bounds)) ReLU layers")
-end
-
-# ── Generator reduction ─────────────────────────────────────────────────
-# Keep top K generators by L1 column norm; merge the rest into one
-# bounding-box column.  Returns the reduced generator matrix.
-function reduce_generators(G::Matrix{Float64}, K::Int)
-    p = size(G, 2)
-    if K <= 0 || p <= K
-        return G
-    end
-    norms = vec(sum(abs.(G), dims=1))          # L1 norm per column
-    perm = sortperm(norms, rev=true)           # largest first
-    keep = perm[1:K]
-    drop = perm[K+1:end]
-    G_keep = G[:, keep]
-    # Merged generator: r_i = Σ_j |G_drop[i,j]|
-    r = vec(sum(abs.(G[:, drop]), dims=2))
-    return hcat(G_keep, reshape(r, :, 1))      # K+1 columns
 end
 
 # ── Conv2d applied to zonotope generators ───────────────────────────────
@@ -1295,6 +1279,32 @@ function conv2d_zonotope(center_4d::Array{Float64,4}, gens::Matrix{Float64},
     return out_center, out_gens, out_shape
 end
 
+# ── Zonotope generator reduction (order reduction) ────────────────────
+# When the number of generators exceeds `max_order * n_neurons`, merge the
+# least-important generators into a single axis-aligned (diagonal) box.
+# This keeps bounds strictly tighter than pure interval arithmetic while
+# bounding the generator matrix size.  Sound by construction: the reduced
+# zonotope contains the original zonotope.
+function reduce_zonotope_generators(gens::Matrix{Float64}, max_order::Int)
+    n, m = size(gens)
+    budget = max_order * n
+    if m <= budget
+        return gens          # nothing to reduce
+    end
+    # Importance of each generator column = its L1 norm (total bound contribution)
+    col_norms = vec(sum(abs.(gens), dims=1))
+    # Keep the top-`budget` generators by importance
+    keep_idx = partialsortperm(col_norms, (m - budget + 1):m, rev=false)
+    # `partialsortperm` with rev=false gives indices of the `budget` largest
+    # values when slicing the top portion.  We want the largest norms, so:
+    keep_set = Set(partialsortperm(col_norms, 1:budget, rev=true))
+    discard_mask = [!(j in keep_set) for j in 1:m]
+    # Merge discarded generators into per-neuron diagonal contribution
+    diag_vals = vec(sum(abs.(gens[:, discard_mask]), dims=2))
+    reduced = hcat(gens[:, sort(collect(keep_set))], diagm(diag_vals))
+    return reduced
+end
+
 # ── Zonotope-based diff bound propagation ──────────────────────────────
 # Same interface as compute_diff_and_comp_bounds but uses zonotope (affine
 # arithmetic) for the diff propagation through FC layers. Zonotope activates
@@ -1332,9 +1342,6 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     zono_active = false
     diff_center = Float64[]
     diff_gens = Matrix{Float64}(undef, 0, 0)
-    # Sparse zonotope: split into correlated (dense matrix) + independent (diagonal vector)
-    diff_gens_corr = Matrix{Float64}(undef, 0, 0)
-    diff_gens_diag = Float64[]
     # 4D shape of generators when zonotope is active during conv layers
     zono_4d_shape = (0, 0, 0, 0)
 
@@ -1358,20 +1365,15 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                 # (generators are already stored as flat columns in the matrix)
                 diff_center = vec(diff_center)
                 zono_4d_shape = (0, 0, 0, 0)  # no longer 4D
-                println("  Zonotope: Flatten (already active), $(length(diff_center)) dims, $(sparse_zonotope ? "$(size(diff_gens_corr, 2)) correlated + $(length(diff_gens_diag)) diagonal" : "$(size(diff_gens, 2))") generators")
+                println("  Zonotope: Flatten (already active), $(length(diff_center)) dims, $(size(diff_gens, 2)) generators")
             else
                 # Convert diff intervals to zonotope
                 n = length(diff_up)
                 diff_center = (diff_up .+ diff_down) ./ 2
                 diff_radius = (diff_up .- diff_down) ./ 2
-                if sparse_zonotope
-                    diff_gens_corr = Matrix{Float64}(undef, n, 0)
-                    diff_gens_diag = diff_radius
-                else
-                    diff_gens = diagm(diff_radius)
-                end
+                diff_gens = diagm(diff_radius)
                 zono_active = true
-                println("  Zonotope: activated at Flatten, $n dims, $n initial generators$(sparse_zonotope ? " (sparse)" : "")")
+                println("  Zonotope: activated at Flatten, $n dims, $n initial generators")
             end
 
         elseif occursin("Linear", string(typeof(l)))
@@ -1387,14 +1389,9 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                 n = length(diff_up)
                 diff_center = (diff_up .+ diff_down) ./ 2
                 diff_radius = (diff_up .- diff_down) ./ 2
-                if sparse_zonotope
-                    diff_gens_corr = Matrix{Float64}(undef, n, 0)
-                    diff_gens_diag = diff_radius
-                else
-                    diff_gens = diagm(diff_radius)
-                end
+                diff_gens = diagm(diff_radius)
                 zono_active = true
-                println("  Zonotope: activated at Linear (FC network), $n dims$(sparse_zonotope ? " (sparse)" : "")")
+                println("  Zonotope: activated at Linear (FC network), $n dims")
             end
 
             if zono_active
@@ -1404,51 +1401,20 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
 
                 new_center = W2 * diff_center .+ ΔW * n1_center .+ Δb
 
-                if sparse_zonotope
-                    m_out = size(W2, 1)
-                    # Correlated: W2 * existing correlated generators
-                    new_corr = W2 * diff_gens_corr
-                    # Diagonal → dense: W2 * diag(g_diag) = column-scaling of W2
-                    # Only include columns for non-zero diagonal entries
-                    nz_diag = findall(!iszero, diff_gens_diag)
-                    if !isempty(nz_diag)
-                        diag_as_dense = W2[:, nz_diag] .* diff_gens_diag[nz_diag]'
-                    else
-                        diag_as_dense = Matrix{Float64}(undef, m_out, 0)
-                    end
-                    # Independent part from n1 intervals: ΔW * diag(n1_radius) = column-scaling of ΔW
-                    nz_n1 = findall(!iszero, n1_radius)
-                    if !isempty(nz_n1)
-                        n1_indep = ΔW[:, nz_n1] .* n1_radius[nz_n1]'
-                    else
-                        n1_indep = Matrix{Float64}(undef, m_out, 0)
-                    end
-                    # After linear layer, all generators become correlated; diagonal is empty
-                    diff_gens_corr = hcat(new_corr, diag_as_dense, n1_indep)
-                    if zonotope_gen_budget > 0
-                        diff_gens_corr = reduce_generators(diff_gens_corr, zonotope_gen_budget)
-                    end
-                    diff_gens_diag = zeros(m_out)
-                    diff_center = new_center
-                    # Update interval bounds
-                    abs_sum = vec(sum(abs.(diff_gens_corr), dims=2))
-                    diff_up   = diff_center .+ abs_sum
-                    diff_down = diff_center .- abs_sum
-                else
-                    # Correlated part: preserve existing generators
-                    new_gens_corr = W2 * diff_gens
-                    # Independent part: ΔW * n1_radius (new generators from n1 intervals)
-                    new_gens_indep = ΔW * diagm(n1_radius)
-                    diff_gens = hcat(new_gens_corr, new_gens_indep)
-                    if zonotope_gen_budget > 0
-                        diff_gens = reduce_generators(diff_gens, zonotope_gen_budget)
-                    end
-                    diff_center = new_center
-                    # Update interval bounds from zonotope
-                    abs_sum = vec(sum(abs.(diff_gens), dims=2))
-                    diff_up   = diff_center .+ abs_sum
-                    diff_down = diff_center .- abs_sum
+                # Correlated part: preserve existing generators
+                new_gens_corr = W2 * diff_gens
+                # Independent part: ΔW * n1_radius (new generators from n1 intervals)
+                new_gens_indep = ΔW * diagm(n1_radius)
+                diff_gens = hcat(new_gens_corr, new_gens_indep)
+                diff_center = new_center
+                # Generator reduction after linear layer
+                if zonotope_max_order > 0
+                    diff_gens = reduce_zonotope_generators(diff_gens, zonotope_max_order)
                 end
+                # Update interval bounds from zonotope
+                abs_sum = vec(sum(abs.(diff_gens), dims=2))
+                diff_up   = diff_center .+ abs_sum
+                diff_down = diff_center .- abs_sum
             else
                 # Interval propagation for conv layers
                 r1_min, r1_max = interval_matrix_vector_multiplication(ΔW, ΔW, n1_act_down, n1_act_up)
@@ -1487,15 +1453,10 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                     n_flat = prod(in_shape)
                     diff_center = (vec(diff_4d_up) .+ vec(diff_4d_down)) ./ 2
                     diff_radius = (vec(diff_4d_up) .- vec(diff_4d_down)) ./ 2
-                    if sparse_zonotope
-                        diff_gens_corr = Matrix{Float64}(undef, n_flat, 0)
-                        diff_gens_diag = diff_radius
-                    else
-                        diff_gens = diagm(diff_radius)
-                    end
+                    diff_gens = diagm(diff_radius)
                     zono_active = true
                     zono_4d_shape = in_shape
-                    println("  Zonotope: activated at Conv (layer $layer_idx), shape=$in_shape, $(n_flat) initial generators$(sparse_zonotope ? " (sparse)" : "")")
+                    println("  Zonotope: activated at Conv (layer $layer_idx), shape=$in_shape, $(n_flat) initial generators")
                 end
 
                 # Zonotope conv propagation: diff = ΔF*n1 + F2*diff_prev + Δb
@@ -1507,7 +1468,7 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                 # Convolve center: F2 * diff_center + ΔF * n1_center + Δb
                 diff_center_4d = reshape(diff_center, in_shape)
                 _, f2_diff_gens, out_shape = conv2d_zonotope(diff_center_4d,
-                    sparse_zonotope ? diff_gens_corr : diff_gens,
+                    diff_gens,
                     F2, Δb, in_shape, l.stride, l.padding)
                 # Center = F2 * diff_center + ΔF * n1_center + Δb
                 out_center_f2 = zeros(Float64, out_shape)
@@ -1535,34 +1496,22 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                     diagm(vec(n1_radius_4d)),
                     ΔF, zeros(Float64, length(Δb)), size(n1_4d_down), l.stride, l.padding)
 
-                if sparse_zonotope
-                    diff_gens_corr = hcat(f2_diff_gens, df_n1_gens)
-                    diff_gens_diag = zeros(prod(out_shape))
-                    if zonotope_gen_budget > 0
-                        diff_gens_corr = reduce_generators(diff_gens_corr, zonotope_gen_budget)
-                    end
-                else
-                    diff_gens = hcat(f2_diff_gens, df_n1_gens)
-                    if zonotope_gen_budget > 0
-                        diff_gens = reduce_generators(diff_gens, zonotope_gen_budget)
-                    end
-                end
+                diff_gens = hcat(f2_diff_gens, df_n1_gens)
                 diff_center = new_center
                 zono_4d_shape = out_shape
+                # Generator reduction after conv layer
+                if zonotope_max_order > 0
+                    diff_gens = reduce_zonotope_generators(diff_gens, zonotope_max_order)
+                end
 
                 # Update interval bounds from zonotope
-                if sparse_zonotope
-                    abs_sum = vec(sum(abs.(diff_gens_corr), dims=2)) .+ abs.(diff_gens_diag)
-                else
-                    abs_sum = vec(sum(abs.(diff_gens), dims=2))
-                end
+                abs_sum = vec(sum(abs.(diff_gens), dims=2))
                 diff_up_flat = diff_center .+ abs_sum
                 diff_down_flat = diff_center .- abs_sum
                 diff_up   = reshape(diff_up_flat, out_shape)
                 diff_down = reshape(diff_down_flat, out_shape)
 
-                n_gens = sparse_zonotope ? size(diff_gens_corr, 2) : size(diff_gens, 2)
-                println("  Zonotope Conv: output shape=$out_shape, $n_gens generators, max diff width = $(maximum(diff_up .- diff_down))")
+                println("  Zonotope Conv: output shape=$out_shape, $(size(diff_gens, 2)) generators, max diff width = $(maximum(diff_up .- diff_down))")
             else
                 # Interval arithmetic for conv layers (original path)
                 diff_4d_down = ndims(diff_down) == 4 ? diff_down : reshape(diff_down, 1, :, 1, 1)
@@ -1599,177 +1548,101 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
             if zono_active
                 n = length(diff_center)
 
-                if sparse_zonotope
-                    # Sparse: extend diag to n entries (may be shorter if from previous layer)
-                    if length(diff_gens_diag) < n
-                        diff_gens_diag = vcat(diff_gens_diag, zeros(n - length(diff_gens_diag)))
-                    end
-                    # Save old diagonal: at split neurons, the λ-scaled old diagonal
-                    # entry is a distinct noise symbol from the new μ, so it must
-                    # become a correlated column.
-                    old_diag = copy(diff_gens_diag)
-                    promoted_cols = Vector{Float64}[]  # λ-scaled old diag entries → correlated
+                new_gen_cols = Vector{Float64}[]
 
-                    for i in 1:n
-                        l_d = diff_down[i]
-                        u_d = diff_up[i]
+                for i in 1:n
+                    l_d = diff_down[i]
+                    u_d = diff_up[i]
 
-                        l_n1 = 0.0; u_n1 = 0.0; l_n2 = 0.0; u_n2 = 0.0
-                        if optimizing_intervals || refined_relu_zonotope
-                            l_n1 = n1_pre_down_cur[i]
-                            u_n1 = n1_pre_up_cur[i]
-                            l_n2 = l_n1 + diff_down[i]
-                            u_n2 = u_n1 + diff_up[i]
-                        end
-
-                        if optimizing_intervals
-                            if l_n1 >= 0 && l_n2 >= 0
-                                continue
-                            elseif u_n1 <= 0 && u_n2 <= 0
-                                diff_center[i] = 0.0
-                                diff_gens_corr[i, :] .= 0.0
-                                diff_gens_diag[i] = 0.0
-                                continue
-                            end
-                        end
-
-                        if l_d >= 0
-                            # pass through
-                        elseif u_d <= 0
-                            diff_center[i] = 0.0
-                            diff_gens_corr[i, :] .= 0.0
-                            diff_gens_diag[i] = 0.0
-                        else
-                            # Determine effective_l_d based on refined analysis
-                            eff_l_d = l_d
-                            if refined_relu_zonotope && l_n1 >= 0 && l_n2 < 0
-                                eff_l_d = max(l_d, -u_n1)
-                                if eff_l_d >= 0
-                                    continue
-                                end
-                            elseif refined_relu_zonotope && l_n2 >= 0 && l_n1 < 0
-                                eff_l_d = l_n2
-                                if eff_l_d >= 0
-                                    continue
-                                end
-                            end
-                            λ = u_d / (u_d - eff_l_d)
-                            μ = -u_d * eff_l_d / (2.0 * (u_d - eff_l_d))
-                            diff_center[i] = λ * diff_center[i] + μ
-                            diff_gens_corr[i, :] .*= λ
-                            # Promote λ-scaled old diagonal to correlated column
-                            if old_diag[i] != 0.0
-                                col = zeros(n)
-                                col[i] = λ * old_diag[i]
-                                push!(promoted_cols, col)
-                            end
-                            diff_gens_diag[i] = μ  # new independent generator
-                        end
+                    # Compute N1/N2 pre-activation bounds when needed by
+                    # optimizing_intervals or refined_relu_zonotope
+                    l_n1 = 0.0; u_n1 = 0.0; l_n2 = 0.0; u_n2 = 0.0
+                    if optimizing_intervals || refined_relu_zonotope
+                        l_n1 = n1_pre_down_cur[i]
+                        u_n1 = n1_pre_up_cur[i]
+                        l_n2 = l_n1 + diff_down[i]
+                        u_n2 = u_n1 + diff_up[i]
                     end
 
-                    # Add promoted diagonal entries as correlated columns
-                    if !isempty(promoted_cols)
-                        diff_gens_corr = hcat(diff_gens_corr, hcat(promoted_cols...))
-                    end
-                    if zonotope_gen_budget > 0
-                        diff_gens_corr = reduce_generators(diff_gens_corr, zonotope_gen_budget)
-                    end
-
-                    # Update interval bounds from sparse zonotope
-                    abs_sum = vec(sum(abs.(diff_gens_corr), dims=2)) .+ abs.(diff_gens_diag)
-                    diff_up   = diff_center .+ abs_sum
-                    diff_down = diff_center .- abs_sum
-                    println("  Zonotope ReLU (sparse): $(size(diff_gens_corr, 2)) correlated + $n diagonal generators, max diff width = $(maximum(diff_up .- diff_down))")
-                else
-                    new_gen_cols = Vector{Float64}[]
-
-                    for i in 1:n
-                        l_d = diff_down[i]
-                        u_d = diff_up[i]
-
-                        # Compute N1/N2 pre-activation bounds when needed by
-                        # optimizing_intervals or refined_relu_zonotope
-                        l_n1 = 0.0; u_n1 = 0.0; l_n2 = 0.0; u_n2 = 0.0
-                        if optimizing_intervals || refined_relu_zonotope
-                            l_n1 = n1_pre_down_cur[i]
-                            u_n1 = n1_pre_up_cur[i]
-                            l_n2 = l_n1 + diff_down[i]
-                            u_n2 = u_n1 + diff_up[i]
-                        end
-
-                        if optimizing_intervals
-                            if l_n1 >= 0 && l_n2 >= 0
-                                # Both active: diff passes through
-                                continue
-                            elseif u_n1 <= 0 && u_n2 <= 0
-                                # Both inactive: diff = 0
-                                diff_center[i] = 0.0
-                                diff_gens[i, :] .= 0.0
-                                continue
-                            end
-                        end
-
-                        # Mixed case: apply DeepZ relaxation to diff
-                        if l_d >= 0
-                            # Diff always non-negative: pass through
-                        elseif u_d <= 0
-                            # Diff always non-positive: clip to 0
+                    if optimizing_intervals
+                        if l_n1 >= 0 && l_n2 >= 0
+                            # Both active: diff passes through
+                            continue
+                        elseif u_n1 <= 0 && u_n2 <= 0
+                            # Both inactive: diff = 0
                             diff_center[i] = 0.0
                             diff_gens[i, :] .= 0.0
-                        elseif refined_relu_zonotope && l_n1 >= 0 && l_n2 < 0
-                            # Refined sub-case A: N1 stable-active, N2 split.
-                            effective_l_d = max(l_d, -u_n1)
-                            if effective_l_d >= 0
-                                continue
-                            end
-                            λ = u_d / (u_d - effective_l_d)
-                            μ = -u_d * effective_l_d / (2.0 * (u_d - effective_l_d))
-                            diff_center[i] = λ * diff_center[i] + μ
-                            diff_gens[i, :] .*= λ
-                            new_col = zeros(n)
-                            new_col[i] = μ
-                            push!(new_gen_cols, new_col)
-                        elseif refined_relu_zonotope && l_n2 >= 0 && l_n1 < 0
-                            # Refined sub-case B: N1 split, N2 stable-active.
-                            effective_l_d = l_n2
-                            if effective_l_d >= 0
-                                continue
-                            end
-                            λ = u_d / (u_d - effective_l_d)
-                            μ = -u_d * effective_l_d / (2.0 * (u_d - effective_l_d))
-                            diff_center[i] = λ * diff_center[i] + μ
-                            diff_gens[i, :] .*= λ
-                            new_col = zeros(n)
-                            new_col[i] = μ
-                            push!(new_gen_cols, new_col)
-                        else
-                            # Both split: generic DeepZ — λ * z + μ ± μ * ε_new
-                            λ = u_d / (u_d - l_d)
-                            μ = -u_d * l_d / (2.0 * (u_d - l_d))
-                            diff_center[i] = λ * diff_center[i] + μ
-                            diff_gens[i, :] .*= λ
-                            # New generator for this neuron
-                            new_col = zeros(n)
-                            new_col[i] = μ
-                            push!(new_gen_cols, new_col)
+                            continue
                         end
                     end
 
-                    # Add new generator columns
-                    if !isempty(new_gen_cols)
-                        new_gens_matrix = hcat(new_gen_cols...)
-                        diff_gens = hcat(diff_gens, new_gens_matrix)
+                    # Mixed case: apply DeepZ relaxation to diff
+                    if l_d >= 0
+                        # Diff always non-negative: pass through
+                    elseif u_d <= 0
+                        # Diff always non-positive: clip to 0
+                        diff_center[i] = 0.0
+                        diff_gens[i, :] .= 0.0
+                    elseif refined_relu_zonotope && l_n1 >= 0 && l_n2 < 0
+                        # Refined sub-case A: N1 stable-active, N2 split.
+                        effective_l_d = max(l_d, -u_n1)
+                        if effective_l_d >= 0
+                            continue
+                        end
+                        λ = u_d / (u_d - effective_l_d)
+                        μ = -u_d * effective_l_d / (2.0 * (u_d - effective_l_d))
+                        diff_center[i] = λ * diff_center[i] + μ
+                        diff_gens[i, :] .*= λ
+                        new_col = zeros(n)
+                        new_col[i] = μ
+                        push!(new_gen_cols, new_col)
+                    elseif refined_relu_zonotope && l_n2 >= 0 && l_n1 < 0
+                        # Refined sub-case B: N1 split, N2 stable-active.
+                        effective_l_d = l_n2
+                        if effective_l_d >= 0
+                            continue
+                        end
+                        λ = u_d / (u_d - effective_l_d)
+                        μ = -u_d * effective_l_d / (2.0 * (u_d - effective_l_d))
+                        diff_center[i] = λ * diff_center[i] + μ
+                        diff_gens[i, :] .*= λ
+                        new_col = zeros(n)
+                        new_col[i] = μ
+                        push!(new_gen_cols, new_col)
+                    else
+                        # Both split: generic DeepZ — λ * z + μ ± μ * ε_new
+                        λ = u_d / (u_d - l_d)
+                        μ = -u_d * l_d / (2.0 * (u_d - l_d))
+                        diff_center[i] = λ * diff_center[i] + μ
+                        diff_gens[i, :] .*= λ
+                        # New generator for this neuron
+                        new_col = zeros(n)
+                        new_col[i] = μ
+                        push!(new_gen_cols, new_col)
                     end
-                    if zonotope_gen_budget > 0
-                        diff_gens = reduce_generators(diff_gens, zonotope_gen_budget)
-                    end
-
-                    # Update interval bounds from zonotope
-                    abs_sum = vec(sum(abs.(diff_gens), dims=2))
-                    diff_up   = diff_center .+ abs_sum
-                    diff_down = diff_center .- abs_sum
-                    println("  Zonotope ReLU: $(size(diff_gens, 2)) generators, max diff width = $(maximum(diff_up .- diff_down))")
                 end
+
+                # Add new generator columns
+                if !isempty(new_gen_cols)
+                    new_gens_matrix = hcat(new_gen_cols...)
+                    diff_gens = hcat(diff_gens, new_gens_matrix)
+                end
+
+                # Generator reduction: cap zonotope order to limit bound loosening
+                if zonotope_max_order > 0
+                    n_before = size(diff_gens, 2)
+                    diff_gens = reduce_zonotope_generators(diff_gens, zonotope_max_order)
+                    n_after = size(diff_gens, 2)
+                    if n_after < n_before
+                        println("  Zonotope order reduction: $n_before → $n_after generators (max_order=$zonotope_max_order)")
+                    end
+                end
+
+                # Update interval bounds from zonotope
+                abs_sum = vec(sum(abs.(diff_gens), dims=2))
+                diff_up   = diff_center .+ abs_sum
+                diff_down = diff_center .- abs_sum
+                println("  Zonotope ReLU: $(size(diff_gens, 2)) generators, max diff width = $(maximum(diff_up .- diff_down))")
             else
                 # Interval clipping (same as compute_diff_and_comp_bounds)
                 if optimizing_intervals
@@ -1821,13 +1694,11 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     global output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
     global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
     println("compute_diff_bounds_zonotope: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
+    global n1_output_up_bounds   = vec(copy(Float64.(n1_pre_up_cur)))
+    global n1_output_down_bounds = vec(copy(Float64.(n1_pre_down_cur)))
 
     if zono_active
-        if sparse_zonotope
-            println("  Final zonotope (sparse): $(size(diff_gens_corr, 2)) correlated + $(length(diff_gens_diag)) diagonal generators")
-        else
-            println("  Final zonotope: $(size(diff_gens, 2)) generators")
-        end
+        println("  Final zonotope: $(size(diff_gens, 2)) generators")
     end
 
     # Save N2 output pert bounds
@@ -2085,4 +1956,6 @@ function compute_output_diff_bounds_only(nn1, nn2)
     output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
     output_diff_down_bounds = vec(copy(Float64.(diff_down)))
     println("compute_output_diff_bounds_only: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
+    global n1_output_up_bounds   = vec(copy(Float64.(pre_up)))
+    global n1_output_down_bounds = vec(copy(Float64.(pre_down)))
 end

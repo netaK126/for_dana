@@ -37,7 +37,7 @@ end
 function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
                                model_name, model_path, model_path2,
                                perturbation, perturbation_size,
-                               delta_1, c_tag_mode, n1_p_mode, delta_diff_positive;
+                               delta_1, c_tag_mode, n1_p_mode;
                                force_cpu::Bool=false)
     best_feasible_via_optimization = 0
     pre_time = 0
@@ -54,8 +54,7 @@ function hyper_attack_transfer(dataset, c_tag, c_target, token_signature,
             "--perturbation_size", create_perturbation_string(perturbation_size),
             "--delta1", string(delta_1),
             "--c_tag_mode", string(c_tag_mode),
-            "--n1_p_mode", string(n1_p_mode),
-            "--delta_diff_positive", string(delta_diff_positive)]
+            "--n1_p_mode", string(n1_p_mode)]
         if force_cpu
             push!(cmd_args, "--cpu")
         end

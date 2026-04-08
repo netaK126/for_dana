@@ -183,7 +183,7 @@ function parse_commandline()
         required = false
         default = false
         "--no_n2_xp_encoding"
-        help = "Skip N2(x') encoding entirely; replace conf(N2,x',c) with interval-bounded output variables using perturbation bounds through N2. Assumes no_n1_encoding_at_all=false (N1 is fully encoded). Supports --use_zonotope, --refined_relu_zonotope, --zonotope_conv for tighter bounds."
+        help = "Skip N2(x') encoding entirely; replace conf(N2,x',c) with interval-bounded output variables using perturbation bounds through N2. Assumes no_n1_encoding_at_all=false (N1 is fully encoded). Supports --use_zonotope for tighter bounds."
         arg_type = Bool
         required = false
         default = false
@@ -192,8 +192,43 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--n1_last_layer_use_box_scalar"
+        help = "When encode_n1_last_layer is active, replace the argmax encoding of conf_n1 with a precomputed scalar lower bound L derived from the last-hidden box B and N1's last-layer weights. Drops the C-1 argmax binaries on the N1 side; sound upper bound on delta_diff. See neta-s-paper/sections/sec_no_n1_soundness_analysis.tex."
+        arg_type = Bool
+        required = false
+        default = false
         "--n1_last_layer_no_binaries"
-        help = "When encode_n1_last_layer is active, use pre-computed scalar lower bound on conf_n1 instead of binary max encoding; zero extra binaries, sound upper bound on delta_diff"
+        help = "DEPRECATED alias for --n1_last_layer_use_box_scalar. Will be removed; use the new name."
+        arg_type = Bool
+        required = false
+        default = false
+        "--n1_last_layer_prune_tol"
+        help = "When encode_n1_last_layer is active: drop h_n1 variables whose zonotope interval width <= this threshold and substitute worst-case constants. Reduces LP size at the cost of some over-approximation. 0.0 = only exact singletons pruned (lossless)."
+        arg_type = Float64
+        required = false
+        default = 0.0
+        "--n1_adaptive_prune_budget"
+        help = "Sensitivity-based adaptive pruning budget. When > 0, replaces fixed-threshold pruning: scores each neuron by max_k|W[c,j]-W[k,j]| * interval_width and prunes lowest-scoring neurons until cumulative error exceeds this budget. 0.0 = disabled."
+        arg_type = Float64
+        required = false
+        default = 0.0
+        "--zonotope_max_order"
+        help = "Maximum zonotope order (generators per neuron) for generator reduction. After each layer, if generators exceed max_order * n_neurons, the least important generators are merged into a diagonal box. 0 = unlimited (no reduction)."
+        arg_type = Int
+        required = false
+        default = 0
+        "--hybrid_solve"
+        help = "Two-phase solve: Phase 1 uses scalar lower bound on conf_n1 (fast, no argmax binaries). Phase 2 inspects the solution and adds a tighter constraint for the identified min-margin class, then re-solves with remaining time budget."
+        arg_type = Bool
+        required = false
+        default = false
+        "--n1_stability_relax_threshold"
+        help = "Transfer-aware: for N2 split neurons where N1 is stable (always active or inactive), replace binary with triangle LP relaxation if gap area <= threshold. -1 = disabled. 0 = only exact-zero gaps. Sound: delta_diff >= exact."
+        arg_type = Float64
+        required = false
+        default = -1.0
+        "--branch_priority_n2x_first"
+        help = "Set Gurobi BranchPriority so N2(x) binaries are resolved before N2(x'). Transfer-only: exploits the dependency structure where N2(x') activations follow from N2(x)."
         arg_type = Bool
         required = false
         default = false
@@ -203,40 +238,35 @@ function parse_commandline()
         required = false
         default = false
         "--use_zonotope"
-        help = "Use zonotope (affine arithmetic) instead of interval arithmetic for diff bound propagation; tighter bounds by tracking correlations between neurons"
+        help = "Use zonotope (affine arithmetic) instead of interval arithmetic for diff bound propagation; tighter bounds by tracking correlations between neurons. Activates at the first conv layer (if any) and propagates through all subsequent layers. Includes the refined-ReLU case split for free."
         arg_type = Bool
         required = false
         default = false
-        "--refined_relu_zonotope"
-        help = "Refined ReLU case analysis in zonotope propagation: when one network is stable-active and the other is split, use tighter sub-case bounds instead of generic DeepZ; reduces generator count and bound width at zero extra cost (requires --use_zonotope true)"
+        "--bound_n2_relu_using_zonotope"
+        help = "Tighten ReLU pre-activation bounds of N2(x) and N2(x') by intersecting them with N1 preact + zonotope diff bounds; can flip split neurons to stable, eliminating binary variables (requires diff bounds to be computed)."
         arg_type = Bool
         required = false
         default = false
-        "--sparse_zonotope"
-        help = "Sparse generator representation: split generators into dense correlated matrix and diagonal independent vector; same bounds, less computation (requires --use_zonotope true)"
+        "--bound_n2_xp_using_composed"
+        help = "Tighten N2(x') pre-activation bounds using N1 preact + composed bounds (diff + pert). Eliminates N2(x') binary variables where the tighter bounds prove the neuron is stable. Transfer-only, sound."
         arg_type = Bool
         required = false
         default = false
-        "--zonotope_gen_budget"
-        help = "Generator reduction budget K: after each layer, keep top K generators by L1 norm and merge the rest into one bounding-box generator; 0 = disabled (requires --use_zonotope true)"
-        arg_type = Int
-        required = false
-        default = 0
-        "--zonotope_conv"
-        help = "Propagate zonotope through convolutional layers (exact for linear conv, DeepZ for ReLU); activates zonotope at first Conv instead of Flatten (requires --use_zonotope true)"
+        "--constrain_n2_xp_via_n1_zonotope"
+        help = "Add conditional constraints linking N2(x') post-ReLU to N2(x)'s binary using perturbation bounds derived via N1 zonotope. Tightens LP relaxation for faster solving. Sound, transfer-only."
         arg_type = Bool
         required = false
         default = false
-        "--tighten_n2_bounds"
-        help = "Derive tighter N2 pre-activation bounds from N1 + diff bounds; can flip split neurons to stable, eliminating binary variables (requires diff bounds to be computed)"
+        "--bound_n2_xp_output_using_composed"
+        help = "Bound N2(x') output logits using N1 output + composed bounds (diff + pert). Tightens the fooling constraint feasible region. Sound, transfer-only."
         arg_type = Bool
         required = false
         default = false
-        "--delta_diff_positive"
-        help = "force delta_diff to be positive."
+        "--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu"
+        help = "Add explicit per-class upper/lower-bound constraints on the final-layer logits of N2(x) using (N1_output ± diff bounds). Complements --bound_n2_relu_using_zonotope, which only tightens pre-ReLU neurons."
         arg_type = Bool
         required = false
-        default = true
+        default = false
         "--force_cpu"
         help = "force CPU-only mode for hyper attack (no GPU)"
         arg_type = Bool
@@ -369,11 +399,15 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     global no_n2_xp_encoding = args["no_n2_xp_encoding"]
     global encode_n1_last_layer = args["encode_n1_last_layer"]
     global use_zonotope = args["use_zonotope"]
-    global refined_relu_zonotope = args["refined_relu_zonotope"]
-    global sparse_zonotope = args["sparse_zonotope"]
-    global zonotope_gen_budget = args["zonotope_gen_budget"]
-    global zonotope_conv = args["zonotope_conv"]
-    global tighten_n2_bounds = args["tighten_n2_bounds"]
+    # Zonotope propagation through conv layers and refined-ReLU case split
+    # are both implied by --use_zonotope (pure-upside, zero extra cost).
+    global zonotope_conv = use_zonotope
+    global refined_relu_zonotope = use_zonotope
+    global bound_n2_relu_using_zonotope = args["bound_n2_relu_using_zonotope"]
+    global bound_n2_xp_using_composed = args["bound_n2_xp_using_composed"]
+    global bound_n2_xp_output_using_composed = args["bound_n2_xp_output_using_composed"]
+    global constrain_n2_xp_via_n1_zonotope = args["constrain_n2_xp_via_n1_zonotope"]
+    global bound_by_zonotope_n2_hidden_neurons_which_are_not_relu = args["bound_by_zonotope_n2_hidden_neurons_which_are_not_relu"]
     # no_n1_encoding_at_all implies no_n1_binaries_and_relaxtions_only_on_n2
     # (N1 isn't encoded, so N2(x') must be relaxed onto N2(x) instead of N1)
     if no_n1_encoding_at_all
@@ -390,11 +424,37 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
         println("WARNING: --encode_n1_last_layer ignored (requires --no_n1_encoding_at_all)")
         global encode_n1_last_layer = false
     end
-    global n1_last_layer_no_binaries = args["n1_last_layer_no_binaries"]
-    if n1_last_layer_no_binaries && !encode_n1_last_layer
-        println("WARNING: --n1_last_layer_no_binaries ignored (requires --encode_n1_last_layer)")
-        global n1_last_layer_no_binaries = false
+    # Accept both the new name and the deprecated alias; warn if old is used.
+    global n1_last_layer_use_box_scalar = args["n1_last_layer_use_box_scalar"] || args["n1_last_layer_no_binaries"]
+    if args["n1_last_layer_no_binaries"] && !args["n1_last_layer_use_box_scalar"]
+        println("WARNING: --n1_last_layer_no_binaries is deprecated; use --n1_last_layer_use_box_scalar instead.")
     end
+    if n1_last_layer_use_box_scalar && !encode_n1_last_layer
+        println("WARNING: --n1_last_layer_use_box_scalar ignored (requires --encode_n1_last_layer)")
+        global n1_last_layer_use_box_scalar = false
+    end
+    global n1_last_layer_prune_tol = args["n1_last_layer_prune_tol"]
+    if n1_last_layer_prune_tol > 0 && !encode_n1_last_layer
+        println("WARNING: --n1_last_layer_prune_tol ignored (requires --encode_n1_last_layer)")
+        global n1_last_layer_prune_tol = 0.0
+    end
+    global n1_adaptive_prune_budget = args["n1_adaptive_prune_budget"]
+    if n1_adaptive_prune_budget > 0 && !encode_n1_last_layer
+        println("WARNING: --n1_adaptive_prune_budget ignored (requires --encode_n1_last_layer)")
+        global n1_adaptive_prune_budget = 0.0
+    end
+    global zonotope_max_order = args["zonotope_max_order"]
+    if zonotope_max_order > 0 && !use_zonotope
+        println("WARNING: --zonotope_max_order ignored (requires --use_zonotope)")
+        global zonotope_max_order = 0
+    end
+    global hybrid_solve = args["hybrid_solve"]
+    if hybrid_solve && !encode_n1_last_layer
+        println("WARNING: --hybrid_solve ignored (requires --encode_n1_last_layer)")
+        global hybrid_solve = false
+    end
+    global n1_stability_relax_threshold = args["n1_stability_relax_threshold"]
+    global branch_priority_n2x_first = args["branch_priority_n2x_first"]
     constrain_n1_xp = args["constrain_n1_xp"]
     if constrain_n1_xp && !no_n1_encoding_at_all
         println("WARNING: --constrain_n1_xp ignored (requires --no_n1_encoding_at_all)")
@@ -445,7 +505,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                     dataset, c_tag, c_target, token_signature,
                     model_name, model_path, model_path2,
                     perturbation, perturbation_size, delta_1,
-                    c_tag_mode, n1_p_mode, args["delta_diff_positive"];
+                    c_tag_mode, n1_p_mode;
                     force_cpu=args["force_cpu"])
             end
             println("Hyper attack: best_val=$suboptimal_solution, time=$suboptimal_time")
@@ -487,6 +547,40 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
                                             activation_start=K+1, layers_offset=2*K,
                                             perturbation_var=d[:Perturbation])
                 end
+            end
+
+            # Output-layer logit bounds on N2(x) derived from N1 output + zonotope diff.
+            # These non-ReLU hidden neurons are not touched by bound_n2_relu_using_zonotope.
+            if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu &&
+               !isempty(n1_output_up_bounds) && !isempty(output_diff_up_bounds) &&
+               haskey(d, :v_out_n2)
+                v_out_n2 = d[:v_out_n2]
+                n_out = length(v_out_n2)
+                n_added = 0
+                for j in 1:n_out
+                    if j > length(n1_output_up_bounds); break; end
+                    @constraint(m, v_out_n2[j] <= n1_output_up_bounds[j]   + output_diff_up_bounds[j])
+                    @constraint(m, v_out_n2[j] >= n1_output_down_bounds[j] + output_diff_down_bounds[j])
+                    n_added += 2
+                end
+                println("bound_by_zonotope_n2_hidden_neurons_which_are_not_relu: added $n_added output-layer bound constraints on v_out_n2")
+            end
+            # Bound N2(x') outputs using N1 output + composed bounds (diff + pert)
+            if bound_n2_xp_output_using_composed &&
+               !isempty(n1_output_up_bounds) && !isempty(output_diff_up_bounds) &&
+               !isempty(output_n2_pert_up) && haskey(d, :v_out_n2_p) && d[:v_out_n2_p] !== nothing
+                v_out_n2_p = d[:v_out_n2_p]
+                n_out = length(v_out_n2_p)
+                n_added_xp = 0
+                for j in 1:n_out
+                    if j > length(n1_output_up_bounds); break; end
+                    comp_up = output_diff_up_bounds[j] + output_n2_pert_up[j]
+                    comp_lo = output_diff_down_bounds[j] + output_n2_pert_down[j]
+                    @constraint(m, v_out_n2_p[j] <= n1_output_up_bounds[j]   + comp_up)
+                    @constraint(m, v_out_n2_p[j] >= n1_output_down_bounds[j] + comp_lo)
+                    n_added_xp += 2
+                end
+                println("bound N2(x') outputs: added $n_added_xp constraints using N1 output + composed bounds")
             end
 
             # Interval bounds between N1 and N2 (requires N1 encoding)
@@ -542,45 +636,61 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             if encode_n1_last_layer
                 name_to_save = name_to_save * "_N1LastLayer"
             end
-            if n1_last_layer_no_binaries
-                name_to_save = name_to_save * "_NoBin"
+            if n1_last_layer_use_box_scalar
+                name_to_save = name_to_save * "_BoxScalarL"
+            end
+            if n1_last_layer_prune_tol > 0
+                name_to_save = name_to_save * "_PruneTol" * string(n1_last_layer_prune_tol)
+            end
+            if n1_adaptive_prune_budget > 0
+                name_to_save = name_to_save * "_AdaptPrune" * string(n1_adaptive_prune_budget)
+            end
+            if hybrid_solve
+                name_to_save = name_to_save * "_HybridSolve"
+            end
+            if n1_stability_relax_threshold >= 0
+                name_to_save = name_to_save * "_N1StabRelax" * string(n1_stability_relax_threshold)
+            end
+            if branch_priority_n2x_first
+                name_to_save = name_to_save * "_BranchPriN2x"
             end
             if use_zonotope
                 name_to_save = name_to_save * "_Zonotope"
             end
-            if refined_relu_zonotope
-                name_to_save = name_to_save * "_RefinedReLU"
+            if zonotope_max_order > 0
+                name_to_save = name_to_save * "_ZonoOrd" * string(zonotope_max_order)
             end
-            if sparse_zonotope
-                name_to_save = name_to_save * "_SparseZono"
+            if bound_n2_xp_output_using_composed
+                name_to_save = name_to_save * "_BoundN2xpOut"
             end
-            if zonotope_gen_budget > 0
-                name_to_save = name_to_save * "_GenBudget" * string(zonotope_gen_budget)
+            if bound_n2_xp_using_composed
+                name_to_save = name_to_save * "_BoundN2xpComp"
             end
-            if zonotope_conv
-                name_to_save = name_to_save * "_ZonoConv"
+            if constrain_n2_xp_via_n1_zonotope
+                name_to_save = name_to_save * "_N2xpViaN1Zono"
             end
-            if tighten_n2_bounds
-                name_to_save = name_to_save * "_TightenN2"
+            if bound_n2_relu_using_zonotope
+                name_to_save = name_to_save * "_BoundN2ReLU"
+            end
+            if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu
+                name_to_save = name_to_save * "_BoundN2NonReLU"
             end
 
             # Set transfer proof constraints and objective
             if no_n2_xp_encoding
                 mip_set_transfer_property_no_n2_xp(m, d, delta_1, c_tag, c_target,
-                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
-                    args["delta_diff_positive"])
+                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
             elseif no_n1_encoding_at_all && encode_n1_last_layer
                 mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
                     c_tag_mode, n2_fewer_binars_encoding,
-                    args["delta_diff_positive"], nn1, n1_last_layer_no_binaries)
+                    nn1, n1_last_layer_use_box_scalar, n1_last_layer_prune_tol,
+                    n1_adaptive_prune_budget)
             elseif no_n1_encoding_at_all
                 mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
-                    c_tag_mode, n2_fewer_binars_encoding,
-                    args["delta_diff_positive"])
+                    c_tag_mode, n2_fewer_binars_encoding)
             else
                 mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
-                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding,
-                    args["delta_diff_positive"])
+                    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
             end
             # Add interval-based constraint: conf(N1, x', c_target) <= 0
             if constrain_n1_xp && !c_tag_mode
@@ -589,11 +699,22 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
 
             set_optimizer(m, optimizer)
-            mip_set_attr_transfer(m, timout, suboptimal_solution, args["delta_diff_positive"])
+            mip_set_attr_transfer(m, timout, suboptimal_solution)
             MOI.set(m, Gurobi.CallbackFunction(), my_callback)
+            if branch_priority_n2x_first
+                set_branch_priority_n2x_first!(m)
+            end
 
             println("Optimizing...")
             optimize!(m)
+            # Hybrid solve Phase 2: if scalar bound was loose, tighten and re-solve
+            if hybrid_solve && JuMP.has_values(m)
+                phase1_time = JuMP.solve_time(m)
+                timout_remaining = max(0.0, timout - phase1_time)
+                if hybrid_solve_phase2!(m, timout_remaining)
+                    println("  hybrid_solve: Phase 1 took $(round(phase1_time, digits=2))s, Phase 2 used remaining $(round(timout_remaining, digits=2))s")
+                end
+            end
             mip_log(m, d)
 
             results.str = update_results_str(results.str, c_tag, c_target, d)

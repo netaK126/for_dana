@@ -482,8 +482,8 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
 
     # Pre-compute diff/composed interval bounds.
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
-    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff).
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds || no_n2_xp_encoding
+    #          (c) bound_n2_relu_using_zonotope (derive N2 preact bounds from N1 + diff).
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || bound_n2_relu_using_zonotope || bound_n2_xp_using_composed || bound_by_zonotope_n2_hidden_neurons_which_are_not_relu || no_n2_xp_encoding || n1_stability_relax_threshold >= 0
         if diff_bounds_cache.valid
             restore_diff_bounds_from_cache!()
         else
@@ -497,7 +497,7 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     end
 
     # Derive tighter N2 pre-activation bounds from N1 + diff
-    if tighten_n2_bounds && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+    if bound_n2_relu_using_zonotope && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
         global n2_derived_preact_up_bounds   = Array{Float64}[]
         global n2_derived_preact_down_bounds = Array{Float64}[]
         n_tightened = 0
@@ -517,7 +517,27 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
                 end
             end
         end
-        println("tighten_n2_bounds: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
+        println("bound_n2_relu_using_zonotope: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
+    end
+
+    # Tighten N2(x') preact bounds using N1 preact + composed bounds
+    if bound_n2_xp_using_composed && !isempty(n1_preact_up_bounds) && !isempty(relu_comp_up_bounds)
+        global n2_xp_derived_preact_up_bounds   = Array{Float64}[]
+        global n2_xp_derived_preact_down_bounds = Array{Float64}[]
+        n_tightened_xp = 0
+        for r in 1:length(n1_preact_up_bounds)
+            if r > length(relu_comp_up_bounds); break; end
+            derived_up   = vec(n1_preact_up_bounds[r])   .+ vec(relu_comp_up_bounds[r])
+            derived_down = vec(n1_preact_down_bounds[r]) .+ vec(relu_comp_down_bounds[r])
+            push!(n2_xp_derived_preact_up_bounds, derived_up)
+            push!(n2_xp_derived_preact_down_bounds, derived_down)
+            for i in eachindex(derived_up)
+                if derived_up[i] <= 0 || derived_down[i] >= 0
+                    n_tightened_xp += 1
+                end
+            end
+        end
+        println("bound_n2_xp_using_composed: derived N2(x') preact bounds for $(length(n2_xp_derived_preact_up_bounds)) ReLU layers, $n_tightened_xp neurons stable by composed bounds")
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active
@@ -567,7 +587,7 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     end
 
     # Pre-compute N2 perturbation bounds for N2(x_p)->N2(x) relaxation
-    if no_n1_binaries_and_relaxtions_only_on_n2
+    if no_n1_binaries_and_relaxtions_only_on_n2 || constrain_n2_xp_via_n1_zonotope
         compute_n2_pert_relaxation_bounds(nn2, I_pert_prev_up, I_pert_prev_down)
     end
 
@@ -651,9 +671,9 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
 
     # Pre-compute diff/composed interval bounds.
     # Used by: (a) old T_relax relaxation (per-ReLU bounds), (b) no_n1_encoding (output-layer bounds),
-    #          (c) tighten_n2_bounds (derive N2 preact bounds from N1 + diff),
+    #          (c) bound_n2_relu_using_zonotope (derive N2 preact bounds from N1 + diff),
     #          (d) no_n2_xp_encoding (output-layer pert bounds for N2(x')).
-    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || tighten_n2_bounds || no_n2_xp_encoding
+    if (use_relaxations && !no_n1_binaries_and_relaxtions_only_on_n2 && !no_n1_encoding_at_all) || no_n1_encoding_at_all || bound_n2_relu_using_zonotope || bound_n2_xp_using_composed || bound_by_zonotope_n2_hidden_neurons_which_are_not_relu || no_n2_xp_encoding || n1_stability_relax_threshold >= 0
         if diff_bounds_cache.valid
             restore_diff_bounds_from_cache!()
         else
@@ -667,7 +687,7 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     end
 
     # Derive tighter N2 pre-activation bounds from N1 + diff
-    if tighten_n2_bounds && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+    if bound_n2_relu_using_zonotope && !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
         global n2_derived_preact_up_bounds   = Array{Float64}[]
         global n2_derived_preact_down_bounds = Array{Float64}[]
         n_tightened = 0
@@ -682,7 +702,27 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
                 end
             end
         end
-        println("tighten_n2_bounds: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
+        println("bound_n2_relu_using_zonotope: derived N2 preact bounds for $(length(n1_preact_up_bounds)) ReLU layers, $n_tightened neurons stable by derived bounds")
+    end
+
+    # Tighten N2(x') preact bounds using N1 preact + composed bounds
+    if bound_n2_xp_using_composed && !isempty(n1_preact_up_bounds) && !isempty(relu_comp_up_bounds)
+        global n2_xp_derived_preact_up_bounds   = Array{Float64}[]
+        global n2_xp_derived_preact_down_bounds = Array{Float64}[]
+        n_tightened_xp = 0
+        for r in 1:length(n1_preact_up_bounds)
+            if r > length(relu_comp_up_bounds); break; end
+            derived_up   = vec(n1_preact_up_bounds[r])   .+ vec(relu_comp_up_bounds[r])
+            derived_down = vec(n1_preact_down_bounds[r]) .+ vec(relu_comp_down_bounds[r])
+            push!(n2_xp_derived_preact_up_bounds, derived_up)
+            push!(n2_xp_derived_preact_down_bounds, derived_down)
+            for i in eachindex(derived_up)
+                if derived_up[i] <= 0 || derived_down[i] >= 0
+                    n_tightened_xp += 1
+                end
+            end
+        end
+        println("bound_n2_xp_using_composed: derived N2(x') preact bounds for $(length(n2_xp_derived_preact_up_bounds)) ReLU layers, $n_tightened_xp neurons stable by composed bounds")
     end
 
     # Skip N1(x) encoding when no_n1_encoding_at_all is active
@@ -721,7 +761,7 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
     end
 
     # Pre-compute N2 perturbation bounds for N2(x_p)->N2(x) relaxation
-    if no_n1_binaries_and_relaxtions_only_on_n2
+    if no_n1_binaries_and_relaxtions_only_on_n2 || constrain_n2_xp_via_n1_zonotope
         compute_n2_pert_relaxation_bounds(nn2, I_pert_prev_up, I_pert_prev_down)
     end
 

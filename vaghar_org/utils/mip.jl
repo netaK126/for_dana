@@ -22,7 +22,9 @@ function mip_set_attr(m, perturbation, d, timout)
         set_optimizer_attribute(m, "NonConvex", 2)
     end
     set_optimizer_attribute(m, "MIPFocus", 3)
-    set_optimizer_attribute(m, "Cutoff", d[:suboptimal_solution])
+    if d[:suboptimal_solution] != 0
+        set_optimizer_attribute(m, "Cutoff", d[:suboptimal_solution])
+    end
     global Threads_num
     set_optimizer_attribute(m, "Threads", Threads_num)
     set_optimizer_attribute(m, "TimeLimit", timout)
@@ -110,7 +112,7 @@ end
 # c_tag_mode=false → c_pert = c_target (targeted)
 # ============================================================
 function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
-    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding, delta_diff_positive)
+    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
     # Confidence margins on clean input (both measured for source class c_tag)
     conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1, "conf_n1_x")
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
@@ -134,11 +136,7 @@ function mip_set_transfer_property(m, d, delta_1, c_tag, c_target,
     # Constraint (2)+(3): delta_diff = C(N2,x,c) - C(N1,x,c) >= 0
     delta_diff = @variable(m, base_name="delta_diff")
     @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
-    if delta_diff_positive
-        @constraint(m, delta_diff >= 0)
-    else
-        @constraint(m, conf_n2_x >= 0)
-    end
+    @constraint(m, conf_n2_x >= 0)
     margin = 1e-3
     # Constraint (4): confidence gap flips under perturbation
 
@@ -181,9 +179,10 @@ end
 # stored in global output_diff_down_bounds / output_diff_up_bounds.
 # ============================================================
 function mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
-    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive)
+    c_tag_mode, n2_fewer_binars_encoding)
 
     global output_diff_up_bounds, output_diff_down_bounds
+    global use_zonotope
     d_hi = output_diff_up_bounds    # N2(x)[k] - N1(x)[k] upper bound
     d_lo = output_diff_down_bounds  # N2(x)[k] - N1(x)[k] lower bound
 
@@ -209,25 +208,48 @@ function mip_set_transfer_property_no_n1(m, d, delta_1, c_tag, c_target,
     # ── Confidence of N2 on clean input (uses binary encoding for max) ──
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
 
-    # ── delta_diff upper-bounded by interval-derived constraints ──
-    # For each k ≠ c_tag, conf_n1_x >= expr_k where
+    # ── delta_diff upper-bounded ──
+    # We need: delta_diff <= conf_n2_x - conf_n1_x for every feasible x.
+    # Since conf_n1_x = min_{k ≠ c} (N1[c] - N1[k]), we need a LOWER bound on
+    # conf_n1_x. The per-class expression
     #   expr_k = (N2(x)[c_tag] - N2(x)[k]) + (d_lo[k] - d_hi[c_tag])
-    # So delta_diff = conf_n2_x - conf_n1_x <= conf_n2_x - expr_k for each k.
-    # These UPPER BOUND constraints prevent unboundedness.
+    # satisfies expr_k <= N1[c] - N1[k] for each k individually.
+    #
+    # Imposing `delta_diff <= conf_n2_x - expr_k` for every k is equivalent to
+    # `delta_diff <= conf_n2_x - max_k expr_k`. But only `min_k expr_k` is a
+    # valid lower bound on conf_n1_x — max_k expr_k can exceed conf_n1_x.
+    # Using max_k can therefore push delta_diff below the true value and
+    # breaks Theorem 2's soundness for the no-N1 MIP.
+    #
+    # Option 2 (scalar cap): replace the per-class constraints by a single
+    # scalar upper bound derived from the diff bounds themselves:
+    #   delta_diff <= max_{k != c_tag} (d_hi[c_tag] - d_lo[k]).
+    # See neta-s-paper/sections/sec_no_n1_soundness_analysis.tex for the
+    # full soundness proof.
     delta_diff = @variable(m, base_name="delta_diff")
-    for k in 1:n_classes
-        if k == c_tag
-            continue
+    if use_zonotope
+        delta_up_scalar = -Inf
+        for k in 1:n_classes
+            if k == c_tag
+                continue
+            end
+            delta_up_scalar = max(delta_up_scalar, d_hi[c_tag] - d_lo[k])
         end
-        expr_k = (d[:v_out_n2][c_tag] - d[:v_out_n2][k]) + (d_lo[k] - d_hi[c_tag])
-        @constraint(m, delta_diff <= conf_n2_x - expr_k)
-    end
-    if delta_diff_positive
-        @constraint(m, delta_diff >= 0)
+        println("  scalar cap delta_up = $delta_up_scalar (Option 2, sound)")
+        @constraint(m, delta_diff <= delta_up_scalar)
     else
-        @constraint(m, conf_n2_x >= 0)
+        # Legacy per-class constraints. Not sound as an upper bound on the
+        # true delta_diff; kept only for backward compatibility when zonotope
+        # diff bounds are not being used.
+        for k in 1:n_classes
+            if k == c_tag
+                continue
+            end
+            expr_k = (d[:v_out_n2][c_tag] - d[:v_out_n2][k]) + (d_lo[k] - d_hi[c_tag])
+            @constraint(m, delta_diff <= conf_n2_x - expr_k)
+        end
     end
-
+    @constraint(m, conf_n2_x >= 0)
     # ── Constraint (4): N2 is fooled on perturbed input ──
     c_pert = c_tag_mode ? c_tag : c_target
     margin = 1e-3
@@ -268,7 +290,7 @@ end
 # or compute_diff_bounds_zonotope() (when --use_zonotope).
 # ============================================================
 function mip_set_transfer_property_no_n2_xp(m, d, delta_1, c_tag, c_target,
-    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding, delta_diff_positive)
+    c_tag_mode, n1_p_mode, n2_fewer_binars_encoding)
 
     global output_n2_pert_up, output_n2_pert_down
     p_up = output_n2_pert_up    # N2(x')[k] - N2(x)[k] upper bound
@@ -291,11 +313,7 @@ function mip_set_transfer_property_no_n2_xp(m, d, delta_1, c_tag, c_target,
     # ── Exact delta_diff = C(N2,x,c) - C(N1,x,c) ──
     delta_diff = @variable(m, base_name="delta_diff")
     @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
-    if delta_diff_positive
-        @constraint(m, delta_diff >= 0)
-    else
-        @constraint(m, conf_n2_x >= 0)
-    end
+    @constraint(m, conf_n2_x >= 0)
 
     # ── N1(x') confidence (only when n1_p_mode is on) ──
     c_pert = c_tag_mode ? c_tag : c_target
@@ -353,41 +371,24 @@ end
 #   linked to N2's encoded hidden layer via diff bounds.
 #
 #   Two modes:
-#   (a) no_binaries=false: binary max encoding for exact conf_n1_x
+#   (a) use_box_scalar=false: binary max encoding for exact conf_n1_x
 #       (C-1 extra binaries, exact delta_diff)
-#   (b) no_binaries=true: pre-computed scalar lower bound on conf_n1
-#       from interval arithmetic on h_n1 bounds → zero extra binaries,
-#       sound upper bound on delta_diff.
+#   (b) use_box_scalar=true:  scalar lower bound L on conf_n1 derived
+#       offline from the last-hidden box and N1's last-layer weights
+#       → zero extra binaries, sound upper bound on delta_diff.
 # ============================================================
 function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
-    c_tag_mode, n2_fewer_binars_encoding, delta_diff_positive, nn1, no_binaries::Bool=false)
+    c_tag_mode, n2_fewer_binars_encoding, nn1, use_box_scalar::Bool=false, prune_tol::Float64=0.0,
+    adaptive_prune_budget::Float64=0.0)
 
     global n1_last_hidden_up, n1_last_hidden_down
     global last_hidden_diff_up, last_hidden_diff_down
 
     n_hidden = length(n1_last_hidden_up)
-    println("  encode_n1_last_layer: $n_hidden bounded hidden vars, no_binaries=$no_binaries")
-    println("  N1 last hidden bounds width: max=$(maximum(n1_last_hidden_up .- n1_last_hidden_down))")
+    a_dn = n1_last_hidden_down
+    a_up = n1_last_hidden_up
 
-    # ── Create interval-bounded variables for N1's last hidden layer ──
-    h_n1 = [@variable(m, lower_bound = n1_last_hidden_down[i],
-                          upper_bound = n1_last_hidden_up[i],
-                          base_name = "h_n1_last_$i") for i in 1:n_hidden]
-
-    # ── Link h_n1 to N2's last hidden layer via difference bounds ──
-    v_n2_hidden = d[:v_n2_last_hidden]
-    if v_n2_hidden !== nothing
-        println("  Adding $n_hidden linking constraints (h_n2 - h_n1 ∈ [Δh_dn, Δh_up])")
-        println("  Hidden diff width: max=$(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
-        for i in 1:n_hidden
-            @constraint(m, v_n2_hidden[i] - h_n1[i] >= last_hidden_diff_down[i])
-            @constraint(m, v_n2_hidden[i] - h_n1[i] <= last_hidden_diff_up[i])
-        end
-    else
-        println("  WARNING: v_n2_last_hidden not available, h_n1 is unlinked (loose bounds)")
-    end
-
-    # ── Get N1's last Linear layer weights ──
+    # ── Get N1's last Linear layer weights (needed before pruning for adaptive mode) ──
     last_linear = nothing
     for l in nn1.layers
         if occursin("Linear", string(typeof(l)))
@@ -395,9 +396,92 @@ function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
         end
     end
     W = Float64.(transpose(last_linear.matrix))  # (n_classes × n_hidden)
-    b = Float64.(last_linear.bias)
-    n_classes = length(b)
+    b_vec = Float64.(last_linear.bias)
+    n_classes = length(b_vec)
+
+    # ── Classify neurons: prune by fixed threshold or adaptive sensitivity budget ──
+    is_pruned = falses(n_hidden)
+    n_pruned = 0
+    if adaptive_prune_budget > 0
+        # Sensitivity-based pruning: score each neuron by worst-case margin error
+        # loss_j = max_k |W[c,j] - W[k,j]| * (a_up[j] - a_dn[j])
+        scores = zeros(n_hidden)
+        for j in 1:n_hidden
+            width_j = a_up[j] - a_dn[j]
+            max_w = maximum([abs(W[c_tag, j] - W[k, j]) for k in 1:n_classes if k != c_tag])
+            scores[j] = max_w * width_j
+        end
+        order = sortperm(scores)   # ascending: least important first
+        cumulative = 0.0
+        for idx in order
+            if cumulative + scores[idx] > adaptive_prune_budget
+                break
+            end
+            is_pruned[idx] = true
+            cumulative += scores[idx]
+            n_pruned += 1
+        end
+        n_active = n_hidden - n_pruned
+        println("  adaptive_prune: H=$n_hidden, pruned $n_pruned (budget=$adaptive_prune_budget, used=$cumulative), $n_active MIP vars")
+    else
+        for i in 1:n_hidden
+            if (a_up[i] - a_dn[i]) <= prune_tol
+                is_pruned[i] = true
+                n_pruned += 1
+            end
+        end
+        n_active = n_hidden - n_pruned
+        println("  encode_n1_last_layer: H=$n_hidden, pruned $n_pruned (width <= $prune_tol), $n_active MIP vars, use_box_scalar=$use_box_scalar")
+    end
+    println("  N1 last hidden bounds width: max=$(maximum(a_up .- a_dn))")
+
+    # ── Create interval-bounded variables only for non-pruned neurons ──
+    # h_n1[i] is a JuMP variable for active neurons, unused for pruned ones.
+    h_n1 = Vector{Any}(undef, n_hidden)
+    for i in 1:n_hidden
+        if !is_pruned[i]
+            h_n1[i] = @variable(m, lower_bound = a_dn[i],
+                                    upper_bound = a_up[i],
+                                    base_name = "h_n1_last_$i")
+        end
+    end
+
+    # ── Link non-pruned h_n1 to N2's last hidden layer via difference bounds ──
+    v_n2_hidden = d[:v_n2_last_hidden]
+    if v_n2_hidden !== nothing
+        println("  Adding $n_active linking constraints (h_n2 - h_n1 ∈ [Δh_dn, Δh_up])")
+        println("  Hidden diff width: max=$(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
+        for i in 1:n_hidden
+            if !is_pruned[i]
+                @constraint(m, v_n2_hidden[i] - h_n1[i] >= last_hidden_diff_down[i])
+                @constraint(m, v_n2_hidden[i] - h_n1[i] <= last_hidden_diff_up[i])
+            end
+        end
+    else
+        println("  WARNING: v_n2_last_hidden not available, h_n1 is unlinked (loose bounds)")
+    end
+
     println("  N1 last layer: $(size(last_linear.matrix,1)) -> $n_classes")
+
+    # ── Helper: build margin expression m_k = (N1[c]-N1[k]) for a given k ──
+    # For active neurons: uses the MIP variable h_n1[j].
+    # For pruned neurons: uses the worst-case constant
+    #   min(w_j * a_dn[j], w_j * a_up[j]) where w_j = W[c,j]-W[k,j].
+    # This lower-bounds the real m_k, keeping delta_diff sound (>= exact).
+    function build_margin_expr(k)
+        # Variable part: sum over non-pruned neurons
+        var_part = sum((W[c_tag, j] - W[k, j]) * h_n1[j]
+                       for j in 1:n_hidden if !is_pruned[j]; init=0.0)
+        # Constant part: worst-case sum over pruned neurons
+        const_part = 0.0
+        for j in 1:n_hidden
+            if is_pruned[j]
+                w_j = W[c_tag, j] - W[k, j]
+                const_part += min(w_j * a_dn[j], w_j * a_up[j])
+            end
+        end
+        return var_part + const_part + (b_vec[c_tag] - b_vec[k])
+    end
 
     # ── Confidence of N2 on clean input (uses binary encoding for max) ──
     conf_n2_x = define_conf!(m, d, c_tag, :v_out_n2, "conf_n2_x")
@@ -405,60 +489,82 @@ function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
     # ── delta_diff ──
     delta_diff = @variable(m, base_name="delta_diff")
 
-    if no_binaries
-        # ── N1 confidence via per-class linear constraints on h_n1 ──
-        # m_k(h_n1) >= delta_1 for each k ≠ c is equivalent to conf_n1 >= delta_1
-        # (since conf_n1 = min_k m_k, and min >= delta_1 ⟺ all >= delta_1).
-        # These constrain h_n1 (and via linking, the input x), shrinking the
-        # feasible set compared to plain no_n1 which has no N1 constraints.
+    if hybrid_solve
+        # ── Hybrid solve: scalar bound + lazy argmax via callback ──
+        # Start with the fast scalar bound formulation (no argmax binaries).
+        # Also create margin variables so the callback can inspect them and
+        # lazily add tighter constraints when it finds the scalar bound is loose.
+        L = delta_1 + 1e-3
+        v_margin = [@variable(m, base_name = "n1_margin_$k") for k in 1:n_classes]
         for k in 1:n_classes
-            if k == c_tag
-                continue
-            end
-            m_k = sum((W[c_tag, j] - W[k, j]) * h_n1[j] for j in 1:n_hidden) + (b[c_tag] - b[k])
-            @constraint(m, m_k >= delta_1 + 1e-3)
+            if k == c_tag; continue; end
+            @constraint(m, v_margin[k] == build_margin_expr(k))
+            @constraint(m, v_margin[k] >= L)     # N1 must be confident
         end
-
-        # ── delta_diff upper bounds: use output-level diff constants (same as plain no_n1) ──
-        # For each k ≠ c:
-        #   delta_diff <= conf_n2_x - ((N2[c]-N2[k]) + (d_lo[k] - d_up[c]))
-        # These use pre-computed scalar bounds, NOT h_n1 variables, so they
-        # correctly upper-bound delta_diff (unlike per-class h_n1 constraints
-        # which compute conf_n2 - max_k m_k, a lower bound).
-        global output_diff_up_bounds, output_diff_down_bounds
-        d_hi = output_diff_up_bounds
-        d_lo = output_diff_down_bounds
-        println("  no_binaries: using output-level diff bounds for delta_diff")
-        println("  output diff bounds: max width = $(maximum(d_hi .- d_lo))")
+        # Initial relaxed bound: delta_diff <= conf_n2 - L
+        @constraint(m, delta_diff <= conf_n2_x - L)
+        @constraint(m, conf_n2_x >= 0)
+        # Store state for Phase 2 tightening (called after optimize!)
+        global hybrid_solve_state
+        hybrid_solve_state.active = true
+        hybrid_solve_state.v_margin = v_margin
+        hybrid_solve_state.delta_diff = delta_diff
+        hybrid_solve_state.conf_n2_x = conf_n2_x
+        hybrid_solve_state.c_tag = c_tag
+        hybrid_solve_state.n_classes = n_classes
+        hybrid_solve_state.L = L
+        hybrid_solve_state.n_cuts_added = 0
+        println("  hybrid_solve: starting with scalar bound L=$L, $(n_classes-1) margin vars (no binaries)")
+    elseif use_box_scalar
+        # ── N1 confidence via per-class linear constraints ──
         for k in 1:n_classes
-            if k == c_tag
-                continue
-            end
-            expr_k = (d[:v_out_n2][c_tag] - d[:v_out_n2][k]) + (d_lo[k] - d_hi[c_tag])
-            @constraint(m, delta_diff <= conf_n2_x - expr_k)
+            if k == c_tag; continue; end
+            @constraint(m, build_margin_expr(k) >= delta_1 + 1e-3)
         end
-        if delta_diff_positive
-            @constraint(m, delta_diff >= 0)
-        else
-            @constraint(m, conf_n2_x >= 0)
-        end
+        # ── delta_diff upper bound: scalar L = delta_1 + eps0 ──
+        L = delta_1 + 1e-3
+        println("  use_box_scalar: L = delta_1 + eps0 = $L")
+        @constraint(m, delta_diff <= conf_n2_x - L)
+        @constraint(m, conf_n2_x >= 0)
     else
-        # ── Binary max encoding: exact conf_n1_x and delta_diff ──
-        # N1 output: v_out_n1[k] = W[k,:] * h_n1 + b[k]
-        v_out_n1 = [@variable(m, base_name = "n1_out_$k") for k in 1:n_classes]
+        # ── Argmax encoding: conf_n1 = min_k m_k via C-1 binaries ──
+        # Each m_k = (N1[c]-N1[k]) is a margin expression built by
+        # build_margin_expr(k): active neurons contribute MIP variables,
+        # pruned neurons contribute worst-case constants (lower-bounding
+        # the real m_k). The argmax then computes the exact min of these
+        # (possibly-loose) expressions.
+        #
+        # Soundness: each m_k^MIP <= m_k^real (worst-case on pruned terms),
+        # so min_k m_k^MIP <= min_k m_k^real = conf_n1^real, hence
+        # delta_diff = conf_n2 - conf_n1^MIP >= conf_n2 - conf_n1^real.
+
+        # Create per-class margin variables and link to the margin expressions.
+        v_margin = [@variable(m, base_name = "n1_margin_$k") for k in 1:n_classes]
         for k in 1:n_classes
-            @constraint(m, v_out_n1[k] == sum(W[k, j] * h_n1[j] for j in 1:n_hidden) + b[k])
+            if k == c_tag
+                continue
+            end
+            @constraint(m, v_margin[k] == build_margin_expr(k))
         end
 
-        d[:v_out_n1_last] = v_out_n1
-        conf_n1_x = define_conf!(m, d, c_tag, :v_out_n1_last, "conf_n1_x")
+        # conf_n1 = min_{k != c} v_margin[k], encoded with C-1 big-M binaries.
+        max_M = 1e6
+        conf_n1_x = @variable(m, base_name="conf_n1_x")
+        a_conf = Dict{Int, Any}()
+        for k in 1:n_classes
+            if k == c_tag; continue; end
+            a_conf[k] = @variable(m, binary = true, base_name="conf_n1_bin_$k")
+        end
+        @constraint(m, sum(a_conf[k] for k in keys(a_conf)) == 1)
+        for k in 1:n_classes
+            if k == c_tag; continue; end
+            @constraint(m, conf_n1_x <= v_margin[k])
+            @constraint(m, conf_n1_x >= v_margin[k] - max_M * (1 - a_conf[k]))
+        end
+
         @constraint(m, conf_n1_x >= delta_1 + 1e-3)
         @constraint(m, delta_diff == conf_n2_x - conf_n1_x)
-        if delta_diff_positive
-            @constraint(m, delta_diff >= 0)
-        else
-            @constraint(m, conf_n2_x >= 0)
-        end
+        @constraint(m, conf_n2_x >= 0)
     end
 
     # ── Constraint: N2 is fooled on perturbed input ──
@@ -483,6 +589,50 @@ function mip_set_transfer_property_n1_last_layer(m, d, delta_1, c_tag, c_target,
     end
 
     @objective(m, Max, delta_diff)
+end
+
+# ── Hybrid solve Phase 2: tighten delta_diff after initial solve ──────
+# After Phase 1 (scalar bound, no argmax binaries), inspect the solution:
+# find which class k* has the minimum margin, then add the exact constraint
+# delta_diff <= conf_n2 - v_margin[k*] and re-solve.
+function hybrid_solve_phase2!(m, timout_remaining)
+    global hybrid_solve_state
+    hs = hybrid_solve_state
+    if !hs.active
+        return false  # nothing to do
+    end
+
+    # Read Phase 1 solution margin values
+    min_margin = Inf
+    k_star = -1
+    for k in 1:hs.n_classes
+        if k == hs.c_tag; continue; end
+        val = JuMP.value(hs.v_margin[k])
+        if val < min_margin
+            min_margin = val
+            k_star = k
+        end
+    end
+
+    # Check if the scalar bound L is already tight (no re-solve needed)
+    if min_margin <= hs.L + 1e-4
+        println("  hybrid_solve: scalar bound is tight (min_margin=$min_margin ≈ L=$(hs.L)), skip Phase 2")
+        hs.active = false
+        return false
+    end
+
+    println("  hybrid_solve Phase 2: tightening for class $k_star (min_margin=$min_margin >> L=$(hs.L))")
+    # Add the tighter constraint: delta_diff <= conf_n2 - v_margin[k_star]
+    @constraint(m, hs.delta_diff <= hs.conf_n2_x - hs.v_margin[k_star])
+
+    # Update time limit for Phase 2
+    if timout_remaining > 0
+        JuMP.set_time_limit_sec(m, timout_remaining)
+    end
+
+    optimize!(m)
+    hs.active = false
+    return true  # Phase 2 was executed
 end
 
 # ============================================================
@@ -522,13 +672,9 @@ function add_n1_xp_confidence_constraint!(m, d, c_tag, c_target)
     end
 end
 
-function mip_set_attr_transfer(m, timout, suboptimal_solution=0, delta_diff_positive=false)
+function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
     set_optimizer_attribute(m, "MIPFocus", 3)
-    if delta_diff_positive
-        set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
-    elseif suboptimal_solution != 0
-        set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
-    end
+    set_optimizer_attribute(m, "Cutoff", suboptimal_solution)
     set_optimizer_attribute(m, "Threads", 32)
     set_optimizer_attribute(m, "TimeLimit", timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)

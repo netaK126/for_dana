@@ -181,13 +181,20 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      no_n1_encoding_at_all=False,
                      no_n2_xp_encoding=False,
                      encode_n1_last_layer=False,
+                     n1_last_layer_use_box_scalar=False,
+                     n1_last_layer_prune_tol=0.0,
+                     n1_adaptive_prune_budget=0.0,
+                     hybrid_solve=False,
+                     n1_stability_relax_threshold=-1.0,
                      constrain_n1_xp=False,
                      use_zonotope=False,
-                     refined_relu_zonotope=False,
-                     sparse_zonotope=False,
-                     zonotope_gen_budget=0,
-                     zonotope_conv=False,
-                     tighten_n2_bounds=False,
+                     zonotope_max_order=0,
+                     bound_n2_relu_using_zonotope=False,
+                     bound_n2_xp_using_composed=False,
+                     bound_n2_xp_output_using_composed=False,
+                     constrain_n2_xp_via_n1_zonotope=False,
+                     branch_priority_n2x_first=False,
+                     bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False,
                      optimizing_intervals=None):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
@@ -204,20 +211,34 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_NoN2xpEnc'
     if encode_n1_last_layer:
         suffix += '_N1LastLayer'
+    if n1_last_layer_use_box_scalar:
+        suffix += '_BoxScalarL'
+    if n1_last_layer_prune_tol > 0:
+        suffix += f'_PruneTol{n1_last_layer_prune_tol}'
+    if n1_adaptive_prune_budget > 0:
+        suffix += f'_AdaptPrune{n1_adaptive_prune_budget}'
+    if hybrid_solve:
+        suffix += '_HybridSolve'
+    if n1_stability_relax_threshold >= 0:
+        suffix += f'_N1StabRelax{n1_stability_relax_threshold}'
     if constrain_n1_xp:
         suffix += '_N1xpConf'
     if use_zonotope:
         suffix += '_Zonotope'
-    if refined_relu_zonotope:
-        suffix += '_RefinedReLU'
-    if sparse_zonotope:
-        suffix += '_SparseZono'
-    if zonotope_gen_budget > 0:
-        suffix += f'_GenBudget{zonotope_gen_budget}'
-    if zonotope_conv:
-        suffix += '_ZonoConv'
-    if tighten_n2_bounds:
-        suffix += '_TightenN2'
+    if zonotope_max_order > 0:
+        suffix += f'_ZonoOrd{zonotope_max_order}'
+    if bound_n2_xp_using_composed:
+        suffix += '_BoundN2xpComp'
+        if bound_n2_xp_output_using_composed:
+            suffix += '_BoundN2xpOut'
+    if constrain_n2_xp_via_n1_zonotope:
+        suffix += '_N2xpViaN1Zono'
+        if branch_priority_n2x_first:
+            suffix += '_BranchPriN2x'
+    if bound_n2_relu_using_zonotope:
+        suffix += '_BoundN2ReLU'
+    if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu:
+        suffix += '_BoundN2NonReLU'
     if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
         suffix += '_noOI'
     return base + suffix
@@ -826,7 +847,7 @@ def step2_vaghar_standard(arch, dataset, itr_n1, itr_n2, perturbation, perturbat
 
 def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               output_dir, timeout, perturbation, ct,
-                              transfer_relaxations, delta_diff_positive, Threads_num =32,
+                              transfer_relaxations, Threads_num =32,
                               relaxation_threshold=None, force_cpu=False,
                               use_hyper_attack=True, dual_seed=False, epochs=None,
                               relaxation_gap_area='false',
@@ -835,14 +856,20 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               no_n1_encoding_at_all=False,
                               no_n2_xp_encoding=False,
                               encode_n1_last_layer=False,
-                              n1_last_layer_no_binaries=False,
+                              n1_last_layer_use_box_scalar=False,
+                              n1_last_layer_prune_tol=0.0,
+                              n1_adaptive_prune_budget=0.0,
+                              hybrid_solve=False,
+                              n1_stability_relax_threshold=-1.0,
                               constrain_n1_xp=False,
                               use_zonotope=False,
-                              refined_relu_zonotope=False,
-                              sparse_zonotope=False,
-                              zonotope_gen_budget=0,
-                              zonotope_conv=False,
-                              tighten_n2_bounds=False):
+                              zonotope_max_order=0,
+                              bound_n2_xp_using_composed=False,
+                              bound_n2_xp_output_using_composed=False,
+                              constrain_n2_xp_via_n1_zonotope=False,
+                              branch_priority_n2x_first=False,
+                              bound_n2_relu_using_zonotope=False,
+                              bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -931,7 +958,6 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             '--use_perturbed_intervals', 'true',
             '--n2_fewer_binars_encoding', 'true',
             '--use_relaxations', transfer_relaxations,
-            '--delta_diff_positive', delta_diff_positive,
             '--force_cpu', str(force_cpu).lower(),
             '--Threads_num', str(Threads_num),
         ]
@@ -948,54 +974,79 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--no_n2_xp_encoding', 'true']
         if encode_n1_last_layer:
             command += ['--encode_n1_last_layer', 'true']
-        if n1_last_layer_no_binaries:
-            command += ['--n1_last_layer_no_binaries', 'true']
+        if n1_last_layer_use_box_scalar:
+            command += ['--n1_last_layer_use_box_scalar', 'true']
+        if n1_last_layer_prune_tol > 0:
+            command += ['--n1_last_layer_prune_tol', str(n1_last_layer_prune_tol)]
+        if n1_adaptive_prune_budget > 0:
+            command += ['--n1_adaptive_prune_budget', str(n1_adaptive_prune_budget)]
+        if hybrid_solve:
+            command += ['--hybrid_solve', 'true']
+        if n1_stability_relax_threshold >= 0:
+            command += ['--n1_stability_relax_threshold', str(n1_stability_relax_threshold)]
         if constrain_n1_xp:
             command += ['--constrain_n1_xp', 'true']
         if use_zonotope:
             command += ['--use_zonotope', 'true']
-        if refined_relu_zonotope:
-            command += ['--refined_relu_zonotope', 'true']
-        if sparse_zonotope:
-            command += ['--sparse_zonotope', 'true']
-        if zonotope_gen_budget > 0:
-            command += ['--zonotope_gen_budget', str(zonotope_gen_budget)]
-        if zonotope_conv:
-            command += ['--zonotope_conv', 'true']
-        if tighten_n2_bounds:
-            command += ['--tighten_n2_bounds', 'true']
+        if zonotope_max_order > 0:
+            command += ['--zonotope_max_order', str(zonotope_max_order)]
+        if bound_n2_xp_using_composed:
+            command += ['--bound_n2_xp_using_composed', 'true']
+            if bound_n2_xp_output_using_composed:
+                command += ['--bound_n2_xp_output_using_composed', 'true']
+            if constrain_n2_xp_via_n1_zonotope:
+                command += ['--constrain_n2_xp_via_n1_zonotope', 'true']
+                if branch_priority_n2x_first:
+                    command += ['--branch_priority_n2x_first', 'true']
+        if bound_n2_relu_using_zonotope:
+            command += ['--bound_n2_relu_using_zonotope', 'true']
+        if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu:
+            command += ['--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
 
 def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturbation_size, ct,
-                   transfer_relaxations, delta_diff_positive,Threads_num=32, relaxation_threshold=None, force_cpu=False,
+                   transfer_relaxations, Threads_num=32, relaxation_threshold=None, force_cpu=False,
                    use_hyper_attack=True, dual_seed=False, epochs=None, optimizing_intervals=None, model_dirs=None,
                    relaxation_gap_area='false', no_n1_binaries_and_relaxtions_only_on_n2=False,
                    no_n1_encoding_at_all=False,
                    no_n2_xp_encoding=False,
                    encode_n1_last_layer=False,
-                   n1_last_layer_no_binaries=False,
+                   n1_last_layer_use_box_scalar=False,
+                   n1_last_layer_prune_tol=0.0,
+                   n1_adaptive_prune_budget=0.0,
+                   hybrid_solve=False,
+                   n1_stability_relax_threshold=-1.0,
                    constrain_n1_xp=False,
                    use_zonotope=False,
-                   refined_relu_zonotope=False,
-                   sparse_zonotope=False,
-                   zonotope_gen_budget=0,
-                   zonotope_conv=False,
-                   tighten_n2_bounds=False):
+                   zonotope_max_order=0,
+                   bound_n2_xp_using_composed=False,
+                   bound_n2_xp_output_using_composed=False,
+                   constrain_n2_xp_via_n1_zonotope=False,
+                   branch_priority_n2x_first=False,
+                   bound_n2_relu_using_zonotope=False,
+                   bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
                                    no_n1_encoding_at_all=no_n1_encoding_at_all,
                                    no_n2_xp_encoding=no_n2_xp_encoding,
                                    encode_n1_last_layer=encode_n1_last_layer,
+                                   n1_last_layer_use_box_scalar=n1_last_layer_use_box_scalar,
+                                   n1_last_layer_prune_tol=n1_last_layer_prune_tol,
+                                   n1_adaptive_prune_budget=n1_adaptive_prune_budget,
+                                   hybrid_solve=hybrid_solve,
+                                   n1_stability_relax_threshold=n1_stability_relax_threshold,
                                    constrain_n1_xp=constrain_n1_xp,
                                    use_zonotope=use_zonotope,
-                                   refined_relu_zonotope=refined_relu_zonotope,
-                                   sparse_zonotope=sparse_zonotope,
-                                   zonotope_gen_budget=zonotope_gen_budget,
-                                   zonotope_conv=zonotope_conv,
-                                   tighten_n2_bounds=tighten_n2_bounds,
+                                   zonotope_max_order=zonotope_max_order,
+                                   bound_n2_xp_using_composed=bound_n2_xp_using_composed,
+                                   bound_n2_xp_output_using_composed=bound_n2_xp_output_using_composed,
+                                   constrain_n2_xp_via_n1_zonotope=constrain_n2_xp_via_n1_zonotope,
+                                   branch_priority_n2x_first=branch_priority_n2x_first,
+                                   bound_n2_relu_using_zonotope=bound_n2_relu_using_zonotope,
+                                   bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=bound_by_zonotope_n2_hidden_neurons_which_are_not_relu,
                                    optimizing_intervals=optimizing_intervals)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1023,7 +1074,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
     run_transfer_from_results(
         arch, dataset, itr_n1, itr_n2,
         dirs['vaghar_n1'], output_dir, timeout, perturbation, ct,
-        transfer_relaxations, delta_diff_positive, Threads_num, relaxation_threshold, force_cpu=force_cpu,
+        transfer_relaxations, Threads_num, relaxation_threshold, force_cpu=force_cpu,
         use_hyper_attack=use_hyper_attack, dual_seed=dual_seed, epochs=epochs,
         optimizing_intervals=optimizing_intervals, model_dirs=model_dirs,
         relaxation_gap_area=relaxation_gap_area,
@@ -1031,14 +1082,20 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         no_n1_encoding_at_all=no_n1_encoding_at_all,
         no_n2_xp_encoding=no_n2_xp_encoding,
         encode_n1_last_layer=encode_n1_last_layer,
-        n1_last_layer_no_binaries=n1_last_layer_no_binaries,
+        n1_last_layer_use_box_scalar=n1_last_layer_use_box_scalar,
+        n1_last_layer_prune_tol=n1_last_layer_prune_tol,
+        n1_adaptive_prune_budget=n1_adaptive_prune_budget,
+        hybrid_solve=hybrid_solve,
+        n1_stability_relax_threshold=n1_stability_relax_threshold,
         constrain_n1_xp=constrain_n1_xp,
         use_zonotope=use_zonotope,
-        refined_relu_zonotope=refined_relu_zonotope,
-        sparse_zonotope=sparse_zonotope,
-        zonotope_gen_budget=zonotope_gen_budget,
-        zonotope_conv=zonotope_conv,
-        tighten_n2_bounds=tighten_n2_bounds,
+        zonotope_max_order=zonotope_max_order,
+        bound_n2_xp_using_composed=bound_n2_xp_using_composed,
+        bound_n2_xp_output_using_composed=bound_n2_xp_output_using_composed,
+        constrain_n2_xp_via_n1_zonotope=constrain_n2_xp_via_n1_zonotope,
+        branch_priority_n2x_first=branch_priority_n2x_first,
+        bound_n2_relu_using_zonotope=bound_n2_relu_using_zonotope,
+        bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=bound_by_zonotope_n2_hidden_neurons_which_are_not_relu,
     )
 
 
@@ -1069,8 +1126,6 @@ def main():
     parser.add_argument('--timeout', type=int, default=10800, help='MIP timeout per class pair (seconds)')
     parser.add_argument('--transfer_relaxations', type=str, default='true',
                         help='Run transfer with relaxations (true/false)')
-    parser.add_argument('--delta_diff_positive', type=str, default='false',
-                        help='Force delta_diff > 0 cutoff (true/false)')
     parser.add_argument('--relaxation_thresholds', type=str, default='0.0,0.25,0.5,1.0',
                         help='Comma-separated relaxation_threshold values to sweep')
     parser.add_argument('--relaxation_gap_area', type=str, default='false',
@@ -1135,30 +1190,49 @@ def main():
     parser.add_argument('--encode_n1_last_layer', action='store_true',
                         help='When no_n1_encoding_at_all is active, encode N1 last linear layer '
                              'exactly using interval-bounded hidden variables; gives exact delta_diff.')
+    parser.add_argument('--n1_last_layer_use_box_scalar', action='store_true',
+                        help='When encode_n1_last_layer is active, use a box-derived scalar lower bound L '
+                             'on conf_n1 instead of the argmax binary encoding; drops C-1 binaries on the N1 side.')
     parser.add_argument('--n1_last_layer_no_binaries', action='store_true',
-                        help='When encode_n1_last_layer is active, use pre-computed scalar lower bound '
-                             'on conf_n1 instead of binary max encoding; zero extra binaries.')
+                        help='DEPRECATED alias for --n1_last_layer_use_box_scalar.')
+    parser.add_argument('--n1_last_layer_prune_tol', type=float, default=0.0,
+                        help='Drop h_n1 variables with interval width <= this and use '
+                             'worst-case constants. 0.0 = only exact singletons.')
+    parser.add_argument('--n1_adaptive_prune_budget', type=float, default=0.0,
+                        help='Sensitivity-based adaptive pruning: prune neurons with lowest '
+                             'max_k|W[c,j]-W[k,j]|*width until cumulative error exceeds budget. '
+                             '0.0 = disabled.')
+    parser.add_argument('--n1_stability_relax_threshold', type=float, default=-1.0,
+                        help='Transfer-aware: replace N2 binary with triangle LP relaxation when '
+                             'N1 neuron is stable and gap area <= threshold. -1 = disabled.')
+    parser.add_argument('--hybrid_solve', action='store_true',
+                        help='Two-phase solve: Phase 1 uses scalar bound (fast), Phase 2 adds '
+                             'tighter argmax constraint for the identified min-margin class.')
     parser.add_argument('--constrain_n1_xp', action='store_true',
                         help='Add interval-based constraint that conf(N1,x\',c_target)<=0; '
                              'no extra variables, uses pre-computed pert bounds through N1.')
     parser.add_argument('--use_zonotope', action='store_true',
                         help='Use zonotope (affine arithmetic) for diff bound propagation; '
                              'tighter bounds by tracking correlations between neurons.')
-    parser.add_argument('--refined_relu_zonotope', action='store_true',
-                        help='Refined ReLU case analysis in zonotope: tighter bounds when one '
-                             'network is stable-active and the other is split (requires --use_zonotope).')
-    parser.add_argument('--sparse_zonotope', action='store_true',
-                        help='Sparse generator representation: split into dense correlated + diagonal '
-                             'independent; same bounds, less computation (requires --use_zonotope).')
-    parser.add_argument('--zonotope_gen_budget', type=int, default=0,
-                        help='Generator reduction budget K: keep top K generators, merge rest; '
-                             '0 = disabled (requires --use_zonotope).')
-    parser.add_argument('--zonotope_conv', action='store_true',
-                        help='Propagate zonotope through conv layers instead of interval '
-                             'arithmetic (requires --use_zonotope).')
-    parser.add_argument('--tighten_n2_bounds', action='store_true',
-                        help='Derive tighter N2 preact bounds from N1 + diff to eliminate '
-                             'binary variables.')
+    parser.add_argument('--zonotope_max_order', type=int, default=0,
+                        help='Max zonotope order (generators/neurons). After each layer, merge '
+                             'least-important generators into a diagonal box. 0 = unlimited.')
+    parser.add_argument('--bound_n2_xp_using_composed', action='store_true',
+                        help='Tighten N2(x\') preact bounds using N1 preact + composed bounds '
+                             'to eliminate N2(x\') binary variables. Transfer-only, sound.')
+    parser.add_argument('--bound_n2_xp_output_using_composed', action='store_true',
+                        help='Bound N2(x\') output logits using N1 output + composed bounds.')
+    parser.add_argument('--constrain_n2_xp_via_n1_zonotope', action='store_true',
+                        help='Add conditional constraints linking N2(x\') post-ReLU to N2(x) binary '
+                             'using perturbation bounds via N1 zonotope. Sound, transfer-only.')
+    parser.add_argument('--branch_priority_n2x_first', action='store_true',
+                        help='Set Gurobi BranchPriority: resolve N2(x) binaries before N2(x\').')
+    parser.add_argument('--bound_n2_relu_using_zonotope', action='store_true',
+                        help='Tighten N2 ReLU preact bounds from N1 preact + zonotope diff to '
+                             'eliminate binary variables.')
+    parser.add_argument('--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu', action='store_true',
+                        help='Add per-class bound constraints on N2 output logits using N1 output '
+                             '+ zonotope diff bounds.')
 
     args = parser.parse_args()
 
@@ -1294,7 +1368,7 @@ def main():
             # Sweep: transfer with relaxations enabled at each threshold
             for thresh in thresholds:
                 step3_transfer(arch, dataset, transfer_n1, transfer_n2, args.timeout, perturbation, perturbation_size,
-                               args.ct, 'true', args.delta_diff_positive, args.Threads_num, relaxation_threshold=thresh,
+                               args.ct, 'true', args.Threads_num, relaxation_threshold=thresh,
                                force_cpu=args.cpu,
                                use_hyper_attack=not args.skip_hyper_transfer_attack,
                                dual_seed=dual_seed, epochs=transfer_epochs,
@@ -1305,14 +1379,20 @@ def main():
                                no_n1_encoding_at_all=args.no_n1_encoding_at_all,
                                no_n2_xp_encoding=args.no_n2_xp_encoding,
                                encode_n1_last_layer=args.encode_n1_last_layer,
-                               n1_last_layer_no_binaries=args.n1_last_layer_no_binaries,
+                               n1_last_layer_use_box_scalar=(args.n1_last_layer_use_box_scalar or args.n1_last_layer_no_binaries),
+                               n1_last_layer_prune_tol=args.n1_last_layer_prune_tol,
+                               n1_adaptive_prune_budget=args.n1_adaptive_prune_budget,
+                               hybrid_solve=args.hybrid_solve,
+                               n1_stability_relax_threshold=args.n1_stability_relax_threshold,
                                constrain_n1_xp=args.constrain_n1_xp,
                                use_zonotope=args.use_zonotope,
-                               refined_relu_zonotope=args.refined_relu_zonotope,
-                               sparse_zonotope=args.sparse_zonotope,
-                               zonotope_gen_budget=args.zonotope_gen_budget,
-                               zonotope_conv=args.zonotope_conv,
-                               tighten_n2_bounds=args.tighten_n2_bounds)
+                               zonotope_max_order=args.zonotope_max_order,
+                               bound_n2_xp_using_composed=args.bound_n2_xp_using_composed,
+                               bound_n2_xp_output_using_composed=args.bound_n2_xp_output_using_composed,
+                               constrain_n2_xp_via_n1_zonotope=args.constrain_n2_xp_via_n1_zonotope,
+                               branch_priority_n2x_first=args.branch_priority_n2x_first,
+                               bound_n2_relu_using_zonotope=args.bound_n2_relu_using_zonotope,
+                               bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=args.bound_by_zonotope_n2_hidden_neurons_which_are_not_relu)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 

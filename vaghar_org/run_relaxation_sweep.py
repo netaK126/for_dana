@@ -31,11 +31,12 @@ import argparse
 import time
 import re
 import glob
+import itertools
 
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
-    ("contrast(1.5)",      "contrast:1.5"),
+    # ("contrast(1.5)",      "contrast:1.5"),
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("occ(5,5,5)",      "occ:5,5,5"),
     ("occ(3,3,5)",      "occ:3,3,5"),
@@ -51,7 +52,7 @@ PERTURBATIONS = [
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
-THRESHOLDS = [0, 0.05] # focused on best T_relax candidate
+THRESHOLDS = [0]#[0, 0.05] # focused on best T_relax candidate
 OPT_INTERVALS = ["true"]#["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
@@ -325,13 +326,18 @@ def _extract_transfer_file_metadata(filename):
     opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
     no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
     has_last_layer = "N1LastLayer" in filename
-    has_no_bin = "NoBin" in filename
+    # New tag is _BoxScalarL; legacy tag is _NoBin. Match either.
+    has_no_bin = ("BoxScalarL" in filename) or ("NoBin" in filename)
     has_n1xp = "N1xpConf" in filename
+    prune_tol_match = re.search(r"PruneTol([\d.]+)", filename)
     has_zonotope = "Zonotope" in filename
-    has_refined_relu = "RefinedReLU" in filename
-    has_sparse_zono = "SparseZono" in filename
+    # Legacy tags (pre-merge): now folded into --use_zonotope but still appear
+    # in historical filenames.
+    has_refined_relu_legacy = "RefinedReLU" in filename
+    has_zonotope_conv_legacy = "ZonoConv" in filename
+    has_sparse_zono_legacy = "SparseZono" in filename
     gen_budget_match = re.search(r"GenBudget(\d+)", filename)
-    has_no_n2_xp = "NoN2xpEncoding" in filename
+    has_no_n2_xp = "NoN2xpEnc" in filename
     # Combine no_n1_encoding and no_n2_xp_encoding into a single field:
     #   "no" = all networks encoded, "no_n1_encoding+..." = N1(x) skipped,
     #   "no_n2_xp_encoding+..." = N2(x') skipped
@@ -343,30 +349,60 @@ def _extract_transfer_file_metadata(filename):
         encoding_skip = "no_n1_encoding+last_layer+n1xp"
     elif has_last_layer:
         encoding_skip = "no_n1_encoding+last_layer"
-    elif "NoN1Encoding" in filename and has_n1xp:
+    elif "NoN1Enc" in filename and has_n1xp:
         encoding_skip = "no_n1_encoding+n1xp"
-    elif "NoN1Encoding" in filename:
+    elif "NoN1Enc" in filename:
         encoding_skip = "no_n1_encoding"
     else:
         encoding_skip = "no"
+    if prune_tol_match:
+        encoding_skip += "+pruneTol" + prune_tol_match.group(1)
+    adapt_prune_match = re.search(r"AdaptPrune([\d.]+)", filename)
+    if adapt_prune_match:
+        encoding_skip += "+adaptPrune" + adapt_prune_match.group(1)
+    if "HybridSolve" in filename:
+        encoding_skip += "+hybridSolve"
+    n1_stab_match = re.search(r"N1StabRelax([\d.]+)", filename)
+    if n1_stab_match:
+        encoding_skip += "+n1StabRelax" + n1_stab_match.group(1)
     if has_zonotope:
         encoding_skip += "+zono"
-    if has_refined_relu:
+    zono_ord_match = re.search(r"ZonoOrd(\d+)", filename)
+    if zono_ord_match:
+        encoding_skip += "+zonoOrd" + zono_ord_match.group(1)
+    # Legacy tags — stop cluttering the label; they're implied by +zono now.
+    if has_refined_relu_legacy:
         encoding_skip += "+refinedReLU"
-    if has_sparse_zono:
+    if has_zonotope_conv_legacy:
+        encoding_skip += "+zonoConv"
+    if has_sparse_zono_legacy:
         encoding_skip += "+sparseZono"
     if gen_budget_match:
         encoding_skip += "+genK" + gen_budget_match.group(1)
-    if "ZonoConv" in filename:
-        encoding_skip += "+zonoConv"
-    has_tighten_n2 = "TightenN2" in filename
+    # Legacy --n2_xp_k_value / --bridge_at_split tags (flags removed).
+    n2_xp_k_match = re.search(r"N2xpK(\d+)", filename)
+    if n2_xp_k_match:
+        encoding_skip += "+n2xpK" + n2_xp_k_match.group(1)
+    if "SplitBridge" in filename:
+        encoding_skip += "+splitBridge"
+    if "BoundN2xpOut" in filename:
+        encoding_skip += "+boundN2xpOut"
+    if "BoundN2xpComp" in filename:
+        encoding_skip += "+boundN2xpComp"
+    if "N2xpViaN1Zono" in filename:
+        encoding_skip += "+n2xpViaN1Zono"
+    if "BranchPriN2x" in filename:
+        encoding_skip += "+branchPriN2x"
+    # N2 bound tightening (current tags + legacy TightenN2 tag)
+    has_bound_n2_relu = ("BoundN2ReLU" in filename) or ("TightenN2" in filename)
+    has_bound_n2_non_relu = "BoundN2NonReLU" in filename
     return {
         "threads": int(threads_match.group(1)) if threads_match else "",
         "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
         "optimizing_intervals": opt_intervals,
-        "no_n1_bin_relax_on_n2": no_n1_bin,
         "encoding_skip": encoding_skip,
-        "tighten_n2": "yes" if has_tighten_n2 else "no",
+        "bound_n2_relu_using_zonotope": "yes" if has_bound_n2_relu else "no",
+        "bound_n2_non_relu_using_zonotope": "yes" if has_bound_n2_non_relu else "no",
     }
 
 
@@ -409,9 +445,9 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
         "T_relax",
         "relax_count",
         "optimizing_intervals",
-        "no_n1_bin_relax_on_n2",
         "encoding_skip",
-        "tighten_n2",
+        "bound_n2_relu_using_zonotope",
+        "bound_n2_non_relu_using_zonotope",
         "how_much_faster",
     ]
     if not compare_to_with_perturbed:
@@ -480,8 +516,8 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                     key = (cs, ct)
                     if key not in standard_results:
                         continue
-                    # Skip old-style optimizing_intervals runs (but allow NoN1BinRelaxOnN2only, NoN1Encoding, NoN2xpEncoding)
-                    if meta["optimizing_intervals"] == "yes" and meta["no_n1_bin_relax_on_n2"] == "no" and meta["encoding_skip"] == "no":
+                    # Skip old-style optimizing_intervals runs (but allow NoN1Encoding and NoN2xpEncoding)
+                    if meta["optimizing_intervals"] == "yes" and meta["encoding_skip"] == "no":
                         continue
                     s_info = standard_results[key]
                     t_time = t_info["optimization_time"] if transfer_opt_time_only else t_info["total_time"]
@@ -503,9 +539,9 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
                         "T_relax": relax_val,
                         "relax_count": meta["relax_count"],
                         "optimizing_intervals": meta["optimizing_intervals"],
-                        "no_n1_bin_relax_on_n2": meta["no_n1_bin_relax_on_n2"],
                         "encoding_skip": meta["encoding_skip"],
-                        "tighten_n2": meta["tighten_n2"],
+                        "bound_n2_relu_using_zonotope": meta["bound_n2_relu_using_zonotope"],
+                        "bound_n2_non_relu_using_zonotope": meta["bound_n2_non_relu_using_zonotope"],
                     }
 
                     if not compare_to_with_perturbed:
@@ -650,30 +686,53 @@ def main():
     parser.add_argument("--encode_n1_last_layer", action="store_true",
                         help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
                              "exactly using interval-bounded hidden variables; gives exact delta_diff.")
+    parser.add_argument("--n1_last_layer_use_box_scalar", action="store_true",
+                        help="When encode_n1_last_layer is active, use a box-derived scalar lower bound L "
+                             "on conf_n1 instead of the argmax binary encoding; drops C-1 binaries on the N1 side.")
     parser.add_argument("--n1_last_layer_no_binaries", action="store_true",
-                        help="When encode_n1_last_layer is active, use pre-computed scalar lower bound "
-                             "on conf_n1 instead of binary max encoding; zero extra binaries.")
+                        help="DEPRECATED alias for --n1_last_layer_use_box_scalar.")
+    parser.add_argument("--n1_last_layer_prune_tol", type=float, default=0.0,
+                        help="Drop h_n1 variables with interval width <= this and use "
+                             "worst-case constants. 0.0 = only exact singletons. "
+                             "Requires --encode_n1_last_layer.")
+    parser.add_argument("--sweep_n1_adaptive_prune_budget", nargs="*", type=float, default=None,
+                        help="Cross-product: sweep over adaptive pruning budget values. "
+                             "E.g. --sweep_n1_adaptive_prune_budget 0 0.1 0.5 1.0")
+    parser.add_argument("--sweep_hybrid_solve", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--hybrid_solve true and once false.")
+    parser.add_argument("--sweep_n1_stability_relax_threshold", nargs="*", type=float, default=None,
+                        help="Cross-product: sweep over N1 stability relaxation threshold values. "
+                             "E.g. --sweep_n1_stability_relax_threshold -1 0 0.05 0.1")
     parser.add_argument("--constrain_n1_xp", action="store_true",
                         help="Add interval-based constraint that conf(N1,x',c_target)<=0; "
                              "no extra variables, uses pre-computed pert bounds through N1.")
     parser.add_argument("--use_zonotope", action="store_true",
                         help="Use zonotope (affine arithmetic) for diff bound propagation; "
                              "tighter bounds by tracking correlations between neurons.")
-    parser.add_argument("--refined_relu_zonotope", action="store_true",
-                        help="Refined ReLU case analysis in zonotope: tighter bounds when one "
-                             "network is stable-active and the other is split (requires --use_zonotope).")
-    parser.add_argument("--sparse_zonotope", action="store_true",
-                        help="Sparse generator representation: split into dense correlated + diagonal "
-                             "independent; same bounds, less computation (requires --use_zonotope).")
-    parser.add_argument("--zonotope_gen_budget", type=int, default=0,
-                        help="Generator reduction budget K: keep top K generators, merge rest; "
-                             "0 = disabled (requires --use_zonotope).")
-    parser.add_argument("--zonotope_conv", action="store_true",
-                        help="Propagate zonotope through conv layers instead of using interval "
-                             "arithmetic (requires --use_zonotope).")
-    parser.add_argument("--tighten_n2_bounds", action="store_true",
-                        help="Derive tighter N2 preact bounds from N1 + diff to eliminate "
-                             "binary variables.")
+    parser.add_argument("--sweep_zonotope_max_order", nargs="*", type=int, default=None,
+                        help="Cross-product: sweep over zonotope max order values. "
+                             "E.g. --sweep_zonotope_max_order 0 3 5 10. Requires --use_zonotope.")
+    parser.add_argument("--sweep_bound_n2_xp_output_using_composed", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--bound_n2_xp_output_using_composed true and once false.")
+    parser.add_argument("--sweep_bound_n2_xp_using_composed", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--bound_n2_xp_using_composed true and once false.")
+    parser.add_argument("--sweep_branch_priority_n2x_first", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--branch_priority_n2x_first true and once false.")
+    parser.add_argument("--sweep_constrain_n2_xp_via_n1_zonotope", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--constrain_n2_xp_via_n1_zonotope true and once false.")
+    parser.add_argument("--sweep_bound_n2_relu_using_zonotope", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--bound_n2_relu_using_zonotope true and once false. If omitted, runs once "
+                             "with the flag off.")
+    parser.add_argument("--sweep_bound_by_zonotope_n2_hidden_neurons_which_are_not_relu", action="store_true",
+                        help="Cross-product: run each transfer job twice, once with "
+                             "--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu true and once false. "
+                             "If omitted, runs once with the flag off.")
     parser.add_argument("--compare_to_with_perturbed", action="store_true",
                         help="Compare transfer results to vagharWithPerturbed (standard with perturbed "
                              "intervals) instead of vagharNoPerturbed.")
@@ -719,17 +778,20 @@ def main():
     # ── Analysis mode: find transfer faster than standard ─────────
     if args.find_transfer_faster_than_standard:
         # Always scan all perturbation types (not just the ones enabled for running)
-        all_perts = [
-            ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-            ("occ(14,14,9)",      "occ:14,14,9"),
-            ("occ(1,1,5)",        "occ:1,1,5"),
-            ("brightness(0.25)",  "brightness:0.25"),
-            ("trans(1,1)",        "translation:1,1"),
-            ("trans(1,3)",        "translation:1,3"),
-            ("trans(3,1)",        "translation:3,1"),
-            ("trans(3,3)",        "translation:3,3"),
-            ("rotation(10)",      "rotation:10"),
-        ]
+        # all_perts = [
+        #     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
+        #     ("occ(14,14,9)",      "occ:14,14,9"),
+        #     ("occ(1,1,5)",        "occ:1,1,5"),
+        #     ("occ(5,5,5)",        "occ:5,5,5"),
+        #     ("brightness(0.25)",  "brightness:0.25"),
+        #     ("contrast(1.5)",     "contrast:1.5"),
+        #     ("trans(1,1)",        "translation:1,1"),
+        #     ("trans(1,3)",        "translation:1,3"),
+        #     ("trans(3,1)",        "translation:3,1"),
+        #     ("trans(3,3)",        "translation:3,3"),
+        #     ("rotation(10)",      "rotation:10"),
+        # ]
+        all_perts = PERTURBATIONS
         # Write combined CSVs to the dataset-level directory (not per-arch)
         dblchk = args.double_check_standard
         suffix = "_double_check_standard" if dblchk else ""
@@ -768,7 +830,8 @@ def main():
             "time_standard", "time_transfer", "delta_standard_lower_bound",
             "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
             "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "no_n1_bin_relax_on_n2", "encoding_skip", "tighten_n2", "how_much_faster",
+            "relax_count", "optimizing_intervals", "encoding_skip",
+            "bound_n2_relu_using_zonotope", "bound_n2_non_relu_using_zonotope", "how_much_faster",
         ]
         if not args.compare_to_with_perturbed:
             _fieldnames += ["gap_standard", "gap_transfer"]
@@ -887,51 +950,89 @@ def main():
                         std_cmd += ["--standard_relaxation_thresholds", args.standard_relaxation_thresholds]
                     standard_jobs.append((job_key, std_label, std_cmd))
 
+                # Cross-product values for sweep flags.
+                # Default: run with the flag off. --sweep_* enables running multiple values.
+                bound_relu_values = [True] if args.sweep_bound_n2_relu_using_zonotope else [False]
+                bound_non_relu_values = [False, True] if args.sweep_bound_by_zonotope_n2_hidden_neurons_which_are_not_relu else [False]
+                bound_n2xp_out_values = [False, True] if args.sweep_bound_n2_xp_output_using_composed else [False]
+                bound_n2xp_comp_values = [False, True] if args.sweep_bound_n2_xp_using_composed else [False]
+                link_n2xp_values = [False, True] if args.sweep_constrain_n2_xp_via_n1_zonotope else [False]
+                branch_pri_values = [False, True] if args.sweep_branch_priority_n2x_first else [False]
+                adapt_prune_values = args.sweep_n1_adaptive_prune_budget if args.sweep_n1_adaptive_prune_budget else [0.0]
+                hybrid_solve_values = [False, True] if args.sweep_hybrid_solve else [False]
+                zono_order_values = args.sweep_zonotope_max_order if args.sweep_zonotope_max_order else [0]
+                n1_stab_values = args.sweep_n1_stability_relax_threshold if args.sweep_n1_stability_relax_threshold else [-1.0]
+
                 t_jobs = []
-                for oi in opt_intervals:
-                    for t in thresholds :
-                        rga_tag = "true" if args.relaxation_gap_area.lower() == "true" else "false"
-                        t_label = f"{arch_prefix}{pert_name} T={t} oi={oi} rga={rga_tag}"
-                        t_cmd = [
-                            "python3", "utils/run_experiment.py",
-                            "--skip_training",
-                            "--skip_standard",
-                            "--perturbations", pert_spec,
-                            "--timeout", str(args.timeout),
-                            "--dataset", dataset,
-                            "--arch", arch,
-                            "--relaxation_thresholds", str(t),
-                            "--optimizing_intervals", oi,
-                            "--Threads_num", str(Threads_num),
-                            "--relaxation_gap_area", args.relaxation_gap_area,
-                        ] + _model_args
-                        if args.no_n1_binaries_and_relaxtions_only_on_n2:
-                            t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
-                        if args.no_n1_encoding_at_all:
-                            t_cmd.append("--no_n1_encoding_at_all")
-                        if args.no_n2_xp_encoding:
-                            t_cmd.append("--no_n2_xp_encoding")
-                        if args.encode_n1_last_layer:
-                            t_cmd.append("--encode_n1_last_layer")
-                        if args.n1_last_layer_no_binaries:
-                            t_cmd.append("--n1_last_layer_no_binaries")
-                        if args.constrain_n1_xp:
-                            t_cmd.append("--constrain_n1_xp")
-                        if args.use_zonotope:
-                            t_cmd.append("--use_zonotope")
-                        if args.refined_relu_zonotope:
-                            t_cmd.append("--refined_relu_zonotope")
-                        if args.sparse_zonotope:
-                            t_cmd.append("--sparse_zonotope")
-                        if args.zonotope_gen_budget > 0:
-                            t_cmd += ["--zonotope_gen_budget", str(args.zonotope_gen_budget)]
-                        if args.zonotope_conv:
-                            t_cmd.append("--zonotope_conv")
-                        if args.tighten_n2_bounds:
-                            t_cmd.append("--tighten_n2_bounds")
-                        if args.skip_hyper_transfer_attack:
-                            t_cmd.append("--skip_hyper_transfer_attack")
-                        t_jobs.append((t_label, t_cmd))
+                for oi, t, b_relu, b_non_relu, b_n2xp_out, b_n2xp, lnk, bpri, ap_budget, hs, zo, sr in itertools.product(
+                        opt_intervals, thresholds, bound_relu_values, bound_non_relu_values,
+                        bound_n2xp_out_values, bound_n2xp_comp_values, link_n2xp_values, branch_pri_values,
+                        adapt_prune_values, hybrid_solve_values, zono_order_values, n1_stab_values):
+                                rga_tag = "true" if args.relaxation_gap_area.lower() == "true" else "false"
+                                br_tag = "1" if b_relu else "0"
+                                bnr_tag = "1" if b_non_relu else "0"
+                                ap_tag = f"ap{ap_budget}" if ap_budget > 0 else ""
+                                hs_tag = "hs" if hs else ""
+                                zo_tag = f"zo{zo}" if zo > 0 else ""
+                                sr_tag = f"sr{sr}" if sr >= 0 else ""
+                                xpout_tag = "bN2xpOut" if b_n2xp_out else ""
+                                xp_tag = "bN2xp" if b_n2xp else ""
+                                lnk_tag = "n1zono" if lnk else ""
+                                bpri_tag = "bpri" if bpri else ""
+                                extra = "".join(f" {x}" for x in [ap_tag, hs_tag, zo_tag, sr_tag, xpout_tag, xp_tag, lnk_tag, bpri_tag] if x)
+                                t_label = f"{arch_prefix}{pert_name} T={t} oi={oi} rga={rga_tag} bRelu={br_tag} bNonRelu={bnr_tag}{extra}"
+                                t_cmd = [
+                                    "python3", "utils/run_experiment.py",
+                                    "--skip_training",
+                                    "--skip_standard",
+                                    "--perturbations", pert_spec,
+                                    "--timeout", str(args.timeout),
+                                    "--dataset", dataset,
+                                    "--arch", arch,
+                                    "--relaxation_thresholds", str(t),
+                                    "--optimizing_intervals", oi,
+                                    "--Threads_num", str(Threads_num),
+                                    "--relaxation_gap_area", args.relaxation_gap_area,
+                                ] + _model_args
+                                if args.no_n1_binaries_and_relaxtions_only_on_n2:
+                                    t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
+                                if args.no_n1_encoding_at_all:
+                                    t_cmd.append("--no_n1_encoding_at_all")
+                                if args.no_n2_xp_encoding:
+                                    t_cmd.append("--no_n2_xp_encoding")
+                                if args.encode_n1_last_layer:
+                                    t_cmd.append("--encode_n1_last_layer")
+                                if args.n1_last_layer_use_box_scalar or args.n1_last_layer_no_binaries:
+                                    t_cmd.append("--n1_last_layer_use_box_scalar")
+                                if args.n1_last_layer_prune_tol > 0:
+                                    t_cmd += ["--n1_last_layer_prune_tol", str(args.n1_last_layer_prune_tol)]
+                                if args.constrain_n1_xp:
+                                    t_cmd.append("--constrain_n1_xp")
+                                if args.use_zonotope:
+                                    t_cmd.append("--use_zonotope")
+                                if b_n2xp_out:
+                                    t_cmd.append("--bound_n2_xp_output_using_composed")
+                                if b_n2xp:
+                                    t_cmd.append("--bound_n2_xp_using_composed")
+                                if lnk:
+                                    t_cmd.append("--constrain_n2_xp_via_n1_zonotope")
+                                if bpri:
+                                    t_cmd.append("--branch_priority_n2x_first")
+                                if b_relu:
+                                    t_cmd.append("--bound_n2_relu_using_zonotope")
+                                if b_non_relu:
+                                    t_cmd.append("--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu")
+                                if ap_budget > 0:
+                                    t_cmd += ["--n1_adaptive_prune_budget", str(ap_budget)]
+                                if hs:
+                                    t_cmd.append("--hybrid_solve")
+                                if zo > 0:
+                                    t_cmd += ["--zonotope_max_order", str(zo)]
+                                if sr >= 0:
+                                    t_cmd += ["--n1_stability_relax_threshold", str(sr)]
+                                if args.skip_hyper_transfer_attack:
+                                    t_cmd.append("--skip_hyper_transfer_attack")
+                                t_jobs.append((t_label, t_cmd))
                 transfer_by_pert[job_key] = t_jobs
 
         # Transfer jobs for skipped-standard perturbations are immediately ready
