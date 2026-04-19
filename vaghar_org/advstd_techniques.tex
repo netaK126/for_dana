@@ -1,0 +1,1337 @@
+\documentclass[11pt]{article}
+
+%% Standalone self-contained explainer: does not depend on the neta-s-paper
+%% or vaghar_org TeX sources. Compile with pdflatex.
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{enumitem}
+\usepackage[table]{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{tikz}
+\usepackage{graphicx}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black,
+}
+
+%% Notation macros
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\xp}{x'}
+\newcommand{\ep}{\varepsilon}
+\newcommand{\conf}[3]{\mathrm{Conf}_{#1}(#2, #3)}
+\newcommand{\II}{\mathcal{I}}
+\newcommand{\delN}[1]{\delta^{\ast}_{N_{#1}}}
+\newcommand{\dexact}{\delta_{\mathrm{exact}}}
+\newcommand{\Fmip}[1]{\mathcal{F}_{#1}}
+\newcommand{\tech}[1]{\textsf{#1}}
+\newcommand{\gurobi}[1]{\texttt{#1}}
+\newcommand{\cli}[1]{\texttt{-{}-#1}}
+
+\title{Advanced Standard Mode: Safe-to-Use Technique Combinations\\
+for Transferring Solver State Across Related Verifications}
+\author{VHAGaR / neta-s-paper --- Internal technical note}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\emph{Advanced standard} (\textsf{advstd}) mode is an execution mode of the
+VHAGaR global-robustness verifier that computes the global robustness
+bound $\delN{2}$ for a target network $N_2$ by \emph{reusing solver state}
+from a prior solve of a structurally similar network~$N_1$.
+
+This note documents only the \textbf{safe-to-use} technique combinations ---
+those empirically validated to produce average speedups with no severe
+slowdowns on any cell (geometric-mean time ratio $< 0.952\times$ and
+worst-cell time ratio $\le 1.333\times$; i.e.\ \textsf{perf\_tier}
+$\in\{\textsf{dominant}, \textsf{avg-win}\}$).
+Out of the full combinatorial space, 54~combinations satisfy this criterion.
+They use four independent techniques (Sections~\ref{sec:tech1}--\ref{sec:tech4}),
+all of which preserve the optimal global-robustness bound $\dexact$.
+Section~\ref{sec:algorithms} gives the complete algorithm for every
+safe combination.
+\end{abstract}
+
+\section{Motivation and Setting}
+\label{sec:motivation}
+
+Let $N_1$ and $N_2$ be two neural networks with the same architecture ---
+same layer sizes, same ReLU structure, same input domain --- but different
+parameter values. A typical instance is $N_2 = N_1$ after one additional
+SGD epoch.
+
+The global robustness verification problem, as formulated in VHAGaR, asks:
+for a given source class~$c_s$, target class~$c_t$, perturbation
+type~$P$, and bound~$\ep$, what is the smallest $\delta$ such that no
+input classified with confidence at least $\delta$ as $c_s$ can be
+perturbed within $\II_\ep(\cdot)$ to be classified as $c_t$? This is
+encoded as a mixed-integer program (MIP) and solved with Gurobi.
+
+When $N_1$ and $N_2$ are structurally identical but numerically close,
+the two MIPs have identical variable names, identical constraint
+structure (only coefficients differ), and similar solution geometry.
+Advanced standard mode exploits this similarity through a set of
+concrete, optional techniques.
+
+\section{Two-Phase Execution}
+\label{sec:twophase}
+
+Advanced standard mode runs in two phases, possibly in separate processes:
+
+\begin{description}[leftmargin=1.5em, style=nextline]
+  \item[Phase 1 --- \emph{N1 solve}]
+    For each $(c_s, c_t)$ class pair, solve the standard-mode MIP for
+    $N_1$ to either optimality or a user-specified timeout. Extract:
+    \begin{itemize}[noitemsep]
+      \item The full primal solution
+        $(\text{var}_i, \text{val}_i)_{i=1}^{|V|}$.
+      \item The per-neuron interval bounds $(l_{m,k}, u_{m,k})$ on all
+        split ReLUs (the $\mathtt{layers\_info}$ dictionary).
+    \end{itemize}
+    Serialise to disk. The resulting $\mathtt{n1\_state}$ directory is a
+    self-contained snapshot of ``everything we learned while solving~$N_1$''.
+
+  \item[Phase 2 --- \emph{N2 sweep}]
+    For each $(c_s, c_t)$ pair, build the standard-mode MIP for $N_2$,
+    load the $N_1$ state, apply each enabled technique, and call
+    \gurobi{optimize!}. Phase~2 never re-solves~$N_1$.
+\end{description}
+
+\section{Background: ReLU Encoding in the MIP}
+\label{sec:background}
+
+The VHAGaR MIP encodes each ReLU neuron $z^+ = \max(0, \hat{z})$ using a
+\emph{big-$M$ formulation} with a binary variable $a \in \{0, 1\}$.
+Given pre-activation bounds $\hat{z} \in [\underline{z}, \overline{z}]$
+(where $\underline{z} < 0 < \overline{z}$ for a ``split'' neuron), the
+encoding introduces:
+\begin{align}
+  z^+ &\ge 0, \label{eq:bg_bigm1}\\
+  z^+ &\ge \hat{z}, \label{eq:bg_bigm2}\\
+  z^+ &\le \hat{z} - \underline{z}\,(1 - a), \label{eq:bg_bigm3}\\
+  z^+ &\le \overline{z}\, a. \label{eq:bg_bigm4}
+\end{align}
+This is \emph{exact}: when $a = 1$ (neuron active), constraints force
+$z^+ = \hat{z}$; when $a = 0$ (neuron inactive), they force $z^+ = 0$.
+The binary $a$ is what makes the problem a \emph{mixed-integer} program ---
+solving over all possible $\{0,1\}$ assignments is what makes
+verification NP-hard.
+
+\paragraph{The LP relaxation of ReLU.} If we \emph{drop} the binary $a$
+and keep only the three constraints that do not involve $a$, we get the
+\emph{triangle LP relaxation}:
+\begin{align}
+  z^+ &\ge 0, \label{eq:bg_tri1}\\
+  z^+ &\ge \hat{z}, \label{eq:bg_tri2}\\
+  z^+ &\le \frac{\overline{z}}{\overline{z} - \underline{z}}\,
+    (\hat{z} - \underline{z}). \label{eq:bg_tri3}
+\end{align}
+This is a \emph{convex relaxation}: it allows $z^+$ to take any value
+inside a triangle in the $(\hat{z}, z^+)$ plane, not just the two
+exact ReLU branches. There is no binary variable, so the problem becomes
+a linear program (LP) --- much faster to solve, but the feasible set is
+\emph{larger} than the exact one. Any solution to the exact encoding
+also satisfies the LP relaxation, but not vice versa.
+
+The LP relaxation is used in two different contexts in this document:
+\begin{enumerate}[noitemsep]
+  \item \textbf{As a building block} inside Technique~2's N1~Probe
+    (Source~C): a full LP model with triangle-relaxed ReLUs is solved
+    to compute tight per-neuron bounds.
+  \item \textbf{As a replacement} in Technique~4: selected binary
+    variables in the final $N_2$ MIP are replaced with triangle
+    relaxations to reduce the integer search space.
+\end{enumerate}
+
+\section{Techniques Used in Safe Combinations}
+\label{sec:techniques}
+
+The safe combinations use exactly four techniques.
+Two techniques from the original advstd toolchain --- MIP Start and LP
+Basis --- are \textbf{not} used in any safe combination and are
+therefore omitted from this document.
+
+\subsection*{Correctness invariant}
+
+Let $\Fmip{2}$ denote the feasible set of $N_2$'s standard-mode MIP and
+let
+\[
+  \dexact \;\triangleq\; \delN{2} \;=\; \max_{x \in \Fmip{2}}
+    \mathrm{obj}_{N_2}(x).
+\]
+For every subset of techniques, the optimal value reported by the solver
+when it terminates at \textsf{OPTIMAL} is exactly $\dexact$. The techniques
+only change the \emph{path} Gurobi takes through the branch-and-bound tree,
+not the set of feasible solutions or the objective function.
+
+\subsection{Technique 1 --- Branch Priorities \textsf{(bp=bounds)}}
+\label{sec:tech1}
+
+\noindent
+\textbf{Flag:} \cli{adv\_std\_branch\_priorities} $\in \{\textsf{off}, \textsf{bounds}\}$.
+\quad \textbf{Gurobi attribute:} $\gurobi{BranchPriority}$.
+
+\paragraph{Idea.} For each binary $a_{m,k}$ in $N_2$, look up $N_1$'s
+final interval bounds $(l_{m,k}, u_{m,k})$ and compute the gap
+$g_{m,k} = |u_{m,k} - l_{m,k}|$. Assign a three-level priority:
+\[
+  \text{pri}(m,k) \;=\;
+    \begin{cases}
+      10 & \text{if } g_{m,k} < 1 \\
+      5  & \text{if } 1 \le g_{m,k} < 5 \\
+      1  & \text{otherwise.}
+    \end{cases}
+\]
+The intuition is that tight-bound neurons are hard-contested neurons, so
+$N_2$ should branch on them first.
+
+\paragraph{Soundness.} \gurobi{BranchPriority} only changes the order in
+which the branch-and-bound tree is explored. No constraint is added:
+$\Fmip{2}^{(\{2\})} = \Fmip{2}$ and $\dexact$ is preserved.
+
+\subsection{Technique 2 --- Bound Tightening \textsf{(boundTight)}}
+\label{sec:tech1}
+
+\noindent
+\textbf{Flag:} \cli{adv\_std\_bound\_tightening} (always \textsf{true} in safe combos).
+\quad \textbf{Model modification:} tightens neuron bounds before the $N_2$
+MIP is built.
+
+This technique runs \emph{before} the MIP is constructed. Its output ---
+tighter per-neuron intervals --- feeds into the MIP encoding itself
+(smaller big-$M$ constants, fewer binary variables). The other techniques
+(branch priorities, variable hints, triangle relaxation) operate
+\emph{on} the already-built MIP.
+
+Technique~2 is independent of the \emph{perturbed interval constraints}
+that are added to the MIP after construction (see the note at the end of
+this subsection).
+
+\paragraph{Goal.} For each ReLU neuron $(m,k)$ in $N_2$, compute a
+sound interval $[d^{\downarrow}_{m,k}, d^{\uparrow}_{m,k}]$ on the
+\emph{weight-drift difference}
+$\hat{z}^{N_2}_{m,k} - \hat{z}^{N_1}_{m,k}$ (how much the
+pre-activation changed due to $N_2$ having different weights than $N_1$).
+Once we have this interval, we combine it with $N_1$'s known bounds
+from Phase~1 to get $N_2$ bounds:
+\[
+  l^{N_2}_{m,k} \;\ge\; l^{N_1}_{m,k} + d^{\downarrow}_{m,k},
+  \qquad
+  u^{N_2}_{m,k} \;\le\; u^{N_1}_{m,k} + d^{\uparrow}_{m,k}.
+\]
+When a neuron's tightened interval lies strictly in $\RR_{<0}$ or
+$\RR_{\ge 0}$, the binary $a_{m,k}$ is fixed and removed from the MIP.
+
+There are three methods to compute $[d^{\downarrow}_{m,k},
+d^{\uparrow}_{m,k}]$, each producing tighter bounds than the previous.
+The safe combinations use one of these three, controlled by the
+\tech{zono} and \tech{n1Probe} flags.
+
+\subsubsection{Method 1: Interval arithmetic (baseline)}
+\label{sec:method_ia}
+
+\noindent
+\textbf{Used when:} \tech{zono}=false and \tech{n1Probe}=off.
+
+This is the default method. From Phase~1 we have $N_1$'s per-neuron
+bounds $(l^{N_1}_{m,k}, u^{N_1}_{m,k})$, so the post-ReLU range is
+$z^{N_1}_{m,k} \in [\max(0, l^{N_1}_{m,k}),\;
+\max(0, u^{N_1}_{m,k})]$.
+
+\paragraph{Weight-drift difference.}
+Because $N_1$ and $N_2$ share the same architecture, every neuron $(m,k)$
+in $N_2$ has a corresponding neuron in $N_1$. The \emph{difference} in
+their pre-activations, $z^{N_2}_{m,k} - z^{N_1}_{m,k}$, depends only on
+the weight difference $\Delta W = W_2 - W_1$ (the ``weight drift'' from
+training). Sound intervals on this difference are computed layer by layer
+using interval arithmetic.
+
+\emph{Affine layers.} Let $\Delta w_{m,k} = w^2_{m,k} - w^1_{m,k}$ and
+$\Delta b_{m,k} = b^2_{m,k} - b^1_{m,k}$ be the weight and bias differences
+at layer $m$. From Phase~1 we have $N_1$'s per-neuron bounds
+$(l^{N_1}_{m,k}, u^{N_1}_{m,k})$ for every ReLU neuron. Since the
+post-ReLU output is $z_{m,k} = \max(0, \hat{z}_{m,k})$, the
+post-ReLU range for each neuron $k$ in layer $m{-}1$ is
+$z^{N_1}_{m-1,k} \in [\max(0, l^{N_1}_{m-1,k}),\;
+\max(0, u^{N_1}_{m-1,k})]$.
+
+The pre-activation difference at neuron $k$ of layer $m$ decomposes as:
+\[
+  \hat{z}^{N_2}_{m,k} - \hat{z}^{N_1}_{m,k} \;=\;
+  \underbrace{\sum_{k'} w^2_{m,k,k'}
+    (z^{N_2}_{m-1,k'} - z^{N_1}_{m-1,k'})}_{\text{propagated diff from previous layer}}
+  \;+\; \underbrace{\sum_{k'} \Delta w_{m,k,k'} \cdot z^{N_1}_{m-1,k'}
+    + \Delta b_{m,k}}_{\text{direct weight-drift contribution}}.
+\]
+Interval arithmetic bounds each term per output neuron $k$:
+\[
+  [d^{\downarrow}_{m,k},\; d^{\uparrow}_{m,k}] \;=\;
+    \sum_{k'} w^2_{m,k,k'} \cdot [d^{\downarrow}_{m-1,k'},\; d^{\uparrow}_{m-1,k'}]
+    \;+\; \sum_{k'} \Delta w_{m,k,k'} \cdot
+      [\max(0, l^{N_1}_{m-1,k'}),\; \max(0, u^{N_1}_{m-1,k'})]
+    \;+\; \Delta b_{m,k},
+\]
+
+\emph{ReLU layers.} The ReLU difference satisfies
+$\sigma(z + d) - \sigma(z) \in [\min(0, d^{\downarrow}),\,
+\max(0, d^{\uparrow})]$, so the diff interval is clipped:
+$d^{\uparrow} \leftarrow \max(0, d^{\uparrow})$ and
+$d^{\downarrow} \leftarrow -\max(0, -d^{\downarrow})$.
+
+The final output at each layer is a sound interval:
+\[
+  d^{\downarrow}_{m,k} \;\le\; z^{N_2}_{m,k} - z^{N_1}_{m,k}
+  \;\le\; d^{\uparrow}_{m,k}.
+\]
+These are then combined with $N_1$'s known bounds to get $N_2$ bounds:
+\[
+  l^{N_2}_{m,k} \;\ge\; l^{N_1}_{m,k} + d^{\downarrow}_{m,k},
+  \qquad
+  u^{N_2}_{m,k} \;\le\; u^{N_1}_{m,k} + d^{\uparrow}_{m,k}.
+\]
+This method is fast but loose: it treats every neuron as independent,
+losing all correlations between neurons in the same layer.
+
+\subsubsection{Method 2: Zonotope arithmetic (Source A + B)}
+\label{sec:method_zono}
+
+\noindent
+\textbf{Used when:} \tech{zono}=true.
+\quad \textbf{Flag:} \cli{adv\_std\_zono\_bounds}.
+
+This method computes the same $[d^{\downarrow}_{m,k},
+d^{\uparrow}_{m,k}]$ as Method~1, but using \emph{zonotope arithmetic}
+instead of interval arithmetic. A zonotope tracks correlations between
+neurons by representing each neuron's value as a linear combination of
+shared noise variables, producing tighter bounds. Additionally, a second
+pass (Source~B) independently bounds $N_2$'s absolute activations and
+intersects the result with the diff-based bounds.
+
+\paragraph{Source~A --- Zonotope diff bounds.}
+Each neuron's difference is represented as a zonotope --- a centre plus
+generators sharing noise variables $\epsilon_j \in [-1,1]$ across all
+neurons in the layer. We store a centre vector
+$\mathbf{c}_m \in \RR^K$ and a generator matrix
+$G_m \in \RR^{K \times p}$ (rows = $K$ neurons, columns = $p$ generators,
+where $p$ is the number of columns accumulated so far --- initially
+$p = K_0$ at the input layer, and each affine layer adds $K'$ columns
+while each ReLU adds one column per split neuron):
+\[
+  d_{m,k} = c_{m,k} + \sum_j g_{m,k,j}\,\epsilon_j,
+  \qquad
+  d^\downarrow_{m,k} = c_{m,k} - \textstyle\sum_j |g_{m,k,j}|,
+  \qquad
+  d^\uparrow_{m,k} = c_{m,k} + \textstyle\sum_j |g_{m,k,j}|.
+\]
+Shared $\epsilon_j$ variables encode correlations: interval arithmetic
+is the special case where $G_m$ is diagonal (no correlations).
+
+\emph{Initialisation.} At the input layer, $N_1$ and $N_2$ receive the
+same input, so the diff is zero: $\mathbf{c}_0 = \mathbf{0}$,
+$G_0 = \mathbf{0}_{K_0 \times 0}$ (no generators yet, $p=0$).
+The first affine update creates the initial generators via
+$G'_{\mathrm{indep}}$.
+
+\emph{Affine layer update.} Let $K'$ = neurons in layer $m{-}1$,
+$K$ = neurons in layer $m$:
+\begin{align}
+  c_{m,k} &= \sum_{k'} w^2_{m,k,k'}\, c_{m-1,k'}
+    + \sum_{k'} \Delta w_{m,k,k'} \cdot \mathrm{mid}_{k'}
+    + \Delta b_{m,k}
+  \label{eq:zono_center}\\[4pt]
+  \underbrace{G'_{\mathrm{corr}}}_{K \times p} &=
+    \underbrace{W_2}_{K \times K'}\,
+    \underbrace{G_{m-1}}_{K' \times p}
+  \label{eq:zono_gcorr}\\
+  \underbrace{G'_{\mathrm{indep}}}_{K \times K'} &=
+    \underbrace{\Delta W}_{K \times K'} \cdot
+    \underbrace{\operatorname{diag}(\mathrm{rad}_{1}, \ldots,
+      \mathrm{rad}_{K'})}_{K' \times K'}
+  \label{eq:zono_gindep}\\
+  \underbrace{G_m}_{K \times (p+K')} &=
+    \bigl[\,G'_{\mathrm{corr}} \;\big|\; G'_{\mathrm{indep}}\,\bigr]
+  \label{eq:zono_gconcat}
+\end{align}
+where $\mathrm{mid}_{k'}$ and $\mathrm{rad}_{k'}$ are the midpoint
+and half-width of $N_1$'s post-ReLU interval at neuron $k'$:
+$\mathrm{mid}_{k'} = \tfrac{1}{2}(\max(0, u^{N_1}_{m-1,k'}) +
+\max(0, l^{N_1}_{m-1,k'}))$,
+$\mathrm{rad}_{k'} = \tfrac{1}{2}(\max(0, u^{N_1}_{m-1,k'}) -
+\max(0, l^{N_1}_{m-1,k'}))$.
+
+After the affine update, the column count grows from $p$ to $p + K'$.
+
+\emph{ReLU layer update (DeepZ).} Compute hull per neuron:
+$l_k = c_{m,k} - \sum_j |g_{m,k,j}|$,
+$u_k = c_{m,k} + \sum_j |g_{m,k,j}|$.
+\begin{itemize}[noitemsep]
+  \item $u_k \le 0$: $c_{m,k} \leftarrow 0$,
+    $g_{m,k,\cdot} \leftarrow 0$.
+  \item $l_k \ge 0$: unchanged.
+  \item Split ($l_k < 0 < u_k$):
+    $\lambda_k = \frac{u_k}{u_k - l_k}$, \;
+    $\mu_k = -\frac{u_k \cdot l_k}{2(u_k - l_k)}$,
+    \[
+      c_{m,k} \leftarrow \lambda_k\, c_{m,k} + \mu_k, \qquad
+      g_{m,k,\cdot} \leftarrow \lambda_k\, g_{m,k,\cdot},
+    \]
+    append column to $G_m$: value $\mu_k$ at row $k$, zero elsewhere.
+\end{itemize}
+After the ReLU update, $p \leftarrow p + |\{k : l_k < 0 < u_k\}|$
+(one new column per split neuron).
+
+So for a network with $L$ affine layers of widths $K_1, \ldots, K_L$
+and $s_m$ split neurons at ReLU layer $m$:
+\[
+  p_{\text{final}} = K_0 + \sum_{m=1}^{L} (K_{m-1} + s_m).
+\]
+
+\paragraph{Source~B --- N1-tightened absolute N2 zonotope.}
+A separate zonotope propagates $N_2$'s \emph{absolute} pre-activations
+(not the diff) through $N_2$ alone, using the same zonotope machinery
+as Source~A but applied to $N_2$'s own values. Initialise with a
+single zonotope whose hull covers both the clean input
+$v_\mathrm{in} \in [0, 1]^n$ \emph{and} the perturbed input
+$v_{x_0} = v_\mathrm{in} + v_e \in [-\ep, 1+\ep]^n$ simultaneously:
+\[
+  \mathbf{c}^{\mathrm{B}}_0 = \tfrac{1}{2}\mathbf{1}, \qquad
+  G^{\mathrm{B}}_0 = \operatorname{diag}\!\bigl(
+    \tfrac{1}{2} + \ep,\, \ldots,\, \tfrac{1}{2} + \ep\bigr)
+  \in \RR^{n \times n},
+\]
+so the initial hull is $[-\ep,\, 1+\ep]^n$ rather than $[0, 1]^n$.
+This widens the input box by $\ep$ on each side relative to the
+clean-only range, which is the price of using one zonotope to bound
+$N_2$'s pre-activations under both the clean and perturbed inputs
+(rather than propagating two separate zonotopes and taking their
+union).
+Propagate through $N_2$'s affine layers ($c \leftarrow W_2 c + b_2$,
+$G \leftarrow W_2 G$) and DeepZ ReLU relaxations exactly as in
+Source~A. At each ReLU layer, the zonotope hull gives per-neuron bounds:
+\[
+  u^{\mathrm{hull}}_{m,k} = c^{\mathrm{B}}_{m,k} +
+    \textstyle\sum_j |g^{\mathrm{B}}_{m,k,j}|, \qquad
+  l^{\mathrm{hull}}_{m,k} = c^{\mathrm{B}}_{m,k} -
+    \textstyle\sum_j |g^{\mathrm{B}}_{m,k,j}|.
+\]
+These are then \emph{intersected} with Source~A's diff-based bounds:
+\begin{equation}
+  u^{N_2}_{m,k} = \min\!\bigl(
+    u^{\mathrm{hull}}_{m,k},\;
+    u^{N_1}_{m,k} + d^{\uparrow}_{m,k}\bigr),
+  \qquad
+  l^{N_2}_{m,k} = \max\!\bigl(
+    l^{\mathrm{hull}}_{m,k},\;
+    l^{N_1}_{m,k} + d^{\downarrow}_{m,k}\bigr).
+  \label{eq:srcB_intersect}
+\end{equation}
+The first term in each $\min$/$\max$ comes from Source~B's own zonotope
+pass on $N_2$; the second term comes from Source~A's diff bounds applied
+to $N_1$'s known bounds (the same formula as in the Goal paragraph
+above). Taking the tighter of the two at each neuron is sound because
+both are valid over-approximations.
+
+The DeepZ ReLU relaxation is then applied using these tightened bounds,
+so Source~B's zonotope passes through a narrower ``tube'' at each layer.
+
+\subsubsection{Method 3: N1 Probe LP --- additional tightening on top
+of Method~1 or~2 (Source C)}
+\label{sec:method_probe}
+
+\noindent
+\textbf{Used when:} \tech{n1Probe}=lp.
+\quad \textbf{Flag:} \cli{adv\_std\_n1\_probe}.
+\quad \textbf{Perturbation support:} $\ell_\infty$, brightness,
+contrast, patch, occlusion, translation. (Rotation is not yet
+supported; Source~C is silently skipped for unsupported types.)
+
+Method~3 is \textbf{not an alternative} to Methods~1/2 --- it runs
+\emph{after} them and further tightens the bounds they produced.
+
+\paragraph{What the probe LP is.}
+The probe LP is a \textbf{separate, temporary model} built from scratch
+--- it is \emph{not} the $N_2$ MIP. It contains:
+\begin{itemize}[noitemsep]
+  \item Shared input variables $v_\mathrm{in}$, $v_{x_0}$
+    (linked by perturbation-specific constraints).
+  \item A complete forward pass through $N_1$: affine layers
+    (weights $W_1$, biases $b_1$) with triangle-relaxed ReLUs.
+  \item A complete forward pass through $N_2$: affine layers
+    (weights $W_2$, biases $b_2$) with triangle-relaxed ReLUs.
+  \item \textbf{No binary variables at all} --- every ReLU in both
+    networks uses the triangle LP relaxation
+    (Eqs.~(\ref{eq:bg_tri1})--(\ref{eq:bg_tri3})), so the entire
+    model is a pure LP.
+\end{itemize}
+The key property is that $N_1$ and $N_2$ share the same input variables.
+When we optimize over this LP, the solver can reason about what inputs
+are feasible given the constraints of \emph{both} networks
+simultaneously --- this is what ``cross-network correlations'' means,
+and it is something that interval arithmetic and zonotopes (which
+process each network independently) cannot capture.
+
+\paragraph{How it computes bounds.}
+For each N2 pre-activation neuron $(m,k)$: temporarily set the LP's
+objective to $\hat{z}^{N_2}_{m,k}$, solve min and max, record the
+bounds, then change the objective to the next neuron. The bounds from
+Methods~1/2 are used as the triangle-relaxation intervals for N2's
+ReLUs inside this LP (tighter input bounds make the LP tighter).
+
+\paragraph{LP construction.}
+The LP encodes both $N_1$ and $N_2$ as triangle-relaxed forward passes
+sharing the same input variables $v_\mathrm{in}$ (clean) and $v_{x_0}$
+(perturbed). The only part that differs by perturbation type is the
+constraint linking $v_\mathrm{in}$ and $v_{x_0}$:
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}l l@{}}
+\toprule
+Perturbation & Constraint on $(v_\mathrm{in}, v_{x_0})$ \\
+\midrule
+$\ell_\infty$ & $v_{x_0} = v_\mathrm{in} + v_e$,
+  \; $v_e \in [-\ep, \ep]^n$ \\
+brightness & $v_{x_0} = v_\mathrm{in} + e$,
+  \; $e \in [0, \ep]$ (scalar) \\
+contrast & $v_{x_0,i} \in [v_{\mathrm{in},i},\;
+  (1{+}\ep)\,v_{\mathrm{in},i}]$ (LP over-approx.\ of $e \cdot v_\mathrm{in}$) \\
+patch & $v_{x_0,i} = v_{\mathrm{in},i} \pm \ep$ on patch,
+  \; $v_{x_0,i} = v_{\mathrm{in},i}$ elsewhere \\
+occlusion & $v_{x_0,i} = 0$ on occluded pixels,
+  \; $v_{x_0,i} = v_{\mathrm{in},i}$ elsewhere \\
+translation & $v_{x_0}$ = shifted $v_\mathrm{in}$
+  with zero-padded borders \\
+\bottomrule
+\end{tabular}
+\end{center}
+All constraints are linear (or, for contrast, a sound LP
+over-approximation of the bilinear $e \cdot v_\mathrm{in}$), so the
+probe LP remains a pure LP for every supported perturbation type.
+
+For $\ell_\infty$ the input variables are:
+\begin{align}
+  v_\mathrm{in} &\in [0, 1]^n, \quad
+  v_e \in [-\ep, \ep]^n, \quad
+  v_{x_0} \in [0, 1]^n, \notag\\
+  v_{x_0} &= v_\mathrm{in} + v_e.
+  \label{eq:probe_input}
+\end{align}
+
+Each ReLU neuron in both $N_1$ and $N_2$ is encoded using the triangle
+LP relaxation (Eqs.~(\ref{eq:bg_tri1})--(\ref{eq:bg_tri3}) from
+Section~\ref{sec:background}), making the entire model a pure LP (no
+binaries). The N2 neuron bounds used in these triangle relaxations come
+from Method~1 or~2 (whichever ran first).
+
+\paragraph{Optimisation-Based Bound Tightening (OBBT).}
+For each N2 pre-activation neuron $(m,k)$ in both the original and
+perturbed network copies, solve two LPs:
+\begin{equation}
+  l^{\mathrm{probe}}_{m,k} =
+    \min_{\mathcal{P}_\mathrm{LP}} \hat{z}^{N_2}_{m,k},
+  \qquad
+  u^{\mathrm{probe}}_{m,k} =
+    \max_{\mathcal{P}_\mathrm{LP}} \hat{z}^{N_2}_{m,k},
+  \label{eq:obbt}
+\end{equation}
+where $\mathcal{P}_\mathrm{LP}$ is the feasible polytope of the joint
+N1+N2 triangle-relaxed LP. Each neuron requires two LP solves (min and
+max), so the total cost is $2 \times (\text{number of N2 ReLU neurons})
+\times 2$ (for org and pert copies).
+
+\paragraph{Soundness of Method~3.} The probe LP's feasible set
+$\mathcal{P}_\mathrm{LP}$ is an over-approximation of the true
+(input, $N_1$-state, $N_2$-state) feasible set: every true feasible
+point satisfies the triangle relaxation at each neuron, so
+$\mathcal{F}_\mathrm{true} \subseteq \mathcal{P}_\mathrm{LP}$.
+Therefore $l^{\mathrm{probe}}_{m,k} \le
+\min_{\mathcal{F}_\mathrm{true}} \hat{z}^{N_2}_{m,k}$ and
+$u^{\mathrm{probe}}_{m,k} \ge
+\max_{\mathcal{F}_\mathrm{true}} \hat{z}^{N_2}_{m,k}$: the probe
+bounds are valid (possibly loose) per-neuron intervals. These bounds are then
+used only to tighten the big-$M$ constants in $N_2$'s MIP encoding
+(via the final bound integration in Section~\ref{sec:bound_integration}).
+Since every tightened bound is satisfied by every $x \in \Fmip{2}$,
+the $\dexact$-attaining point $x^\ast$ remains feasible and the
+optimal $\delN{2}$ is unchanged regardless of whether Method~3 is
+enabled. For contrast perturbation, the LP over-approximation of the
+bilinear $e \cdot v_\mathrm{in}$ is looser than the exact constraint,
+but soundness is preserved: the LP feasible set is still a superset
+of the true feasible set.
+
+\subsubsection{Final bound integration}
+\label{sec:bound_integration}
+
+When $N_2$'s MIP is built, each ReLU neuron's bounds are the tightest
+(intersection) of all available sources:
+\begin{align}
+  u^{N_2}_{m,k} &\leftarrow \min\!\bigl(
+    u^{N_1}_{m,k} + d^\uparrow_{m,k},\;
+    u^{\mathrm{B}}_{m,k},\;
+    u^{\mathrm{probe,org}}_{m,k},\;
+    u^{\mathrm{probe,pert}}_{m,k}\bigr),
+  \label{eq:final_upper}\\
+  l^{N_2}_{m,k} &\leftarrow \max\!\bigl(
+    l^{N_1}_{m,k} + d^\downarrow_{m,k},\;
+    l^{\mathrm{B}}_{m,k},\;
+    l^{\mathrm{probe,org}}_{m,k},\;
+    l^{\mathrm{probe,pert}}_{m,k}\bigr),
+  \label{eq:final_lower}
+\end{align}
+ Terms from disabled methods are simply omitted
+from the $\min$/$\max$. When the final interval is single-signed
+($u^{N_2}_{m,k} \le 0$ or $l^{N_2}_{m,k} \ge 0$), the associated
+binary is eliminated from the MIP entirely.
+
+\paragraph{Soundness.} All three methods produce sound
+over-approximations:
+\begin{itemize}[noitemsep]
+  \item Method~1 (interval arithmetic): standard interval arithmetic
+    rules over-approximate the true range at each layer.
+  \item Method~2 (zonotope): zonotope arithmetic is a sound abstract
+    interpretation; Source~B's intersection of two sound
+    over-approximations is itself sound.
+  \item Method~3 (N1 probe): the triangle LP relaxation is a convex
+    superset of the true feasible region, so OBBT over it yields
+    valid bounds.
+\end{itemize}
+Every resulting bound is satisfied by every $x \in \Fmip{2}$, so
+$x^\ast$ remains feasible and $\dexact$ is preserved.
+
+% \paragraph{Relationship to perturbed interval constraints.}
+% In addition to the bound-tightening described above, the $N_2$ MIP also
+% receives \emph{perturbed interval constraints} --- these are added
+% \emph{after} the MIP is built and are \textbf{independent of Technique~4}.
+% They are always enabled in the safe combinations
+% (\cli{use\_perturbed\_intervals}=true) and operate as follows.
+
+% The VHAGaR MIP for a single network contains two copies: one for the
+% clean input $v_\mathrm{in}$ (the ``org'' copy) and one for the perturbed
+% input $v_{x_0} = v_\mathrm{in} + v_e$ (the ``perturbation'' copy).
+% Because both copies share the same network weights and their inputs
+% differ by at most $v_e \in [-\ep, \ep]^n$, the post-ReLU activations of
+% the two copies cannot differ by much. Perturbed interval constraints
+% make this explicit: for each ReLU neuron $(m,k)$, compute sound intervals
+% $[\Delta^\downarrow_{m,k}, \Delta^\uparrow_{m,k}]$ on the difference
+% $z^+_\mathrm{pert}(m,k) - z^+_\mathrm{org}(m,k)$ by propagating
+% $[-\ep, \ep]$ through the network using interval arithmetic. Then add
+% two linking constraints directly to the MIP:
+% \begin{align}
+%   z^+_\mathrm{pert}(m,k) &\le z^+_\mathrm{org}(m,k) +
+%     \Delta^\uparrow_{m,k}, \label{eq:pi_upper}\\
+%   z^+_\mathrm{pert}(m,k) &\ge z^+_\mathrm{org}(m,k) +
+%     \Delta^\downarrow_{m,k}. \label{eq:pi_lower}
+% \end{align}
+% These constraints couple the org and perturbation copies, preventing them
+% from diverging beyond what the perturbation bound allows. They are
+% derived from interval arithmetic (sound), so they never exclude feasible
+% points.
+
+
+\textbf{Summary of what operates where:}
+\begin{itemize}[noitemsep]
+  \item \textbf{Technique~4} (bound tightening, Sources~A/B/C):
+    runs \emph{before} MIP construction. Output: tighter per-neuron
+    intervals $\to$ smaller big-$M$ constants, fewer binaries.
+  \item \textbf{Perturbed interval constraints}:
+    runs \emph{after} MIP construction. Output: additional linear
+    constraints linking the org and perturbation copies of $N_2$.
+  \item Both are always active in the safe combinations and complement
+    each other.
+\end{itemize}
+
+\subsection{Technique 3 --- Variable Hints \textsf{(varHint)}}
+\label{sec:tech3}
+
+\noindent
+\textbf{Flag:} \cli{adv\_std\_var\_hint} $\in \{\textsf{false}, \textsf{true}\}$.
+\quad \textbf{Gurobi attributes:} $\gurobi{VarHintVal}$, $\gurobi{VarHintPri}$.
+
+\paragraph{Background: how Gurobi solves a MIP.}
+When Gurobi solves $N_2$'s MIP, it uses \emph{branch-and-bound}: it
+maintains a search tree where each node is a sub-problem with some
+binaries fixed and the rest relaxed to continuous $[0,1]$. At each
+node, Gurobi solves an LP relaxation of that sub-problem. The LP
+solution gives fractional values for the unfixed binaries (e.g.\
+$a_{m,k} = 0.37$). Gurobi then needs to decide:
+\begin{enumerate}[noitemsep]
+  \item \emph{Which} fractional binary to branch on next.
+  \item \emph{Which direction} to try first ($a_i = 0$ or $a_i = 1$).
+  \item Whether to run \emph{heuristics} (RINS, diving, rounding) that
+    try to round the fractional LP solution into a feasible integer
+    solution (an ``incumbent'').
+\end{enumerate}
+Variable hints influence all three decisions as soft suggestions.
+
+\paragraph{What the two hint attributes do.}
+For each binary $a_i$ in $N_2$'s MIP, we set:
+\begin{itemize}[noitemsep]
+  \item \gurobi{VarHintVal}$(a_i)$: ``what value should $a_i$ take?''
+    --- Gurobi's heuristics prefer rounding $a_i$ toward this value.
+  \item \gurobi{VarHintPri}$(a_i)$: ``how confident are we?'' ---
+    higher priority means Gurobi follows the hint more strongly.
+    Priority~0 means ``ignore unless nothing else is available.''
+\end{itemize}
+Both are \emph{soft}: they do not add constraints or change the MIP.
+If the LP relaxation at some node clearly disagrees with the hint,
+Gurobi overrides it. A wrong hint wastes some effort but cannot change
+the final answer.
+
+\paragraph{Setting \gurobi{VarHintVal} --- the suggested value.}
+After solving $N_1$, every binary $a_i$ has a known optimal value
+$\mathrm{val}_i^{N_1} \in \{0, 1\}$. Because $N_2$ has nearly the same
+weights as $N_1$, most ReLU neurons settle to the same on/off state in
+both networks. For each binary $a_i$ in $N_2$ whose name matches an
+$N_1$ variable:
+\[
+  \gurobi{VarHintVal}(a_i) \;\leftarrow\; \mathrm{val}_i^{N_1}.
+\]
+This tells Gurobi: ``neuron $i$ was active (or inactive) in $N_1$;
+try the same in $N_2$ first.''
+
+\paragraph{Setting \gurobi{VarHintPri} --- the confidence.}
+Not all hints are equally trustworthy. A binary that was ``easy'' in
+$N_1$ (Gurobi barely had to think about it) is less informative than
+one that was ``hard'' (Gurobi branched on it many times and each branch
+significantly improved the objective). We use $N_1$'s \emph{pseudo-cost
+statistics} to measure this.
+
+During the $N_1$ solve, every time Gurobi branches on a binary $a_i$,
+it creates two child nodes: one with $a_i = 0$ (``down'') and one with
+$a_i = 1$ (``up''). After solving the LP at each child, Gurobi records
+how much the LP objective improved compared to the parent node. Over the
+entire $N_1$ solve, Gurobi accumulates four statistics per binary:
+\begin{itemize}[noitemsep]
+  \item $\mathrm{PsDDown}_i$: average LP improvement per branch-down.
+  \item $\mathrm{PsDDownCnt}_i$: number of times $a_i$ was branched down.
+  \item $\mathrm{PsDUp}_i$: average LP improvement per branch-up.
+  \item $\mathrm{PsDUpCnt}_i$: number of times $a_i$ was branched up.
+\end{itemize}
+The importance score is the \emph{total} LP improvement attributed to
+branching on $a_i$ across the entire $N_1$ solve:
+\[
+  s_i \;=\; \mathrm{PsDDown}_i \cdot \mathrm{PsDDownCnt}_i
+    \;+\; \mathrm{PsDUp}_i \cdot \mathrm{PsDUpCnt}_i.
+\]
+A high $s_i$ means ``branching on $a_i$ was very useful for closing
+the optimality gap in $N_1$'' --- and since $N_1 \approx N_2$, it is
+likely useful for $N_2$ too.
+
+Rank all variables with $s_i > 0$ by decreasing $s_i$ and map to
+integer priorities in $[1, 100]$:
+\[
+  \gurobi{VarHintPri}(a_i) \;=\;
+    \begin{cases}
+      \max\!\bigl(1,\; \mathrm{round}\bigl(100 \cdot
+        (1 - \frac{\mathrm{rank}(i) - 1}{|\{j : s_j > 0\}|})\bigr)\bigr)
+        & \text{if } s_i > 0, \\[2pt]
+      0 & \text{if } s_i = 0
+        \;\text{(Gurobi never branched on $a_i$ in $N_1$)}.
+    \end{cases}
+\]
+The most important variable gets priority 100, the least important
+nonzero gets 1, and variables Gurobi never branched on get 0 (hint
+present but essentially ignored).
+
+\paragraph{How Gurobi uses the hints during the $N_2$ solve.}
+At each node in $N_2$'s branch-and-bound tree:
+\begin{enumerate}[noitemsep]
+  \item Gurobi solves the node's LP relaxation, obtaining fractional
+    values for unfixed binaries.
+  \item Its heuristics (RINS, diving, rounding) try to construct a
+    feasible incumbent by rounding fractional binaries to integers. When
+    deciding which way to round $a_i$, the heuristic checks
+    \gurobi{VarHintVal}$(a_i)$ and prefers that direction, weighted by
+    \gurobi{VarHintPri}$(a_i)$.
+  \item The priority determines the tradeoff: a high priority (e.g.\ 100)
+    means Gurobi follows the hint even if the LP leans the other way;
+    a low priority (e.g.\ 1) means Gurobi defers to the LP; priority~0
+    means the hint is essentially ignored.
+\end{enumerate}
+The net effect: Gurobi finds a high-quality incumbent faster (because
+$N_1$'s binary pattern is already close to $N_2$'s optimum), which
+tightens the \gurobi{Cutoff} bound and prunes more sub-trees.
+
+\paragraph{Why hints and not a full candidate solution?}
+Gurobi also supports \gurobi{Start} (MIP~Start), which submits the
+entire $N_1$ solution as a candidate that Gurobi must repair into an
+$N_2$-feasible point. This is a harder commitment: if $N_2$ differs
+enough that the $N_1$ solution is infeasible, Gurobi wastes effort
+trying to repair it. Variable hints avoid this: each binary is nudged
+independently, and Gurobi can ignore individual hints that don't work.
+Empirically, MIP~Start was harmful in all tested combinations (all
+LOSER), while variable hints contribute to 32~of the 54~safe ones.
+
+\paragraph{Soundness.} \gurobi{VarHintVal} and \gurobi{VarHintPri} are
+advisory attributes: no constraint is added, no coefficient is changed,
+no variable bound is modified. The MIP feasible set is unchanged:
+$\Fmip{2}^{(\{5\})} = \Fmip{2}$ and $\dexact$ is preserved.
+
+\subsection{Technique 4 --- N2 Triangle Relaxation \textsf{(relaxT)}}
+\label{sec:tech4}
+
+\noindent
+\textbf{Flag:} \cli{adv\_std\_n2\_relax\_threshold}
+$\in \{\textsf{off},\, 0.01,\, 0.1,\, 0.5,\, 1.0\}$ (in safe combos;
+\textsf{off} means Technique~4 is disabled).
+\quad \textbf{Model modification:} replaces selected N2 binary variables
+with LP relaxations.
+
+\paragraph{Background: exact vs.\ relaxed ReLU encoding.}
+Recall from Section~\ref{sec:background} that a split ReLU neuron
+($l < 0 < u$) can be encoded in two ways:
+
+\begin{center}
+\begin{tikzpicture}[scale=0.8]
+  % Left plot: exact ReLU
+  \begin{scope}[shift={(-5,0)}]
+    \draw[->] (-2.5,0) -- (2.5,0) node[right] {$\hat{z}$};
+    \draw[->] (0,-0.3) -- (0,2.8) node[above] {$z^+$};
+    % ReLU function
+    \draw[very thick, blue] (-2,0) -- (0,0) -- (2,2);
+    % Bounds
+    \draw[dashed, gray] (-2,-0.1) node[below] {$l$} -- (-2,0.1);
+    \draw[dashed, gray] (2,-0.1) node[below] {$u$} -- (2,2);
+    \node[below] at (0,-0.6) {\textbf{(a) Exact encoding}};
+    \node[below] at (0,-1.0) {4 constraints + binary $a$};
+    \node[below] at (0,-1.4) {$z^+$ on the blue line only};
+  \end{scope}
+  % Right plot: triangle relaxation
+  \begin{scope}[shift={(3,0)}]
+    \draw[->] (-2.5,0) -- (2.5,0) node[right] {$\hat{z}$};
+    \draw[->] (0,-0.3) -- (0,2.8) node[above] {$z^+$};
+    % ReLU function
+    \draw[very thick, blue] (-2,0) -- (0,0) -- (2,2);
+    % Triangle upper envelope
+    \draw[thick, red, dashed] (-2,0) -- (2,2);
+    % Shaded triangle (the gap)
+    \fill[red!15] (-2,0) -- (0,0) -- (2,2) -- (-2,0);
+    % Gap area label
+    \node[red!70!black] at (-0.3,0.5) {\small gap};
+    % Bounds
+    \draw[dashed, gray] (-2,-0.1) node[below] {$l$} -- (-2,0.1);
+    \draw[dashed, gray] (2,-0.1) node[below] {$u$} -- (2,2);
+    \node[below] at (0,-0.6) {\textbf{(b) Triangle relaxation}};
+    \node[below] at (0,-1.0) {3 constraints, no binary};
+    \node[below] at (0,-1.4) {$z^+$ anywhere in shaded region};
+  \end{scope}
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Exact} (a): uses a binary variable $a \in \{0,1\}$ and
+    4~constraints (Eqs.~(\ref{eq:bg_bigm1})--(\ref{eq:bg_bigm4})). The
+    post-ReLU value $z^+$ is forced onto the exact ReLU curve (blue line).
+    This is precise but expensive: the binary makes the problem NP-hard.
+  \item \textbf{Relaxed} (b): drops the binary and uses 3~constraints
+    (Eqs.~(\ref{eq:bg_tri1})--(\ref{eq:bg_tri3})). $z^+$ can be anywhere
+    inside the triangle (shaded region). This is an over-approximation:
+    the true ReLU value is always inside the triangle, but the triangle
+    also contains points that are not on the ReLU curve. The shaded area
+    between the blue line and the red dashed line is the \emph{gap} ---
+    the approximation error introduced by the relaxation.
+\end{itemize}
+
+\paragraph{The idea.} When the gap is very small (the triangle is very
+thin), the relaxation is almost as precise as the exact encoding, so
+there is little benefit in paying for a binary variable. Technique~4
+identifies these ``nearly stable'' neurons using $N_1$'s bounds and
+replaces their exact encoding with the cheaper triangle relaxation.
+
+\paragraph{Triangle gap area.} For a ReLU neuron with pre-activation
+bounds $[l, u]$ from $N_1$, the gap area is:
+\begin{equation}
+  \mathrm{gap}(l, u) \;=\;
+    \begin{cases}
+      0 & \text{if } l \ge 0 \text{ or } u \le 0
+        \quad\text{(stable --- no gap at all)},\\[4pt]
+      \displaystyle\frac{u \cdot |l|}{2\,(u - l)}
+      & \text{otherwise (split neuron)}.
+    \end{cases}
+  \label{eq:gap_area}
+\end{equation}
+This is the area of the shaded triangle in diagram~(b) above. When $l$
+is close to~0 (neuron almost always active) or $u$ is close to~0
+(neuron almost always inactive), the gap is small. When $|l| \approx u$
+(neuron is maximally ambiguous), the gap is largest.
+
+\paragraph{Decision rule.} For each ReLU neuron $(m,k)$ during $N_2$'s
+MIP construction:
+\begin{enumerate}[noitemsep]
+  \item Look up $N_1$'s tight bounds $(l^{N_1}_{m,k}, u^{N_1}_{m,k})$
+    from the bound-tightening dictionary (populated by Technique~4).
+  \item Compute
+    $\mathrm{gap}_{m,k} = \mathrm{gap}(l^{N_1}_{m,k}, u^{N_1}_{m,k})$.
+  \item If $\mathrm{gap}_{m,k} \le \tau$: \textbf{relax} --- use the
+    triangle (3~constraints, no binary).\\
+    Otherwise: \textbf{encode exactly} --- use the big-$M$ formulation
+    (4~constraints + binary $a_{m,k}$).
+\end{enumerate}
+This is applied independently to both the original copy
+$N_2(v_\mathrm{in})$ and the perturbed copy $N_2(v_{x_0})$.
+
+\paragraph{Why use $N_1$'s bounds for the decision?}
+This is the same principle behind all of advstd: \emph{reuse what we
+already learned from $N_1$}. During Phase~1, when $N_1$'s MIP was
+constructed, LP tightening computed per-neuron bounds
+$(l^{N_1}_{m,k}, u^{N_1}_{m,k})$ as a byproduct. These bounds already
+tell us which neurons are nearly stable (small gap) and which are
+genuinely contested (large gap). Technique~4 simply reuses this
+``free'' information: if $N_1$'s LP tightening showed that a neuron
+has a tiny gap, then encoding that neuron as an exact binary in $N_2$
+is likely wasteful --- the binary would contribute almost nothing to
+the MIP's precision.
+
+$N_2$'s own tightened bounds from Technique~2 are also available and
+could be used instead. Both come from the same kind of LP tightening
+(not from the MIP solve itself). The practical reason to prefer
+$N_1$'s is that they are fixed across all advstd configurations ---
+they were computed once in Phase~1 and do not change regardless of
+which Technique~2 methods (zonotope, probe) are enabled for $N_2$.
+This makes the threshold $\tau$ have a consistent meaning across all
+54~safe combinations.
+
+\paragraph{Important: the triangle uses $N_2$'s bounds, not $N_1$'s.}
+The decision of \emph{whether} to relax is based on $N_1$'s gap (a
+heuristic). But the \emph{actual triangle constraints} written into
+$N_2$'s MIP use $N_2$'s own tightened bounds
+$(l^{N_2}_{m,k}, u^{N_2}_{m,k})$ from Technique~2's final bound
+integration. Soundness depends only on the encoding step: the triangle
+on $[l^{N_2}_{m,k}, u^{N_2}_{m,k}]$ is a valid over-approximation of
+the exact ReLU on that interval, regardless of why we decided to relax.
+
+\paragraph{Effect on the MIP.} Each relaxed neuron removes one binary
+variable and one constraint from the MIP. For a network with hundreds
+of split neurons, relaxing those with small gap can remove dozens of
+binaries, making the branch-and-bound search significantly faster.
+
+\paragraph{Effect on the result.} The relaxation is an
+\emph{over-approximation}: the triangle contains all points on the
+exact ReLU curve plus some extra points. This means:
+\[
+  \delta_{\mathrm{relaxed}} \;\ge\; \dexact.
+\]
+The reported $\delta$ may be slightly higher (looser) than the exact
+optimum, but it is always a valid upper bound. In practice the error
+grows with $\tau$, but only neurons with gap area $\le \tau$ are
+relaxed, so the encoding remains close to exact for the thin-triangle
+neurons that dominate the relaxation budget.
+
+\paragraph{Threshold values.} The safe combinations cover the full
+range $\tau \in \{\textsf{off}, 0.01, 0.1, 0.5, 1.0\}$:
+\begin{itemize}[noitemsep]
+  \item $\tau = \textsf{off}$: Technique~4 disabled --- every split
+    neuron keeps its binary. Included in 8 safe combinations; useful
+    as a baseline when the other techniques already deliver speedup.
+  \item $\tau = 0.01$: very conservative --- only neurons with a tiny
+    gap are relaxed. Fewer binaries removed, but almost no looseness.
+  \item $\tau = 0.1$: modestly aggressive --- more neurons relaxed,
+    more binaries removed, slightly looser bounds.
+  \item $\tau = 0.5$ or $1.0$: most aggressive --- relaxes any split
+    neuron whose triangle gap is up to $0.5$ or $1.0$ in area. On the
+    MNIST \textsf{patch} sweep these thresholds still pass the
+    safe-set criterion (worst-cell time ratio $\le 1.333\times$) and are
+    included in many high-ranking safe combinations. Avoid them on
+    unseen perturbations until the ranking has been refreshed, since
+    aggressive relaxation can cause catastrophic slowdowns
+    (as high as $18.87\times$) on other instances.
+\end{itemize}
+
+\paragraph{Soundness.} The triangle LP relaxation is a convex superset
+of the exact ReLU encoding: every point satisfying the exact constraints
+also satisfies the relaxed constraints. Therefore
+$\Fmip{2} \subseteq \Fmip{2}^{(\{6\})}$ and the $\dexact$-attaining
+$x^\ast$ remains feasible. The maximum over the relaxed set can only be
+$\ge \dexact$, never below it.
+
+\section{Safe-to-Use Combinations}
+\label{sec:safe}
+
+% BEGIN AUTO: safe_tables
+Tables below list the safe-to-use combinations at \textsf{seed}$=4$ and relax threshold $\tau=0.1$, evaluated per-architecture and broken out by perturbation type and size. For each (combo, perturbation, size) row we report \textsf{t\_std} and \textsf{t\_adv} (mean wall-clock $N_2$ solve times in seconds, averaged across all $(c_\mathrm{tag}, c_\mathrm{target})$ cells in the block) and \textsf{sp}$=\textsf{t\_adv}/\textsf{t\_std}$ (lower is better; $<\!1$ means advstd finished faster than the with-perturbed-intervals baseline). We also report \textsf{t\_adv\_lp} and $\textsf{sp}_\mathrm{lp}=\textsf{t\_adv\_lp}/\textsf{t\_std}$, which include the N1-probe LP construction time on top of \textsf{t\_adv}; both are \textsf{---} when the \tech{bound\_tight} label has no \texttt{+lp} suffix. The \tech{bound\_tight} column labels which Technique~2 variant is used (\texttt{interval} / \texttt{interval+lp} / \texttt{zono} / \texttt{zono+lp} / \texttt{none}), and the $\tau$ column is the Technique~4 threshold. Rows are kept only if \textsf{perf\_tier}$\in\{\textsf{dominant},\textsf{avg-win}\}$ (geometric-mean per-cell time ratio $<0.952\times$ and worst-cell $t_\mathrm{adv}/t_\mathrm{std}\le 1.333\times$); within each (perturbation, size) block rows are sorted by ascending \textsf{sp}. \tech{mipStart} and \tech{lpBasis} are always off and omitted for brevity.
+
+% auto-generated: archs=[cnn1=47, 3x50=0, 3x10=16], seed=4, tau=0.1
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}l l l l l l r r r r r r r@{}}
+\toprule
+p\_type & p\_size & \tech{bound\_tight} & \tech{bp} & \tech{varHint} & $\tau$ & t\_std & t\_adv & $\text{sp}$ & t\_adv\_lp & $\text{sp}_\mathrm{lp}$ & min\_speed\_up & n\_relax \\
+\midrule
+patch       & \texttt{1,14,14,3}   & interval+lp & bounds & no  & 0.1  &  162.24 &   81.14 & 0.500 &     --- &   --- & 0.807$\times$ &    2.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & no  & 0.1  &  162.24 &   82.30 & 0.507 &     --- &   --- & 0.716$\times$ &    2.0 \\
+            &                      & zono        & bounds & no  & 0.1  &  162.24 &   82.65 & 0.509 &     --- &   --- & 0.720$\times$ &    2.0 \\
+            &                      & zono+lp     & off    & no  & 0.1  &  162.24 &   84.47 & 0.521 &     --- &   --- & 0.748$\times$ &    2.0 \\
+            &                      & interval    & bounds & no  & 0.1  &  162.24 &   85.51 & 0.527 &     --- &   --- & 0.861$\times$ &    2.0 \\
+            &                      & zono+lp     & bounds & no  & 0.1  &  162.24 &   88.66 & 0.546 &     --- &   --- & 0.754$\times$ &    2.0 \\
+            &                      & interval+lp & off    & no  & 0.1  &  162.24 &   93.39 & 0.576 &     --- &   --- & 0.755$\times$ &    2.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & no  & 0.1  &  162.24 &   94.58 & 0.583 &     --- &   --- & 0.827$\times$ &    2.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & yes & 0.1  &  162.24 &   97.84 & 0.603 &     --- &   --- & 0.883$\times$ &    2.0 \\
+            &                      & zono        & bounds & yes & 0.1  &  162.24 &   99.66 & 0.614 &     --- &   --- & 0.886$\times$ &    2.0 \\
+            &                      & zono+lp     & bounds & yes & 0.1  &  162.24 &  100.26 & 0.618 &     --- &   --- & 0.889$\times$ &    2.0 \\
+            &                      & interval    & bounds & yes & 0.1  &  162.24 &  100.80 & 0.621 &     --- &   --- & 0.919$\times$ &    2.0 \\
+            &                      & interval+lp & bounds & yes & 0.1  &  162.24 &  104.78 & 0.646 &     --- &   --- & 1.081$\times$ &    2.0 \\
+            &                      & zono+lp     & off    & yes & 0.1  &  162.24 &  106.34 & 0.655 &     --- &   --- & 0.936$\times$ &    2.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & yes & 0.1  &  162.24 &  107.61 & 0.663 &     --- &   --- & 0.877$\times$ &    2.0 \\
+            &                      & interval+lp & off    & yes & 0.1  &  162.24 &  111.04 & 0.684 &     --- &   --- & 0.949$\times$ &    2.0 \\
+\midrule
+\rowcolor{green!15} occ         & \texttt{3,3,5}       & zono        & off    & no  & 0.1  &  162.63 &  111.34 & 0.685 &  111.34 & 0.685 & 0.874$\times$ &    7.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & no  & 0.1  &  279.13 &  191.61 & 0.686 &  191.61 & 0.686 & 0.863$\times$ &    7.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & yes & 0.1  &  230.81 &  160.28 & 0.694 &  160.28 & 0.694 & 0.866$\times$ &    7.0 \\
+            &                      & interval+lp & off    & no  & 0.1  &  230.81 &  160.37 & 0.695 &  181.19 & 0.785 & 0.886$\times$ &    7.0 \\
+            &                      & zono+lp     & off    & no  & 0.1  &  230.81 &  161.16 & 0.698 &  183.22 & 0.794 & 0.868$\times$ &    7.0 \\
+            &                      & interval+lp & off    & yes & 0.1  &  230.81 &  199.68 & 0.865 &  236.72 & 1.026 & 1.122$\times$ &    7.0 \\
+            &                      & zono+lp     & off    & yes & 0.1  &  230.81 &  213.92 & 0.927 &  255.62 & 1.108 & 1.151$\times$ &    7.0 \\
+\midrule
+\rowcolor{green!15} occ         & \texttt{5,5,5}       & zono        & off    & yes & 0.1  &  229.70 &  144.25 & 0.628 &  144.25 & 0.628 & 1.043$\times$ &    3.0 \\
+\midrule
+translation & \texttt{1,1}         & interval+lp & off    & yes & 0.1  &  393.66 &  267.31 & 0.679 &  288.89 & 0.734 & 0.808$\times$ &   27.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & yes & 0.1  &  393.66 &  274.61 & 0.698 &  274.61 & 0.698 & 0.819$\times$ &   27.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & yes & 0.1  &  393.66 &  283.71 & 0.721 &  283.71 & 0.721 & 0.777$\times$ &   27.0 \\
+            &                      & zono+lp     & off    & yes & 0.1  &  393.66 &  300.38 & 0.763 &  334.83 & 0.851 & 0.962$\times$ &   27.0 \\
+            &                      & interval    & bounds & yes & 0.1  &  393.66 &  309.89 & 0.787 &  309.89 & 0.787 & 1.192$\times$ &   27.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & no  & 0.1  &  393.66 &  312.32 & 0.793 &  312.32 & 0.793 & 1.045$\times$ &   27.0 \\
+            &                      & zono        & bounds & no  & 0.1  &  393.66 &  318.03 & 0.808 &  318.03 & 0.808 & 0.955$\times$ &   27.0 \\
+            &                      & interval+lp & off    & no  & 0.1  &  393.66 &  319.14 & 0.811 &  343.80 & 0.873 & 1.019$\times$ &   27.0 \\
+            &                      & zono        & bounds & yes & 0.1  &  393.66 &  327.34 & 0.832 &  327.34 & 0.832 & 1.154$\times$ &   27.0 \\
+            &                      & interval    & bounds & no  & 0.1  &  393.66 &  332.98 & 0.846 &  332.98 & 0.846 & 1.024$\times$ &   27.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & no  & 0.1  &  393.66 &  336.51 & 0.855 &  336.51 & 0.855 & 1.066$\times$ &   27.0 \\
+            &                      & zono+lp     & off    & no  & 0.1  &  393.66 &  339.24 & 0.862 &  363.12 & 0.922 & 1.054$\times$ &   27.0 \\
+            &                      & interval+lp & bounds & no  & 0.1  &  393.66 &  343.43 & 0.872 &  365.29 & 0.928 & 1.093$\times$ &   27.0 \\
+            &                      & zono+lp     & bounds & no  & 0.1  &  393.66 &  344.27 & 0.875 &  364.79 & 0.927 & 1.138$\times$ &   27.0 \\
+            &                      & zono+lp     & bounds & yes & 0.1  &  393.66 &  366.63 & 0.931 &  386.44 & 0.982 & 1.185$\times$ &   27.0 \\
+\midrule
+translation & \texttt{3,3}         & zono+lp     & off    & yes & 0.1  &  741.83 &  344.03 & 0.464 &  368.94 & 0.497 & 0.502$\times$ &   20.0 \\
+            &                      & interval+lp & off    & no  & 0.1  &  741.83 &  348.58 & 0.470 &  376.55 & 0.508 & 0.514$\times$ &   20.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & yes & 0.1  &  741.83 &  354.63 & 0.478 &  354.63 & 0.478 & 0.590$\times$ &   20.0 \\
+            &                      & zono+lp     & off    & no  & 0.1  &  741.83 &  368.52 & 0.497 &  391.51 & 0.528 & 0.618$\times$ &   20.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & no  & 0.1  &  741.83 &  401.29 & 0.541 &  401.29 & 0.541 & 0.629$\times$ &   20.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & yes & 0.1  &  741.83 &  425.88 & 0.574 &  425.88 & 0.574 & 0.785$\times$ &   20.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & no  & 0.1  &  741.83 &  446.06 & 0.601 &  446.06 & 0.601 & 0.659$\times$ &   20.0 \\
+            &                      & interval+lp & off    & yes & 0.1  &  741.83 &  591.36 & 0.797 &  612.31 & 0.825 & 0.945$\times$ &   20.0 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Architecture \textbf{cnn1} --- safe advstd combinations at \textsf{seed}$=4$, $\tau=0.1$, broken out by perturbation type and size. \textsf{t\_std} and \textsf{t\_adv} are mean $N_2$ solve times (seconds) averaged across $(c_\mathrm{tag}, c_\mathrm{target})$ cells in each block; \textsf{sp}$=\textsf{t\_adv}/\textsf{t\_std}$ ($<\!1$ means advstd was faster). \textsf{t\_adv\_lp} adds the N1-probe LP construction time (i.e.\ $\textsf{t\_adv}+t_\mathrm{LP}$) and $\textsf{sp}_\mathrm{lp}=\textsf{t\_adv\_lp}/\textsf{t\_std}$; both are \textsf{---} when the \tech{bound\_tight} label has no \texttt{+lp} suffix. \tech{bound\_tight} collapses Technique~2 and its optional Source~C into a single label: \texttt{interval} / \texttt{interval+lp} / \texttt{zono} / \texttt{zono+lp} / \texttt{none} (maps to \tech{boundTight}$\in\{$yes, no$\}$, \tech{zono}$\in\{$yes, no$\}$, \tech{n1Probe}$\in\{$lp, off$\}$). All 47 rows pass the safe-set criterion (\textsf{perf\_tier}$\in\{\textsf{dominant},\textsf{avg-win}\}$), based on $t_\mathrm{adv}/t_\mathrm{std}$; \textsf{min\_speed\_up} is the worst-cell ratio $\max(t_\mathrm{adv}/t_\mathrm{std})$ per group. \textsf{n\_relax} is the mean number of N2 binary variables removed by Technique~4 (sum of N2 original + perturbed copies), averaged across $(c_\mathrm{tag}, c_\mathrm{target})$ cells; \textsf{---} when $\tau=\textsf{off}$. \tech{mipStart} and \tech{lpBasis} are always off (omitted for brevity). Rows shaded green satisfy both \tech{bp}=\textsf{off} and \tech{n1Probe}=\textsf{off} (no \texttt{+lp} suffix), the simplified configuration recommended for explainability. Auto-generated by \texttt{update\_advstd\_tex\_tables.py}.}
+\label{tab:safe_cnn1}
+\end{table}
+
+% no safe-tier rows for arch=3x50 at seed=4, tau=0.1
+
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}l l l l l l r r r r r r r@{}}
+\toprule
+p\_type & p\_size & \tech{bound\_tight} & \tech{bp} & \tech{varHint} & $\tau$ & t\_std & t\_adv & $\text{sp}$ & t\_adv\_lp & $\text{sp}_\mathrm{lp}$ & min\_speed\_up & n\_relax \\
+\midrule
+\rowcolor{green!15} patch       & \texttt{1,14,14,3}   & zono        & off    & no  & 0.1  &   15.37 &   11.72 & 0.762 &     --- &   --- & 0.804$\times$ &    0.0 \\
+            &                      & interval    & bounds & yes & 0.1  &   15.37 &   11.95 & 0.777 &     --- &   --- & 0.809$\times$ &    0.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & yes & 0.1  &   15.37 &   12.77 & 0.831 &     --- &   --- & 0.885$\times$ &    0.0 \\
+\rowcolor{green!15}             &                      & zono        & off    & yes & 0.1  &   15.37 &   12.78 & 0.831 &     --- &   --- & 0.913$\times$ &    0.0 \\
+            &                      & zono+lp     & off    & yes & 0.1  &   15.37 &   12.82 & 0.834 &     --- &   --- & 0.989$\times$ &    0.0 \\
+            &                      & zono+lp     & off    & no  & 0.1  &   15.37 &   12.83 & 0.835 &     --- &   --- & 0.923$\times$ &    0.0 \\
+            &                      & interval    & bounds & no  & 0.1  &   15.37 &   13.13 & 0.854 &     --- &   --- & 0.866$\times$ &    0.0 \\
+            &                      & zono+lp     & bounds & no  & 0.1  &   15.37 &   13.30 & 0.865 &     --- &   --- & 0.891$\times$ &    0.0 \\
+\rowcolor{green!15}             &                      & interval    & off    & no  & 0.1  &   15.37 &   13.49 & 0.877 &     --- &   --- & 0.972$\times$ &    0.0 \\
+            &                      & zono+lp     & bounds & yes & 0.1  &   15.37 &   13.85 & 0.901 &     --- &   --- & 1.076$\times$ &    0.0 \\
+            &                      & interval+lp & bounds & yes & 0.1  &   15.68 &   14.15 & 0.902 &     --- &   --- & 0.988$\times$ &    0.0 \\
+            &                      & zono        & bounds & yes & 0.1  &   15.00 &   13.65 & 0.910 &     --- &   --- & 0.988$\times$ &    0.0 \\
+            &                      & interval+lp & off    & no  & 0.1  &   15.37 &   14.10 & 0.917 &     --- &   --- & 0.939$\times$ &    0.0 \\
+            &                      & interval+lp & off    & yes & 0.1  &   15.37 &   14.28 & 0.929 &     --- &   --- & 1.141$\times$ &    0.0 \\
+            &                      & zono        & bounds & no  & 0.1  &   15.37 &   14.39 & 0.936 &     --- &   --- & 1.036$\times$ &    0.0 \\
+            &                      & interval+lp & bounds & no  & 0.1  &   15.37 &   14.53 & 0.945 &     --- &   --- & 1.035$\times$ &    0.0 \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Architecture \textbf{3x10} --- safe advstd combinations at \textsf{seed}$=4$, $\tau=0.1$, broken out by perturbation type and size. \textsf{t\_std} and \textsf{t\_adv} are mean $N_2$ solve times (seconds) averaged across $(c_\mathrm{tag}, c_\mathrm{target})$ cells in each block; \textsf{sp}$=\textsf{t\_adv}/\textsf{t\_std}$ ($<\!1$ means advstd was faster). \textsf{t\_adv\_lp} adds the N1-probe LP construction time (i.e.\ $\textsf{t\_adv}+t_\mathrm{LP}$) and $\textsf{sp}_\mathrm{lp}=\textsf{t\_adv\_lp}/\textsf{t\_std}$; both are \textsf{---} when the \tech{bound\_tight} label has no \texttt{+lp} suffix. \tech{bound\_tight} collapses Technique~2 and its optional Source~C into a single label: \texttt{interval} / \texttt{interval+lp} / \texttt{zono} / \texttt{zono+lp} / \texttt{none} (maps to \tech{boundTight}$\in\{$yes, no$\}$, \tech{zono}$\in\{$yes, no$\}$, \tech{n1Probe}$\in\{$lp, off$\}$). All 16 rows pass the safe-set criterion (\textsf{perf\_tier}$\in\{\textsf{dominant},\textsf{avg-win}\}$), based on $t_\mathrm{adv}/t_\mathrm{std}$; \textsf{min\_speed\_up} is the worst-cell ratio $\max(t_\mathrm{adv}/t_\mathrm{std})$ per group. \textsf{n\_relax} is the mean number of N2 binary variables removed by Technique~4 (sum of N2 original + perturbed copies), averaged across $(c_\mathrm{tag}, c_\mathrm{target})$ cells; \textsf{---} when $\tau=\textsf{off}$. \tech{mipStart} and \tech{lpBasis} are always off (omitted for brevity). Rows shaded green satisfy both \tech{bp}=\textsf{off} and \tech{n1Probe}=\textsf{off} (no \texttt{+lp} suffix), the simplified configuration recommended for explainability. Auto-generated by \texttt{update\_advstd\_tex\_tables.py}.}
+\label{tab:safe_3x10}
+\end{table}
+
+% END AUTO: safe_tables
+
+\section{Algorithms}
+\label{sec:algorithms}
+
+All 54~safe combinations share the same two-phase structure
+(Algorithm~\ref{alg:phase1} and Algorithm~\ref{alg:phase2}).
+They differ only in which optional sub-steps are enabled, as indicated
+by the Boolean flags \textsc{bp}, \textsc{zono}, \textsc{probe},
+\textsc{varHint}, and the threshold~$\tau$.
+
+\begin{algorithm}[H]
+\caption{Phase 1: Solve $N_1$ and extract state (shared by all safe combos)}
+\label{alg:phase1}
+\begin{algorithmic}[1]
+\REQUIRE Network $N_1$, perturbation $(P, \ep)$, class pairs $(c_s, c_t)$, timeout $T$
+\ENSURE State directory $\mathcal{S}$ on disk
+\FOR{each class pair $(c_s, c_t)$}
+  \STATE $x_{\mathrm{pgd}} \leftarrow \text{HyperAttack}(N_1, c_s, c_t, P, \ep)$
+    \COMMENT{PGD warm-start}
+  \STATE Build MIP $\mathcal{M}_1$ for $N_1$ with standard encoding
+  \STATE Apply PGD hints to $\mathcal{M}_1$
+  \STATE Add VHAGaR dependency constraints to $\mathcal{M}_1$
+  \STATE Add perturbed interval constraints to $\mathcal{M}_1$
+  \STATE $\gurobi{optimize!}(\mathcal{M}_1, T)$
+  \STATE Extract primal solution $(\text{var}_i, \text{val}_i)_i$
+  \STATE Extract neuron bounds $(l_{m,k}, u_{m,k})_{\forall m,k}$ from $\mathtt{layers\_info}$
+  \STATE Serialise to $\mathcal{S}/(c_s, c_t)$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Phase 2: Solve $N_2$ with advstd techniques (parameterised)}
+\label{alg:phase2}
+\begin{algorithmic}[1]
+\REQUIRE Networks $N_1, N_2$, perturbation $(P, \ep)$, class pairs, timeout $T$,
+  N1 state $\mathcal{S}$
+\REQUIRE Flags: $\textsc{bp} \in \{\text{off}, \text{bounds}\}$,
+  $\textsc{zono} \in \{\text{false}, \text{true}\}$,
+  $\textsc{probe} \in \{\text{off}, \text{lp}\}$,
+  $\textsc{varHint} \in \{\text{false}, \text{true}\}$,
+  $\tau \in \{\text{off}, 0.01, 0.1, 0.5, 1.0\}$
+\ENSURE Global robustness bound $\delN{2}$ for each $(c_s, c_t)$
+\STATE \textbf{// Technique 2: Precompute N2 bounds from N1 (once, before the loop)}
+\STATE Load $N_1$ diff bounds from $\mathcal{S}$
+\IF{$\textsc{zono}$}
+  \STATE Compute zonotope diff bounds (Source A) between $N_1$ and $N_2$
+  \STATE Compute N1-tightened absolute N2 zonotope (Source B), intersect with Source A
+\ELSE
+  \STATE Compute interval-arithmetic diff bounds between $N_1$ and $N_2$
+\ENDIF
+\IF{$\textsc{probe} = \text{lp}$}
+  \STATE Build joint $N_1$+$N_2$ LP with triangle-relaxed ReLUs (Source C)
+  \STATE Run per-neuron OBBT to tighten N2 pre-activation bounds
+\ENDIF
+\FOR{each class pair $(c_s, c_t)$}
+  \STATE \textbf{// Skip if result already exists for this pair}
+  \IF{result file contains $(c_s, c_t)$}
+    \STATE \textbf{continue}
+  \ENDIF
+  \STATE Load $N_1$ state from $\mathcal{S}/(c_s, c_t)$:
+    primal $(\text{var}_i, \text{val}_i)$, bounds $(l_{m,k}, u_{m,k})$
+  \STATE \textbf{// Technique 2: Set N1 neuron bounds for N2 encoding}
+  \STATE Inject $(l_{m,k}, u_{m,k})$ as initial N2 bounds
+    \COMMENT{fixes stable ReLUs, tightens big-$M$}
+  \IF{$\tau \ne \text{off}$}
+    \STATE \textbf{// Technique 4: Replace near-stable N2 binaries with LP relaxations}
+    \FOR{each ReLU neuron $(m,k)$ in N2 and N2'}
+      \IF{triangle gap area of $N_1$'s interval at $(m,k)$ $\le \tau$}
+        \STATE Replace binary $a_{m,k}$ with triangle LP relaxation
+      \ENDIF
+    \ENDFOR
+  \ENDIF
+  \STATE Build MIP $\mathcal{M}_2$ for $N_2$
+    \COMMENT{with tightened bounds and relaxed neurons}
+  \STATE $x_{\mathrm{pgd}} \leftarrow \text{HyperAttack}(N_2, c_s, c_t, P, \ep)$
+  \STATE Apply PGD hints to $\mathcal{M}_2$
+  \IF{$\textsc{bp} = \text{bounds}$}
+    \STATE \textbf{// Technique 1: Branch priorities from N1 bound gaps}
+    \FOR{each binary $a_{m,k}$ in $\mathcal{M}_2$}
+      \STATE $g \leftarrow |u_{m,k} - l_{m,k}|$
+      \STATE Set $\gurobi{BranchPriority}(a_{m,k}) \leftarrow
+        \begin{cases} 10 & g < 1 \\ 5 & 1 \le g < 5 \\ 1 & \text{else} \end{cases}$
+    \ENDFOR
+  \ENDIF
+  \IF{$\textsc{varHint}$}
+    \STATE \textbf{// Technique 3: Soft variable hints from N1 solution}
+    \FOR{each binary $a_i$ in $\mathcal{M}_2$ with matching $N_1$ variable}
+      \STATE Set $\gurobi{VarHintVal}(a_i) \leftarrow \text{val}_i^{N_1}$
+      \STATE Set $\gurobi{VarHintPri}(a_i) \leftarrow \text{rank}(s_i)$
+        \COMMENT{pseudo-cost ranked $\in [0, 100]$}
+    \ENDFOR
+  \ENDIF
+  \STATE Add VHAGaR dependency constraints to $\mathcal{M}_2$
+  \STATE Add perturbed interval constraints to $\mathcal{M}_2$
+  \STATE $\gurobi{optimize!}(\mathcal{M}_2, T)$
+  \STATE Record $\delN{2}(c_s, c_t)$ from incumbent
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Instantiation for Each Safe Combination}
+\label{sec:instantiation}
+
+Table~\ref{tab:instantiation} maps each safe combination to its flag
+settings in Algorithm~\ref{alg:phase2}. To reproduce any combination,
+set the five flags accordingly; all other aspects of the algorithm are
+identical.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}r c c c c c@{}}
+\toprule
+\# & \textsc{bp} & \textsc{varHint} & \textsc{zono} & \textsc{probe} & $\tau$ \\
+\midrule
+ 1 & bounds & true  & true  & lp  & 1.0  \\
+ 2 & off    & true  & true  & off & 0.5  \\
+ 3 & bounds & true  & false & lp  & 1.0  \\
+ 4 & bounds & true  & true  & lp  & 0.5  \\
+ 5 & bounds & true  & true  & off & 1.0  \\
+ 6 & off    & true  & true  & lp  & 1.0  \\
+ 7 & off    & true  & false & off & 0.5  \\
+ 8 & bounds & false & true  & lp  & 1.0  \\
+ 9 & bounds & true  & false & off & 1.0  \\
+10 & off    & true  & false & lp  & 1.0  \\
+11 & off    & true  & true  & lp  & 0.5  \\
+12 & off    & true  & true  & lp  & off  \\
+13 & bounds & false & false & off & 0.5  \\
+14 & off    & false & true  & lp  & 1.0  \\
+15 & off    & false & false & lp  & 0.5  \\
+16 & bounds & false & false & lp  & 0.5  \\
+17 & off    & false & false & off & 0.5  \\
+18 & bounds & false & false & lp  & 1.0  \\
+19 & off    & true  & false & lp  & 0.5  \\
+20 & bounds & false & true  & lp  & 0.5  \\
+21 & off    & false & true  & off & 1.0  \\
+22 & bounds & true  & false & lp  & 0.5  \\
+23 & bounds & false & false & off & 1.0  \\
+24 & off    & false & true  & off & 0.1  \\
+25 & off    & true  & false & lp  & off  \\
+26 & off    & true  & true  & off & off  \\
+27 & bounds & true  & false & lp  & off  \\
+28 & bounds & false & true  & off & 0.5  \\
+29 & off    & true  & true  & off & 1.0  \\
+30 & off    & true  & false & off & 1.0  \\
+31 & off    & false & false & lp  & 1.0  \\
+32 & off    & false & true  & lp  & 0.5  \\
+33 & off    & false & true  & off & 0.5  \\
+34 & bounds & false & true  & off & 1.0  \\
+35 & bounds & true  & true  & lp  & off  \\
+36 & bounds & true  & true  & off & off  \\
+37 & bounds & false & true  & lp  & 0.01 \\
+38 & off    & true  & false & off & off  \\
+39 & bounds & true  & false & lp  & 0.01 \\
+40 & off    & true  & false & off & 0.1  \\
+41 & bounds & true  & true  & lp  & 0.01 \\
+42 & off    & true  & true  & lp  & 0.1  \\
+43 & off    & true  & false & lp  & 0.01 \\
+44 & bounds & true  & false & off & 0.01 \\
+\midrule
+45 & bounds & true  & false & off & 0.5  \\
+46 & bounds & false & false & lp  & 0.1  \\
+47 & off    & false & false & off & 1.0  \\
+48 & bounds & false & true  & off & 0.1  \\
+49 & bounds & false & false & off & 0.01 \\
+50 & bounds & true  & false & off & off  \\
+51 & off    & false & false & lp  & 0.01 \\
+52 & bounds & true  & false & lp  & 0.1  \\
+53 & off    & true  & false & lp  & 0.1  \\
+54 & off    & true  & false & off & 0.01 \\
+\bottomrule
+\end{tabular}
+\caption{Flag instantiation for each safe combination from the full
+ranking (rows 1--44 are \textsf{dominant}, rows 45--54 are
+\textsf{avg-win}). This table lists all 54 combinations from
+\texttt{advstd\_combo\_ranking\_vs\_withPerturbed.csv}; the per-architecture
+Tables~\ref{tab:safe_cnn1} and~\ref{tab:safe_3x10} use independent
+numbering. \tech{boundTight} is always true and is not shown.
+$\tau=\text{off}$ disables Technique~4 entirely.}
+\label{tab:instantiation}
+\end{table}
+
+\section{Summary of Effects}
+\label{sec:summary}
+
+Table~\ref{tab:summary} summarises which Gurobi attribute each safe
+technique uses and whether it modifies the mathematical problem.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}l l l l l@{}}
+\toprule
+Technique & Flag (short) & Gurobi API &
+  Modifies MIP? & $N_1$ state consumed \\
+\midrule
+1.~Branch Prio \textsf{bounds}
+  & \tech{bp=bounds}
+  & \gurobi{BranchPriority} & no & final neuron bounds \\
+2.~Bound Tightening & \tech{boundTight}
+  & (linear constr.)
+  & yes\textsuperscript{$\dagger$} & final neuron bounds \\
+2+.~Zonotope Bounds & \tech{zono}
+  & (linear constr.)
+  & yes\textsuperscript{$\dagger$} & diff bounds \\
+2+.~N1 Probe LP & \tech{n1Probe=lp}
+  & (linear constr.)
+  & yes\textsuperscript{$\dagger$} & network weights \\
+3.~Variable Hints & \tech{varHint}
+  & \gurobi{VarHintVal}+\gurobi{VarHintPri}
+  & no & primal solution \\
+4.~N2 Relaxation & \tech{relaxT=$\tau$}
+  & (replaces binaries)
+  & yes\textsuperscript{$\ddagger$} & N1 neuron bounds \\
+\bottomrule
+\end{tabular}
+\caption{Summary of the safe advstd techniques.
+\textsuperscript{$\dagger$}Adds sound constraints derived from
+over-approximations; the optimum is preserved.
+\textsuperscript{$\ddagger$}Replaces binaries with LP relaxations;
+the reported $\delta$ is a sound upper bound ($\ge \dexact$).}
+\label{tab:summary}
+\end{table}
+
+\section{Command-Line Interface}
+\label{sec:cli}
+
+A minimal invocation using the top-ranked safe combination (\#1) is:
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, breaklines=true, frame=single]
+julia run.jl --mode advanced_standard_n2 \
+  --dataset mnist --model_name cnn1 \
+  --model_path  /path/to/N1/model.p \
+  --model_path2 /path/to/N2/model.p \
+  --perturbation patch --perturbation_size "1,14,14,3" \
+  --ctag 1 --ct "4,5,6" --timout 1800 \
+  --n1_state_dir /path/to/n1_state \
+  --adv_std_mip_start          false  \
+  --adv_std_branch_priorities  bounds \
+  --adv_std_lp_basis           false  \
+  --adv_std_bound_tightening   true   \
+  --adv_std_zono_bounds        true   \
+  --adv_std_n1_probe           lp     \
+  --adv_std_n2_relax_threshold 1.0    \
+  --adv_std_var_hint           true
+\end{lstlisting}
+
+The Python sweep script can run all 54~safe combinations automatically:
+
+\begin{lstlisting}[basicstyle=\ttfamily\small, breaklines=true, frame=single]
+python3 run_relaxation_sweep.py --timeout 1800 \
+  --arch_models cnn1=/path/to/n1 3x10=/path/to/n1 \
+  --advanced_standard \
+  --sweep_adv_std_mip_start false \
+  --sweep_adv_std_lp_basis false \
+  --sweep_adv_std_bound_tightening true \
+  --sweep_adv_std_zono_bounds false true \
+  --sweep_adv_std_n1_probe off lp \
+  --sweep_adv_std_n2_relax_threshold off 0.01 0.1 0.5 1.0 \
+  --sweep_adv_std_branch_priorities off bounds \
+  --sweep_adv_std_var_hint false true \
+  --advstd_safe_combos_only \
+      paper_experiments/mnist/advstd_combo_ranking_vs_withPerturbed.csv \
+  --sweep_gurobi_seed 0 1 2 3 4 --ct 4,5,6
+\end{lstlisting}
+
+The \cli{advstd\_safe\_combos\_only} flag filters the cross-product to only
+the 54~validated combinations (perf\_tier $\in$ \{dominant, avg-win\}),
+blocking known loser/risky combos while allowing untested new
+combinations through.
+
+\end{document}

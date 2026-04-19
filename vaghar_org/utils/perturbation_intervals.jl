@@ -682,7 +682,7 @@ function perturbed_interval_constraints(m, nn, clean_prefix, pert_prefix)
             # Find clean x_rect variables by name
             vec_clean = []
             for n in eachindex(av)
-                if occursin(clean_prefix * "x_rect" * "_" * "layerCount" * string(layer_cnt), JuMP.name(av[n]))
+                if occursin(clean_prefix * "x_rect" * "_" * "layerCount" * string(layer_cnt) * "_", JuMP.name(av[n]))
                     append!(vec_clean, n)
                 end
             end
@@ -690,7 +690,7 @@ function perturbed_interval_constraints(m, nn, clean_prefix, pert_prefix)
             # Find perturbed x_rect variables by name
             vec_pert = []
             for n in eachindex(av)
-                if occursin(pert_prefix * "x_rect" * "_" * "layerCount" * string(layer_cnt), JuMP.name(av[n]))
+                if occursin(pert_prefix * "x_rect" * "_" * "layerCount" * string(layer_cnt) * "_", JuMP.name(av[n]))
                     append!(vec_pert, n)
                 end
             end
@@ -1737,6 +1737,254 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     println("compute_diff_bounds_zonotope: N1 pert bounds width = $(maximum(output_n1_pert_up .- output_n1_pert_down))")
 
     println("compute_diff_bounds_zonotope: populated $(length(relu_diff_up_bounds)) ReLU layers")
+end
+
+# ── advstd: absolute N2 zonotope bound propagation with N1 tightening ──
+# Source B for the --adv_std_zono_bounds feature. Propagates a zonotope for
+# N2's pre-activations directly (using N2's own weights W2) starting from an
+# input zonotope that covers [0-ε, 1+ε] per input pixel. At every ReLU layer
+# the zonotope hull is intersected with the "Source A" bound
+# [n1_preact + diff_down, n1_preact + diff_up] BEFORE the DeepZ relaxation is
+# applied, so every downstream layer's zonotope starts from a tighter box.
+#
+# Required populated globals (caller must have run compute_diff_bounds_zonotope
+# or compute_diff_and_comp_bounds before invoking this function):
+#   relu_diff_up_bounds, relu_diff_down_bounds — per-ReLU-layer diff bounds
+#   n1_preact_up_bounds, n1_preact_down_bounds — per-ReLU-layer N1 preact bounds
+#
+# Populates:
+#   n2_abs_up_bounds, n2_abs_down_bounds — per-ReLU-layer N2 preact bounds,
+#     each entry a Float64 vector (layer-flat shape). Consumed in core_ops.jl
+#     inside the relu() bound-tightening block.
+#
+# Soundness: every step is an over-approximating abstract interpretation, and
+# the per-layer intersection is the intersection of two sound over-approxima-
+# tions of the same quantity, so the result over-approximates N2's true value
+# set. Adding these scalar bounds inside the MIP big-M encoding therefore
+# preserves N2's integer optimum.
+function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init)
+    global n2_abs_up_bounds, n2_abs_down_bounds
+    global relu_diff_up_bounds, relu_diff_down_bounds
+    global n1_preact_up_bounds, n1_preact_down_bounds
+    global zonotope_max_order, zonotope_conv
+
+    n2_abs_up_bounds   = Array{Float64}[]
+    n2_abs_down_bounds = Array{Float64}[]
+
+    # Check prerequisite: Source A must have been run first.
+    if isempty(n1_preact_up_bounds) || isempty(relu_diff_up_bounds)
+        println("compute_n2_bounds_zonotope_with_n1_tighten: Source A bounds not populated, skipping (Source B disabled)")
+        return
+    end
+    if length(n1_preact_up_bounds) != length(relu_diff_up_bounds)
+        println("compute_n2_bounds_zonotope_with_n1_tighten: n1_preact and relu_diff layer counts differ ($(length(n1_preact_up_bounds)) vs $(length(relu_diff_up_bounds))), skipping Source B")
+        return
+    end
+
+    # Seed the absolute-N2 input zonotope from [0-ε, 1+ε]. We conservatively
+    # cover both the clean-input (network_version="org") and perturbed-input
+    # (network_version="perturbation") passes with a single set of bounds;
+    # the consumer in core_ops.jl applies them to both.
+    #
+    # Input range: center = 0.5, radius = 0.5 + ε (per input pixel).
+    I_pert_up_flat   = vec(Float64.(I_pert_up_init))
+    I_pert_down_flat = vec(Float64.(I_pert_down_init))
+    # Per-pixel half-width of the perturbation box (non-negative)
+    pert_radius = max.(abs.(I_pert_up_flat), abs.(I_pert_down_flat))
+
+    input_is_4d = ndims(I_pert_up_init) == 4
+    if input_is_4d
+        in_shape_4d = size(I_pert_up_init)
+        n_flat = prod(in_shape_4d)
+        center_4d = fill(0.5, in_shape_4d)
+        radius_4d = reshape(0.5 .+ pert_radius, in_shape_4d)
+    else
+        n_flat = length(I_pert_up_flat)
+        center_4d = nothing
+        in_shape_4d = (0, 0, 0, 0)
+    end
+
+    # Running state
+    zono_active = false               # zonotope representation is currently active
+    center = Float64[]                # flat center vector when zono_active
+    gens   = Matrix{Float64}(undef, 0, 0)   # (n_flat × n_gens)
+    cur_4d_shape = (0, 0, 0, 0)       # current 4D shape when zono_active && conv context
+
+    # Interval state for pre-zonotope conv/flatten propagation (matches the
+    # convention used by compute_diff_bounds_zonotope)
+    abs_up   = input_is_4d ? (ones(Float64, in_shape_4d) .+ reshape(pert_radius, in_shape_4d))   : (1.0 .+ pert_radius)
+    abs_down = input_is_4d ? (zeros(Float64, in_shape_4d) .- reshape(pert_radius, in_shape_4d)) : (0.0 .- pert_radius)
+
+    relu_layer_idx = 0
+    for (layer_idx, l2) in enumerate(nn2.layers)
+        layer_type = string(typeof(l2))
+
+        if occursin("Flatten", layer_type)
+            if ndims(abs_up) > 1
+                abs_up   = vec(abs_up   |> l2)
+                abs_down = vec(abs_down |> l2)
+            end
+            if zono_active
+                # Generators already stored as flat columns; nothing shape-wise to do
+                center       = vec(center)
+                cur_4d_shape = (0, 0, 0, 0)
+            end
+
+        elseif occursin("Linear", layer_type)
+            W2 = Float64.(transpose(l2.matrix))
+            b2 = Float64.(l2.bias)
+
+            if !zono_active
+                # Activate zonotope: convert current interval state to a zono.
+                n = length(abs_up)
+                c0 = (abs_up .+ abs_down) ./ 2
+                r0 = (abs_up .- abs_down) ./ 2
+                center = c0
+                gens   = diagm(r0)
+                zono_active = true
+            end
+            center = W2 * center .+ b2
+            gens   = W2 * gens
+            if zonotope_max_order > 0
+                gens = reduce_zonotope_generators(gens, zonotope_max_order)
+            end
+            abs_sum = vec(sum(abs.(gens), dims=2))
+            abs_up   = center .+ abs_sum
+            abs_down = center .- abs_sum
+
+        elseif occursin("Conv", layer_type)
+            F2 = Float64.(l2.filter)
+            b2 = Float64.(l2.bias)
+
+            if zonotope_conv
+                if !zono_active
+                    in4 = ndims(abs_up) == 4 ? size(abs_up) : (1, length(abs_up), 1, 1)
+                    abs_up_4d   = ndims(abs_up)   == 4 ? abs_up   : reshape(abs_up,   in4)
+                    abs_down_4d = ndims(abs_down) == 4 ? abs_down : reshape(abs_down, in4)
+                    c0 = (vec(abs_up_4d) .+ vec(abs_down_4d)) ./ 2
+                    r0 = (vec(abs_up_4d) .- vec(abs_down_4d)) ./ 2
+                    center       = c0
+                    gens         = diagm(r0)
+                    cur_4d_shape = in4
+                    zono_active  = true
+                end
+                center_4d_cur = reshape(center, cur_4d_shape)
+                out_center, out_gens, out_shape = conv2d_zonotope(
+                    center_4d_cur, gens, F2, Float64.(b2), cur_4d_shape, l2.stride, l2.padding)
+                center = vec(out_center)
+                gens   = out_gens
+                if zonotope_max_order > 0
+                    gens = reduce_zonotope_generators(gens, zonotope_max_order)
+                end
+                cur_4d_shape = out_shape
+                abs_sum = vec(sum(abs.(gens), dims=2))
+                abs_up   = reshape(center .+ abs_sum, out_shape)
+                abs_down = reshape(center .- abs_sum, out_shape)
+            else
+                # Interval conv — keep interval state only, zonotope stays off
+                in4_up   = ndims(abs_up)   == 4 ? abs_up   : reshape(abs_up,   1, :, 1, 1)
+                in4_down = ndims(abs_down) == 4 ? abs_down : reshape(abs_down, 1, :, 1, 1)
+                zero_bias = zeros(Float64, length(b2))
+                rmin, rmax = interval_conv2d_bounds(F2, F2, in4_down, in4_up, zero_bias, l2.stride, l2.padding)
+                abs_down = rmin
+                abs_up   = rmax
+                for oc in 1:length(b2)
+                    abs_down[:, :, :, oc] .+= b2[oc]
+                    abs_up[:, :, :, oc]   .+= b2[oc]
+                end
+            end
+
+        elseif occursin("ReLU", layer_type)
+            relu_layer_idx += 1
+
+            # 1. Get current pre-activation scalar hull (flat)
+            if zono_active
+                abs_sum = vec(sum(abs.(gens), dims=2))
+                u_hull  = center .+ abs_sum
+                l_hull  = center .- abs_sum
+            else
+                u_hull = vec(Float64.(abs_up))
+                l_hull = vec(Float64.(abs_down))
+            end
+
+            # 2. Intersect with the Source-A-derived bound at this ReLU layer:
+            #    [n1_preact + diff_down, n1_preact + diff_up]
+            if relu_layer_idx <= length(n1_preact_up_bounds)
+                n1_up   = vec(Float64.(n1_preact_up_bounds[relu_layer_idx]))
+                n1_dn   = vec(Float64.(n1_preact_down_bounds[relu_layer_idx]))
+                diff_up = vec(Float64.(relu_diff_up_bounds[relu_layer_idx]))
+                diff_dn = vec(Float64.(relu_diff_down_bounds[relu_layer_idx]))
+                u_fromA = n1_up .+ diff_up
+                l_fromA = n1_dn .+ diff_dn
+                # Shape-tolerant intersection: only when lengths match.
+                if length(u_fromA) == length(u_hull)
+                    u_tight = min.(u_hull, u_fromA)
+                    l_tight = max.(l_hull, l_fromA)
+                else
+                    u_tight = u_hull
+                    l_tight = l_hull
+                end
+            else
+                u_tight = u_hull
+                l_tight = l_hull
+            end
+
+            # 3. Store per-ReLU-layer N2 absolute bounds (flat vectors)
+            push!(n2_abs_up_bounds,   copy(u_tight))
+            push!(n2_abs_down_bounds, copy(l_tight))
+
+            # 4. Update the running state through the ReLU, using the tightened
+            #    [l_tight, u_tight] as the per-neuron box the DeepZ relaxation
+            #    acts on.
+            if zono_active
+                n = length(center)
+                new_cols = Vector{Float64}[]
+                for i in 1:n
+                    u_i = u_tight[i]
+                    l_i = l_tight[i]
+                    if u_i <= 0.0
+                        # Stable inactive: clip to zero
+                        center[i] = 0.0
+                        gens[i, :] .= 0.0
+                    elseif l_i >= 0.0
+                        # Stable active: pass through (no change)
+                    else
+                        # Split: DeepZ relaxation  relu(x) ≈ λx + μ ± μ·ε_new
+                        λ = u_i / (u_i - l_i)
+                        μ = -u_i * l_i / (2.0 * (u_i - l_i))
+                        center[i] = λ * center[i] + μ
+                        gens[i, :] .*= λ
+                        col = zeros(n)
+                        col[i] = μ
+                        push!(new_cols, col)
+                    end
+                end
+                if !isempty(new_cols)
+                    gens = hcat(gens, hcat(new_cols...))
+                end
+                if zonotope_max_order > 0
+                    gens = reduce_zonotope_generators(gens, zonotope_max_order)
+                end
+                # Refresh interval state for the next layer
+                abs_sum = vec(sum(abs.(gens), dims=2))
+                abs_up_flat   = center .+ abs_sum
+                abs_down_flat = center .- abs_sum
+                if cur_4d_shape != (0, 0, 0, 0)
+                    abs_up   = reshape(abs_up_flat,   cur_4d_shape)
+                    abs_down = reshape(abs_down_flat, cur_4d_shape)
+                else
+                    abs_up   = abs_up_flat
+                    abs_down = abs_down_flat
+                end
+            else
+                # Interval mode: clip to [0, max(0, u)]
+                abs_up   = max.(0.0, abs_up)
+                abs_down = .- max.(0.0, .- abs_down)
+            end
+        end
+    end
+
+    println("compute_n2_bounds_zonotope_with_n1_tighten: populated $(length(n2_abs_up_bounds)) ReLU layers")
 end
 
 # ── N2-only perturbation relaxation bounds ──────────────────────────────

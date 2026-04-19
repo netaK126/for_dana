@@ -14,6 +14,7 @@ using Memento
 using DocStringExtensions
 using ProgressMeter
 using ArgParse
+using Serialization
 
 np = pyimport("numpy")
 
@@ -35,6 +36,7 @@ include("utils/datasets.jl")
 include("utils/models.jl")
 include("utils/mip.jl")
 include("utils/perturbation_intervals.jl")
+include("utils/n1_probe_lp.jl")
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -93,7 +95,7 @@ function parse_commandline()
         required = false
         default = ""#"itr18"
         "--mode"
-        help = "standard or transfer"
+        help = "standard, transfer, transfer_distilation, or advanced_standard"
         arg_type = String
         required = false
         default = "transfer"
@@ -131,7 +133,7 @@ function parse_commandline()
         help = "activate perturbation interval constraints between clean and perturbed copies"
         arg_type = Bool
         required = false
-        default = false
+        default = true
         "--activate_vaghgar_deps"
         help = "activate  vaghgar depandencies"
         arg_type = Bool
@@ -267,6 +269,16 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--standard_warmstart"
+        help = "In transfer mode: first solve standard MIP for N1 per (c_tag,c_target) to get delta_1 and binary values, then use those binaries as warm-start hints for the transfer MIP (N1 and N2 copies). Replaces --vaghar_results."
+        arg_type = Bool
+        required = false
+        default = false
+        "--standard_warmstart_n1_only"
+        help = "Restrict --standard_warmstart so only N1(x) (n1_org) binaries are hinted in the transfer MIP — skip n1_pert, n2_org, and n2_pert."
+        arg_type = Bool
+        required = false
+        default = false
         "--force_cpu"
         help = "force CPU-only mode for hyper attack (no GPU)"
         arg_type = Bool
@@ -277,6 +289,86 @@ function parse_commandline()
         arg_type = Int
         required = false
         default = 32
+        "--gurobi_seed"
+        help = "Gurobi Seed parameter — perturbs tie-breaking for variance measurement across identical runs"
+        arg_type = Int
+        required = false
+        default = 0
+        # ── Advanced-standard mode flags ─────────────────────────────────
+        "--adv_std_mip_start"
+        help = "advanced_standard: use N1's solution as MIP start hints for N2 (Technique 1)"
+        arg_type = Bool
+        required = false
+        default = true
+        "--adv_std_branch_priorities"
+        help = "advanced_standard branch-priority mode: off | bounds | pseudocost. " *
+               "bounds = N1 final bound width → BranchPriority (existing heuristic). " *
+               "pseudocost = N1 Gurobi pseudo-cost rank → BranchPriority (new). " *
+               "Legacy true/false accepted (true → bounds, false → off)."
+        arg_type = String
+        required = false
+        default = "bounds"
+        range_tester = x -> x in ("off", "bounds", "pseudocost", "true", "false")
+        "--adv_std_var_hint"
+        help = "advanced_standard variable-hint mode (new, Technique 5): when true, " *
+               "set VarHintVal from N1's optimal binary values and VarHintPri from " *
+               "N1 pseudo-cost rank. Orthogonal to --adv_std_branch_priorities."
+        arg_type = Bool
+        required = false
+        default = false
+        "--adv_std_var_hint_fix"
+        help = "advanced_standard: when true, filter n1_pseudocosts down to " *
+               "binaries that still exist in N2 (post T2/T4) before ranking " *
+               "priorities. No effect unless --adv_std_var_hint is also true. " *
+               "Opt-in so existing sweep results remain reproducible."
+        arg_type = Bool
+        required = false
+        default = false
+        "--adv_std_lp_basis"
+        help = "advanced_standard: transfer N1's LP basis to N2's root node (Technique 3). " *
+               "No effect when --adv_std_bound_tightening is true (guarded — basis is " *
+               "incompatible with eliminated binaries). Default false; opt in explicitly."
+        arg_type = Bool
+        required = false
+        default = false
+        "--adv_std_bound_tightening"
+        help = "advanced_standard: tighten N2 bounds using N1 + compute_diff_and_comp_bounds (Technique 4)"
+        arg_type = Bool
+        required = false
+        default = true
+        "--adv_std_zono_bounds"
+        help = "advanced_standard: within Technique 4, compute N2 bounds via zonotope propagation " *
+               "(compute_diff_bounds_zonotope) plus a second N1-tightened absolute N2 zonotope pass, " *
+               "and intersect both against the ReLU [l,u]. Strictly tighter than the default interval " *
+               "path; preserves the integer optimum. Requires --adv_std_bound_tightening true."
+        arg_type = Bool
+        required = false
+        default = false
+        "--adv_std_n1_probe"
+        help = "advanced_standard: run post-Phase-1 LP probing against a joint N1+N2 LP " *
+               "relaxation (triangle ReLU relaxations) to derive tighter per-neuron N2 " *
+               "pre-activation bounds, eliminating more N2 binaries via the existing stable-flip " *
+               "short-circuit. Values: off | lp. Requires --adv_std_bound_tightening true. " *
+               "linf perturbation only in the first implementation; other perturbations skip with a warning."
+        arg_type = String
+        required = false
+        default = "off"
+        range_tester = x -> x in ("off", "lp")
+        "--adv_std_n2_relax_threshold"
+        help = "advanced_standard (Technique 6): replace N2/N2p ReLU binaries with a " *
+               "triangle LP relaxation (no binary) when the triangle-gap-area of N1's interval " *
+               "at the same neuron is <= this value. Sound over-approximation: delta_relaxed >= " *
+               "delta_exact, and every concrete feasible point remains feasible in the relaxed " *
+               "MIP. Default -1.0 disables. Requires --adv_std_bound_tightening true so that " *
+               "n1_neuron_bounds is populated."
+        arg_type = Float64
+        required = false
+        default = -1.0
+        "--n1_state_dir"
+        help = "Directory with pre-saved N1 solver state (from advanced_standard_n1). When set, skip N1 solve and load state from disk."
+        arg_type = String
+        required = false
+        default = ""
 
     end
     return parse_args(s)
@@ -291,6 +383,10 @@ function main()
     name_to_save = args["name_to_save"]
     use_hyper_attack = args["use_hyper_attack"]
     global Threads_num = args["Threads_num"]
+    global gurobi_seed = args["gurobi_seed"]
+    if gurobi_seed != 0
+        name_to_save = name_to_save * "_seed" * string(gurobi_seed)
+    end
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
 
@@ -298,6 +394,12 @@ function main()
         main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     elseif mode == "transfer_distilation"
         main_transfer_distilation(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
+    elseif mode == "advanced_standard"
+        main_advanced_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
+    elseif mode == "advanced_standard_n1"
+        main_advanced_standard_n1(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
+    elseif mode == "advanced_standard_n2"
+        main_advanced_standard_n2(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     else
         main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     end
@@ -380,9 +482,627 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     end
 end
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Advanced Standard Mode
+# ═══════════════════════════════════════════════════════════════════════════
+"""
+    advstd_results_complete(results_path, n2_name_suffix, c_tag, c_targets) -> Bool
+
+Check whether a completed results file already exists in `results_path` that
+contains results for ALL requested (c_tag, c_target) pairs.  The file must
+contain a `c_source=<c_tag-1>,c_target=<ct-1>` line for every c_target in
+`c_targets` (skipping c_target == c_tag).  Returns true only when every
+expected line is present.
+"""
+function advstd_results_complete(results_path::AbstractString, n2_name_suffix::AbstractString,
+                                  c_tag::Int, c_targets::Vector{Int})
+    if !isdir(results_path)
+        return false
+    end
+    # Expected c_target set (0-indexed, excluding self)
+    expected = Set(ct - 1 for ct in c_targets if ct != c_tag)
+    if isempty(expected)
+        return true
+    end
+    # Search for any .txt file whose name contains the n2_name suffix and the cTag marker.
+    # Strip the probe's _elimOrg{N}_elimPert{N} counts before matching: when
+    # adv_std_n1_probe=lp those counts are injected between the tech flags and
+    # _HyperAttackHints, so the raw filename no longer contains n2_name_suffix
+    # as a contiguous substring. n2_name_suffix itself never has elim counts.
+    ctag_marker = "_cTag" * string(c_tag)
+    elim_re = r"_elimOrg\d+_elimPert\d+"
+    for fname in readdir(results_path)
+        if !endswith(fname, ".txt")
+            continue
+        end
+        fname_for_match = replace(fname, elim_re => "")
+        if !occursin(n2_name_suffix, fname_for_match) || !occursin(ctag_marker, fname_for_match)
+            continue
+        end
+        # Parse the file: collect all (c_source, c_target) pairs present
+        fpath = joinpath(results_path, fname)
+        found = Set{Int}()
+        for line in eachline(fpath)
+            m_src = match(r"c_source=(\d+)", line)
+            m_tgt = match(r"c_target=(\d+)", line)
+            if m_src !== nothing && m_tgt !== nothing
+                src = parse(Int, m_src.captures[1])
+                tgt = parse(Int, m_tgt.captures[1])
+                if src == c_tag - 1
+                    push!(found, tgt)
+                end
+            end
+        end
+        if expected ⊆ found
+            println("advstd_results_complete: found complete results in $fname — skipping run")
+            return true
+        end
+    end
+    return false
+end
+
+"""
+    advstd_result_exists_for_pair(results_path, n2_name_suffix, c_tag, c_target) -> Bool
+
+Check whether a results file in `results_path` already contains a completed
+entry for a single (c_tag, c_target) pair.  Returns true if a matching
+`c_source=<c_tag-1>,c_target=<c_target-1>` line is found.
+"""
+function advstd_result_exists_for_pair(results_path::AbstractString, n2_name_suffix::AbstractString,
+                                       c_tag::Int, c_target::Int)
+    if !isdir(results_path)
+        return false
+    end
+    expected_src = c_tag - 1
+    expected_tgt = c_target - 1
+    ctag_marker = "_cTag" * string(c_tag)
+    elim_re = r"_elimOrg\d+_elimPert\d+"
+    for fname in readdir(results_path)
+        if !endswith(fname, ".txt")
+            continue
+        end
+        fname_for_match = replace(fname, elim_re => "")
+        if !occursin(n2_name_suffix, fname_for_match) || !occursin(ctag_marker, fname_for_match)
+            continue
+        end
+        fpath = joinpath(results_path, fname)
+        for line in eachline(fpath)
+            m_src = match(r"c_source=(\d+)", line)
+            m_tgt = match(r"c_target=(\d+)", line)
+            if m_src !== nothing && m_tgt !== nothing
+                if parse(Int, m_src.captures[1]) == expected_src && parse(Int, m_tgt.captures[1]) == expected_tgt
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+"""
+    advstd_read_result_line(results_path, n2_name_suffix, c_tag, c_target) -> Union{String, Nothing}
+
+Read and return the full result line for a specific (c_tag, c_target) pair from
+an existing results file.  Returns nothing if not found.
+"""
+function advstd_read_result_line(results_path::AbstractString, n2_name_suffix::AbstractString,
+                                  c_tag::Int, c_target::Int)
+    if !isdir(results_path)
+        return nothing
+    end
+    expected_src = string(c_tag - 1)
+    expected_tgt = string(c_target - 1)
+    ctag_marker = "_cTag" * string(c_tag)
+    elim_re = r"_elimOrg\d+_elimPert\d+"
+    for fname in readdir(results_path)
+        if !endswith(fname, ".txt")
+            continue
+        end
+        fname_for_match = replace(fname, elim_re => "")
+        if !occursin(n2_name_suffix, fname_for_match) || !occursin(ctag_marker, fname_for_match)
+            continue
+        end
+        fpath = joinpath(results_path, fname)
+        for line in eachline(fpath)
+            m_src = match(r"c_source=(\d+)", line)
+            m_tgt = match(r"c_target=(\d+)", line)
+            if m_src !== nothing && m_tgt !== nothing
+                if m_src.captures[1] == expected_src && m_tgt.captures[1] == expected_tgt
+                    return strip(line)
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+function main_advanced_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
+    model_path2 = args["model_path2"]
+    if model_path2 == "" || model_path2 == model_path
+        error("advanced_standard mode requires --model_path2 pointing to N2 (different from N1)")
+    end
+
+    use_mip_start = args["adv_std_mip_start"]
+    bp_mode = args["adv_std_branch_priorities"]
+    # Backward compatibility: accept legacy true/false as bounds/off
+    bp_mode = bp_mode == "true"  ? "bounds" :
+              bp_mode == "false" ? "off"    : bp_mode
+    use_var_hint = args["adv_std_var_hint"]
+    use_var_hint_fix = args["adv_std_var_hint_fix"]
+    if use_var_hint_fix && !use_var_hint
+        println("WARNING: --adv_std_var_hint_fix has no effect when " *
+                "--adv_std_var_hint is false.")
+    end
+    use_lp_basis = args["adv_std_lp_basis"]
+    use_bound_tightening = args["adv_std_bound_tightening"]
+    use_zono_bounds = args["adv_std_zono_bounds"]
+    # Technique 6: N1-gated N2/N2p triangle LP relaxation. Propagated to the
+    # core_ops.jl::relu() consumer via the `adv_std_n2_relax_threshold` global.
+    global adv_std_n2_relax_threshold = args["adv_std_n2_relax_threshold"]
+    if adv_std_n2_relax_threshold >= 0.0 && !use_bound_tightening
+        println("WARNING: --adv_std_n2_relax_threshold >= 0 but --adv_std_bound_tightening is " *
+                "false. The relaxation block needs n1_neuron_bounds to be populated, which only " *
+                "happens when bound_tightening is true — no neurons will be relaxed in this run.")
+    end
+    n1_state_dir = args["n1_state_dir"]
+
+    c_tag_list = [args["ctag"]]
+    activate_vaghgar_deps = args["activate_vaghgar_deps"]
+    global use_relaxations = args["use_relaxations"]
+    global relaxation_threshold = args["relaxation_threshold"]
+    global optimizing_intervals = args["optimizing_intervals"]
+    global relaxation_gap_area = args["relaxation_gap_area"]
+    name_to_save_init = name_to_save
+
+    println("Advanced-standard mode: techniques enabled:")
+    println("  Technique 1 (MIP Start):          $(use_mip_start)")
+    println("  Technique 2 (Branch Priorities):   $(bp_mode)")
+    println("  Technique 3 (LP Basis):            $(use_lp_basis)")
+    println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
+    println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
+    println("  Technique 4+ (N1 Probe):           $(args["adv_std_n1_probe"])")
+    println("  Technique 5 (Variable Hints):      $(use_var_hint)")
+    println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
+
+    # ── Pre-flight: build n2_check suffix for skip detection ──
+    n2_check = name_to_save
+    if occursin("_N2_advStd", n2_check)
+        # already has technique flags
+    else
+        n2_check = n2_check * "_N2_advStd"
+        if use_mip_start;             n2_check = n2_check * "_mipStart"; end
+        if bp_mode == "bounds";       n2_check = n2_check * "_branchPri"; end
+        if bp_mode == "pseudocost";   n2_check = n2_check * "_branchPriPsd"; end
+        if use_lp_basis;              n2_check = n2_check * "_lpBasis"; end
+        if use_bound_tightening;      n2_check = n2_check * "_boundTight"; end
+        if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
+        if args["adv_std_n1_probe"] == "lp"; n2_check = n2_check * "_n1ProbeLP"; end
+        if args["adv_std_n2_relax_threshold"] >= 0.0
+            n2_check = n2_check * "_relaxT" * string(args["adv_std_n2_relax_threshold"])
+        end
+        if use_var_hint;              n2_check = n2_check * "_varHint"; end
+        if use_var_hint && use_var_hint_fix; n2_check = n2_check * "_varHintFix"; end
+    end
+    if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
+    if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps"; end
+    if args["use_perturbed_intervals"];     n2_check = n2_check * "_PerturbedIntervals"; end
+
+    # Check if ALL results already exist — if so, skip entirely
+    for c_tag in c_tag_list
+        c_targets = parse_numbers_to_Int64(args["ct"])
+        results_path = args["output_dir"]
+        if advstd_results_complete(results_path, n2_check, c_tag, c_targets)
+            println("All results already present for c_tag=$c_tag — nothing to do.")
+            return
+        end
+    end
+
+    for c_tag in c_tag_list
+        results.str = ""
+        results_n2 = Results("")
+        c_targets = parse_numbers_to_Int64(args["ct"])
+        results_path = args["output_dir"]
+        timout = args["timout"]
+        w, h, k, c = get_dataset_params(dataset)
+        token_signature = string(now().instant.periods.value)
+
+        load_n1_from_disk = n1_state_dir != "" && isdir(n1_state_dir)
+        # nn1 is needed for Technique 4 diff-bound computation and for the
+        # N1-probe LP (Source C). In the state-dir load path we normally
+        # skip loading nn1 to save time, but if the probe is enabled we
+        # need nn1's weights to build the joint LP.
+        nn1_needed = !load_n1_from_disk || args["adv_std_n1_probe"] == "lp"
+        nn1 = nn1_needed ? get_nn(model_path, model_name, w, h, k, c, dataset) : nothing
+        nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
+
+        # ── Technique 4: precompute sound per-neuron diff bounds ──────────
+        clear_n2_abs_bounds()
+        if use_bound_tightening
+            input_dummy = zeros(Float64, 1, w, h, k)
+            p_size = perturbation_size[1]
+            if size(input_dummy)[4] > 1
+                I_pert_up_init = p_size .* ones(Float64, size(input_dummy)[4], 1)
+                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy)[4], 1)
+            else
+                I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
+                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
+            end
+
+            if load_n1_from_disk
+                load_n1_diff_bounds!(n1_state_dir)
+            elseif use_zono_bounds
+                # Source A: zonotope diff bounds (tighter than interval for deep nets)
+                global use_zonotope = true
+                println("Advanced-standard: computing zonotope diff bounds (Source A) between N1 and N2...")
+                compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
+                println("  Source A diff bounds computed: $(length(relu_diff_up_bounds)) ReLU layers")
+            else
+                println("Advanced-standard: computing diff bounds between N1 and N2...")
+                compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
+                println("  diff bounds computed: $(length(relu_diff_up_bounds)) ReLU layers")
+            end
+
+            # Source B: absolute N2 zonotope, intersected with Source A per layer.
+            # Needs nn2 (always available here) and Source A's globals
+            # (relu_diff_*_bounds, n1_preact_*_bounds). Skips internally with a
+            # warning if those globals are empty, e.g. legacy n1_state_dir load.
+            if use_zono_bounds
+                println("Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...")
+                compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init)
+            end
+
+            # Source C: joint N1+N2 LP probe via OBBT (--adv_std_n1_probe=lp).
+            # Builds a fresh LP-only model with triangle-relaxed ReLUs for
+            # both N1 and N2 sharing v_in/v_x0, runs per-neuron min/max on
+            # every N2 pre-activation. Output is strictly tighter than
+            # Source A/B because the LP polytope captures cross-neuron
+            # correlations that scalar/zonotope projections lose.
+            clear_n2_probe_bounds()
+            if args["adv_std_n1_probe"] == "lp"
+                println("Advanced-standard: running N1-probe LP (Source C) to tighten N2 bounds...")
+                probe_ran = compute_n2_bounds_n1_probe_lp(
+                    nn1, nn2, perturbation, perturbation_size,
+                    w, h, k, Gurobi.Optimizer)
+                if !probe_ran
+                    println("ERROR: --adv_std_n1_probe=lp was requested but Source C could not run " *
+                            "(see the compute_n2_bounds_n1_probe_lp message above). Aborting this " *
+                            "Phase 2 invocation without running any MIP solves — no result files " *
+                            "will be written. Re-run with compatible prerequisites (supported " *
+                            "perturbation + populated n1_preact/relu_diff bounds + matching ReLU " *
+                            "layer counts) or drop --adv_std_n1_probe.")
+                    return
+                end
+            end
+        end
+
+        for c_target in c_targets
+            name_to_save = name_to_save_init
+            global relaxation_condition_count = 0
+            if c_tag == c_target
+                continue
+            end
+
+            # ── Per-c_target skip: avoid re-solving if this pair already exists ──
+            if advstd_result_exists_for_pair(results_path, n2_check, c_tag, c_target)
+                println("Result already exists for c_tag=$c_tag, c_target=$c_target — skipping")
+                # Preserve the existing result line in results_n2.str so
+                # save_results (which overwrites the file) doesn't lose it.
+                existing_line = advstd_read_result_line(results_path, n2_check, c_tag, c_target)
+                if existing_line !== nothing
+                    results_n2.str = results_n2.str * existing_line * "\n"
+                end
+                continue
+            end
+
+            # ═══ PASS 1: Get N1 solver state (solve or load from disk) ═══
+            n1_var_names, n1_var_values = String[], Float64[]
+            n1_layers_info = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
+            n1_vbasis = Dict{String, Int}()
+            n1_pseudocosts = nothing
+
+            if load_n1_from_disk
+                println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
+                n1_var_names, n1_var_values, n1_layers_info, n1_vbasis, n1_pseudocosts = load_n1_state(n1_state_dir, c_tag, c_target)
+            else
+                println("\n══ Advanced-standard PASS 1: solving N1 (c_tag=$c_tag, c_target=$c_target) ══")
+                suboptimal_solution_n1, suboptimal_time_n1 = 0, 0
+                if use_hyper_attack
+                    suboptimal_solution_n1, suboptimal_time_n1 = hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size; force_cpu=args["force_cpu"])
+                end
+                optimizer = Gurobi.Optimizer
+                d_n1 = Dict()
+                d_n1[:TargetIndex] = get_target_indexes(c_target, c)
+                d_n1[:SourceIndex] = get_target_indexes(c_tag, c)
+                d_n1[:suboptimal_solution] = suboptimal_solution_n1
+                d_n1[:suboptimal_time] = suboptimal_time_n1
+                mip_reset()
+                clear_n1_neuron_bounds()
+                bounds_time_n1 = @elapsed begin
+                    merge!(d_n1, get_model(w, h, k, perturbation, perturbation_size, nn1, zeros(Float64, 1, w, h, k), optimizer,
+                    get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
+                end
+                d_n1[:bounds_time] = bounds_time_n1
+                m_n1 = d_n1[:Model]
+                if use_hyper_attack
+                    hyper_attack_hints(m_n1, token_signature, c_tag, c_target)
+                end
+                if activate_vaghgar_deps
+                    perturbation_dependencies(m_n1, nn1, perturbation, perturbation_size, w, h, k;
+                                              perturbation_var=d_n1[:Perturbation])
+                end
+                if args["use_perturbed_intervals"]
+                    perturbed_interval_constraints(m_n1, nn1, "org", "perturbation")
+                end
+                mip_set_delta_property(m_n1, perturbation, d_n1)
+                set_optimizer(m_n1, optimizer)
+                mip_set_attr(m_n1, perturbation, d_n1, timout)
+                MOI.set(m_n1, Gurobi.CallbackFunction(), my_callback)
+                optimize!(m_n1)
+                mip_log(m_n1, d_n1)
+
+                # Extract ALL N1 solver info (regardless of which techniques are enabled,
+                # so the state is complete for any N2 job)
+                n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
+                n1_layers_info = deepcopy(layers_info_dict)
+                n1_vbasis = extract_vbasis(m_n1)
+                n1_pseudocosts = extract_pseudocosts(m_n1)
+                m_n1 = nothing
+            end
+
+            # ═══ PASS 2: Solve N2 (accelerated standard) ═══════════════════
+            println("\n══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=$c_tag, c_target=$c_target) ══")
+
+            # Run hyper_attack for N2 to get suboptimal_solution (used as
+            # Gurobi Cutoff for branch pruning), regardless of mip_start.
+            # When mip_start is active, we still skip applying PGD hints
+            # (N1's full solution is used instead), but we need the Cutoff.
+            suboptimal_solution_n2, suboptimal_time_n2 = 0, 0
+            if use_hyper_attack
+                suboptimal_solution_n2, suboptimal_time_n2 = hyper_attack(dataset, c_tag, c_target, token_signature * "_n2", model_name, model_path2, perturbation, perturbation_size; force_cpu=args["force_cpu"])
+            end
+            d_n2 = Dict()
+            d_n2[:TargetIndex] = get_target_indexes(c_target, c)
+            d_n2[:SourceIndex] = get_target_indexes(c_tag, c)
+            d_n2[:suboptimal_solution] = suboptimal_solution_n2
+            d_n2[:suboptimal_time] = suboptimal_time_n2
+            d_n2[:adv_std_flags] = (
+                adv_std_mip_start            = args["adv_std_mip_start"],
+                adv_std_branch_priorities    = args["adv_std_branch_priorities"],
+                adv_std_lp_basis             = args["adv_std_lp_basis"],
+                adv_std_bound_tightening     = args["adv_std_bound_tightening"],
+                adv_std_zono_bounds          = args["adv_std_zono_bounds"],
+                adv_std_n1_probe             = args["adv_std_n1_probe"],
+                adv_std_n2_relax_threshold   = args["adv_std_n2_relax_threshold"],
+                adv_std_var_hint             = args["adv_std_var_hint"],
+                gurobi_seed                  = args["gurobi_seed"],
+            )
+            optimizer = Gurobi.Optimizer
+            mip_reset()
+
+            # Technique 4: set N1 neuron bounds (consumed by relu() during get_model)
+            if use_bound_tightening
+                set_n1_neuron_bounds(n1_layers_info)
+            end
+
+            # Technique 6: reset the relaxed-binary counters per c_target so
+            # the filename reflects the counts for *this specific* MIP build.
+            clear_n2_relaxed_counters!()
+
+            bounds_time_n2 = @elapsed begin
+                merge!(d_n2, get_model(w, h, k, perturbation, perturbation_size, nn2, zeros(Float64, 1, w, h, k), optimizer,
+                get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
+            end
+            d_n2[:bounds_time] = bounds_time_n2
+            m_n2 = d_n2[:Model]
+
+            # Technique 1: MIP Start hints from N1's solution
+            if use_mip_start
+                apply_n1_hints!(m_n2, n1_var_names, n1_var_values)
+            end
+            # Build N2 result filename with active technique flags
+            # If name_to_save already has technique flags (set by sweep), use as-is
+            if occursin("_N2_advStd", name_to_save)
+                n2_name = name_to_save
+            else
+                n2_name = name_to_save * "_N2_advStd"
+                if use_mip_start;             n2_name = n2_name * "_mipStart"; end
+                if bp_mode == "bounds";       n2_name = n2_name * "_branchPri"; end
+                if bp_mode == "pseudocost";   n2_name = n2_name * "_branchPriPsd"; end
+                if use_lp_basis;              n2_name = n2_name * "_lpBasis"; end
+                if use_bound_tightening;      n2_name = n2_name * "_boundTight"; end
+                if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
+                if args["adv_std_n1_probe"] == "lp"; n2_name = n2_name * "_n1ProbeLP"; end
+                if args["adv_std_n2_relax_threshold"] >= 0.0
+                    n2_name = n2_name * "_relaxT" * string(args["adv_std_n2_relax_threshold"])
+                end
+                if use_var_hint;              n2_name = n2_name * "_varHint"; end
+                if use_var_hint && use_var_hint_fix; n2_name = n2_name * "_varHintFix"; end
+            end
+            # Append the probe's binary-elimination counts (org + pert split)
+            # as the LAST suffix so pre-flight substring matching (which uses
+            # n2_check without these counts) still finds already-completed files.
+            if args["adv_std_n1_probe"] == "lp"
+                n2_name = n2_name *
+                          "_elimOrg" * string(n_probe_eliminated_binaries_org) *
+                          "_elimPert" * string(n_probe_eliminated_binaries_pert)
+            end
+
+            if use_hyper_attack && !use_mip_start
+                hyper_attack_hints(m_n2, token_signature * "_n2", c_tag, c_target)
+                n2_name = n2_name * "_HyperAttackHints"
+            elseif use_hyper_attack && use_mip_start
+                # PGD hints not applied (N1 mip_start used instead),
+                # but hyper_attack ran above to provide Cutoff via suboptimal_solution
+                n2_name = n2_name * "_HyperAttackCutoff"
+            end
+            if activate_vaghgar_deps
+                n2_name = n2_name * "_VagharDeps"
+                perturbation_dependencies(m_n2, nn2, perturbation, perturbation_size, w, h, k;
+                                          perturbation_var=d_n2[:Perturbation])
+            end
+            if args["use_perturbed_intervals"]
+                n2_name = n2_name * "_PerturbedIntervals"
+                perturbed_interval_constraints(m_n2, nn2, "org", "perturbation")
+            end
+            mip_set_delta_property(m_n2, perturbation, d_n2)
+            set_optimizer(m_n2, optimizer)
+            mip_set_attr(m_n2, perturbation, d_n2, timout)
+
+            MOI.set(m_n2, Gurobi.CallbackFunction(), my_callback)
+            # Technique 2: Branching priorities (must be after mip_set_attr to bridge Gurobi backend)
+            if bp_mode == "bounds"
+                apply_n1_branch_priorities!(m_n2, n1_layers_info)
+            elseif bp_mode == "pseudocost"
+                apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info)
+            end
+            # Technique 5: Variable hints (independent of bp_mode; both can be active)
+            if use_var_hint
+                apply_n1_var_hints!(m_n2, n1_var_names, n1_var_values, n1_pseudocosts;
+                                    fix_mode=use_var_hint_fix)
+            end
+            # Technique 3: LP Basis transfer from N1
+            # Skip when bound tightening is active — the model structure changes
+            # (eliminated binaries, different big-M) make N1's basis incompatible.
+            if use_lp_basis && !use_bound_tightening
+                apply_vbasis!(m_n2, n1_vbasis)
+            elseif use_lp_basis && use_bound_tightening
+                println("apply_vbasis!: skipped (incompatible with bound tightening)")
+            end
+            optimize!(m_n2)
+            mip_log(m_n2, d_n2)
+
+            # Save N2 results (no mip_reuse_bounds — interleaved N1/N2 prevents safe reuse)
+            clear_n1_neuron_bounds()
+            results_n2.str = update_results_str(results_n2.str, c_tag, c_target, d_n2)
+            save_results(results_path, model_name, perturbation, perturbation_size, results_n2.str, d_n2, nn2, c_tag-1, c_target-1, w, h, k, n2_name*"_cTag"*string(c_tag), token_signature * "_n2")
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Advanced Standard N1: solve N1 only and save solver state to disk.
+# Run once; then run advanced_standard_n2 (or advanced_standard --n1_state_dir)
+# multiple times in parallel with different technique flags.
+# ═══════════════════════════════════════════════════════════════════════════
+function main_advanced_standard_n1(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
+    model_path2 = args["model_path2"]
+    n1_state_dir = args["n1_state_dir"]
+    if n1_state_dir == ""
+        error("advanced_standard_n1 requires --n1_state_dir (where to save N1 state)")
+    end
+
+    c_tag_list = [args["ctag"]]
+    activate_vaghgar_deps = args["activate_vaghgar_deps"]
+    global use_relaxations = args["use_relaxations"]
+    global relaxation_threshold = args["relaxation_threshold"]
+    global optimizing_intervals = args["optimizing_intervals"]
+    global relaxation_gap_area = args["relaxation_gap_area"]
+
+    for c_tag in c_tag_list
+        c_targets = parse_numbers_to_Int64(args["ct"])
+        timout = args["timout"]
+        w, h, k, c = get_dataset_params(dataset)
+        token_signature = string(now().instant.periods.value)
+
+        nn1 = get_nn(model_path, model_name, w, h, k, c, dataset)
+
+        # Compute and save diff bounds (needs both nn1 and nn2)
+        if model_path2 != ""
+            nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
+            input_dummy = zeros(Float64, 1, w, h, k)
+            p_size = perturbation_size[1]
+            if size(input_dummy)[4] > 1
+                I_pert_up_init = p_size .* ones(Float64, size(input_dummy)[4], 1)
+                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy)[4], 1)
+            else
+                I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
+                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
+            end
+            if args["adv_std_zono_bounds"]
+                global use_zonotope = true
+                println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
+                compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
+            else
+                println("Advanced-standard-N1: computing diff bounds between N1 and N2...")
+                compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
+            end
+            save_n1_diff_bounds(n1_state_dir)
+        end
+
+        for c_target in c_targets
+            global relaxation_condition_count = 0
+            if c_tag == c_target
+                continue
+            end
+
+            println("\n══ Advanced-standard-N1: solving N1 (c_tag=$c_tag, c_target=$c_target) ══")
+            suboptimal_solution_n1, suboptimal_time_n1 = 0, 0
+            if use_hyper_attack
+                suboptimal_solution_n1, suboptimal_time_n1 = hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size; force_cpu=args["force_cpu"])
+            end
+            optimizer = Gurobi.Optimizer
+            d_n1 = Dict()
+            d_n1[:TargetIndex] = get_target_indexes(c_target, c)
+            d_n1[:SourceIndex] = get_target_indexes(c_tag, c)
+            d_n1[:suboptimal_solution] = suboptimal_solution_n1
+            d_n1[:suboptimal_time] = suboptimal_time_n1
+            mip_reset()
+            clear_n1_neuron_bounds()
+            bounds_time_n1 = @elapsed begin
+                merge!(d_n1, get_model(w, h, k, perturbation, perturbation_size, nn1, zeros(Float64, 1, w, h, k), optimizer,
+                get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
+            end
+            d_n1[:bounds_time] = bounds_time_n1
+            m_n1 = d_n1[:Model]
+            if use_hyper_attack
+                hyper_attack_hints(m_n1, token_signature, c_tag, c_target)
+            end
+            if activate_vaghgar_deps
+                perturbation_dependencies(m_n1, nn1, perturbation, perturbation_size, w, h, k;
+                                          perturbation_var=d_n1[:Perturbation])
+            end
+            if args["use_perturbed_intervals"]
+                perturbed_interval_constraints(m_n1, nn1, "org", "perturbation")
+            end
+            mip_set_delta_property(m_n1, perturbation, d_n1)
+            set_optimizer(m_n1, optimizer)
+            mip_set_attr(m_n1, perturbation, d_n1, timout)
+            MOI.set(m_n1, Gurobi.CallbackFunction(), my_callback)
+            optimize!(m_n1)
+            mip_log(m_n1, d_n1)
+
+            # Extract ALL solver info and save to disk
+            n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
+            n1_layers_info = deepcopy(layers_info_dict)
+            n1_vbasis = extract_vbasis(m_n1)
+            n1_pseudocosts = extract_pseudocosts(m_n1)
+            save_n1_state(n1_state_dir, c_tag, c_target, n1_var_names, n1_var_values, n1_layers_info, n1_vbasis; n1_pseudocosts=n1_pseudocosts)
+
+            mip_reuse_bounds()
+            m_n1 = nothing
+        end
+    end
+    println("\n══ Advanced-standard-N1: done. State saved to $n1_state_dir ══")
+end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Advanced Standard N2: load N1 state from disk and solve N2.
+# Equivalent to advanced_standard --n1_state_dir, but as a dedicated mode.
+# ═══════════════════════════════════════════════════════════════════════════
+function main_advanced_standard_n2(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
+    n1_state_dir = args["n1_state_dir"]
+    if n1_state_dir == "" || !isdir(n1_state_dir)
+        error("advanced_standard_n2 requires --n1_state_dir pointing to saved N1 state")
+    end
+    # Delegate to main_advanced_standard which already handles --n1_state_dir
+    main_advanced_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
+end
+
 function main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_Attack_delta_diff)
     model_path2 = args["model_path2"]
     vaghar_results = args["vaghar_results"]
+    standard_warmstart = args["standard_warmstart"]
+    standard_warmstart_n1_only = args["standard_warmstart_n1_only"]
     c_tag_mode = args["c_tag_mode"]
     use_intervals = args["use_intervals"]
     results_path = args["output_dir"]
@@ -488,9 +1208,83 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
 
             println("=== c_tag=$c_tag, c_target=$c_target ===")
-            delta_1 = get_delta1_vaghar(vaghar_results, c_target)
             name_to_save = name_to_save_init
             global relaxation_condition_count = 0
+
+            # ── Phase 0: Obtain delta_1 and optionally binary hints ──
+            std_binary_names = String[]
+            std_binary_values = Float64[]
+
+            # Try to read delta_1 from existing vaghar results file
+            delta_1_from_file = false
+            if vaghar_results != "unused_standard_warmstart" && isfile(vaghar_results)
+                try
+                    delta_1 = get_delta1_vaghar(vaghar_results, c_target)
+                    delta_1_from_file = true
+                    println("delta_1 = $delta_1 (from vaghar results file)")
+                catch e
+                    println("  Warning: could not read delta_1 from file: $e")
+                end
+            end
+
+            if standard_warmstart
+                # Solve standard MIP for N1 to extract binary warm-start hints
+                println("  [standard_warmstart] Solving standard MIP for N1 binary hints...")
+                name_to_save = name_to_save * (standard_warmstart_n1_only ? "_StdWarmstartN1Only" : "_StdWarmstart")
+                optimizer_std = Gurobi.Optimizer
+                mip_reset()
+                d_std = Dict()
+                d_std[:TargetIndex] = get_target_indexes(c_target, c)
+                d_std[:SourceIndex] = get_target_indexes(c_tag, c)
+                d_std[:suboptimal_solution] = 0
+                d_std[:suboptimal_time] = 0
+                std_bounds_time = @elapsed begin
+                    merge!(d_std, get_model(w, h, k, perturbation, perturbation_size, nn1, zeros(Float64, 1, w, h, k), optimizer_std,
+                        get_default_tightening_options(optimizer_std), DEFAULT_TIGHTENING_ALGORITHM))
+                end
+                m_std = d_std[:Model]
+                mip_set_delta_property(m_std, perturbation, d_std)
+                if args["use_perturbed_intervals"]
+                    perturbed_interval_constraints(m_std, nn1, "org", "perturbation")
+                end
+                set_optimizer(m_std, optimizer_std)
+                mip_set_attr(m_std, perturbation, d_std, timout)
+                MOI.set(m_std, Gurobi.CallbackFunction(), my_callback)
+                optimize!(m_std)
+                mip_log(m_std, d_std)
+
+                std_binary_names, std_binary_values = extract_binary_values(m_std)
+
+                # Use delta_1 from standard solve only if we don't have it from file
+                delta_1_from_solve = d_std[:best_bound]
+                if delta_1_from_file
+                    if abs(delta_1 - delta_1_from_solve) > 0.01
+                        println("  WARNING: delta_1 mismatch! file=$delta_1 vs solve=$delta_1_from_solve (diff=$(abs(delta_1 - delta_1_from_solve)))")
+                    end
+                else
+                    delta_1 = delta_1_from_solve
+                    println("  [standard_warmstart] delta_1=$delta_1 (from standard solve)")
+                end
+
+                # Save standard phase results only if we don't already have them
+                if !delta_1_from_file
+                    std_results_str = update_results_str("", c_tag, c_target, d_std)
+                    std_basename = token_signature * "_" * model_name * "_standard_warmstart_" *
+                        perturbation * "_" * create_perturbation_string(perturbation_size) *
+                        "_ctag" * string(c_tag) * "_ct" * string(c_target) * "_StdPhase"
+                    std_file = open(safe_filepath(results_path, std_basename), "w")
+                    write(std_file, std_results_str)
+                    close(std_file)
+                end
+
+                m_std = nothing  # free memory
+
+                # Reset global state for transfer encoding
+                reuse_bounds_conf.is_reuse_bounds_and_deps = false
+            elseif !delta_1_from_file
+                delta_1 = get_delta1_vaghar(vaghar_results, c_target)
+            end
+
             println("delta_1 = $delta_1")
             if delta_1 <= 0
                 println("Skipping: delta_1 <= 0")
@@ -524,6 +1318,13 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             end
             d[:bounds_time] = bounds_time
             m = d[:Model]
+
+            # Apply warm-start hints from standard solve (N1 binaries → N1+N2 transfer binaries)
+            if standard_warmstart && !isempty(std_binary_names)
+                apply_standard_warmstart!(m, std_binary_names, std_binary_values,
+                    no_n1_encoding_at_all, n1_p_mode, no_n2_xp_encoding;
+                    n1_only=standard_warmstart_n1_only)
+            end
 
             # Apply warm-start hints from PGD attack
             if use_hyper_Attack_delta_diff

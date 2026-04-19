@@ -181,6 +181,7 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      no_n1_encoding_at_all=False,
                      no_n2_xp_encoding=False,
                      encode_n1_last_layer=False,
+                     cap_delta_diff=False,
                      n1_last_layer_use_box_scalar=False,
                      n1_last_layer_prune_tol=0.0,
                      n1_adaptive_prune_budget=0.0,
@@ -195,7 +196,8 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
                      constrain_n2_xp_via_n1_zonotope=False,
                      branch_priority_n2x_first=False,
                      bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False,
-                     optimizing_intervals=None):
+                     optimizing_intervals=None,
+                     standard_warmstart_n1_only=False):
     """Return the transfer output dir for a specific relaxation_threshold."""
     base = base_dirs['transfer']
     if threshold is None:
@@ -211,6 +213,8 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_NoN2xpEnc'
     if encode_n1_last_layer:
         suffix += '_N1LastLayer'
+    if cap_delta_diff:
+        suffix += '_capDD'
     if n1_last_layer_use_box_scalar:
         suffix += '_BoxScalarL'
     if n1_last_layer_prune_tol > 0:
@@ -239,6 +243,8 @@ def get_transfer_dir(base_dirs, threshold, relaxation_gap_area='false',
         suffix += '_BoundN2ReLU'
     if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu:
         suffix += '_BoundN2NonReLU'
+    if standard_warmstart_n1_only:
+        suffix += '_StdWarmstartN1Only'
     if optimizing_intervals is not None and str(optimizing_intervals).lower() == 'false':
         suffix += '_noOI'
     return base + suffix
@@ -849,6 +855,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               output_dir, timeout, perturbation, ct,
                               transfer_relaxations, Threads_num =32,
                               relaxation_threshold=None, force_cpu=False,
+                              perturbation_size_override=None,
                               use_hyper_attack=True, dual_seed=False, epochs=None,
                               relaxation_gap_area='false',
                               optimizing_intervals=None, model_dirs=None,
@@ -856,6 +863,7 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               no_n1_encoding_at_all=False,
                               no_n2_xp_encoding=False,
                               encode_n1_last_layer=False,
+                              cap_delta_diff=False,
                               n1_last_layer_use_box_scalar=False,
                               n1_last_layer_prune_tol=0.0,
                               n1_adaptive_prune_budget=0.0,
@@ -869,7 +877,9 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
                               constrain_n2_xp_via_n1_zonotope=False,
                               branch_priority_n2x_first=False,
                               bound_n2_relu_using_zonotope=False,
-                              bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False):
+                              bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False,
+                              standard_warmstart=False,
+                              standard_warmstart_n1_only=False):
     """
     Iterate over VHAGaR results files for N1.
     Each file contains delta_1 values for a specific perturbation_size and c_tag.
@@ -898,6 +908,104 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
         n2_path = os.path.join(dirs['model_n2'], 'model.p')
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── standard_warmstart without existing vaghar results: bypass file scanning ──
+    # Julia will compute delta_1 internally via the standard solve.
+    if standard_warmstart and not os.path.exists(vaghar_results_dir):
+        if perturbation_size_override is None:
+            print(f"  Error: --standard_warmstart without vaghar results requires perturbation_size_override")
+            return
+        # Run c_tags 1 and 2 (matching the standard phase convention)
+        run_entries = [(perturbation_size_override, str(ctag)) for ctag in range(1, 3)]
+        print(f"  [standard_warmstart] No vaghar results found — launching transfer with inline standard solve "
+              f"for {len(run_entries)} c_tags, eps={perturbation_size_override}")
+        for perturbation_size, c_tag_n in run_entries:
+            vaghar_results_path = "unused_standard_warmstart"
+
+            print(f"  [standard_warmstart] eps={perturbation_size}, ctag={c_tag_n}")
+
+            command = [
+                '--mode', 'transfer',
+                '--standard_warmstart', 'true',
+                '--dataset', julia_dataset,
+                '--model_name', model_name,
+                '--model_path', n1_path,
+                '--model_path2', n2_path,
+                '--vaghar_results', vaghar_results_path,
+                '--perturbation', perturbation,
+                '--perturbation_size', perturbation_size,
+                '--ctag', c_tag_n,
+                '--ct', ct,
+                '--timout', str(timeout),
+                '--output_dir', output_dir + '/',
+                '--c_tag_mode', 'false',
+                '--use_hyper_attack', str(use_hyper_attack).lower(),
+                '--activate_vaghgar_deps', 'true',
+                '--use_intervals', 'true',
+                '--use_perturbed_intervals', 'true',
+                '--n2_fewer_binars_encoding', 'true',
+                '--use_relaxations', transfer_relaxations,
+                '--force_cpu', str(force_cpu).lower(),
+                '--Threads_num', str(Threads_num),
+            ]
+            if relaxation_threshold is not None:
+                command += ['--relaxation_threshold', str(relaxation_threshold)]
+            if optimizing_intervals is not None:
+                command += ['--optimizing_intervals', str(optimizing_intervals).lower()]
+            command += ['--relaxation_gap_area', str(relaxation_gap_area).lower()]
+            if no_n1_binaries_and_relaxtions_only_on_n2:
+                command += ['--no_n1_binaries_and_relaxtions_only_on_n2', 'true']
+            if no_n1_encoding_at_all:
+                command += ['--no_n1_encoding_at_all', 'true']
+            if no_n2_xp_encoding:
+                command += ['--no_n2_xp_encoding', 'true']
+            if encode_n1_last_layer:
+                command += ['--encode_n1_last_layer', 'true']
+            if cap_delta_diff:
+                command += ['--cap_delta_diff', 'true']
+            if n1_last_layer_use_box_scalar:
+                command += ['--n1_last_layer_use_box_scalar', 'true']
+            if n1_last_layer_prune_tol > 0:
+                command += ['--n1_last_layer_prune_tol', str(n1_last_layer_prune_tol)]
+            if n1_adaptive_prune_budget > 0:
+                command += ['--n1_adaptive_prune_budget', str(n1_adaptive_prune_budget)]
+            if hybrid_solve:
+                command += ['--hybrid_solve', 'true']
+            if n1_stability_relax_threshold >= 0:
+                command += ['--n1_stability_relax_threshold', str(n1_stability_relax_threshold)]
+            if constrain_n1_xp:
+                command += ['--constrain_n1_xp', 'true']
+            if use_zonotope:
+                command += ['--use_zonotope', 'true']
+            if zonotope_max_order > 0:
+                command += ['--zonotope_max_order', str(zonotope_max_order)]
+            if bound_n2_xp_using_composed:
+                command += ['--bound_n2_xp_using_composed', 'true']
+                if bound_n2_xp_output_using_composed:
+                    command += ['--bound_n2_xp_output_using_composed', 'true']
+                if constrain_n2_xp_via_n1_zonotope:
+                    command += ['--constrain_n2_xp_via_n1_zonotope', 'true']
+                    if branch_priority_n2x_first:
+                        command += ['--branch_priority_n2x_first', 'true']
+            if bound_n2_relu_using_zonotope:
+                command += ['--bound_n2_relu_using_zonotope', 'true']
+            if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu:
+                command += ['--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu', 'true']
+            if standard_warmstart_n1_only:
+                command += ['--standard_warmstart_n1_only', 'true']
+
+            run_julia(command, f'transfer+stdwarmstart {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
+        return
+
+    # ── Normal path (also used when standard_warmstart + existing vaghar results) ──
+
+    if not os.path.exists(vaghar_results_dir):
+        print(f"  Warning: Directory {vaghar_results_dir} not found, trying noPI dir...")
+        vaghar_results_dir = vaghar_results_dir.replace('vagharWithPerturbed_', 'vagharNoPerturbed_')
+        if not os.path.exists(vaghar_results_dir):
+            print(f"  Error: Fallback directory {vaghar_results_dir} also not found.")
+            return
+        print(f"  Using fallback: {vaghar_results_dir}")
 
     # Collect matching files, falling back to noPI dir if none found
     result_files = []
@@ -974,6 +1082,8 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--no_n2_xp_encoding', 'true']
         if encode_n1_last_layer:
             command += ['--encode_n1_last_layer', 'true']
+        if cap_delta_diff:
+            command += ['--cap_delta_diff', 'true']
         if n1_last_layer_use_box_scalar:
             command += ['--n1_last_layer_use_box_scalar', 'true']
         if n1_last_layer_prune_tol > 0:
@@ -1002,6 +1112,10 @@ def run_transfer_from_results(arch, dataset, itr_n1, itr_n2, vaghar_results_dir,
             command += ['--bound_n2_relu_using_zonotope', 'true']
         if bound_by_zonotope_n2_hidden_neurons_which_are_not_relu:
             command += ['--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu', 'true']
+        if standard_warmstart:
+            command += ['--standard_warmstart', 'true']
+        if standard_warmstart_n1_only:
+            command += ['--standard_warmstart_n1_only', 'true']
 
         run_julia(command, f'transfer {arch} (ctag={c_tag_n}, relax_thresh={relaxation_threshold})')
 
@@ -1013,6 +1127,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    no_n1_encoding_at_all=False,
                    no_n2_xp_encoding=False,
                    encode_n1_last_layer=False,
+                   cap_delta_diff=False,
                    n1_last_layer_use_box_scalar=False,
                    n1_last_layer_prune_tol=0.0,
                    n1_adaptive_prune_budget=0.0,
@@ -1026,13 +1141,16 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                    constrain_n2_xp_via_n1_zonotope=False,
                    branch_priority_n2x_first=False,
                    bound_n2_relu_using_zonotope=False,
-                   bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False):
+                   bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=False,
+                   standard_warmstart=False,
+                   standard_warmstart_n1_only=False):
     dirs = get_exp_dirs(arch, dataset, itr_n1, itr_n2, perturbation=perturbation, perturbation_size=perturbation_size, dual_seed=dual_seed, epochs=epochs, model_dirs=model_dirs)
     output_dir = get_transfer_dir(dirs, relaxation_threshold, relaxation_gap_area=relaxation_gap_area,
                                    no_n1_binaries_and_relaxtions_only_on_n2=no_n1_binaries_and_relaxtions_only_on_n2,
                                    no_n1_encoding_at_all=no_n1_encoding_at_all,
                                    no_n2_xp_encoding=no_n2_xp_encoding,
                                    encode_n1_last_layer=encode_n1_last_layer,
+                                   cap_delta_diff=cap_delta_diff,
                                    n1_last_layer_use_box_scalar=n1_last_layer_use_box_scalar,
                                    n1_last_layer_prune_tol=n1_last_layer_prune_tol,
                                    n1_adaptive_prune_budget=n1_adaptive_prune_budget,
@@ -1047,7 +1165,8 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
                                    branch_priority_n2x_first=branch_priority_n2x_first,
                                    bound_n2_relu_using_zonotope=bound_n2_relu_using_zonotope,
                                    bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=bound_by_zonotope_n2_hidden_neurons_which_are_not_relu,
-                                   optimizing_intervals=optimizing_intervals)
+                                   optimizing_intervals=optimizing_intervals,
+                                   standard_warmstart_n1_only=standard_warmstart_n1_only)
     os.makedirs(output_dir, exist_ok=True)
 
     if _dir_has_results(output_dir):
@@ -1075,6 +1194,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         arch, dataset, itr_n1, itr_n2,
         dirs['vaghar_n1'], output_dir, timeout, perturbation, ct,
         transfer_relaxations, Threads_num, relaxation_threshold, force_cpu=force_cpu,
+        perturbation_size_override=perturbation_size,
         use_hyper_attack=use_hyper_attack, dual_seed=dual_seed, epochs=epochs,
         optimizing_intervals=optimizing_intervals, model_dirs=model_dirs,
         relaxation_gap_area=relaxation_gap_area,
@@ -1082,6 +1202,7 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         no_n1_encoding_at_all=no_n1_encoding_at_all,
         no_n2_xp_encoding=no_n2_xp_encoding,
         encode_n1_last_layer=encode_n1_last_layer,
+        cap_delta_diff=cap_delta_diff,
         n1_last_layer_use_box_scalar=n1_last_layer_use_box_scalar,
         n1_last_layer_prune_tol=n1_last_layer_prune_tol,
         n1_adaptive_prune_budget=n1_adaptive_prune_budget,
@@ -1096,6 +1217,8 @@ def step3_transfer(arch, dataset, itr_n1, itr_n2, timeout, perturbation, perturb
         branch_priority_n2x_first=branch_priority_n2x_first,
         bound_n2_relu_using_zonotope=bound_n2_relu_using_zonotope,
         bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=bound_by_zonotope_n2_hidden_neurons_which_are_not_relu,
+        standard_warmstart=standard_warmstart,
+        standard_warmstart_n1_only=standard_warmstart_n1_only,
     )
 
 
@@ -1190,6 +1313,9 @@ def main():
     parser.add_argument('--encode_n1_last_layer', action='store_true',
                         help='When no_n1_encoding_at_all is active, encode N1 last linear layer '
                              'exactly using interval-bounded hidden variables; gives exact delta_diff.')
+    parser.add_argument('--cap_delta_diff', action='store_true',
+                        help='Add delta_diff <= max_k(d_hi[c]-d_lo[k]) as a valid upper bound. '
+                             'Tightens LP relaxation for faster solving.')
     parser.add_argument('--n1_last_layer_use_box_scalar', action='store_true',
                         help='When encode_n1_last_layer is active, use a box-derived scalar lower bound L '
                              'on conf_n1 instead of the argmax binary encoding; drops C-1 binaries on the N1 side.')
@@ -1233,6 +1359,13 @@ def main():
     parser.add_argument('--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu', action='store_true',
                         help='Add per-class bound constraints on N2 output logits using N1 output '
                              '+ zonotope diff bounds.')
+    parser.add_argument('--standard_warmstart', action='store_true',
+                        help='In transfer mode: first solve standard MIP for N1 per (c_tag,c_target) '
+                             'to get delta_1 and binary values, then use those binaries as warm-start '
+                             'hints for the transfer MIP. Eliminates need for pre-computed vaghar results.')
+    parser.add_argument('--standard_warmstart_n1_only', action='store_true',
+                        help='Restrict --standard_warmstart so only N1(x) (n1_org) binaries are '
+                             'hinted in the transfer MIP — skip n1_pert, n2_org, and n2_pert.')
 
     args = parser.parse_args()
 
@@ -1379,6 +1512,7 @@ def main():
                                no_n1_encoding_at_all=args.no_n1_encoding_at_all,
                                no_n2_xp_encoding=args.no_n2_xp_encoding,
                                encode_n1_last_layer=args.encode_n1_last_layer,
+                               cap_delta_diff=args.cap_delta_diff,
                                n1_last_layer_use_box_scalar=(args.n1_last_layer_use_box_scalar or args.n1_last_layer_no_binaries),
                                n1_last_layer_prune_tol=args.n1_last_layer_prune_tol,
                                n1_adaptive_prune_budget=args.n1_adaptive_prune_budget,
@@ -1392,7 +1526,9 @@ def main():
                                constrain_n2_xp_via_n1_zonotope=args.constrain_n2_xp_via_n1_zonotope,
                                branch_priority_n2x_first=args.branch_priority_n2x_first,
                                bound_n2_relu_using_zonotope=args.bound_n2_relu_using_zonotope,
-                               bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=args.bound_by_zonotope_n2_hidden_neurons_which_are_not_relu)
+                               bound_by_zonotope_n2_hidden_neurons_which_are_not_relu=args.bound_by_zonotope_n2_hidden_neurons_which_are_not_relu,
+                               standard_warmstart=args.standard_warmstart,
+                               standard_warmstart_n1_only=args.standard_warmstart_n1_only)
         else:
             print("  Skipping transfer VHAGaR (--skip_transfer)")
 

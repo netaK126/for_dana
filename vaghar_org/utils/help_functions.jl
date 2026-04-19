@@ -70,6 +70,53 @@ global branch_priority_n2x_first::Bool = false  # set Gurobi BranchPriority: N2(
 global bound_n2_xp_output_using_composed::Bool = false  # bound N2(x') output logits using N1 output + composed (diff+pert) bounds
 global n2_xp_derived_preact_up_bounds   = []
 global n2_xp_derived_preact_down_bounds = []
+
+# ── advstd Technique 4 + zono bounds (--adv_std_zono_bounds) ───────────────
+# Per-ReLU-layer scalar bounds on N2's pre-activation, produced by
+# compute_n2_bounds_zonotope_with_n1_tighten (Source B). Independent of the
+# diff-zonotope path (Source A), intersected against the ReLU [l,u] inside
+# core_ops.jl::relu(). Empty when the --adv_std_zono_bounds flag is off.
+global n2_abs_up_bounds::Vector   = []
+global n2_abs_down_bounds::Vector = []
+
+# ── advstd Technique 4 + N1-probe LP bounds (--adv_std_n1_probe) ───────────
+# Per-ReLU-layer scalar bounds on N2's pre-activation, produced by
+# compute_n2_bounds_n1_probe_lp (Source C). Computed via OBBT on a joint
+# LP-relaxed (N1 + N2) model using N1's post-solve bounds for the triangle
+# relaxation. Separate arrays for the "org" (clean-input) and "perturbation"
+# (perturbed-input) network_version passes, since the probe runs once per
+# pass with the appropriate input seed.
+global n2_probe_up_bounds_org::Vector   = []
+global n2_probe_down_bounds_org::Vector = []
+global n2_probe_up_bounds_pert::Vector  = []
+global n2_probe_down_bounds_pert::Vector = []
+# Count of N2 binaries eliminated *specifically by the N1-probe LP step*:
+# neurons that would still have been split after Technique 4 + Source A/B,
+# but whose probe-derived bound is single-signed. Tracked separately for
+# N2(x) ("org") and N2(x') ("pert") so the result file can report both
+# numbers. `n_probe_eliminated_binaries` is the sum of the two and is
+# retained for filename composition.
+global n_probe_eliminated_binaries_org::Int = 0
+global n_probe_eliminated_binaries_pert::Int = 0
+global n_probe_eliminated_binaries::Int = 0
+global n1_probe_lp_time::Float64 = 0.0
+
+# ── advstd Technique 6: N1-gated N2/N2p triangle LP relaxation ─────────────
+# When >= 0, core_ops.jl::relu() replaces the big-M binary encoding of an
+# N2/N2p ReLU with a three-inequality triangle LP whenever the
+# triangle-gap-area of N1's interval at the corresponding neuron is
+# <= this threshold. Sound over-approximation: delta_relaxed >= delta_exact.
+# -1 = disabled (default).
+global adv_std_n2_relax_threshold = -1.0
+# Counters for the filename suffix / result-line columns — how many
+# N2(x) and N2(x') ReLU binaries were replaced by triangles this run.
+# NOTE: no `::Int` type annotation here because core_ops.jl (included
+# earlier via net_components.jl) already references these globals inside
+# relu() via `global n_n2_relaxed_binaries_* += 1`, which creates an
+# implicit untyped binding. Re-declaring with a type would raise
+# "cannot set type for global ... it already has a value" at include time.
+global n_n2_relaxed_binaries_org  = 0
+global n_n2_relaxed_binaries_pert = 0
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
 # N1 output-layer logit bounds (final linear layer of N1 over admissible inputs).
@@ -212,6 +259,198 @@ hybrid_solve_state = HybridSolveState(false, [], nothing, nothing, 0, 0, 0.0, 0)
 
 layers_info_dict = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
 
+# ── Advanced-standard mode: N1 neuron bounds for bound tightening ────
+# Populated after solving N1's standard MIP from layers_info_dict.
+# Consumed by relu() in core_ops.jl to tighten N2's big-M bounds.
+global n1_neuron_bounds = Dict{Tuple{Int,Int}, Tuple{Float64,Float64}}()
+
+function set_n1_neuron_bounds(n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    global n1_neuron_bounds = Dict{Tuple{Int,Int}, Tuple{Float64,Float64}}()
+    for ((layer, neuron), (u, l, _)) in n1_layers_info
+        n1_neuron_bounds[(layer, neuron)] = (u, l)
+    end
+    println("set_n1_neuron_bounds: loaded $(length(n1_neuron_bounds)) neuron bounds from N1")
+end
+
+function clear_n1_neuron_bounds()
+    global n1_neuron_bounds = Dict{Tuple{Int,Int}, Tuple{Float64,Float64}}()
+end
+
+function clear_n2_abs_bounds()
+    global n2_abs_up_bounds   = Array{Float64}[]
+    global n2_abs_down_bounds = Array{Float64}[]
+end
+
+function clear_n2_probe_bounds()
+    global n2_probe_up_bounds_org   = Array{Float64}[]
+    global n2_probe_down_bounds_org = Array{Float64}[]
+    global n2_probe_up_bounds_pert  = Array{Float64}[]
+    global n2_probe_down_bounds_pert = Array{Float64}[]
+    global n_probe_eliminated_binaries_org  = 0
+    global n_probe_eliminated_binaries_pert = 0
+    global n_probe_eliminated_binaries      = 0
+    global n1_probe_lp_time                 = 0.0
+end
+
+function clear_n2_relaxed_counters!()
+    global n_n2_relaxed_binaries_org  = 0
+    global n_n2_relaxed_binaries_pert = 0
+end
+
+"""
+    apply_n1_branch_priorities!(m_n2, n1_layers_info)
+
+Set Gurobi BranchPriority for N2's binary variables based on N1's bound tightness.
+Neurons with tighter bounds (smaller |u - l|) in N1 get higher priority in N2,
+since they were likely the most contested during N1's solve.
+"""
+function apply_n1_branch_priorities!(m_n2, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    applied = 0
+    for v in JuMP.all_variables(m_n2)
+        if JuMP.is_binary(v)
+            vname = JuMP.name(v)
+            for ((layer, neuron), (u, l, _)) in n1_layers_info
+                if occursin("_$(layer)_$(neuron)", vname) && endswith(vname, "_$(layer)_$(neuron)")
+                    gap = abs(u - l)
+                    priority = gap < 1.0 ? 10 : (gap < 5.0 ? 5 : 1)
+                    MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), priority)
+                    applied += 1
+                    break
+                end
+            end
+        end
+    end
+    println("apply_n1_branch_priorities!: set priorities for $applied binaries")
+end
+
+"""
+    compute_n1_var_scores(n1_pseudocosts)
+
+Compute per-variable importance scores from Gurobi N1 pseudo-cost statistics.
+The score `pd_down * n_down + pd_up * n_up` is the total LP objective
+improvement that Gurobi attributed to branching on that variable during N1.
+Variables Gurobi never branched on get score 0.
+"""
+function compute_n1_var_scores(n1_pseudocosts)
+    scores = Dict{String, Float64}()
+    for (name, pc) in n1_pseudocosts
+        scores[name] = pc.pd_down * pc.n_down + pc.pd_up * pc.n_up
+    end
+    return scores
+end
+
+"""
+    rank_to_priority(scores; max_pri=100)
+
+Convert a Dict{name→score} into a Dict{name→Int} priority in [0, max_pri].
+The highest-scoring nonzero variable gets `max_pri`; the lowest nonzero gets 1;
+variables with score ≤ 0 get priority 0.
+"""
+function rank_to_priority(scores::Dict{String, Float64}; max_pri::Int=100)
+    priorities = Dict{String, Int}()
+    nonzero = sort([n for (n, s) in scores if s > 0]; by=n -> -scores[n])
+    n_rank = length(nonzero)
+    for (rank, name) in enumerate(nonzero)
+        priorities[name] = max(1, round(Int, max_pri * (1 - (rank - 1) / n_rank)))
+    end
+    for (name, s) in scores
+        if s <= 0
+            priorities[name] = 0
+        end
+    end
+    return priorities
+end
+
+"""
+    apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info)
+
+Gurobi `BranchPriority` mode that uses N1's measured pseudo-cost × branch-count
+ranking (instead of the bound-width heuristic). Falls back to the bounds-based
+`apply_n1_branch_priorities!` if pseudo-costs are unavailable (e.g. legacy
+saved N1 state with no pseudocost file).
+"""
+function apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    if n1_pseudocosts === nothing || isempty(n1_pseudocosts)
+        @warn "pseudocost bp mode requested but n1_pseudocosts is empty — falling back to bounds heuristic"
+        apply_n1_branch_priorities!(m_n2, n1_layers_info)
+        return
+    end
+    priorities = rank_to_priority(compute_n1_var_scores(n1_pseudocosts))
+    applied = 0
+    for v in JuMP.all_variables(m_n2)
+        if !JuMP.is_binary(v); continue; end
+        name = JuMP.name(v)
+        pri = get(priorities, name, nothing)
+        if pri === nothing; continue; end
+        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), pri)
+        applied += 1
+    end
+    println("apply_n1_branch_priorities_pseudocost!: assigned BranchPriority to $applied N2 binaries " *
+            "(from $(length(priorities)) N1 pseudocost entries)")
+end
+
+"""
+    apply_n1_var_hints!(m_n2, n1_var_names, n1_var_values, n1_pseudocosts;
+                        fix_mode=false)
+
+Set Gurobi `VarHintVal` and `VarHintPri` on N2 binaries, using N1's optimal
+binary values as the hint value and N1 pseudo-cost rank as the hint priority.
+Unlike `BranchPriority`, these hints are soft and affect both the heuristics
+and the branching rule. If pseudo-costs are unavailable, all priorities default
+to a low uniform value (10) so Gurobi treats the hints as low-confidence.
+
+When `fix_mode=true`, filter `n1_pseudocosts` down to names that still exist
+as binaries in `m_n2` (post T2 elimination and T4 triangle relaxation) before
+ranking, so the priority distribution is computed over the actual hintable set
+rather than the pre-relaxation superset.
+"""
+function apply_n1_var_hints!(m_n2, n1_var_names::Vector{String},
+                             n1_var_values::Vector{Float64},
+                             n1_pseudocosts;
+                             fix_mode::Bool=false)
+    if isempty(n1_var_names)
+        println("apply_n1_var_hints!: no N1 values to hint")
+        return
+    end
+    # Build name → value lookup from the parallel vectors
+    value_by_name = Dict{String, Float64}()
+    for i in eachindex(n1_var_names)
+        value_by_name[n1_var_names[i]] = n1_var_values[i]
+    end
+    # Priority source: pseudo-cost rank if available, else low uniform
+    if n1_pseudocosts === nothing || isempty(n1_pseudocosts)
+        @warn "apply_n1_var_hints!: n1_pseudocosts empty — using uniform priority 10 (low confidence)"
+        priority_by_name = Dict{String, Int}(name => 10 for name in n1_var_names)
+    elseif fix_mode
+        n2_binary_names = Set{String}()
+        for v in JuMP.all_variables(m_n2)
+            if JuMP.is_binary(v)
+                push!(n2_binary_names, JuMP.name(v))
+            end
+        end
+        filtered_pc = Dict(name => pc for (name, pc) in n1_pseudocosts
+                           if name in n2_binary_names)
+        priority_by_name = rank_to_priority(compute_n1_var_scores(filtered_pc))
+        println("apply_n1_var_hints!: fix_mode=true, filtered " *
+                "$(length(n1_pseudocosts)) N1 pseudocost entries down to " *
+                "$(length(filtered_pc)) N2-surviving entries before ranking")
+    else
+        priority_by_name = rank_to_priority(compute_n1_var_scores(n1_pseudocosts))
+    end
+    applied = 0
+    for v in JuMP.all_variables(m_n2)
+        if !JuMP.is_binary(v); continue; end
+        name = JuMP.name(v)
+        value = get(value_by_name, name, nothing)
+        if value === nothing; continue; end
+        pri = get(priority_by_name, name, 0)
+        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), value)
+        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), pri)
+        applied += 1
+    end
+    println("apply_n1_var_hints!: set VarHintVal/VarHintPri on $applied N2 binaries")
+end
+
 mutable struct Results
     str::String
 end
@@ -286,7 +525,7 @@ function safe_filepath(dir::AbstractString, basename::AbstractString, ext::Abstr
 end
 
 function save_results(results_path, model_name, perturbation, perturbation_size, results_str, d, nn, ss, tt, w_, h_, k_,name_to_save,token_signature)
-
+    mkpath(results_path)
     basename = token_signature*"_"*model_name * "_" * perturbation * "_" * create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_"*name_to_save
     file = open(safe_filepath(results_path, basename), "w")
     write(file, results_str)
@@ -398,14 +637,24 @@ end
 
 function update_results_str(results, c_tag, c_target, d)
     hyper_time = haskey(d, :suboptimal_time) ? d[:suboptimal_time] : 0.0
-    return results *
-        "c_source=" * string(c_tag-1) * "," *
-        "c_target=" * string(c_target-1) * "," *
-        "lower_bound=" * string(d[:incumbent_obj]) * "," *
-        "upper_bound=" * string(d[:best_bound]) * "," *
-        "optimization_time=" * string(d[:solve_time]) * "," *
-        "hyper_attack_time=" * string(hyper_time) * "," *
-        "solve_status=" * string(d[:SolveStatus]) * "\n"
+    row = "c_source=" * string(c_tag-1) * "," *
+          "c_target=" * string(c_target-1) * "," *
+          "lower_bound=" * string(d[:incumbent_obj]) * "," *
+          "upper_bound=" * string(d[:best_bound]) * "," *
+          "optimization_time=" * string(d[:solve_time]) * "," *
+          "hyper_attack_time=" * string(hyper_time) * "," *
+          "solve_status=" * string(d[:SolveStatus]) * "," *
+          "n2_org_probe_eliminated_binaries=" * string(n_probe_eliminated_binaries_org) * "," *
+          "n2_pert_probe_eliminated_binaries=" * string(n_probe_eliminated_binaries_pert) * "," *
+          "n2_org_relaxed_binaries=" * string(n_n2_relaxed_binaries_org) * "," *
+          "n2_pert_relaxed_binaries=" * string(n_n2_relaxed_binaries_pert) * "," *
+          "lp_optimization_time=" * string(n1_probe_lp_time)
+    if haskey(d, :adv_std_flags)
+        for (k, v) in pairs(d[:adv_std_flags])
+            row *= "," * string(k) * "=" * string(v)
+        end
+    end
+    return results * row * "\n"
 end
 
 # Read delta_1 (upper_bound) from a VHAGaR results file for a given c_target.
