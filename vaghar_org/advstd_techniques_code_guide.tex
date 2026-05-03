@@ -1,10 +1,14 @@
 \documentclass[11pt]{article}
 
-%% Companion to advstd_techniques.tex:
-%% "How is each advanced-standard technique actually implemented in the
-%%  vaghar_org/ code?" — with file paths, line ranges, and code excerpts.
-%% Also flags bugs discovered while cross-reading the implementation
-%% against the paper (see Section "Bugs").
+%% Code-level companion to advstd_techniques.tex.
+%%
+%% This guide focuses on:
+%%   (1) the top-ranked safe combination zono + prev_pgd + tau=0.5;
+%%   (2) the hyper-attack (PGD warm-start) integration in advstd Phase 2;
+%%   (3) the VHAGaR dependency constraints in advstd Phase 2.
+%%
+%% All paths are relative to /root/Downloads/for_dana/vaghar_org/.
+%% Line numbers reflect the source as of 2026-04-25.
 
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath, amssymb}
@@ -40,22 +44,35 @@
 \newcommand{\src}[1]{\texttt{\small #1}}
 \newcommand{\tech}[1]{\textsf{#1}}
 \newcommand{\flag}[1]{\texttt{-{}-#1}}
+\newcommand{\fileline}[2]{\src{#1}:\src{#2}}
 
-\title{Implementation Guide for \texttt{advstd\_techniques.tex}\\
-A code-level companion}
-\author{Auto-generated walkthrough of \texttt{vaghar\_org/}}
-\date{}
+\title{Implementation Guide: \\
+  the safe combo \texttt{zono} + \texttt{prev\_pgd} + $\tau=0.5$, \\
+  with hyper-attack and VHAGaR-deps wiring}
+\author{Code-level companion to \texttt{advstd\_techniques.tex}}
+\date{2026-04-25}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This document walks through the \texttt{vaghar\_org/} implementation of
-each advanced-standard (advstd) technique described in the paper note
-\texttt{advstd\_techniques.tex}, with file paths, function names, line
-ranges, and short code excerpts. Section~\ref{sec:bugs} lists bugs and
-latent hazards found while reading the implementation, with suggested
-fixes. \emph{No code was modified as part of producing this document.}
+This document is a code-level walkthrough of three things: (1)~the
+top-ranked safe combination \texttt{zono} + \texttt{prev\_pgd} +
+$\tau=0.5$ from Section~9 of \texttt{advstd\_techniques.tex}; (2)~the
+hyper-attack (PGD warm-start) integration into advstd Phase~2;
+(3)~the VHAGaR dependency constraints (\flag{activate\_vaghgar\_deps})
+as they apply to advstd Phase~2. The aim is operational: every claim is
+backed by a file path and line range, and the call order in
+\src{main\_advanced\_standard} (\src{run.jl}) is reproduced verbatim so
+a reader can step through it.
+
+The combo is sound: at solver \texttt{OPTIMAL} it returns
+$\delta_{\text{exact}}$. The other two pieces (hyper-attack and
+VHAGaR-deps) are independent toggles that work alongside the combo.
+Hyper-attack provides a Cutoff and (in \texttt{prev\_pgd} mode) a
+warm-start that the consensus filter then rationalises against
+$N_1$. VHAGaR-deps adds inter-copy constraints linking the org and
+pert encodings and is preserved exactly as in standard mode.
 \end{abstract}
 
 \tableofcontents
@@ -64,920 +81,763 @@ fixes. \emph{No code was modified as part of producing this document.}
 \section{Code Map}
 \label{sec:codemap}
 
-All paths are relative to \src{/root/Downloads/for\_dana/vaghar\_org/}.
+All paths relative to \src{vaghar\_org/}.
 
 \begin{center}
 \footnotesize
 \begin{tabular}{@{}l l l@{}}
 \toprule
-Technique (paper \#) & File & Key symbols \\
+Topic & File & Key entry points (line) \\
 \midrule
-Phase-1 driver & \src{run.jl} & \src{main\_advanced\_standard\_n1} (lines 960--1063) \\
-Phase-2 driver & \src{run.jl} & \src{main\_advanced\_standard} (lines 609--953) \\
-Phase-2 thin wrapper & \src{run.jl} & \src{main\_advanced\_standard\_n2} (lines 1065--1072) \\[4pt]
-T1 Branch Priorities & \src{utils/help\_functions.jl} & \src{apply\_n1\_branch\_priorities!} (307--324) \\
-T2 diff bounds (interval) & \src{utils/perturbation\_intervals.jl} & \src{compute\_diff\_and\_comp\_bounds} (1009--1230) \\
-T2 zonotope (Source A) & \src{utils/perturbation\_intervals.jl} & \src{compute\_diff\_bounds\_zonotope} (1317--1740) \\
-T2 absolute N2 (Source B) & \src{utils/perturbation\_intervals.jl} & \src{compute\_n2\_bounds\_zonotope\_with\_n1\_tighten} (1765--1988) \\
-T2 N1 probe LP (Source C) & \src{utils/n1\_probe\_lp.jl} & \src{compute\_n2\_bounds\_n1\_probe\_lp} (158--408) \\
-T2 final bound injection & \src{utils/help\_functions.jl} & \src{set\_n1\_neuron\_bounds} (267--273) \\
-T2 bound consumption & \src{utils/MIPVerify.jl/src/net\_components/core\_ops.jl} & \src{relu} (578--598) \\
-T3 Variable Hints & \src{utils/help\_functions.jl} & \src{apply\_n1\_var\_hints!} (401--430), \src{rank\_to\_priority} (349--362) \\
-T4 N2 triangle relax & \src{utils/MIPVerify.jl/src/net\_components/core\_ops.jl} & \src{relu} (547--576) \\[4pt]
-MIP Start (not in safe set) & \src{utils/hyper\_attack.jl} & \src{apply\_n1\_hints!} (246--268) \\
-LP Basis (not in safe set) & \src{utils/hyper\_attack.jl} & \src{extract\_vbasis}/\src{apply\_vbasis!} (276--357) \\
-N1 state persistence & \src{utils/hyper\_attack.jl} & \src{save/load\_n1\_state}, \src{save/load\_n1\_diff\_bounds} (370--454) \\
-Perturbed interval constraints & \src{utils/perturbation\_intervals.jl} & \src{perturbed\_interval\_constraints} (634--708) \\
+Phase-2 driver           & \src{run.jl}                                        & \src{main\_advanced\_standard} (630--1052) \\
+Phase-2 N2-only wrapper  & \src{run.jl}                                        & \src{main\_advanced\_standard\_n2} (1181--1188) \\[3pt]
+Tech 1 zono Source A     & \src{utils/perturbation\_intervals.jl}              & \src{compute\_diff\_bounds\_zonotope} (1317--1740) \\
+Tech 1 zono Source B     & \src{utils/perturbation\_intervals.jl}              & \src{compute\_n2\_zono\_abs\_bounds} (1743--1988) \\
+Tech 1 bound integration & \src{utils/MIPVerify.jl/.../core\_ops.jl}            & \src{intersect\_per\_copy\_bounds} (199--246) \\
+Tech 2 prev\_pgd hints   & \src{utils/help\_functions.jl}                      & \src{apply\_n1\_var\_hints!} (598--741) \\
+Tech 2 \emph{p}-formula  & \src{utils/help\_functions.jl}                      & \src{compute\_varhint} (507--523) \\
+Tech 3 $\tau$ decision   & \src{utils/n2\_relax\_decision.jl}                  & \src{compute\_n2\_relax\_decision!} (23--130) \\
+Tech 3 MIP emit          & \src{utils/MIPVerify.jl/.../core\_ops.jl}            & \src{relu} (248--610), gating at 554--605 \\[3pt]
+Hyper-attack subprocess  & \src{utils/hyper\_attack.jl}                        & \src{hyper\_attack} (98--113) \\
+Hyper-attack PGD code    & \src{utils/hyper\_attack.py}                        & \src{attack} (120--303) \\
+Hyper-attack hint apply  & \src{utils/hyper\_attack.jl}                        & \src{hyper\_attack\_hints} (1--35) \\
+Cutoff plumbing          & \src{utils/mip.jl}                                  & \src{mip\_set\_attr} (20--34) \\[3pt]
+VHAGaR deps (entry)      & \src{utils/perturbation\_dependencies.jl}           & \src{perturbation\_dependencies} (202--232) \\
+VHAGaR deps (encoder)    & \src{utils/perturbation\_dependencies.jl}           & \src{encode\_dependencies} (112--200) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\paragraph{Naming mismatch.} The code's internal numbering does not line
-up with the paper's. \src{run.jl} labels MIP Start as ``Technique~1'',
-Branch Priorities as ``2'', LP Basis as ``3'', Bound Tightening as
-``4'', Variable Hints as ``5'', N2 Relaxation as ``6'' (see
-\src{run.jl:642--650}). The paper's \texttt{advstd\_techniques.tex}
-renumbers to the four safe techniques only (T1 Branch Priorities,
-T2 Bound Tightening, T3 Variable Hints, T4 N2 Relaxation) and omits
-MIP Start / LP Basis entirely. This guide uses the \textbf{paper}
-numbering throughout.
-
 %%─────────────────────────────────────────────────────────────────────
-\section{Two-Phase Orchestration}
-\label{sec:phases}
+\section{Phase-2 call sequence (the source of truth)}
+\label{sec:driver}
 
-\subsection{Phase 1: solve $N_1$ and serialise state}
+The advstd Phase-2 driver \src{main\_advanced\_standard} in
+\fileline{run.jl}{630--1052} processes one $(c_s, c_t)$ pair at a time.
+Globally (before the pair loop), it loads the \texttt{n1\_state}
+directory and calls \src{compute\_diff\_bounds\_zonotope} +
+\src{compute\_n2\_zono\_abs\_bounds} once.\footnote{Grep
+\src{run.jl} around lines 1090--1100 for the once-only zonotope
+computation. The Source-B pass is genuinely shared across $(c_s, c_t)$
+because it depends only on $N_2$'s weights and the input box.}
+Per pair, the order is:
 
-Entry point \src{run.jl:389--390} dispatches mode
-\texttt{advanced\_standard\_n1} to
-\src{main\_advanced\_standard\_n1} (\src{run.jl:960--1063}). Phase~1
-does three things per $(c_s, c_t)$ pair:
-
-\begin{enumerate}[noitemsep]
-  \item Solve $N_1$'s standard-mode MIP exactly like baseline VHAGaR,
-    with \tech{hyper\_attack} PGD hints and (optionally) perturbed
-    interval constraints and VHAGaR dependency constraints.
-  \item Extract the primal solution, the \src{layers\_info\_dict}
-    (per-neuron big-$M$ bounds), Gurobi's LP basis (\src{VBasis}),
-    and Gurobi's per-variable pseudo-cost statistics.
-  \item Serialise all of the above to \flag{n1\_state\_dir} with
-    \src{save\_n1\_state} and \src{save\_n1\_diff\_bounds}.
+\begin{enumerate}[leftmargin=2em, itemsep=2pt, label=\arabic*.]
+  \item Run \src{hyper\_attack} for $N_2$ to get
+    \src{suboptimal\_solution\_n2} for the Gurobi
+    \texttt{Cutoff}.~\fileline{run.jl}{909--912}
+  \item \src{mip\_reset()}; install $N_1$'s neuron bounds globally
+    via \src{set\_n1\_neuron\_bounds(n1\_layers\_info)}.~\fileline{run.jl}{930--935}
+  \item \emph{(Tech 3, only if $\tau\ge 0$)} call
+    \src{compute\_n2\_relax\_decision!($\tau$)}
+    --- this populates the \src{n2\_relax\_decision} dict consulted
+    later inside \src{relu()}.~\fileline{run.jl}{945--949}
+  \item \src{get\_model(...)} builds the dual-copy $N_2$ MIP. Inside
+    every \src{relu()} call, both the per-copy bound integration
+    (Sources A/B/C) and the triangle-vs-bigM choice happen
+    here.~\fileline{run.jl}{951--956}
+  \item Build the result filename suffix from active flags.
+    For our combo: \src{\_BoundTightPertRelax0.5\_zonoBounds\_varHintPrevPGD}.
+    \fileline{run.jl}{962--989}
+  \item \emph{(hyper-attack)} \src{hyper\_attack\_hints(m\_n2,
+    token*"\_n2", c\_tag, c\_target)} — read PGD output from
+    \src{/tmp} and call \src{set\_start\_value} on the matched binaries.
+    Filename suffix \src{\_HyperAttackHints} appended.~\fileline{run.jl}{999--1006}
+  \item \emph{(VHAGaR deps)} \src{perturbation\_dependencies(m\_n2,
+    nn2, ...)}; suffix \src{\_VagharDeps}.~\fileline{run.jl}{1007--1011}
+  \item \emph{(perturbed intervals)}
+    \src{perturbed\_interval\_constraints(m\_n2, nn2, "org",
+    "perturbation")}; suffix \src{\_PerturbedIntervals}.~\fileline{run.jl}{1012--1015}
+  \item \src{mip\_set\_delta\_property}, \src{set\_optimizer},
+    \src{mip\_set\_attr} (this is where the \texttt{Cutoff} is
+    installed using the value from step~1).~\fileline{run.jl}{1016--1018}
+  \item \emph{(Tech 2)} call
+    \src{apply\_n1\_var\_hints!(m\_n2, var\_hint\_mode, ...)} ---
+    must run \emph{after} \src{hyper\_attack\_hints} so the
+    Start-consensus filter sees PGD's values.~\fileline{run.jl}{1027--1034}
+  \item \src{optimize!(m\_n2)}, then \src{mip\_log}.~\fileline{run.jl}{1043--1044}
 \end{enumerate}
 
-Key excerpt (\src{run.jl:1048--1053}):
-\begin{lstlisting}[style=jl]
-n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
-n1_layers_info   = deepcopy(layers_info_dict)
-n1_vbasis        = extract_vbasis(m_n1)
-n1_pseudocosts   = extract_pseudocosts(m_n1)
-save_n1_state(n1_state_dir, c_tag, c_target,
-              n1_var_names, n1_var_values, n1_layers_info,
-              n1_vbasis; n1_pseudocosts=n1_pseudocosts)
-\end{lstlisting}
+\noindent\textbf{The order matters.} Two specific dependencies:
 
-The state layout on disk (see \src{save\_n1\_state} at
-\src{utils/hyper\_attack.jl:370--384}):
-\begin{itemize}[noitemsep]
-  \item \src{n1\_vars\_\{ct\}\_\{ctt\}.bin} — paired vectors
-    \src{(names, values)}.
-  \item \src{n1\_layers\_\{ct\}\_\{ctt\}.bin} — the
-    \src{layers\_info\_dict} dict \src{(layer, neuron) $\to$ (u, l,
-    var\_index)}.
-  \item \src{n1\_vbasis\_\{ct\}\_\{ctt\}.bin} — per-variable
-    \src{VBasis} ints.
-  \item \src{n1\_pseudocosts\_\{ct\}\_\{ctt\}.bin} — per-binary
-    \src{NamedTuple(pd\_down, pd\_up, n\_down, n\_up)}.
-  \item \src{diff\_bounds.bin} — per-ReLU-layer diff bounds (shared
-    across all $(c_s, c_t)$).
-  \item \src{n1\_preact\_bounds.bin} — per-ReLU-layer $N_1$
-    pre-activation bounds (optional; required by Source~B of T2).
+\begin{itemize}[noitemsep, leftmargin=2em]
+  \item \src{compute\_n2\_relax\_decision!} must run \emph{before}
+    \src{get\_model}, because \src{relu()} consults the global
+    decision dict at MIP-build time. Calling it after the build is a
+    no-op.
+  \item \src{apply\_n1\_var\_hints!} (the \texttt{prev\_pgd} branch)
+    must run \emph{after} \src{hyper\_attack\_hints}, otherwise PGD
+    silently overwrites the consensus filter's writes.
 \end{itemize}
 
-\subsection{Phase 2: sweep $N_2$ reusing $N_1$ state}
-
-Entry point \src{run.jl:391--392} dispatches
-\texttt{advanced\_standard\_n2} to
-\src{main\_advanced\_standard\_n2} (\src{run.jl:1065--1072}), which is
-just a wrapper that forwards to \src{main\_advanced\_standard}
-(\src{run.jl:609--953}). The same function also serves as
-\texttt{mode=advanced\_standard} when run in a single process
-(solving $N_1$ in-line and then sweeping $N_2$).
-
-Phase~2 is structured as:
-\begin{enumerate}[noitemsep]
-  \item Parse the technique flags into local booleans
-    (\src{run.jl:615--630}).
-  \item Precompute T2 diff bounds once, before the $(c_s, c_t)$ loop
-    (\src{run.jl:702--751}). This runs Source~A, optionally Source~B,
-    optionally Source~C, and never re-runs for subsequent class pairs.
-  \item For each class pair, load $N_1$ state, build $N_2$'s MIP with
-    T2/T4 applied during construction (\src{get\_model}), then
-    optionally apply T1 and T3 to the already-built model before
-    \src{optimize!} (\src{run.jl:855--945}).
-\end{enumerate}
-
 %%─────────────────────────────────────────────────────────────────────
-\section{Technique~1 — Branch Priorities \tech{(bp=bounds)}}
-\label{sec:t1}
+\section{Tech 1 --- \texttt{zono} bound tightening}
+\label{sec:zono}
 
-\textbf{Flag:} \flag{adv\_std\_branch\_priorities bounds}.\quad
-\textbf{File:} \src{utils/help\_functions.jl:307--324}.
+\subsection{Source A --- diff zonotope $N_1 \to N_2$}
 
-For every binary $a_{m,k}$ in the already-built $N_2$ MIP, look up
-$N_1$'s \src{layers\_info} entry \src{(u, l, \_)} by matching the
-\texttt{\_layer\_neuron} suffix of the variable name, compute the raw
-gap $g = |u - l|$, and set Gurobi's \src{BranchPriority}:
+\paragraph{What it produces.}
+For every ReLU neuron $(m, k)$ in $N_2$, two arrays:
+\src{relu\_diff\_up\_bounds[m][k]} and
+\src{relu\_diff\_down\_bounds[m][k]}, sound over-approximations of
+$d^{N_2}_{m,k} - d^{N_1}_{m,k}$. These are stored as 1-indexed Julia
+arrays of length $K$ = number of ReLU layers per copy
+(\src{help\_functions.jl}, declared near line 74).
+
+\paragraph{Where.}
+\src{compute\_diff\_bounds\_zonotope} in
+\fileline{utils/perturbation\_intervals.jl}{1317--1740}. The affine
+update at lines 1397--1423 implements
+\[
+  c_{m,k} \leftarrow \sum_{k'} w^2_{m,k,k'}\, c_{m-1,k'}
+    + \sum_{k'} \Delta w_{m,k,k'}\, \mathrm{mid}_{k'} + \Delta b_{m,k},
+\]
+\[
+  G'_{\mathrm{corr}} = W_2 \cdot G_{m-1}, \qquad
+  G'_{\mathrm{indep}} = \Delta W \cdot \mathrm{diag}(\mathrm{rad}_{1..K'}),
+\]
+\[
+  G_m \leftarrow [G'_{\mathrm{corr}} \;\big|\; G'_{\mathrm{indep}}],
+\]
+with $\mathrm{mid}_{k'} = \tfrac12(\max(0, u^{N_1}_{m{-}1,k'}) +
+\max(0, l^{N_1}_{m{-}1,k'}))$ and $\mathrm{rad}_{k'}$ the
+half-width (post-ReLU clipping is applied, matching
+\texttt{advstd\_techniques.tex} \S 4.1.2). The DeepZ ReLU update
+(formulas $\lambda_k = u_k/(u_k - l_k)$, $\mu_k = -u_k l_k /
+(2(u_k - l_k))$) lives at \src{perturbation\_intervals.jl} lines
+1614--1615; the per-split-neuron new column with $\mu_k$ at row $k$
+and zero elsewhere is appended at line 1958.
+
+\paragraph{Caching.}
+Source A is computed exactly once per Phase-2 invocation, before the
+$(c_s, c_t)$ loop. The resulting global arrays are then reused for
+every pair.
+
+\subsection{Source B --- absolute $N_2$ zonotope}
+
+\paragraph{What it produces.}
+\src{n2\_abs\_up\_bounds[m][k]} and \src{n2\_abs\_down\_bounds[m][k]}
+--- sound over-approximations of $\hat z^{N_2}_{m,k}$ propagated
+through $N_2$ alone, with a single zonotope whose initial hull
+covers \emph{both} the clean input box $[0,1]^n$ and the perturbed
+input box $[-\varepsilon, 1{+}\varepsilon]^n$. Initialisation:
+$\mathbf c^{\mathrm{B}}_0 = \tfrac12\mathbf 1$,
+$G^{\mathrm{B}}_0 = \mathrm{diag}(\tfrac12 + \varepsilon)$
+(\fileline{utils/perturbation\_intervals.jl}{1839--1843}). The
+intersection with Source A is applied \emph{at every ReLU layer},
+\emph{before} the DeepZ relaxation (line 1921), so the relaxed tube
+narrows as Source A tightens it.
+
+\subsection{Per-copy bound integration --- \src{intersect\_per\_copy\_bounds}}
+
+\paragraph{Where.}
+\fileline{utils/MIPVerify.jl/src/net\_components/core\_ops.jl}{199--246}.
+Called by \emph{both} the decision site (\src{compute\_n2\_relax\_decision!})
+and the emit site (\src{relu()}).
 
 \begin{lstlisting}[style=jl]
-# help_functions.jl:307-324
-function apply_n1_branch_priorities!(m_n2, n1_layers_info)
-    applied = 0
-    for v in JuMP.all_variables(m_n2)
-        if JuMP.is_binary(v)
-            vname = JuMP.name(v)
-            for ((layer, neuron), (u, l, _)) in n1_layers_info
-                if occursin("_$(layer)_$(neuron)", vname) &&
-                   endswith(vname, "_$(layer)_$(neuron)")
-                    gap = abs(u - l)
-                    priority = gap < 1.0 ? 10 :
-                               (gap < 5.0 ? 5 : 1)
-                    MOI.set(JuMP.backend(m_n2),
-                        Gurobi.VariableAttribute("BranchPriority"),
-                        JuMP.index(v), priority)
-                    applied += 1
-                    break
-                end
+function intersect_per_copy_bounds(
+    l_init::Real, u_init::Real,
+    nn_layer::Int, nn_neuron::Int,
+    m_idx::Int, k_idx::Int,
+    version::AbstractString,
+)::Tuple{Float64, Float64}
+    l = Float64(l_init); u = Float64(u_init)
+    # Source A: N1 per-copy bound + diff bound
+    if !isempty(n1_neuron_bounds) && (version == "org" || version == "perturbation")
+        key = (nn_layer, nn_neuron)
+        if haskey(n1_neuron_bounds, key)
+            (n1_u, n1_l) = n1_neuron_bounds[key]
+            if !isempty(relu_diff_up_bounds) && 1 <= m_idx <= length(relu_diff_up_bounds) &&
+               1 <= k_idx <= length(relu_diff_up_bounds[m_idx])
+                u = min(u, n1_u + relu_diff_up_bounds[m_idx][k_idx])
+                l = max(l, n1_l + relu_diff_down_bounds[m_idx][k_idx])
             end
         end
     end
+    # Source B: shared absolute N2 hull
+    if !isempty(n2_abs_up_bounds) && (version == "org" || version == "perturbation")
+        if 1 <= m_idx <= length(n2_abs_up_bounds) &&
+           1 <= k_idx <= length(n2_abs_up_bounds[m_idx])
+            u = min(u, n2_abs_up_bounds[m_idx][k_idx])
+            l = max(l, n2_abs_down_bounds[m_idx][k_idx])
+        end
+    end
+    # ... Source C (n1 probe LP) intentionally omitted for our combo
+    return (l, u)
 end
 \end{lstlisting}
 
-\textbf{Invoked at} \src{run.jl:926--930}, after \src{mip\_set\_attr}
-has attached Gurobi as the backend (this ordering is mandatory; the
-\src{BranchPriority} attribute requires Gurobi to be bound).
+The per-copy story: \src{n1\_neuron\_bounds} is keyed by
+\src{(neurons\_names.layer, neurons\_names.neuron)}, where
+\src{neurons\_names.layer} runs $1..K$ during the org pass and
+$K{+}1..2K$ during the pert pass. The diff and Source-B arrays are
+indexed by \src{(m\_idx, k\_idx)} with \src{m\_idx} resetting to
+$1..K$ in each pass, so they are shared between copies. This
+asymmetry is exactly what \texttt{advstd\_techniques.tex} \S 4.3
+calls out: only Source A varies per copy.
 
-\paragraph{Soundness.} Pure Gurobi attribute; no constraint added.
-$\mathcal{F}_{\text{MIP}}$ is unchanged.
+\paragraph{Emit-site call.}
+Inside \src{relu()} at \fileline{core\_ops.jl}{295--301}:
+
+\begin{lstlisting}[style=jl]
+if network_version == "org" || network_version == "perturbation"
+    (l, u) = intersect_per_copy_bounds(
+        l, u,
+        neurons_names.layer, neurons_names.neuron,
+        layer_counter, neurons_names.neuron,
+        network_version,
+    )
+end
+\end{lstlisting}
+
+\src{layer\_counter} is reset to 0 at the start of each pass
+(see e.g. \fileline{utils/perturbation\_models.jl}{142}) and
+incremented by 1 per ReLU layer at \fileline{core\_ops.jl}{739}, so
+\src{layer\_counter} runs $1..K$ for each pass --- matching the
+decision-site call argument-for-argument.
 
 %%─────────────────────────────────────────────────────────────────────
-\section{Technique~2 — Bound Tightening \tech{(boundTight)}}
-\label{sec:t2}
+\section{Tech 2 --- \texttt{prev\_pgd} variable hints}
+\label{sec:prevpgd}
 
-Technique~2 is the most complex technique. It runs \emph{before} the
-$N_2$ MIP is built and populates several globals that the MIP
-construction (\src{relu} in \src{core\_ops.jl}) reads when building the
-big-$M$ encoding of each ReLU.
+\paragraph{Where.}
+\src{apply\_n1\_var\_hints!} in
+\fileline{utils/help\_functions.jl}{598--741}; the \texttt{prev}
+math in \src{compute\_varhint} at lines 507--523.
 
-\subsection{Method~1 — interval arithmetic (baseline)}
+\paragraph{What \texttt{prev\_pgd} delivers.}
+For each surviving $N_2$ binary $a_i$ (i.e.\ those with
+$l^{N_2}_i < 0 < u^{N_2}_i$ after Tech 1's elimination), compute
+\(
+  \mathtt{hint\_val}(a_i) = (p_i \ge 0.5)\,?\, v^{N_1}_i \,:\, 1 - v^{N_1}_i
+\)
+using the prev rule, then route it through \src{set\_start\_value}
+filtered by PGD's three-way consensus. \emph{No}
+\texttt{VarHintVal}/\texttt{VarHintPri} is written.
 
-\textbf{File:} \src{utils/perturbation\_intervals.jl:1009--1230}.
+\subsection{Step 1 --- name-match $N_1$'s primal}
 
-\src{compute\_diff\_and\_comp\_bounds} walks through $N_1$ and $N_2$
-layer by layer, maintaining four interval state vectors:
+\fileline{help\_functions.jl}{619--654}. The N2 binary's name is
+\src{\{nv\}a\_layerCount\{lc\}\_neuronCount\{nc\}\_\{layer\}\_\{neuron\}};
+the regex \src{r"a\_layerCount\textbackslash d+\_neuronCount\textbackslash d+\_(\textbackslash d+)\_(\textbackslash d+)\$"}
+extracts \src{(layer, neuron)} which keys directly into
+\src{layers\_info\_dict} (the global $N_2$ tightened-bounds table)
+and into the saved \src{n1\_layers\_info}. Confidence and other
+non-ReLU binaries are skipped because their names don't match the
+regex.
+
+\subsection{Step 2 --- the prev rule for $p_i$}
+
+\fileline{help\_functions.jl}{671--699}. Two proxies:
 
 \begin{itemize}[noitemsep]
-  \item \src{diff\_up}, \src{diff\_down}: bounds on
-    $\hat{z}^{N_2}_{m,k} - \hat{z}^{N_1}_{m,k}$.
-  \item \src{pert\_up}, \src{pert\_down}: bounds on the
-    perturbation-induced diff inside a single network.
-  \item \src{n1\_act\_up}, \src{n1\_act\_down}: $N_1$'s post-ReLU bounds.
-  \item \src{n1\_pre\_up\_cur}, \src{n1\_pre\_down\_cur}: $N_1$'s
-    pre-activation bounds at the most recent Linear/Conv layer.
+  \item \emph{Active} ($v^{N_1}_i = 1$): read $\hat z^{N_1}_i$
+    directly from N1's primal via the matching \src{x\_rect}
+    name --- same name pattern, with the literal substring
+    \src{a\_layerCount} replaced by \src{x\_rect\_layerCount} once
+    (line 681).
+  \item \emph{Inactive} ($v^{N_1}_i = 0$): the big-$M$ encoding
+    only constrains $\hat z^{N_1}_i \in [l^{N_1}_i, 0]$, so use
+    the midpoint $l^{N_1}_i / 2$ as a proxy (line 684).
 \end{itemize}
 
-Per the paper formula
-$\hat{z}^{N_2}_{m,k} - \hat{z}^{N_1}_{m,k} = W_2\,(\text{prev diff}) +
-\Delta W \cdot z^{N_1}_{m-1} + \Delta b$, the Linear update is:
+The diff bound is looked up at line 688 via
+\src{r = (layer <= K) ? layer : (layer - K)}, mapping the
+1..2K global layer back to the 1..K diff slot (the same diff
+applies to both copies). Then \src{compute\_varhint} at lines
+507--523 builds
+\(
+  \tilde I_i = [\hat z^{N_1}_i + d^\downarrow_i,\; \hat z^{N_1}_i + d^\uparrow_i] \cap [l^{N_2}_i, u^{N_2}_i]
+\)
+and computes
+\(
+  p_i = \mathrm{length}(\tilde I_i \cap \text{N1-side}) / \mathrm{length}(\tilde I_i)
+\),
+where N1-side is $(-\infty, 0]$ if $v^{N_1}_i = 0$ else
+$[0, +\infty)$. Degenerate (empty/point) intervals fall back to
+$(\mathtt{hint\_val} = v^{N_1}_i,\, \mathtt{pri} = 1)$ at line 513.
+
+\subsection{Step 3 --- PGD-consensus Start filter}
+
+\fileline{help\_functions.jl}{702--720}:
 
 \begin{lstlisting}[style=jl]
-# perturbation_intervals.jl:1056-1082 (elided)
-elseif occursin("Linear", string(typeof(l)))
-    W1 = Float64.(transpose(l.matrix))
-    W2 = Float64.(transpose(l2.matrix))
-    ΔW = W2 - W1;  Δb = b2 - b1
-    r1_min, r1_max = interval_matrix_vector_multiplication(
-        ΔW, ΔW, n1_act_down, n1_act_up)           # ΔW · a_n1
-    r2_min, r2_max = interval_matrix_vector_multiplication(
-        W2, W2, diff_down, diff_up)               # W2 · prev_diff
-    diff_down = r1_min .+ r2_min .+ Δb
-    diff_up   = r1_max .+ r2_max .+ Δb
-\end{lstlisting}
-
-ReLU clipping is done at \src{perturbation\_intervals.jl:1120--1170}.
-It has two modes — default (non-expansive $d^\uparrow \leftarrow
-\max(0, d^\uparrow)$, $d^\downarrow \leftarrow -\max(0, -d^\downarrow)$)
-and \src{optimizing\_intervals=true} (tighter per-neuron clipping using
-the concurrent $N_1$ and $N_2$ stability).
-
-\subsection{Method~2 — zonotope bounds}
-
-\textbf{Flag:} \flag{adv\_std\_zono\_bounds true}.\quad
-\textbf{Files:}
-Source~A in \src{perturbation\_intervals.jl:1317--1740};
-Source~B in \src{perturbation\_intervals.jl:1765--1988}.
-
-\paragraph{Source~A — diff zonotope
-(\src{compute\_diff\_bounds\_zonotope}).} Tracks per-layer
-\src{diff\_center} (vector) and \src{diff\_gens} (matrix, rows =
-neurons, columns = shared noise $\epsilon_j$). Affine update
-concatenates correlated ($W_2 \cdot G_{m-1}$) and independent
-($\Delta W \cdot \mathrm{diag}(\mathrm{rad})$) generators:
-
-\begin{lstlisting}[style=jl]
-# perturbation_intervals.jl:1402-1413
-new_center      = W2 * diff_center .+ ΔW * n1_center .+ Δb
-new_gens_corr   = W2 * diff_gens
-new_gens_indep  = ΔW * diagm(n1_radius)
-diff_gens       = hcat(new_gens_corr, new_gens_indep)
-diff_center     = new_center
-\end{lstlisting}
-
-DeepZ ReLU relaxation for split neurons (\src{perturbation\_intervals.jl:1612--1622}):
-\begin{lstlisting}[style=jl]
-# Generic split case: λ·z + μ ± μ·ε_new
-λ = u_d / (u_d - l_d)
-μ = -u_d * l_d / (2.0 * (u_d - l_d))
-diff_center[i] = λ * diff_center[i] + μ
-diff_gens[i, :] .*= λ
-new_col = zeros(n);  new_col[i] = μ
-push!(new_gen_cols, new_col)
-\end{lstlisting}
-
-\paragraph{Source~B — absolute $N_2$ zonotope
-(\src{compute\_n2\_bounds\_zonotope\_with\_n1\_tighten}).} A separate
-zonotope propagating $N_2$'s \emph{absolute} values from
-$[0, 1]^n \pm \ep$. At each ReLU layer the hull is intersected with
-Source~A's bounds before applying DeepZ:
-
-\begin{lstlisting}[style=jl]
-# perturbation_intervals.jl:1910-1934
-# 1. hull of current zonotope
-abs_sum = vec(sum(abs.(gens), dims=2))
-u_hull  = center .+ abs_sum
-l_hull  = center .- abs_sum
-# 2. intersect with Source A: [n1_preact + diff_down, n1_preact + diff_up]
-u_fromA = n1_up .+ diff_up
-l_fromA = n1_dn .+ diff_dn
-if length(u_fromA) == length(u_hull)
-    u_tight = min.(u_hull, u_fromA)
-    l_tight = max.(l_hull, l_fromA)
-end
-# 3. store, then apply DeepZ ReLU with [l_tight, u_tight]
-push!(n2_abs_up_bounds,   copy(u_tight))
-push!(n2_abs_down_bounds, copy(l_tight))
-\end{lstlisting}
-
-\subsection{Method~3 — N1 probe LP (Source C)}
-
-\textbf{Flag:} \flag{adv\_std\_n1\_probe lp}.\quad
-\textbf{File:} \src{utils/n1\_probe\_lp.jl:158--408}.
-
-The probe builds a \emph{fresh} pure-LP JuMP model containing
-triangle-relaxed forward passes of \emph{both} $N_1$ and $N_2$ sharing
-the same input variables $v_\mathrm{in}, v_{x_0}$. The input link
-constraint is perturbation-specific and dispatched by
-\src{\_setup\_probe\_inputs} (\src{n1\_probe\_lp.jl:49--156}), which
-handles \texttt{linf}, \texttt{brightness}, \texttt{contrast},
-\texttt{patch}, \texttt{occ}, and \texttt{translation}. Rotation is
-not supported and Source~C silently skips.
-
-The triangle ReLU is emitted inside
-\src{forward\_pass\_triangle\_relaxed} (lines 226--281):
-
-\begin{lstlisting}[style=jl]
-# n1_probe_lp.jl:255-270
-for i in 1:n_neurons
-    u_i = u_r[i];  l_i = l_r[i]
-    if u_i <= 0.0
-        post_flat[i] = zero(JuMP.AffExpr)
-    elseif l_i >= 0.0
-        post_flat[i] = flat_state[i]
+if mode == VH_DIRECT_PGD || mode == VH_PREV_PGD
+    v_pgd_raw = JuMP.start_value(v)
+    if v_pgd_raw === nothing
+        JuMP.set_start_value(v, Float64(hint_val))      # fill
+        n_pgd_silent_filled += 1
     else
-        v = @variable(m, lower_bound=0.0, upper_bound=max(0.0, u_i))
-        @constraint(m, v >= flat_state[i])
-        @constraint(m, v >= 0.0)
-        @constraint(m, v <= (u_i / (u_i - l_i)) * (flat_state[i] - l_i))
-        post_flat[i] = v
-    end
-end
-\end{lstlisting}
-
-OBBT loops run \src{optimize!} twice per pre-activation neuron (min and
-max), for both the clean and perturbed copies of $N_2$:
-
-\begin{lstlisting}[style=jl]
-# n1_probe_lp.jl:301-317 (org copy; pert copy is symmetric)
-for r in 1:length(n2_org_handles)
-    for k in 1:length(n2_org_handles[r])
-        @objective(m_probe, Min, n2_org_handles[r][k])
-        optimize!(m_probe)
-        if termination_status(m_probe) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
-            n2_probe_down_bounds_org[r][k] = objective_value(m_probe)
-        end
-        @objective(m_probe, Max, n2_org_handles[r][k])
-        optimize!(m_probe)
-        if termination_status(m_probe) in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
-            n2_probe_up_bounds_org[r][k] = objective_value(m_probe)
+        v_pgd_bit = Int(round(v_pgd_raw))
+        if v_pgd_bit == hint_val
+            n_pgd_agreed_nop += 1                       # leave
+        else
+            JuMP.set_start_value(v, nothing)            # withdraw
+            n_pgd_disagreed_withdrew += 1
         end
     end
+    applied += 1
+else
+    MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), Float64(hint_val))
+    MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), hint_pri)
+    applied += 1
 end
 \end{lstlisting}
 
-The probe's bounds flow into the four
-\src{n2\_probe\_\{up,down\}\_bounds\_\{org,pert\}} globals, which the
-MIP's \src{relu} reads during N2 construction (see
-Section~\ref{sec:t2_integration}).
+The non-PGD modes (\texttt{prev}/\texttt{direct}) take the
+\texttt{else} branch and write the soft hint pair. The \texttt{\_pgd}
+modes never enter that branch, so they never write
+\texttt{VarHintVal}/\texttt{VarHintPri} --- the hint priority is
+discarded by design.
 
-\subsection{Final bound integration}
-\label{sec:t2_integration}
+\paragraph{What survives the filter.}
+The function tracks four counters logged at line 728:
+\src{pgd-silent-filled}, \src{pgd-agreed-nop},
+\src{pgd-disagreed-withdrew}, and \src{flipped} (how many of the
+\src{hint\_val}s disagreed with $v^{N_1}_i$ after the prev rule's
+flip). The third counter --- withdrawals --- represents binaries
+where \emph{both} signals had an opinion but disagreed. Sweep logs
+typically show the silent-filled count is the largest, because PGD
+only sets Start on a small subset of binaries.
 
-\textbf{Handoff:} After the Phase-2 pre-compute,
-\src{run.jl:857--860} calls \src{set\_n1\_neuron\_bounds}
-(\src{help\_functions.jl:267--273}) to freeze $N_1$'s
-\src{layers\_info\_dict} into the \src{n1\_neuron\_bounds} global keyed
-by \src{(layer, neuron)}.
+\paragraph{Survivor filter.}
+Lines 661--664 short-circuit any binary whose tightened bound is
+single-signed:
+\begin{lstlisting}[style=jl]
+if l_n2 >= 0 || u_n2 <= 0
+    n_tier1_skipped += 1
+    continue
+end
+\end{lstlisting}
+This is defensive: \src{relu()} would not have created the binary
+in the first place. The counter logged at line 728 names this
+``Tech2-eliminated-but-survived''.
 
-\src{get\_model} then builds the $N_2$ MIP and, at every split ReLU,
-\src{relu} consults the globals populated by T2 to intersect all
-available sources before emitting the big-$M$ constraints
-(\src{core\_ops.jl:578--598}). This is where the $\min/\max$ in
-\texttt{advstd\_techniques.tex}, Eqs.~(3)--(4) live operationally: each
-source is a term in the final $\min/\max$ that happens as the
-MIPVerify framework tightens its bound before emitting the big-$M$.
-
-When the tightened interval is single-signed,
-\src{relu} short-circuits and returns either $x$ (always active) or
-$0$ (always inactive) at the top of the function
-(\src{core\_ops.jl:301--303}), removing the binary entirely.
+\paragraph{Abort guard.}
+Line 736: if \src{applied == 0} but the model has any binaries, the
+function errors out before \src{optimize!} so we never silently ship
+a no-hint result mislabeled as \texttt{prev\_pgd}.
 
 %%─────────────────────────────────────────────────────────────────────
-\section{Technique~3 — Variable Hints \tech{(varHint)}}
-\label{sec:t3}
+\section{Tech 3 --- $\tau=0.5$ BoundTightPertRelax}
+\label{sec:tau}
 
-\textbf{Flag:} \flag{adv\_std\_var\_hint true}.\quad
-\textbf{File:} \src{utils/help\_functions.jl:401--430}
-(helpers at 334--362).
+\subsection{Decision site}
 
-\paragraph{Step 1 — pseudo-cost score.} From the saved $N_1$ pseudo-cost
-dict, compute per-variable score $s_i = p_i^\downarrow n_i^\downarrow
-+ p_i^\uparrow n_i^\uparrow$:
+\fileline{utils/n2\_relax\_decision.jl}{23--130}. Pseudocode-faithful
+to \texttt{advstd\_techniques.tex} \S 4.3. The tiered rule:
 
 \begin{lstlisting}[style=jl]
-# help_functions.jl:334-340
-function compute_n1_var_scores(n1_pseudocosts)
-    scores = Dict{String, Float64}()
-    for (name, pc) in n1_pseudocosts
-        scores[name] = pc.pd_down * pc.n_down + pc.pd_up * pc.n_up
+if max(g_org, g_pert) <= threshold              # Tier 1
+    relax_org, relax_pert = true, true
+elseif min(g_org, g_pert) <= threshold          # Tier 2
+    if g_org <= g_pert
+        relax_org, relax_pert = true, false     # org wins on tie
+    else
+        relax_org, relax_pert = false, true
     end
-    return scores
+else                                            # Tier 3
+    relax_org, relax_pert = false, false
 end
 \end{lstlisting}
 
-\paragraph{Step 2 — rank to integer priority.} Sort nonzero scores
-descending, map rank to $[1, 100]$:
+The gap formula $g(l, u) = u \cdot |l| / (2(u-l))$ is in
+\src{\_tri\_gap} at \fileline{core\_ops.jl}{187--188} (returns 0 for
+single-signed intervals). The decision starts with
+\src{(l\_init, u\_init) = (-Inf, +Inf)} (\src{n2\_relax\_decision.jl}
+lines 48--49) and lets \src{intersect\_per\_copy\_bounds} narrow.
+This is intentionally conservative: a wider starting envelope can
+only shrink the relaxation count.
 
+\paragraph{Decision dict layout.}
+Lines 113--123:
 \begin{lstlisting}[style=jl]
-# help_functions.jl:349-362
-function rank_to_priority(scores; max_pri=100)
-    priorities = Dict{String, Int}()
-    nonzero = sort([n for (n, s) in scores if s > 0]; by=n -> -scores[n])
-    n_rank = length(nonzero)
-    for (rank, name) in enumerate(nonzero)
-        priorities[name] = max(1,
-            round(Int, max_pri * (1 - (rank - 1) / n_rank)))
-    end
-    for (name, s) in scores
-        if s <= 0; priorities[name] = 0; end
-    end
-    return priorities
+if relax_org
+    n2_relax_decision[(nn_layer_org, k_idx)]  = (true, false)
+end
+if relax_pert
+    n2_relax_decision[(nn_layer_pert, k_idx)] = (false, true)
 end
 \end{lstlisting}
+The keys distinguish copies (\src{nn\_layer\_org = m\_idx},
+\src{nn\_layer\_pert = m\_idx + K}). The lookup site (next subsection)
+selects the right boolean by \src{network\_version}.
 
-\paragraph{Step 3 — set \src{VarHintVal} and \src{VarHintPri} on $N_2$.}
+\subsection{MIP emit site}
 
-\begin{lstlisting}[style=jl]
-# help_functions.jl:418-429
-for v in JuMP.all_variables(m_n2)
-    if !JuMP.is_binary(v); continue; end
-    name  = JuMP.name(v)
-    value = get(value_by_name, name, nothing)
-    if value === nothing; continue; end
-    pri = get(priority_by_name, name, 0)
-    MOI.set(JuMP.backend(m_n2),
-        Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), value)
-    MOI.set(JuMP.backend(m_n2),
-        Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), pri)
-end
-\end{lstlisting}
-
-If pseudo-costs are not available (legacy saved state), the code
-falls back to a uniform priority~10 per
-\src{help\_functions.jl:412--414}.
-
-\paragraph{Invoked at} \src{run.jl:932--935}, independent of the
-\src{bp\_mode} setting — T1 and T3 can both be active simultaneously.
-
-%%─────────────────────────────────────────────────────────────────────
-\section{Technique~4 — N2 Triangle Relaxation \tech{(relaxT)}}
-\label{sec:t4}
-
-\textbf{Flag:} \flag{adv\_std\_n2\_relax\_threshold $\tau$} (default
-$-1.0$ disables).\quad
-\textbf{File:} \src{utils/MIPVerify.jl/src/net\_components/core\_ops.jl:547--576}.
-
-The gap-area scoring helper is defined once at the top of the
-\src{relu} function (line 308):
+\fileline{core\_ops.jl}{554--605}. After
+\src{intersect\_per\_copy\_bounds} narrowed $(l, u)$:
 
 \begin{lstlisting}[style=jl]
-_tri_gap(l_val, u_val) =
-    (l_val >= 0.0 || u_val <= 0.0) ? 0.0 :
-    u_val * (-l_val) / (2.0 * (u_val - l_val))
-\end{lstlisting}
-
-The advstd relaxation branch fires only in standard-mode copies
-(\texttt{org}/\texttt{perturbation}), and only when
-\src{n1\_neuron\_bounds} is populated (i.e.\ T2 is active):
-
-\begin{lstlisting}[style=jl]
-# core_ops.jl:547-576
 if adv_std_n2_relax_threshold >= 0.0 &&
    (network_version == "org" || network_version == "perturbation") &&
-   !isempty(n1_neuron_bounds)
-    key = (neurons_names.layer, neurons_names.neuron)
-    if haskey(n1_neuron_bounds, key)
-        (n1_u_val, n1_l_val) = n1_neuron_bounds[key]
-        n1_score = _tri_gap(n1_l_val, n1_u_val)
-        if n1_score <= adv_std_n2_relax_threshold
-            av = JuMP.all_variables(model)
-            push!(layers_info_dict,
-                  (neurons_names.layer, neurons_names.neuron) =>
-                      (u, l, length(av)))
-            x_rect = @variable(model)
-            set_lower_bound(x_rect, 0.0)
-            set_upper_bound(x_rect, max(0.0, u))
-            set_name(x_rect, string(network_version,
-                "x_rect_n1relax_advstd_",
-                "layerCount", layer_counter,
-                "_neuronCount", nueron_counter,
-                "_", neurons_names.layer, "_", neurons_names.neuron))
-            @constraint(model, x_rect >= 0)
-            @constraint(model, x_rect >= x)
-            @constraint(model, x_rect <= (u / (u - l)) * (x - l))
-            if network_version == "org"
-                global n_n2_relaxed_binaries_org += 1
-            else
-                global n_n2_relaxed_binaries_pert += 1
-            end
-            return x_rect
+   haskey(n2_relax_decision, (neurons_names.layer, neurons_names.neuron))
+    (relax_org, relax_pert) = n2_relax_decision[(neurons_names.layer, neurons_names.neuron)]
+    should_relax = (network_version == "org") ? relax_org : relax_pert
+    if should_relax
+        # emit triangle inequalities on (l, u): the SAME (l, u) the decision saw
+        # ... triangle big-M-free encoding here ...
+    end
+end
+\end{lstlisting}
+
+The load-bearing invariant is that the emit site uses the same $(l,
+u)$ that the decision evaluated. Both sites compute $(l, u)$ via
+\src{intersect\_per\_copy\_bounds} with arg-equivalent inputs (see
+\S\ref{sec:zono}). The triangle is therefore emitted on the exact
+interval whose gap was tested against $\tau$.
+
+\subsection{Soundness}
+
+For $(m, k, \mathrm{copy}) \notin R$: the exact big-$M$ encoding is
+emitted, identical to baseline. For $(m, k, \mathrm{copy}) \in R$:
+the triangle inequalities are emitted on
+$[l^{N_2,\mathrm{copy}}_{m,k}, u^{N_2,\mathrm{copy}}_{m,k}]$, which
+covers the exact ReLU on the same interval. So
+$\mathcal F_{2} \subseteq \mathcal F_{2}^{(R)}$ and
+$\delta_{\mathrm{BTPR}} \ge \delta_{\mathrm{exact}}$. (Same argument
+as \texttt{advstd\_techniques.tex} \S 4.3 \emph{Soundness}.)
+
+%%─────────────────────────────────────────────────────────────────────
+\section{Hyper-attack (PGD) in advstd Phase 2}
+\label{sec:hyperattack}
+
+\paragraph{Two channels.} \flag{use\_hyper\_attack}\;\texttt{true}
+arms two distinct things in Phase 2:
+
+\begin{enumerate}[noitemsep]
+  \item A \texttt{Cutoff} on $N_2$'s MIP (always installed when PGD
+    succeeded).
+  \item Either MIP-Start hints (\texttt{adv\_std\_mip\_start=true},
+    rejected by every safe combo) or Start values feeding the
+    \texttt{prev\_pgd}/\texttt{direct\_pgd} consensus filter.
+\end{enumerate}
+
+\subsection{Subprocess invocation}
+
+\src{hyper\_attack} at \fileline{utils/hyper\_attack.jl}{98--113}
+shells out to the Python script:
+
+\begin{lstlisting}[style=jl]
+function hyper_attack(dataset, c_tag, c_target, token_signature,
+                      model_name, model_path, perturbation, perturbation_size;
+                      force_cpu::Bool=false)
+    pre_time = @elapsed begin
+        cmd_args = ["python3", "./utils/hyper_attack.py",
+                    "--dataset", string(dataset),
+                    "--source", string(c_tag-1),       # 0-indexed for Python
+                    "--target", string(c_target-1),
+                    "--token", token_signature,
+                    "--model", model_name,
+                    "--model_path", model_path*"th",   # .pth checkpoint
+                    "--perturbation", perturbation,
+                    "--perturbation_size", create_perturbation_string(perturbation_size)]
+        if force_cpu; push!(cmd_args, "--cpu"); end
+        run(Cmd(cmd_args))
+        best_feasible_via_optimization = read_best_val_via_optimization(c_tag, c_target, token_signature)
+    end
+    return best_feasible_via_optimization, pre_time
+end
+\end{lstlisting}
+
+The Python side (\src{utils/hyper\_attack.py}) runs PGD for 500
+iterations (\src{attack} at lines 120--303), keeps the top-$K$
+adversarial inputs satisfying source$\to$target misclassification,
+and writes three \src{/tmp} files per $(c_s, c_t)$ pair (or, on
+failure, a single \src{fail\_*} file):
+
+\begin{itemize}[noitemsep]
+  \item \src{/tmp/booleans\_\{c-1\}\_\{t-1\}\_\{token\}.txt} ---
+    comma-separated 0/1/-1 flags per binary (-1 = abstain).
+  \item \src{/tmp/strings\_\{c-1\}\_\{t-1\}\_\{token\}.txt} ---
+    matching variable names. \src{build\_str} at lines 100--117
+    constructs the names: e.g.\
+    \src{org a\_layerCount2\_neuronCount0\_2\_5}
+    for ReLU layer 2 / neuron 5 in the org copy, or with
+    \src{perturbation} for the perturbed copy.
+  \item \src{/tmp/best\_val\_\{c-1\}\_\{t-1\}\_\{token\}.txt} ---
+    the feasible objective value, used as the Cutoff.
+\end{itemize}
+
+In Phase 2, \emph{both} $N_1$ and $N_2$ get their own PGD run with
+distinct tokens (\src{token\_signature} for $N_1$ at
+\fileline{run.jl}{860--862}, \src{token\_signature * "\_n2"} for
+$N_2$ at \fileline{run.jl}{909--912}).
+
+\subsection{Hint application}
+
+\src{hyper\_attack\_hints} at \fileline{utils/hyper\_attack.jl}{1--35}
+reads the two text files, matches names against
+\src{JuMP.all\_variables(m)}, and calls \src{set\_start\_value} on
+matched binaries (skipping \src{-1} abstains and unmatched names):
+
+\begin{lstlisting}[style=jl]
+function hyper_attack_hints(m, token, c_tag, c_target)
+    av = JuMP.all_variables(m)
+    if isfile("/tmp/fail_"*string(c_tag-1)*"_"*string(c_target-1)*"_"*token*".txt")
+        rm("/tmp/fail_"*string(c_tag-1)*"_"*string(c_target-1)*"_"*token*".txt")
+    else
+        # ... read booleans + strings ...
+        for n in eachindex(arr_strings)
+            if indexes_[n] == -1 || arr_booleans[n] == -1; continue; end
+            set_start_value(av[indexes_[n]], arr_booleans[n])
         end
     end
 end
 \end{lstlisting}
 
-Key property, matching the paper: the \emph{decision} uses
-$N_1$'s bounds (via \src{n1\_neuron\_bounds}) while the triangle
-\emph{constraints} use $N_2$'s tightened \src{(u, l)} produced by T2.
-Relaxed ReLUs still push an entry to \src{layers\_info\_dict} (with the
-variable index but no companion binary), keeping downstream code that
-iterates that dict unbroken.
-
-\paragraph{Guard.} \src{run.jl:627--631} warns if the user sets
-$\tau \ge 0$ without \flag{adv\_std\_bound\_tightening true}, because
-then \src{n1\_neuron\_bounds} would be empty and the check at
-\src{core\_ops.jl:549} silently disables the whole technique.
-
-%%─────────────────────────────────────────────────────────────────────
-\section{Not-in-safe-set Techniques (for completeness)}
-\label{sec:unsafe}
-
-\subsection{MIP Start}
-
-\textbf{Flag:} \flag{adv\_std\_mip\_start true}.\quad
-\textbf{File:} \src{utils/hyper\_attack.jl:246--268}.
-
+\paragraph{Cutoff plumbing.}
+Whatever PGD returned as the best feasible objective rides in
+\src{d\_n2[:suboptimal\_solution]}. \src{mip\_set\_attr} at
+\fileline{utils/mip.jl}{20--34}:
 \begin{lstlisting}[style=jl]
-function apply_n1_hints!(m_n2, n1_names, n1_values)
+function mip_set_attr(m, perturbation, d, timout)
     ...
-    av = JuMP.all_variables(m_n2)
-    name_to_idx = Dict{String, Int}()
-    for k in eachindex(av)
-        n = JuMP.name(av[k])
-        if !isempty(n); name_to_idx[n] = k; end
+    if d[:suboptimal_solution] != 0
+        set_optimizer_attribute(m, "Cutoff", d[:suboptimal_solution])
     end
-    for i in eachindex(n1_names)
-        idx = get(name_to_idx, n1_names[i], -1)
-        if idx > 0
-            set_start_value(av[idx], n1_values[i])
+    ...
+end
+\end{lstlisting}
+\texttt{Cutoff} prunes any branch whose objective is provably worse,
+giving Gurobi a strong dual-bound prune even when no MIP-Start is
+installed.
+
+\subsection{Interaction with \texttt{prev\_pgd}}
+
+The \texttt{prev\_pgd} consensus filter at
+\fileline{help\_functions.jl}{702--720} reads
+\src{JuMP.start\_value(v)} on every surviving binary --- which is
+exactly what \src{hyper\_attack\_hints} just wrote. The filter
+reconciles the two signals:
+
+\begin{itemize}[noitemsep]
+  \item Binaries where PGD wrote a value and the prev-rule
+    \src{hint\_val} agrees: PGD's value is left in place
+    (\emph{leave}).
+  \item Binaries where they disagree: \src{set\_start\_value(v,
+    nothing)} unsets PGD's value (\emph{withdraw}).
+  \item Binaries where PGD wrote nothing: filled with the prev-rule
+    \src{hint\_val} (\emph{fill}).
+\end{itemize}
+
+So in our combo, hyper-attack contributes \emph{(a)} the Cutoff
+unconditionally and \emph{(b)} a partial Start that the consensus
+filter trims down to the high-confidence overlap with $N_1$'s
+transferred bits. If PGD failed entirely (\src{fail\_*} file
+present, every \src{start\_value} is \src{nothing}), the combo
+degrades gracefully to ``prev fills every gap'' --- i.e.\ a pure
+$N_1$-transfer Start.
+
+\paragraph{Order constraint, again.} \src{hyper\_attack\_hints} runs
+at \fileline{run.jl}{999--1006}; \src{apply\_n1\_var\_hints!} runs at
+\fileline{run.jl}{1027--1034}. Reversing the order would cause PGD to
+overwrite the consensus filter's writes and silently break the
+combo's semantics.
+
+%%─────────────────────────────────────────────────────────────────────
+\section{VHAGaR dependencies in advstd Phase 2}
+\label{sec:vagharddeps}
+
+\paragraph{Toggle.} \flag{activate\_vaghgar\_deps}\;\texttt{true}.
+The advstd Phase-2 driver wires it into both passes:
+\fileline{run.jl}{880--882} for the $N_1$ MIP and
+\fileline{run.jl}{1007--1011} for the $N_2$ MIP.
+
+\paragraph{Entry point.}
+\src{perturbation\_dependencies} in
+\fileline{utils/perturbation\_dependencies.jl}{202--232}:
+
+\begin{lstlisting}[style=jl]
+function perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
+                                   activation_start=1, layers_offset=nothing,
+                                   perturbation_var=nothing)
+    layers_n = isnothing(layers_offset) ? layers_number(nn) : layers_offset
+    phi_dep = fill(NaN, (1, w, h, k))
+    perturbation_init_deps(phi_dep, perturbation, perturbation_size)
+    activation_cnt = activation_start
+    if reuse_bounds_conf.is_reuse_bounds_and_deps && activation_start == 1
+        for (activation_cnt, phi_dep) in enumerate(reuse_bounds_conf.reusable_deps)
+            encode_dependencies(m, layers_n, phi_dep, activation_cnt)
+        end
+    else
+        for l in nn.layers
+            if occursin("Flatten", string(typeof(l)))
+                phi_dep = phi_dep |> l
+            elseif occursin("Linear", string(typeof(l))) || occursin("Conv", string(typeof(l)))
+                phi_dep_l = dep_propagation(l, phi_dep)
+                phi_dep = dep_additional(m, layers_n, l, phi_dep, phi_dep_l,
+                                          perturbation, perturbation_size,
+                                          activation_cnt, activation_start, perturbation_var)
+            elseif occursin("ReLU", string(typeof(l)))
+                phi_dep = encode_dependencies(m, layers_n, phi_dep, activation_cnt)
+                if activation_start == 1; push!(reuse_bounds_conf.reusable_deps, phi_dep); end
+                if all(isnan, phi_dep); break; end
+                activation_cnt += 1
+            end
         end
     end
 end
 \end{lstlisting}
 
-\textbf{Invoked at} \src{run.jl:873--876}. Per the paper this was
-harmful (all LOSER) and should stay off in the safe set.
+\paragraph{What \src{phi\_dep} encodes.}
+A 4D matrix shaped like the perturbation input, holding one of
+$\{0,\,1,\,-1,\,\mathrm{NaN}\}$ per element:
+\begin{itemize}[noitemsep]
+  \item \texttt{0} --- org and pert copies are forced equal at this
+    neuron.
+  \item \texttt{1} --- pert dominates org (org $\le$ pert).
+  \item \texttt{-1} --- org dominates pert.
+  \item \texttt{NaN} --- relation unknown; the encoder resolves it via a
+    sub-LP if the upstream interval bounds permit (see below).
+\end{itemize}
 
-\subsection{LP Basis}
-
-\textbf{Flag:} \flag{adv\_std\_lp\_basis true}.\quad
-\textbf{Files:} \src{utils/hyper\_attack.jl:276--295}
-(\src{extract\_vbasis}) and \src{343--357} (\src{apply\_vbasis!}).
-
-Read the Gurobi \src{VBasis} status per variable from $N_1$'s solved
-model into a \src{Dict\{name$\to$Int\}}, then set it back on $N_2$'s
-matching variables. Skipped automatically when T2 is active
-(\src{run.jl:939--943}) because eliminated binaries change model
-structure.
-
-%%─────────────────────────────────────────────────────────────────────
-\section{Perturbed Interval Constraints (\flag{use\_perturbed\_intervals})}
-\label{sec:pi}
-
-\textbf{File:} \src{utils/perturbation\_intervals.jl:634--708}.
-
-Always enabled in the safe combinations (in Phase~1 and Phase~2).
-Propagates interval bounds on $z^+_{\mathrm{pert}} - z^+_{\mathrm{org}}$
-through a single network, then adds inequality-pair constraints that
-link the org and perturbation copies of every split ReLU post-ReLU
-variable:
+\paragraph{Per-neuron constraint emit.}
+\src{encode\_dependencies} at \fileline{utils/perturbation\_dependencies.jl}{112--200}
+walks each ReLU layer index \src{activation\_cnt}. For each neuron
+$n$ where both copies have a stored bound entry
+(\src{layers\_info\_dict[(activation\_cnt, n)]} for org and
+\src{layers\_info\_dict[(activation\_cnt + layers\_n, n)]} for pert,
+where \src{layers\_n = K} is the per-copy layer count):
 
 \begin{lstlisting}[style=jl]
-# perturbation_intervals.jl:674-703
-elseif occursin("ReLU", string(typeof(l)))
-    layer_cnt += 1
-    # σ(z+Δ) - σ(z) ∈ [min(0, Δ_down), max(0, Δ_up)]
-    I_pert_up_local   = max.(0.0, I_pert_up_local)
-    I_pert_down_local = .- max.(0.0, .- I_pert_down_local)
-    # collect x_rect vars in the org / pert copies of this ReLU layer
-    vec_clean = [n for n in eachindex(av)
-        if occursin(clean_prefix * "x_rect_layerCount" * string(layer_cnt),
-                    JuMP.name(av[n]))]
-    vec_pert  = [n for n in eachindex(av)
-        if occursin(pert_prefix * "x_rect_layerCount" * string(layer_cnt),
-                    JuMP.name(av[n]))]
-    if length(vec_clean) > 0 && length(vec_pert) > 0
-        constraints_added += add_matched_interval_constraints!(
-            m, av, vec_clean, vec_pert,
-            ensure_1d(I_pert_up_local), ensure_1d(I_pert_down_local))
+if dep == 0
+    @constraint(m, av[ind_o+1] == av[ind_p+1])    # x_rect equality
+    if has_a_o && has_a_p
+        @constraint(m, av[ind_o+2] == av[ind_p+2])  # binary equality
+    end
+elseif dep == 1
+    @constraint(m, av[ind_o+1] <= av[ind_p+1])
+    if has_a_o && has_a_p
+        @constraint(m, av[ind_o+2] <= av[ind_p+2])
+    end
+elseif dep == -1
+    @constraint(m, av[ind_o+1] >= av[ind_p+1])
+    if has_a_o && has_a_p
+        @constraint(m, av[ind_o+2] >= av[ind_p+2])
     end
 end
 \end{lstlisting}
 
-The constraints are (\src{perturbation\_intervals.jl:144--146}):
-\[
-  \text{av}[\text{pert}] \le \text{av}[\text{clean}] + I^\uparrow,
-  \quad
-  \text{av}[\text{pert}] \ge \text{av}[\text{clean}] + I^\downarrow.
-\]
+The \src{ind\_o + 1} and \src{ind\_o + 2} offsets correspond to the
+\src{x\_rect} (post-ReLU) and binary $a$ that follow the
+pre-activation \src{ind\_o} in the variable layout. The
+\src{has\_a\_o} / \src{has\_a\_p} guards (lines 124--134) check the
+expected variable name suffix \src{\_\{layer\}\_\{neuron\}} before
+emitting the binary-equality constraint --- this defends against
+neurons whose binary was \emph{eliminated} by Tech 1
+(\src{l \(\ge\) 0} or \src{u \(\le\) 0}) or \emph{relaxed} by Tech 3
+(triangle, no binary). When the binary is gone, only the
+\src{x\_rect} constraint is emitted, which remains sound because the
+relaxed encoding still produces a valid $z^+$.
 
-\paragraph{Invoked at} \src{run.jl:917--920} for $N_2$ and
-\src{run.jl:808--810} for $N_1$.
+\paragraph{Sub-LP for unknown relations.}
+When \src{dep == NaN} and the upstream bounds don't immediately resolve
+it (lines 152--159 handle the easy
+$l_\mathrm{org} \ge u_\mathrm{pert}$ and
+$l_\mathrm{pert} \ge u_\mathrm{org}$ cases), \src{encode\_dependencies}
+introduces an auxiliary objective on
+$\mathrm{av}[\mathrm{ind}_o + 1] - \mathrm{av}[\mathrm{ind}_p + 1]$
+and calls \src{optimize!(m)} to compute a sound lower or upper bound
+on the diff (lines 161--192). The Cutoff is set to 0 to terminate the
+sub-LP early once a definitive sign is found. If the resulting
+sub-bound is sufficiently far from zero
+(\src{l\_diff > -non\_equality\_tolerance} or
+\src{u\_diff < non\_equality\_tolerance}, where the default tolerance
+is \texttt{1e-4}), the dependency is ratified and the corresponding
+constraint pair is emitted. This sub-LP machinery is unchanged from
+standard mode and is independent of the advstd techniques.
 
-%%─────────────────────────────────────────────────────────────────────
-\section{End-to-End Mapping to Algorithm~2 of the Paper}
-\label{sec:mapping}
+\paragraph{Interaction with the combo.}
+\src{phi\_dep} is built from the \emph{same} \src{layers\_info\_dict}
+that \src{relu()} populated during \src{get\_model}. Because Tech 1
+already injected $N_1$'s tighter bounds and Tech 3 may have eliminated
+or relaxed some neurons, the dep encoder sees the \emph{post-Tech}
+view of $(u, l)$. This works correctly because:
+\begin{itemize}[noitemsep]
+  \item Tighter bounds make the easy resolution at lines 152--159
+    fire more often, reducing sub-LP work.
+  \item Eliminated binaries trigger the \src{has\_a\_o}/\src{has\_a\_p}
+    guard at lines 133--134, suppressing the binary-equality
+    constraint that would otherwise reference a non-existent
+    \src{av[ind+2]}.
+  \item Relaxed binaries (Tech 3 triangle) similarly miss
+    \src{av[ind+2]} and the guard suppresses the binary constraint.
+\end{itemize}
 
-The table below cross-walks every numbered line in Algorithm~2 of
-\texttt{advstd\_techniques.tex} (``Phase~2'') to its concrete code
-site:
-
-\begin{center}
-\footnotesize
-\begin{tabular}{@{}r l l@{}}
-\toprule
-Alg.2 step & Code location & Description \\
-\midrule
-precompute N2 bounds & \src{run.jl:702--751} &
-  Source A/B/C dispatch \\
-load N1 state        & \src{run.jl:778--780} &
-  \src{load\_n1\_state} (vbasis + pseudocosts included) \\
-inject N1 bounds     & \src{run.jl:857--860} &
-  \src{set\_n1\_neuron\_bounds} \\
-$\tau$-relax in MIP  & \src{core\_ops.jl:547--576} &
-  replaces binary with triangle when $N_1$-gap $\le \tau$ \\
-build N2 MIP         & \src{run.jl:866--871} &
-  \src{get\_model} reads globals populated above \\
-PGD hints            & \src{run.jl:904--906} &
-  \src{hyper\_attack\_hints} \\
-BranchPriority       & \src{run.jl:926--931} &
-  \src{apply\_n1\_branch\_priorities!} \\
-VarHintVal/Pri       & \src{run.jl:932--935} &
-  \src{apply\_n1\_var\_hints!} \\
-VHAGaR deps          & \src{run.jl:912--916} &
-  \src{perturbation\_dependencies} \\
-perturbed intervals  & \src{run.jl:917--920} &
-  \src{perturbed\_interval\_constraints} \\
-optimize             & \src{run.jl:944} &
-  \src{optimize!(m\_n2)} \\
-record $\delta$      & \src{run.jl:949--950} &
-  \src{save\_results} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-%%─────────────────────────────────────────────────────────────────────
-\section{Bugs and Latent Hazards}
-\label{sec:bugs}
-
-The following issues were identified while reading the implementation
-against the paper description. Each item notes the recommended fix and
-current status. Bugs~1 and~2 are still open; Bugs~3, 4, 6, 7, and the
-Source~B non-bug note have since been addressed in-place (dates
-below); Bug~5 has been addressed via an \emph{opt-in} flag
-(\flag{adv\_std\_var\_hint\_fix}) so existing sweep results remain
-reproducible. Open bugs are listed first, then fixed bugs.
-
-%%═════════════════════════════════════════════════════════════════════
-%% Open bugs (not yet fixed)
-%%═════════════════════════════════════════════════════════════════════
-
-\subsection{Bug~1: documentation mismatch in \texttt{run.jl} technique labels}
-
-\textbf{File:} \src{run.jl:642--650}, also the help text at
-\src{run.jl:298--356}.
-
-\textbf{Symptom.} The \texttt{println} labels and \texttt{--help}
-output number the techniques (``Technique 1 (MIP Start)'',
-``Technique 2 (Branch Priorities)'', \ldots) using the old internal
-numbering. The paper \texttt{advstd\_techniques.tex} renumbers to
-\emph{only} the four safe techniques (T1--T4) and deliberately drops
-MIP Start and LP Basis. Readers cross-referencing the paper will be
-confused when the log says ``Technique 5 (Variable Hints)'' even
-though the paper calls it T3.
-
-\textbf{Fix.} Update the log strings and help text to match the paper
-numbering (T1 Branch Priorities, T2 Bound Tightening, T3 Variable
-Hints, T4 N2 Relaxation, and label MIP Start / LP Basis as
-``unsafe / not in safe combos''). Alternatively, leave the code
-numbering alone but add a sentence near line~642 explaining that these
-codes predate the paper.
-
-\subsection{Bug~2: \src{apply\_n1\_branch\_priorities!} does double work}
-
-\textbf{File:} \src{utils/help\_functions.jl:313}.
-
-\textbf{Symptom.}
-\begin{lstlisting}[style=jl]
-if occursin("_$(layer)_$(neuron)", vname) &&
-   endswith(vname, "_$(layer)_$(neuron)")
-\end{lstlisting}
-\src{endswith} already implies \src{occursin} for the same needle, so
-the \src{occursin} call is pure overhead. With a few thousand binaries
-$\times$ a few thousand \src{layers\_info} entries per call, the double
-scan matters in the inner loop.
-
-\textbf{Fix.} Drop the \src{occursin} clause; \src{endswith} alone is
-both necessary and sufficient for the disambiguation this function
-needs. (Mere micro-optimisation — no correctness impact.)
-
-%%═════════════════════════════════════════════════════════════════════
-%% Fixed bugs
-%%═════════════════════════════════════════════════════════════════════
-
-\subsection{[FIXED] Bug~3: silent skip when Source~C prerequisites are missing}
-
-\textbf{File:} \src{utils/n1\_probe\_lp.jl:176--196}.
-
-\textbf{Symptom.} If \flag{adv\_std\_n1\_probe lp} is requested but
-\src{n1\_preact\_up\_bounds} or \src{relu\_diff\_up\_bounds} are empty
-(e.g.\ Phase~1 was run without also calling
-\src{compute\_diff\_and\_comp\_bounds}, or a rotation perturbation is
-used), the function printed a one-line \texttt{println} and returned
-without populating the probe globals. The outer flow in
-\src{run.jl:898--902} still appended a
-\texttt{\_elimOrg0\_elimPert0} suffix to the filename as though the
-probe had run, and the MIP solve proceeded without Source~C
-tightening. Result files with \texttt{\_n1ProbeLP} in their name could
-therefore represent runs where Source~C silently did nothing.
-
-\textbf{Fix (applied).} Abort the whole Phase~2 invocation when the
-probe is requested but cannot run --- no MIP solve, no result file
-written. This differs from the guide's originally-proposed
-\src{@warn} fix: users care about clean sweep bookkeeping more than
-about best-effort fallback, so we strictly refuse to produce a result
-that would misrepresent the combo.
-
-\textbf{Status.} FIXED 2026-04-19 at
-\src{utils/n1\_probe\_lp.jl:176--196} and \src{run.jl:761--772}.
-\src{compute\_n2\_bounds\_n1\_probe\_lp} now returns \src{Bool}
-(\src{true} on success, \src{false} on any of the four skip paths).
-Phase~2 checks the return value and, when the probe was requested but
-returned \src{false}, prints a clear \texttt{ERROR:} message and
-\src{return}s from \src{main\_advanced\_standard} before the c\_target
-loop --- so no \src{optimize!} runs and no \src{save\_results} is
-called. In the sweep driver, affected combos (most notably
-\texttt{rotation} perturbation with \texttt{probe=lp}) will simply not
-produce result files; \src{\_advstd\_result\_exists} will keep
-returning \src{false} for them, making the gap visible rather than
-pretending the combo was measured.
-
-\subsection{[FIXED] Bug~4: substring collision in \src{perturbed\_interval\_constraints} layer matching}
-
-\textbf{File:} \src{utils/perturbation\_intervals.jl:685, 693}.
-
-\textbf{Symptom.} The code collects per-layer \src{x\_rect} variables
-by substring:
-\begin{lstlisting}[style=jl]
-occursin(clean_prefix * "x_rect" * "_" * "layerCount" * string(layer_cnt),
-         JuMP.name(av[n]))
-\end{lstlisting}
-For \src{layer\_cnt = 1} the substring \texttt{"orgx\_rect\_layerCount1"}
-is also a prefix of \texttt{"orgx\_rect\_layerCount10\_..."}, so
-variables belonging to ReLU layer~10, 11, \ldots\ match the layer~1
-pattern. The constraints added via
-\src{add\_matched\_interval\_constraints!} then pair \emph{different}
-ReLU layers under the same interval bounds, producing either (a)
-over-constrained infeasible MIPs when the bounds conflict, or (b)
-silently wrong (loose in one direction, tight in the other) constraints
-that still happen to be sound because of the clipping at
-\src{perturbation\_intervals.jl:679--680}.
-
-\textbf{Exposure.} All current MNIST models in the repo (3x10, 4x10,
-5x10, cnn0--cnn3) have $\le 6$ ReLU layers, so the collision never
-triggers on the tables in the paper. Any future architecture with
-$\ge 10$ ReLU layers will hit the bug.
-
-\textbf{Fix.} Disambiguate by appending the next separator to the
-pattern so \texttt{"layerCount1"} only matches \texttt{"layerCount1\_"}:
-\begin{lstlisting}[style=jl]
-occursin(clean_prefix * "x_rect_layerCount" * string(layer_cnt) * "_",
-         JuMP.name(av[n]))
-\end{lstlisting}
-(The \src{endswith(\_, "\_$(layer)\_$(neuron)")} guard used in
-\src{apply\_n1\_branch\_priorities!} at
-\src{help\_functions.jl:313} is immune to the same bug because
-\src{endswith} is a full-suffix test, not a substring test.)
-
-\textbf{Status.} FIXED 2026-04-19 at
-\src{utils/perturbation\_intervals.jl:685, 693} (trailing \texttt{\_}
-appended to both clean and perturbed layer-match patterns in
-\src{perturbed\_interval\_constraints}). The same collision pattern
-survives in four sister sites in the same file (lines 408, 416, 607,
-615) in other interval / distillation functions and has not yet been
-patched.
-
-\subsection{[FIXED OPT-IN] Bug~5: \texttt{VarHintVal} set without checking variable bounds}
-
-\textbf{File:} \src{utils/help\_functions.jl:418--428}.
-
-\textbf{Symptom.} \src{apply\_n1\_var\_hints!} blindly copies
-$N_1$'s \src{JuMP.value(v)} as the hint value for every matching
-binary in $N_2$. After T2 bound tightening has eliminated some
-binaries (\src{n1\_neuron\_bounds} collapsed their interval to
-single-signed), those variables simply don't exist in $N_2$'s
-\src{JuMP.all\_variables} and the loop skips them via the
-\src{get(value\_by\_name, name, nothing)} check. But for \emph{other}
-binaries whose $N_2$ encoding was replaced by a triangle relaxation
-(T4), the variable name now starts with
-\src{\{version\}x\_rect\_n1relax\_advstd\_...} (see
-\src{core\_ops.jl:561--564}), which does \emph{not} appear in
-\src{n1\_var\_names} (that suffix was never in $N_1$). So T4-relaxed
-neurons are silently un-hinted; fine. But the paired
-\src{\{version\}a\_...} binary is missing altogether, so the score
-accounting in \src{rank\_to\_priority} (which ranks based on the full
-$N_1$ pseudo-cost dict) still assigns priority to non-existent $N_2$
-binaries and wastes cycles matching them. Cosmetic; no correctness
-impact.
-
-\textbf{Fix.} Filter \src{n1\_pseudocosts} down to names that survive
-in $N_2$ before calling \src{rank\_to\_priority} so the priority
-distribution is computed over the actual hintable set, not the
-pre-relaxation superset.
-
-\textbf{Status.} ADDRESSED OPT-IN 2026-04-19 via the new
-\flag{adv\_std\_var\_hint\_fix} flag (default \texttt{false}). When
-enabled alongside \flag{adv\_std\_var\_hint true}, the flag walks
-\src{JuMP.all\_variables(m\_n2)}, collects the set of names that are
-still binary in $N_2$, and filters \src{n1\_pseudocosts} to that set
-before \src{rank\_to\_priority} at
-\src{utils/help\_functions.jl:415--430}. The filename suffix
-\texttt{\_varHintFix} is appended (in addition to the existing
-\texttt{\_varHint}) so A/B comparisons against pre-fix sweep
-results are unambiguous. The parallel sweep driver
-(\src{run\_relaxation\_sweep.py}) accepts
-\flag{sweep\_adv\_std\_var\_hint\_fix} and auto-prunes
-\texttt{vhf=true $\land$ vh=false} combos. Note: pre-fix varHint
-results are \emph{sound} (the fix affects hint \emph{priority} only, not
-hint \emph{value} or the solved $\delta$), but solve times and hence
-win/tie/loss categorisations may shift slightly under the fix.
-
-\subsection{[FIXED] Bug~6: \src{adv\_std\_lp\_basis} defaults to true even though it's never safe with bound tightening}
-
-\textbf{File:} \src{run.jl:319--323}.
-
-\textbf{Symptom.} The default for \flag{adv\_std\_lp\_basis} is
-\texttt{true}, and the default for \flag{adv\_std\_bound\_tightening}
-is also \texttt{true}. Users running \src{main\_advanced\_standard}
-with no flags get a warning \texttt{"apply\_vbasis!: skipped
-(incompatible with bound tightening)"} (\src{run.jl:942}) on every
-class pair — the basis is loaded from disk, the pointer is threaded
-through the call chain, and then silently discarded. No correctness
-issue but noisy and surprising.
-
-\textbf{Fix.} Change the default of \flag{adv\_std\_lp\_basis} to
-\texttt{false}, or make the flag auto-disable when
-\flag{adv\_std\_bound\_tightening} is \texttt{true}.
-
-\textbf{Status.} FIXED 2026-04-19 at \src{run.jl:327--334}. The flag
-default is now \texttt{false} and the help text explicitly notes the
-flag is a no-op when \flag{adv\_std\_bound\_tightening} is
-\texttt{true}. Users who want LP-basis transfer must opt in
-explicitly. Prior sweep results (where every combo was silently
-tagged \texttt{\_lpBasis} with the basis never actually applied) are
-sound but measurement-identical across \texttt{lb=true}/\texttt{lb=false}
-for \texttt{bt=true} rows; new sweeps will no longer produce that
-duplication by default. The parallel default in
-\src{run\_relaxation\_sweep.py:1860} still reads \texttt{["true"]} —
-left as-is to avoid silently changing sweep behaviour for existing
-invocations that rely on it.
-
-\subsection{[FIXED] Bug~7: \src{apply\_vbasis!} calls MOI.set on the JuMP model, not the backend}
-
-\textbf{File:} \src{utils/hyper\_attack.jl:352}.
-
-\textbf{Symptom.} The call is
-\begin{lstlisting}[style=jl]
-MOI.set(m_n2, Gurobi.VariableAttribute("VBasis"),
-        JuMP.index(v), vbasis[name])
-\end{lstlisting}
-whereas every other Gurobi-attribute call in the codebase uses
-\src{MOI.set(JuMP.backend(m\_n2), Gurobi.VariableAttribute(...))} —
-for example \src{help\_functions.jl:316, 385, 425, 426}. When
-\src{m\_n2} is a \src{JuMP.Model} (the common case), passing it
-directly to \src{MOI.set} can fail with
-\texttt{MOI.UnsupportedAttribute} or silently no-op depending on the
-MOI bridging in use, defeating the purpose of LP-basis transfer.
-
-\textbf{Fix.} Use the backend consistently:
-\begin{lstlisting}[style=jl]
-MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VBasis"),
-        JuMP.index(v), vbasis[name])
-\end{lstlisting}
-This matches the working pattern used by the other four
-attribute-setting functions in the codebase.
-
-\textbf{Status.} FIXED 2026-04-19 at
-\src{utils/hyper\_attack.jl:352} --- \src{MOI.set} now takes
-\src{JuMP.backend(m\_n2)} as its first argument, matching the working
-pattern. Combined with Bug~6's fixed default, LP-basis transfer is now
-functional on the \texttt{bt=false, lb=true} path for users who
-explicitly enable it; prior \texttt{bt=false, lb=true} runs (if any)
-likely no-op'd silently, so their timings may differ from post-fix
-re-runs.
-
-\subsection{[RESOLVED] Non-bug note: Source~B input coverage is looser than paper}
-
-\textbf{File:} \src{utils/perturbation\_intervals.jl:1815--1816}.
-
-The paper states Source~B initialises the absolute-$N_2$ zonotope
-from ``$v_\mathrm{in} \in [0, 1]^n$ with perturbation~$\ep$''. The
-code seeds from
-\[
-  c = 0.5,\quad r = 0.5 + \ep
-\]
-per pixel, so the initial hull is $[-\ep, 1+\ep]$ rather than
-$[0, 1+\ep]$. This is intentional (single zonotope covers both clean
-\emph{and} perturbed copies), sound, but \emph{slightly looser} at the
-input layer than the paper suggests. Not a bug; worth a sentence in
-the paper's description if precision matters.
-
-\textbf{Status.} RESOLVED 2026-04-19 in the paper:
-\src{advstd\_techniques.tex} Source~B paragraph now explicitly
-describes the initial hull as $[-\ep,\, 1+\ep]^n$ and notes the
-single-zonotope rationale. Code unchanged.
+\paragraph{Caching.}
+First call (\src{activation\_start == 1}) pushes each layer's resolved
+\src{phi\_dep} into \src{reuse\_bounds\_conf.reusable\_deps}. On
+subsequent class-pair iterations within the same Phase 2 the
+encoder reuses these resolved depending-relations and skips the
+sub-LP step (lines 209--212). The cache lives in
+\src{help\_functions.jl}'s globals; it is cleared between Phase-2
+runs.
 
 %%─────────────────────────────────────────────────────────────────────
-\section{How to reproduce the top-ranked safe combination}
-\label{sec:repro}
+\section{Reproducing the safe combo end-to-end}
+\label{sec:reproduce}
 
-Combination~\#1 from Table~\ref{tab:instantiation} of the paper is
-\texttt{bp=bounds, varHint=true, zono=true, probe=lp, $\tau=1.0$}. The
-corresponding invocation is (also reproduced from the paper, CLI
-section):
+\subsection{Phase 1 --- solve $N_1$ once}
 
-\begin{lstlisting}[basicstyle=\ttfamily\small, breaklines=true, frame=single]
-julia run.jl --mode advanced_standard_n2 \
-  --dataset mnist --model_name cnn1 \
+\begin{lstlisting}[basicstyle=\ttfamily\small,breaklines=true,frame=single]
+julia run.jl --mode advanced_standard_n1 \
+  --dataset mnist --model_name 3x10 \
   --model_path  /path/to/N1/model.p \
   --model_path2 /path/to/N2/model.p \
-  --perturbation patch --perturbation_size "1,14,14,3" \
+  --perturbation translation --perturbation_size "1,1" \
   --ctag 1 --ct "4,5,6" --timout 1800 \
   --n1_state_dir /path/to/n1_state \
-  --adv_std_mip_start          false  \
-  --adv_std_branch_priorities  bounds \
-  --adv_std_lp_basis           false  \
-  --adv_std_bound_tightening   true   \
-  --adv_std_zono_bounds        true   \
-  --adv_std_n1_probe           lp     \
-  --adv_std_n2_relax_threshold 1.0    \
-  --adv_std_var_hint           true
+  --use_hyper_attack       true \
+  --activate_vaghgar_deps  true \
+  --use_perturbed_intervals true
 \end{lstlisting}
 
-This dispatches to \src{main\_advanced\_standard\_n2}
-(\src{run.jl:1065--1072}) which forwards to
-\src{main\_advanced\_standard} (\src{run.jl:609--953}). The
-\flag{n1\_state\_dir} path must have been populated by a prior
-\texttt{--mode advanced\_standard\_n1} run using the same $N_1$ model
-and class pairs.
+This solves $N_1$'s standard MIP (with PGD warmstart, VHAGaR-deps,
+and perturbed intervals all active) and serialises
+\src{n1\_layers\_info}, the primal solution, and the diff-bound
+inputs into \src{n1\_state}. Repeat per $(c_s, c_t)$ pair.
+
+\subsection{Phase 2 --- the safe combo}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small,breaklines=true,frame=single]
+julia run.jl --mode advanced_standard_n2 \
+  --dataset mnist --model_name 3x10 \
+  --model_path  /path/to/N1/model.p \
+  --model_path2 /path/to/N2/model.p \
+  --perturbation translation --perturbation_size "1,1" \
+  --ctag 1 --ct "4,5,6" --timout 1800 \
+  --n1_state_dir /path/to/n1_state \
+  --use_hyper_attack             true   \   # Cutoff + PGD Start (consumed by prev_pgd)
+  --activate_vaghgar_deps        true   \   # Section 6
+  --use_perturbed_intervals      true   \   # required for sound BoundTightPertRelax
+  --adv_std_bound_tightening     true   \   # Tech 1, prerequisite for tau and prev_pgd
+  --adv_std_zono_bounds          true   \   # zono Source A + B
+  --adv_std_n2_relax_threshold   0.5    \   # Tech 3, tau = 0.5
+  --adv_std_var_hint             prev_pgd   # Tech 2, prev rule + Start consensus
+\end{lstlisting}
+
+\paragraph{Healthy-stdout sanity checks.}
+\begin{itemize}[noitemsep, leftmargin=2em]
+  \item \src{compute\_n2\_relax\_decision!: tau=0.5, both=...
+    org-only=... pert-only=... none=... (plus ... stable neurons)}
+    --- non-zero \src{both + org-only + pert-only}.
+  \item \src{apply\_n1\_var\_hints!: mode=PREV\_PGD, Start-consensus
+    on N of M N2 binaries (pgd-silent-filled=...,
+    pgd-agreed-nop=..., pgd-disagreed-withdrew=..., flipped=...)}
+    --- no abort, \src{N == M}.
+  \item Filename suffix on the saved CSV:
+    \src{...\_N2\_advStd\_BoundTightPertRelax0.5\_zonoBounds\_varHintPrevPGD\_HyperAttackHints\_VagharDeps\_PerturbedIntervals\_cTag\{c\_tag\}}.
+  \item Final \src{delta\_n2} is finite and the run terminates
+    \src{OPTIMAL} or \src{TIME\_LIMIT} with a finite incumbent.
+\end{itemize}
+
+\paragraph{Unsoundness guard.}
+The driver aborts before encoding if
+\flag{adv\_std\_n2\_relax\_threshold}\;\texttt{>}\;0 is paired with
+\flag{use\_perturbed\_intervals}\;\texttt{false}, because the
+soundness argument for tiered BoundTightPertRelax requires the
+inter-copy coupling to remain intact (\fileline{run.jl}{673--680}).
 
 \end{document}

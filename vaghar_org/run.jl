@@ -37,6 +37,7 @@ include("utils/models.jl")
 include("utils/mip.jl")
 include("utils/perturbation_intervals.jl")
 include("utils/n1_probe_lp.jl")
+include("utils/n2_relax_decision.jl")
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -301,29 +302,39 @@ function parse_commandline()
         required = false
         default = true
         "--adv_std_branch_priorities"
-        help = "advanced_standard branch-priority mode: off | bounds | pseudocost. " *
-               "bounds = N1 final bound width → BranchPriority (existing heuristic). " *
-               "pseudocost = N1 Gurobi pseudo-cost rank → BranchPriority (new). " *
-               "Legacy true/false accepted (true → bounds, false → off)."
+        help = "advanced_standard branch-priority mode: off | rank | decay. " *
+               "rank = order N2 binaries by N1 gap, map ranks to [1,100] (uniform spacing). " *
+               "decay = pri = max(1, round(100·exp(-g/g_med))) (magnitude-aware). " *
+               "Legacy true/false accepted (true → rank, false → off). " *
+               "Legacy values 'bounds' and 'pseudocost' are retired and produce a migration error."
         arg_type = String
         required = false
-        default = "bounds"
-        range_tester = x -> x in ("off", "bounds", "pseudocost", "true", "false")
+        default = "rank"
+        # Legacy 'bounds' and 'pseudocost' are accepted here only so the friendly
+        # migration error in main_advanced_standard can fire; otherwise ArgParse
+        # would reject them with a generic message before the shim runs.
+        range_tester = x -> x in ("off", "rank", "decay",
+                                  "bounds", "pseudocost",
+                                  "true", "false")
         "--adv_std_var_hint"
-        help = "advanced_standard variable-hint mode (new, Technique 5): when true, " *
-               "set VarHintVal from N1's optimal binary values and VarHintPri from " *
-               "N1 pseudo-cost rank. Orthogonal to --adv_std_branch_priorities."
-        arg_type = Bool
+        help = "advanced_standard variable-hint mode (Technique 5): " *
+               "off | prev | direct | direct_pgd | prev_pgd. " *
+               "'prev' uses the previous §4.3 rule (shift N1's pre-activation by the diff " *
+               "bound, clip to [l_n2, u_n2], take p from interval-length ratios). " *
+               "'direct' derives p directly from Tech 2's tightened [l_n2, u_n2], without " *
+               "re-introducing the ẑ^N1 midpoint proxy or diff-width noise. " *
+               "'direct_pgd' computes p the same way as 'direct', but routes hint_val into " *
+               "set_start_value() (Gurobi Start) with PGD consensus filtering: fill where PGD " *
+               "is silent, leave where PGD agrees, withdraw where PGD disagrees. VarHintVal/" *
+               "VarHintPri are NOT set under this mode. " *
+               "'prev_pgd' is the same Start-consensus routing applied to 'prev's p_i. " *
+               "Legacy 'true'/'false' still accepted (map to 'prev'/'off') with a deprecation warning. " *
+               "Orthogonal to --adv_std_branch_priorities."
+        arg_type = String
         required = false
-        default = false
-        "--adv_std_var_hint_fix"
-        help = "advanced_standard: when true, filter n1_pseudocosts down to " *
-               "binaries that still exist in N2 (post T2/T4) before ranking " *
-               "priorities. No effect unless --adv_std_var_hint is also true. " *
-               "Opt-in so existing sweep results remain reproducible."
-        arg_type = Bool
-        required = false
-        default = false
+        default = "off"
+        range_tester = x -> lowercase(strip(String(x))) in
+                             ("off", "prev", "direct", "direct_pgd", "prev_pgd", "true", "false")
         "--adv_std_lp_basis"
         help = "advanced_standard: transfer N1's LP basis to N2's root node (Technique 3). " *
                "No effect when --adv_std_bound_tightening is true (guarded — basis is " *
@@ -624,15 +635,17 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
 
     use_mip_start = args["adv_std_mip_start"]
     bp_mode = args["adv_std_branch_priorities"]
-    # Backward compatibility: accept legacy true/false as bounds/off
-    bp_mode = bp_mode == "true"  ? "bounds" :
-              bp_mode == "false" ? "off"    : bp_mode
-    use_var_hint = args["adv_std_var_hint"]
-    use_var_hint_fix = args["adv_std_var_hint_fix"]
-    if use_var_hint_fix && !use_var_hint
-        println("WARNING: --adv_std_var_hint_fix has no effect when " *
-                "--adv_std_var_hint is false.")
+    # Backward compatibility: accept legacy true/false as rank/off
+    bp_mode = bp_mode == "true"  ? "rank" :
+              bp_mode == "false" ? "off"  : bp_mode
+    if bp_mode == "bounds"
+        error("--adv_std_branch_priorities=bounds is retired; use 'rank' (uniform-spacing) or 'decay' (magnitude-aware) instead.")
     end
+    if bp_mode == "pseudocost"
+        error("--adv_std_branch_priorities=pseudocost is retired; use 'rank' or 'decay' instead.")
+    end
+    # Technique 5: 5-valued mode (off/prev/direct/direct_pgd/prev_pgd); see parse_var_hint_mode.
+    var_hint_mode = parse_var_hint_mode(args["adv_std_var_hint"])
     use_lp_basis = args["adv_std_lp_basis"]
     use_bound_tightening = args["adv_std_bound_tightening"]
     use_zono_bounds = args["adv_std_zono_bounds"]
@@ -643,6 +656,29 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         println("WARNING: --adv_std_n2_relax_threshold >= 0 but --adv_std_bound_tightening is " *
                 "false. The relaxation block needs n1_neuron_bounds to be populated, which only " *
                 "happens when bound_tightening is true — no neurons will be relaxed in this run.")
+    end
+    # Unsound-combination guard: Technique 4 (BoundTightPertRelax) relies on the
+    # perturbed-interval coupling constraints to link a relaxed copy's post-ReLU
+    # value to the exact one (see §4.4 of advstd_techniques.tex). Without those
+    # constraints the two copies can drift apart in the joint feasible set and
+    # δ_exact is no longer guaranteed to be reached. Refuse to run rather than
+    # silently produce unsound results.
+    #
+    # τ == 0.0 is treated as "effectively disabled" and allowed through: the gap
+    # formula u·|l| / (2(u-l)) is strictly positive for every split neuron
+    # (l < 0 < u), so gap ≤ 0 is only reachable when the neuron is stable — in
+    # which case Tech 2 has already removed the binary and n2_relax_decision's
+    # stable-both short-circuit skips it. No actual triangle relaxation is
+    # emitted at τ = 0, so no coupling constraint is needed.
+    if adv_std_n2_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
+        println("UNSOUND COMBINATION: --adv_std_n2_relax_threshold > 0 (Technique 4, " *
+                "BoundTightPertRelax) requires --use_perturbed_intervals=true for soundness. " *
+                "Without the perturbed-interval coupling constraints the relaxed and exact " *
+                "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
+                "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
+                "Technique 4 with --adv_std_n2_relax_threshold off (or use τ = 0, which " *
+                "emits no actual relaxations).")
+        return
     end
     n1_state_dir = args["n1_state_dir"]
 
@@ -661,7 +697,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
     println("  Technique 4+ (N1 Probe):           $(args["adv_std_n1_probe"])")
-    println("  Technique 5 (Variable Hints):      $(use_var_hint)")
+    println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
 
     # ── Pre-flight: build n2_check suffix for skip detection ──
@@ -671,17 +707,29 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     else
         n2_check = n2_check * "_N2_advStd"
         if use_mip_start;             n2_check = n2_check * "_mipStart"; end
-        if bp_mode == "bounds";       n2_check = n2_check * "_branchPri"; end
-        if bp_mode == "pseudocost";   n2_check = n2_check * "_branchPriPsd"; end
+        if bp_mode == "rank";         n2_check = n2_check * "_branchPriRank"; end
+        if bp_mode == "decay";        n2_check = n2_check * "_branchPriDecay"; end
         if use_lp_basis;              n2_check = n2_check * "_lpBasis"; end
-        if use_bound_tightening;      n2_check = n2_check * "_boundTight"; end
+        # Technique 6 (BoundTightPertRelax) subsumes bound-tightening — when
+        # τ ≥ 0 we emit _BoundTightPertRelax{τ} instead of _boundTight since
+        # the relaxation logically depends on bound-tightening being active.
+        if use_bound_tightening
+            if args["adv_std_n2_relax_threshold"] >= 0.0
+                n2_check = n2_check * "_BoundTightPertRelax" * string(args["adv_std_n2_relax_threshold"])
+            else
+                n2_check = n2_check * "_boundTight"
+            end
+        end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
         if args["adv_std_n1_probe"] == "lp"; n2_check = n2_check * "_n1ProbeLP"; end
-        if args["adv_std_n2_relax_threshold"] >= 0.0
-            n2_check = n2_check * "_relaxT" * string(args["adv_std_n2_relax_threshold"])
-        end
-        if use_var_hint;              n2_check = n2_check * "_varHint"; end
-        if use_var_hint && use_var_hint_fix; n2_check = n2_check * "_varHintFix"; end
+        # Mode-specific varHint filename tag. Keep the legacy "_varHintFixed"
+        # token for VH_PREV (so historical result files keep comparing cleanly);
+        # VH_DIRECT emits "_varHintDirect"; VH_DIRECT_PGD emits "_varHintDirectPGD";
+        # VH_PREV_PGD emits "_varHintPrevPGD".
+        if var_hint_mode == VH_PREV;       n2_check = n2_check * "_varHintFixed";     end
+        if var_hint_mode == VH_DIRECT;     n2_check = n2_check * "_varHintDirect";    end
+        if var_hint_mode == VH_DIRECT_PGD; n2_check = n2_check * "_varHintDirectPGD"; end
+        if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
     if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
     if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps"; end
@@ -729,9 +777,12 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             end
 
             if load_n1_from_disk
-                load_n1_diff_bounds!(n1_state_dir)
+                # Phase-2 loads from disk. diff_bounds.bin is mandatory;
+                # n1_preact_bounds.bin is mandatory iff zono (Source B) is active.
+                # Both loads crash-on-miss rather than silently degrading.
+                load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
             elseif use_zono_bounds
-                # Source A: zonotope diff bounds (tighter than interval for deep nets)
+                # No state dir — compute diff bounds on the fly (no Phase 1 to load from).
                 global use_zonotope = true
                 println("Advanced-standard: computing zonotope diff bounds (Source A) between N1 and N2...")
                 compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
@@ -798,11 +849,11 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             n1_var_names, n1_var_values = String[], Float64[]
             n1_layers_info = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
             n1_vbasis = Dict{String, Int}()
-            n1_pseudocosts = nothing
 
             if load_n1_from_disk
                 println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
-                n1_var_names, n1_var_values, n1_layers_info, n1_vbasis, n1_pseudocosts = load_n1_state(n1_state_dir, c_tag, c_target)
+                n1_var_names, n1_var_values, n1_layers_info, n1_vbasis =
+                    load_n1_state(n1_state_dir, c_tag, c_target; require_vbasis=use_lp_basis)
             else
                 println("\n══ Advanced-standard PASS 1: solving N1 (c_tag=$c_tag, c_target=$c_target) ══")
                 suboptimal_solution_n1, suboptimal_time_n1 = 0, 0
@@ -845,7 +896,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
                 n1_layers_info = deepcopy(layers_info_dict)
                 n1_vbasis = extract_vbasis(m_n1)
-                n1_pseudocosts = extract_pseudocosts(m_n1)
                 m_n1 = nothing
             end
 
@@ -867,13 +917,13 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:suboptimal_time] = suboptimal_time_n2
             d_n2[:adv_std_flags] = (
                 adv_std_mip_start            = args["adv_std_mip_start"],
-                adv_std_branch_priorities    = args["adv_std_branch_priorities"],
+                adv_std_branch_priorities    = bp_mode,
                 adv_std_lp_basis             = args["adv_std_lp_basis"],
                 adv_std_bound_tightening     = args["adv_std_bound_tightening"],
                 adv_std_zono_bounds          = args["adv_std_zono_bounds"],
                 adv_std_n1_probe             = args["adv_std_n1_probe"],
                 adv_std_n2_relax_threshold   = args["adv_std_n2_relax_threshold"],
-                adv_std_var_hint             = args["adv_std_var_hint"],
+                adv_std_var_hint             = var_hint_mode_label(var_hint_mode),   # "off" | "prev" | "direct"
                 gurobi_seed                  = args["gurobi_seed"],
             )
             optimizer = Gurobi.Optimizer
@@ -887,6 +937,16 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # Technique 6: reset the relaxed-binary counters per c_target so
             # the filename reflects the counts for *this specific* MIP build.
             clear_n2_relaxed_counters!()
+
+            # Technique 6 (BoundTightPertRelax): precompute the per-copy
+            # relaxation decision using N2's own tightened bounds (Sources
+            # A/B/C, now populated above). relu() consults the resulting
+            # n2_relax_decision dict instead of re-scoring from N1's bounds.
+            if adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
+                compute_n2_relax_decision!(adv_std_n2_relax_threshold)
+            else
+                clear_n2_relax_decision!()
+            end
 
             bounds_time_n2 = @elapsed begin
                 merge!(d_n2, get_model(w, h, k, perturbation, perturbation_size, nn2, zeros(Float64, 1, w, h, k), optimizer,
@@ -906,17 +966,26 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             else
                 n2_name = name_to_save * "_N2_advStd"
                 if use_mip_start;             n2_name = n2_name * "_mipStart"; end
-                if bp_mode == "bounds";       n2_name = n2_name * "_branchPri"; end
-                if bp_mode == "pseudocost";   n2_name = n2_name * "_branchPriPsd"; end
+                if bp_mode == "rank";         n2_name = n2_name * "_branchPriRank"; end
+                if bp_mode == "decay";        n2_name = n2_name * "_branchPriDecay"; end
                 if use_lp_basis;              n2_name = n2_name * "_lpBasis"; end
-                if use_bound_tightening;      n2_name = n2_name * "_boundTight"; end
+                # See n2_check builder above: _BoundTightPertRelax subsumes _boundTight.
+                if use_bound_tightening
+                    if args["adv_std_n2_relax_threshold"] >= 0.0
+                        n2_name = n2_name * "_BoundTightPertRelax" * string(args["adv_std_n2_relax_threshold"])
+                    else
+                        n2_name = n2_name * "_boundTight"
+                    end
+                end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
                 if args["adv_std_n1_probe"] == "lp"; n2_name = n2_name * "_n1ProbeLP"; end
-                if args["adv_std_n2_relax_threshold"] >= 0.0
-                    n2_name = n2_name * "_relaxT" * string(args["adv_std_n2_relax_threshold"])
-                end
-                if use_var_hint;              n2_name = n2_name * "_varHint"; end
-                if use_var_hint && use_var_hint_fix; n2_name = n2_name * "_varHintFix"; end
+                # See n2_check builder above: VH_PREV keeps the legacy tag,
+                # VH_DIRECT emits "_varHintDirect", VH_DIRECT_PGD emits "_varHintDirectPGD",
+                # VH_PREV_PGD emits "_varHintPrevPGD".
+                if var_hint_mode == VH_PREV;       n2_name = n2_name * "_varHintFixed";     end
+                if var_hint_mode == VH_DIRECT;     n2_name = n2_name * "_varHintDirect";    end
+                if var_hint_mode == VH_DIRECT_PGD; n2_name = n2_name * "_varHintDirectPGD"; end
+                if var_hint_mode == VH_PREV_PGD;   n2_name = n2_name * "_varHintPrevPGD";   end
             end
             # Append the probe's binary-elimination counts (org + pert split)
             # as the LAST suffix so pre-flight substring matching (which uses
@@ -950,15 +1019,18 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
 
             MOI.set(m_n2, Gurobi.CallbackFunction(), my_callback)
             # Technique 2: Branching priorities (must be after mip_set_attr to bridge Gurobi backend)
-            if bp_mode == "bounds"
-                apply_n1_branch_priorities!(m_n2, n1_layers_info)
-            elseif bp_mode == "pseudocost"
-                apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info)
+            if bp_mode == "rank"
+                apply_n1_branch_priorities_rank!(m_n2, n1_layers_info)
+            elseif bp_mode == "decay"
+                apply_n1_branch_priorities_decay!(m_n2, n1_layers_info)
             end
-            # Technique 5: Variable hints (independent of bp_mode; both can be active)
-            if use_var_hint
-                apply_n1_var_hints!(m_n2, n1_var_names, n1_var_values, n1_pseudocosts;
-                                    fix_mode=use_var_hint_fix)
+            # Technique 5: Variable hints (independent of bp_mode; both can be active).
+            # Mode ∈ {off, prev, direct, direct_pgd, prev_pgd}; apply_n1_var_hints!
+            # early-returns on VH_OFF. The *_PGD modes additionally consume PGD's
+            # Start values (set by hyper_attack_hints above), so they must run
+            # after the hyper_attack_hints call at line ~999.
+            if var_hint_mode != VH_OFF
+                apply_n1_var_hints!(m_n2, var_hint_mode, n1_var_names, n1_var_values, n1_layers_info)
             end
             # Technique 3: LP Basis transfer from N1
             # Skip when bound tightening is active — the model structure changes
@@ -1026,7 +1098,25 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
                 println("Advanced-standard-N1: computing diff bounds between N1 and N2...")
                 compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
             end
-            save_n1_diff_bounds(n1_state_dir)
+            # Preserve existing on-disk diff_bounds when completing a partial
+            # state dir: per-pair n1_vars/n1_layers/... files already on disk
+            # were produced against those saved bounds, and overwriting with
+            # freshly-recomputed bounds (which can differ in the last ULPs due
+            # to Gurobi LP threading) would desync old vs new pair files.
+            # In-memory globals are still populated above so this c_tag's
+            # per-c_target N1 MIPs get the comp-bound tightening.
+            diff_bounds_path = joinpath(n1_state_dir, "diff_bounds.bin")
+            preact_path = joinpath(n1_state_dir, "n1_preact_bounds.bin")
+            if !isfile(diff_bounds_path)
+                save_n1_diff_bounds(n1_state_dir)
+            elseif !isfile(preact_path) && !isempty(n1_preact_up_bounds)
+                # Diff bounds on disk, but n1_preact upgrade available.
+                # Write only the new preact file; leave diff_bounds.bin alone.
+                serialize(preact_path, (n1_preact_up_bounds, n1_preact_down_bounds))
+                println("Advanced-standard-N1: preserved existing diff_bounds.bin; wrote new n1_preact_bounds.bin to $n1_state_dir")
+            else
+                println("Advanced-standard-N1: preserved existing diff_bounds.bin + n1_preact_bounds.bin at $n1_state_dir (partial-completion mode)")
+            end
         end
 
         for c_target in c_targets
@@ -1075,8 +1165,7 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
             n1_layers_info = deepcopy(layers_info_dict)
             n1_vbasis = extract_vbasis(m_n1)
-            n1_pseudocosts = extract_pseudocosts(m_n1)
-            save_n1_state(n1_state_dir, c_tag, c_target, n1_var_names, n1_var_values, n1_layers_info, n1_vbasis; n1_pseudocosts=n1_pseudocosts)
+            save_n1_state(n1_state_dir, c_tag, c_target, n1_var_names, n1_var_values, n1_layers_info, n1_vbasis)
 
             mip_reuse_bounds()
             m_n1 = nothing

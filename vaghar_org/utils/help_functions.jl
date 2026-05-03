@@ -297,46 +297,100 @@ function clear_n2_relaxed_counters!()
     global n_n2_relaxed_binaries_pert = 0
 end
 
-"""
-    apply_n1_branch_priorities!(m_n2, n1_layers_info)
+# ── advstd Technique 6 (BoundTightPertRelax): per-copy relax decision ──────
+# Precomputed once per N2 build (after all bound-tightening sources have
+# populated their globals). Maps (layer, neuron) → (relax_org, relax_pert).
+# core_ops.jl::relu() consults this dict to decide whether to emit the
+# exact big-M encoding or a triangle LP relaxation for each copy.
+global n2_relax_decision = Dict{Tuple{Int,Int}, Tuple{Bool,Bool}}()
 
-Set Gurobi BranchPriority for N2's binary variables based on N1's bound tightness.
-Neurons with tighter bounds (smaller |u - l|) in N1 get higher priority in N2,
-since they were likely the most contested during N1's solve.
-"""
-function apply_n1_branch_priorities!(m_n2, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
-    applied = 0
-    for v in JuMP.all_variables(m_n2)
-        if JuMP.is_binary(v)
-            vname = JuMP.name(v)
-            for ((layer, neuron), (u, l, _)) in n1_layers_info
-                if occursin("_$(layer)_$(neuron)", vname) && endswith(vname, "_$(layer)_$(neuron)")
-                    gap = abs(u - l)
-                    priority = gap < 1.0 ? 10 : (gap < 5.0 ? 5 : 1)
-                    MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), priority)
-                    applied += 1
-                    break
-                end
-            end
-        end
-    end
-    println("apply_n1_branch_priorities!: set priorities for $applied binaries")
+function clear_n2_relax_decision!()
+    global n2_relax_decision = Dict{Tuple{Int,Int}, Tuple{Bool,Bool}}()
 end
 
 """
-    compute_n1_var_scores(n1_pseudocosts)
+    _collect_binary_gaps(m_n2, n1_layers_info) -> Dict{String, Float64}
 
-Compute per-variable importance scores from Gurobi N1 pseudo-cost statistics.
-The score `pd_down * n_down + pd_up * n_up` is the total LP objective
-improvement that Gurobi attributed to branching on that variable during N1.
-Variables Gurobi never branched on get score 0.
+Walk N2's binary variables, match each to its N1 (layer, neuron) entry by
+JuMP variable name, and return a Dict mapping vname → gap = |u - l|. Shared
+by both branch-priority modes (rank, decay) so the matching logic stays in
+one place.
 """
-function compute_n1_var_scores(n1_pseudocosts)
-    scores = Dict{String, Float64}()
-    for (name, pc) in n1_pseudocosts
-        scores[name] = pc.pd_down * pc.n_down + pc.pd_up * pc.n_up
+function _collect_binary_gaps(m_n2, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    gaps = Dict{String, Float64}()
+    for v in JuMP.all_variables(m_n2)
+        JuMP.is_binary(v) || continue
+        vname = JuMP.name(v)
+        for ((layer, neuron), (u, l, _)) in n1_layers_info
+            if occursin("_$(layer)_$(neuron)", vname) && endswith(vname, "_$(layer)_$(neuron)")
+                gaps[vname] = abs(u - l)
+                break
+            end
+        end
     end
-    return scores
+    return gaps
+end
+
+"""
+    apply_n1_branch_priorities_rank!(m_n2, n1_layers_info)
+
+Rank-based BranchPriority: orders N2 binaries by N1 gap ascending (smaller
+gap → higher priority), then maps ranks to priorities in [1, 100] via the
+existing `rank_to_priority` helper. Only constant: max_pri=100 (Gurobi's
+integer ceiling). Tie-broken by Gurobi's internal pseudocost.
+"""
+function apply_n1_branch_priorities_rank!(m_n2, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    gaps = _collect_binary_gaps(m_n2, n1_layers_info)
+    if isempty(gaps)
+        println("apply_n1_branch_priorities_rank!: no matching binaries found")
+        return
+    end
+    G_max = maximum(values(gaps))
+    # +ε guarantees the largest-gap neuron has score > 0 so rank_to_priority
+    # doesn't bucket it to priority 0 (which it reserves for score ≤ 0).
+    scores = Dict{String, Float64}(vname => G_max - g + 1e-9 for (vname, g) in gaps)
+    priorities = rank_to_priority(scores)
+    applied = 0
+    for v in JuMP.all_variables(m_n2)
+        JuMP.is_binary(v) || continue
+        pri = get(priorities, JuMP.name(v), nothing)
+        pri === nothing && continue
+        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), pri)
+        applied += 1
+    end
+    println("apply_n1_branch_priorities_rank!: assigned BranchPriority to $applied binaries (G_max=$(round(G_max, digits=4)))")
+end
+
+"""
+    apply_n1_branch_priorities_decay!(m_n2, n1_layers_info)
+
+Magnitude-aware BranchPriority: pri = max(1, round(100·exp(-g/g_med))) where
+g_med is the median gap. Distinguishes neurons with very small gaps from
+those with merely small gaps; collapses heavy-tail outliers to priority 1.
+Only constants: max_pri=100 and the data-derived g_med.
+"""
+function apply_n1_branch_priorities_decay!(m_n2, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    gaps = _collect_binary_gaps(m_n2, n1_layers_info)
+    if isempty(gaps)
+        println("apply_n1_branch_priorities_decay!: no matching binaries found")
+        return
+    end
+    sorted_g = sort(collect(values(gaps)))
+    n = length(sorted_g)
+    g_med = isodd(n) ? sorted_g[(n+1)÷2] : (sorted_g[n÷2] + sorted_g[n÷2 + 1]) / 2
+    # If every gap is 0 the formula has no signal; fall back so every neuron
+    # gets max priority rather than dividing by zero.
+    g_med <= 0 && (g_med = 1.0)
+    applied = 0
+    for v in JuMP.all_variables(m_n2)
+        JuMP.is_binary(v) || continue
+        g = get(gaps, JuMP.name(v), nothing)
+        g === nothing && continue
+        pri = max(1, round(Int, 100 * exp(-g / g_med)))
+        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), pri)
+        applied += 1
+    end
+    println("apply_n1_branch_priorities_decay!: assigned BranchPriority to $applied binaries (g_med=$(round(g_med, digits=4)))")
 end
 
 """
@@ -361,94 +415,329 @@ function rank_to_priority(scores::Dict{String, Float64}; max_pri::Int=100)
     return priorities
 end
 
-"""
-    apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info)
+# ── Technique 5 (Variable Hints) mode ────────────────────────────────────
+# Four methods share the hint-value formula; they differ in how the transfer
+# probability p_i is computed and which Gurobi channel carries the result.
+#   VH_PREV       — shift N1's achieved pre-activation ẑ^N1 by the diff bound,
+#                   clip to [l_n2, u_n2], take p from that interval's lengths.
+#                   Output: VarHintVal + VarHintPri (soft hints).
+#   VH_DIRECT     — take p directly from how lopsided [l_n2, u_n2] is around 0.
+#                   Output: VarHintVal + VarHintPri (soft hints).
+#   VH_DIRECT_PGD — same p as VH_DIRECT, but the hint_val is routed into
+#                   set_start_value() (Gurobi Start), filtered by PGD consensus:
+#                   fill where PGD is silent, leave where PGD agrees, withdraw
+#                   where PGD disagrees. No VarHintVal / VarHintPri written.
+#   VH_PREV_PGD   — same p as VH_PREV (shift-and-clip from ẑ^N1), routed
+#                   through set_start_value() with the same PGD consensus
+#                   filter as VH_DIRECT_PGD. No VarHintVal / VarHintPri written.
+# See §4.3 of advstd_techniques.tex and compute_varhint{,_direct} below.
+@enum VarHintMode VH_OFF VH_PREV VH_DIRECT VH_DIRECT_PGD VH_PREV_PGD
 
-Gurobi `BranchPriority` mode that uses N1's measured pseudo-cost × branch-count
-ranking (instead of the bound-width heuristic). Falls back to the bounds-based
-`apply_n1_branch_priorities!` if pseudo-costs are unavailable (e.g. legacy
-saved N1 state with no pseudocost file).
 """
-function apply_n1_branch_priorities_pseudocost!(m_n2, n1_pseudocosts, n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
-    if n1_pseudocosts === nothing || isempty(n1_pseudocosts)
-        @warn "pseudocost bp mode requested but n1_pseudocosts is empty — falling back to bounds heuristic"
-        apply_n1_branch_priorities!(m_n2, n1_layers_info)
-        return
+    parse_var_hint_mode(s::AbstractString) -> VarHintMode
+
+Accepts `{"off", "prev", "direct", "direct_pgd", "prev_pgd"}` (case-insensitive).
+Legacy Boolean values `{"true", "false"}` are still accepted and map as
+`"true" → VH_PREV`, `"false" → VH_OFF` with a one-time deprecation warning.
+Any other value raises.
+"""
+function parse_var_hint_mode(s::AbstractString)
+    t = lowercase(strip(String(s)))
+    if t == "off" || t == "false"
+        t == "false" && @warn "adv_std_var_hint=false is deprecated; use adv_std_var_hint=off" maxlog=1
+        return VH_OFF
+    elseif t == "prev" || t == "true"
+        t == "true" && @warn "adv_std_var_hint=true is deprecated; use adv_std_var_hint=prev" maxlog=1
+        return VH_PREV
+    elseif t == "direct"
+        return VH_DIRECT
+    elseif t == "direct_pgd"
+        return VH_DIRECT_PGD
+    elseif t == "prev_pgd"
+        return VH_PREV_PGD
+    else
+        error("Invalid --adv_std_var_hint value: '$(s)'. Expected one of {off, prev, direct, direct_pgd, prev_pgd} (true/false accepted for backward compatibility).")
     end
-    priorities = rank_to_priority(compute_n1_var_scores(n1_pseudocosts))
-    applied = 0
-    for v in JuMP.all_variables(m_n2)
-        if !JuMP.is_binary(v); continue; end
-        name = JuMP.name(v)
-        pri = get(priorities, name, nothing)
-        if pri === nothing; continue; end
-        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), pri)
-        applied += 1
-    end
-    println("apply_n1_branch_priorities_pseudocost!: assigned BranchPriority to $applied N2 binaries " *
-            "(from $(length(priorities)) N1 pseudocost entries)")
 end
 
 """
-    apply_n1_var_hints!(m_n2, n1_var_names, n1_var_values, n1_pseudocosts;
-                        fix_mode=false)
+    var_hint_mode_label(m::VarHintMode) -> String
 
-Set Gurobi `VarHintVal` and `VarHintPri` on N2 binaries, using N1's optimal
-binary values as the hint value and N1 pseudo-cost rank as the hint priority.
-Unlike `BranchPriority`, these hints are soft and affect both the heuristics
-and the branching rule. If pseudo-costs are unavailable, all priorities default
-to a low uniform value (10) so Gurobi treats the hints as low-confidence.
-
-When `fix_mode=true`, filter `n1_pseudocosts` down to names that still exist
-as binaries in `m_n2` (post T2 elimination and T4 triangle relaxation) before
-ranking, so the priority distribution is computed over the actual hintable set
-rather than the pre-relaxation superset.
+Lower-case label matching the CLI/sweep vocabulary (`"off"`, `"prev"`,
+`"direct"`, `"direct_pgd"`, `"prev_pgd"`). Used when serialising the mode back
+into result CSVs so the downstream pipeline sees the same tokens it accepted
+on the command line.
 """
-function apply_n1_var_hints!(m_n2, n1_var_names::Vector{String},
+function var_hint_mode_label(m::VarHintMode)
+    m == VH_OFF        && return "off"
+    m == VH_PREV       && return "prev"
+    m == VH_DIRECT     && return "direct"
+    m == VH_DIRECT_PGD && return "direct_pgd"
+    m == VH_PREV_PGD   && return "prev_pgd"
+    error("unknown VarHintMode: $m")
+end
+
+"""
+    hint_from_p(v1_bit::Int, p::Float64) -> (hint_val::Int, hint_pri::Int)
+
+Shared tail of the VarHint rule used by both VH_PREV and VH_DIRECT. Agrees
+with N1 when `p ≥ 0.5`, flips when `p < 0.5`; priority is a V-shape in `p`,
+maxing at 100 when `p ∈ {0, 1}` and floored at 1 (priority 0 is reserved by
+Gurobi for "ignore"). Factored out so the two branches cannot drift in how
+they translate a transfer probability into an advisory hint.
+"""
+function hint_from_p(v1_bit::Int, p::Float64)
+    hint_val = (p >= 0.5) ? v1_bit : 1 - v1_bit
+    hint_pri = max(1, round(Int, 100 * abs(2 * p - 1)))
+    return (hint_val, hint_pri)
+end
+
+"""
+    compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
+
+Mode **VH_PREV** — previous §4.3 rule. Shifts N1's achieved pre-activation
+`z1_preact` by the weight-drift diff bound `[d_lo, d_hi]` to form the
+predicted N2 pre-activation interval, clips to `[l_n2, u_n2]`, and takes
+`p` as the fraction of the clipped interval on N1's side of zero
+(`v1_bit=0` → `(-inf, 0]`; `v1_bit=1` → `[0, +inf)`).
+
+Caller must only pass surviving binaries (`l_n2 < 0 < u_n2`). Returns
+`(hint_val, hint_pri)` via `hint_from_p`.
+"""
+function compute_varhint(z1_preact::Float64, v1_bit::Int, d_lo::Float64, d_hi::Float64,
+                         l_n2::Float64, u_n2::Float64)
+    # Shifted interval I_i = [z1 + d_lo, z1 + d_hi], clipped to N2's sound bounds.
+    I_lo = max(l_n2, z1_preact + d_lo)
+    I_hi = min(u_n2, z1_preact + d_hi)
+    if I_lo >= I_hi                       # degenerate (empty or point)
+        return (v1_bit, 1)
+    end
+    len = I_hi - I_lo
+    # Length of the portion of the clipped interval supporting N1's choice:
+    #   v1_bit == 0 → supporting side is (-inf, 0], length = min(I_hi, 0) - I_lo
+    #   v1_bit == 1 → supporting side is [0, +inf), length = I_hi - max(I_lo, 0)
+    L_support = (v1_bit == 0) ? max(0.0, min(I_hi, 0.0) - I_lo) :
+                                max(0.0, I_hi - max(I_lo, 0.0))
+    p = L_support / len                   # in [0, 1]
+    return hint_from_p(v1_bit, p)
+end
+
+"""
+    compute_varhint_direct(v1_bit, l_n2, u_n2)
+
+Mode **VH_DIRECT** — new rule. Derives the transfer probability `p` directly
+from Tech 2's tightened pre-activation range `[l_n2, u_n2]`, without
+constructing any shifted interval or using N1's pre-activation scalar:
+
+  `v1_bit = 0`:  `p = (-l_n2) / (u_n2 - l_n2)`  — fraction of `[l_n2, u_n2]` in `R⁻`
+  `v1_bit = 1`:  `p =   u_n2  / (u_n2 - l_n2)`  — fraction of `[l_n2, u_n2]` in `R⁺`
+
+Self-calibrates: a wider diff bound flows through Tech 2 to produce a wider
+`[l_n2, u_n2]`, pulling `p` toward 0.5 and automatically lowering the hint
+priority. No midpoint-proxy error, no diff-width false confidence.
+
+Precondition: `l_n2 < 0 < u_n2` (enforced upstream by Tech 2 elimination).
+Returns `(hint_val, hint_pri)` via `hint_from_p`.
+"""
+function compute_varhint_direct(v1_bit::Int, l_n2::Float64, u_n2::Float64)
+    @assert l_n2 < 0 && u_n2 > 0 "compute_varhint_direct expects a split neuron (l_n2 < 0 < u_n2), got [$l_n2, $u_n2]"
+    W = u_n2 - l_n2
+    side_len = (v1_bit == 0) ? -l_n2 : u_n2
+    p = side_len / W
+    return hint_from_p(v1_bit, p)
+end
+
+"""
+    apply_n1_var_hints!(m_n2, mode, n1_var_names, n1_var_values, n1_layers_info)
+
+Set Gurobi hints on N2 binaries. `mode` is a `VarHintMode` enum:
+
+  * `VH_OFF` — return without setting any hint.
+  * `VH_PREV` — use `compute_varhint` (shift ẑ^N1 by diff bound, clip, take p).
+    Output: `VarHintVal` + `VarHintPri`.
+  * `VH_DIRECT` — use `compute_varhint_direct` (p from [l_n2, u_n2] directly).
+    Output: `VarHintVal` + `VarHintPri`.
+  * `VH_DIRECT_PGD` — same p as `VH_DIRECT`, but route `hint_val` through
+    `set_start_value` filtered by PGD consensus. For each surviving binary:
+    if PGD is silent (no Start set yet), fill with `hint_val`; if PGD agrees
+    with `hint_val`, leave PGD's value in place; if PGD disagrees, call
+    `set_start_value(a_i, nothing)` to withdraw both. **No `VarHintVal`/
+    `VarHintPri` is written under this mode** — MIPStart is the sole channel.
+  * `VH_PREV_PGD` — same p as `VH_PREV` (shift-and-clip from ẑ^N1), routed
+    through the same Start-consensus filter as `VH_DIRECT_PGD`. No
+    `VarHintVal`/`VarHintPri` is written.
+
+For each surviving N2 binary `a_i` (with `l^{N2}_i < 0 < u^{N2}_i`):
+
+  1. Look up N1's binary value `v^{N1}_i` by matching variable name in
+     `n1_var_values`.
+  2. Dispatch on `mode` to compute `(hint_val, hint_pri)` (hint_pri is
+     ignored under `VH_*_PGD`):
+       - `VH_PREV` / `VH_PREV_PGD`: also look up `z1_preact` (x_rect for
+         active neurons, `l^{N1}_i / 2` for inactive) and the diff bound
+         `[d_lo, d_hi]`.
+       - `VH_DIRECT` / `VH_DIRECT_PGD`: use only `v1_bit, l_n2, u_n2` — no N1
+         preact, no diff.
+  3. Emit:
+       - `VH_PREV` / `VH_DIRECT`: set `VarHintVal` and `VarHintPri`.
+       - `VH_DIRECT_PGD` / `VH_PREV_PGD`: run the Start-consensus update above.
+
+`VH_PREV` and `VH_PREV_PGD` use globals `relu_diff_up_bounds`/
+`relu_diff_down_bounds` (populated by `load_n1_diff_bounds!` in Phase 2).
+`VH_DIRECT` and `VH_DIRECT_PGD` use only the current `layers_info_dict` (N2's
+final tightened bounds after Tech 2 integration). `VH_DIRECT_PGD` and
+`VH_PREV_PGD` additionally read `JuMP.start_value(v)` on each binary,
+expecting PGD's hints (set by `hyper_attack_hints()`) to have already run for
+this N2 MIP.
+
+**Soundness.** Under all modes the set attributes (`VarHintVal`, `VarHintPri`,
+`Start`) are advisory. No constraint, coefficient, or variable bound is
+modified. MIP feasible set is unchanged, so δ_exact is preserved whenever the
+solver terminates at OPTIMAL.
+"""
+function apply_n1_var_hints!(m_n2, mode::VarHintMode,
+                             n1_var_names::Vector{String},
                              n1_var_values::Vector{Float64},
-                             n1_pseudocosts;
-                             fix_mode::Bool=false)
-    if isempty(n1_var_names)
-        println("apply_n1_var_hints!: no N1 values to hint")
+                             n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
+    if mode == VH_OFF
+        println("apply_n1_var_hints!: mode=off, no hints set")
         return
     end
-    # Build name → value lookup from the parallel vectors
+    if isempty(n1_var_names)
+        println("apply_n1_var_hints!: no N1 values to hint (mode=$(mode))")
+        return
+    end
+    @assert length(n1_var_names) == length(n1_var_values) "n1_var_names and n1_var_values length mismatch ($(length(n1_var_names)) vs $(length(n1_var_values)))"
+    # PREV and PREV_PGD need diff bounds populated by load_n1_diff_bounds!;
+    # DIRECT variants do not.
+    if (mode == VH_PREV || mode == VH_PREV_PGD) &&
+       (isempty(relu_diff_up_bounds) || isempty(relu_diff_down_bounds))
+        error("apply_n1_var_hints!: mode=$(var_hint_mode_label(mode)) requires relu_diff_*_bounds globals. " *
+              "Ensure load_n1_diff_bounds! or compute_diff_bounds_* has run before Phase 2 MIP build.")
+    end
+    # Name → value lookup for N1's primal.
     value_by_name = Dict{String, Float64}()
     for i in eachindex(n1_var_names)
         value_by_name[n1_var_names[i]] = n1_var_values[i]
     end
-    # Priority source: pseudo-cost rank if available, else low uniform
-    if n1_pseudocosts === nothing || isempty(n1_pseudocosts)
-        @warn "apply_n1_var_hints!: n1_pseudocosts empty — using uniform priority 10 (low confidence)"
-        priority_by_name = Dict{String, Int}(name => 10 for name in n1_var_names)
-    elseif fix_mode
-        n2_binary_names = Set{String}()
-        for v in JuMP.all_variables(m_n2)
-            if JuMP.is_binary(v)
-                push!(n2_binary_names, JuMP.name(v))
-            end
-        end
-        filtered_pc = Dict(name => pc for (name, pc) in n1_pseudocosts
-                           if name in n2_binary_names)
-        priority_by_name = rank_to_priority(compute_n1_var_scores(filtered_pc))
-        println("apply_n1_var_hints!: fix_mode=true, filtered " *
-                "$(length(n1_pseudocosts)) N1 pseudocost entries down to " *
-                "$(length(filtered_pc)) N2-surviving entries before ranking")
-    else
-        priority_by_name = rank_to_priority(compute_n1_var_scores(n1_pseudocosts))
-    end
+    # Number of ReLU layers per network copy; layers 1..K are the org copy,
+    # K+1..2K are the pert copy. Same diff bound applies to both copies.
+    # Only needed under VH_PREV / VH_PREV_PGD (the diff-bound lookup path).
+    K = (mode == VH_PREV || mode == VH_PREV_PGD) ? length(relu_diff_up_bounds) : 0
     applied = 0
+    flipped = 0
+    n2_binary_count = 0
+    n_tier1_skipped = 0
+    n_no_match = 0
+    # PGD Start-consensus bucket counters (used by VH_DIRECT_PGD and VH_PREV_PGD).
+    n_pgd_silent_filled     = 0
+    n_pgd_agreed_nop        = 0
+    n_pgd_disagreed_withdrew = 0
     for v in JuMP.all_variables(m_n2)
         if !JuMP.is_binary(v); continue; end
-        name = JuMP.name(v)
-        value = get(value_by_name, name, nothing)
-        if value === nothing; continue; end
-        pri = get(priority_by_name, name, 0)
-        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), value)
-        MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), pri)
-        applied += 1
+        n2_binary_count += 1
+        bin_name = JuMP.name(v)
+        v1_raw = get(value_by_name, bin_name, nothing)
+        if v1_raw === nothing
+            n_no_match += 1
+            continue
+        end
+        v1_bit = Int(round(v1_raw))  # N1's binary incumbent, rounded to {0,1}
+        # Parse (layer, neuron) from the binary's name. ReLU binaries are named
+        # "{nv}a_layerCount{lc}_neuronCount{nc}_{layer}_{neuron}" (see
+        # MIPVerify core_ops.jl). Other binaries live in the same MIP —
+        # conf_n1_bin_k, conf_n1_est_bin_k, max-anonymous (from maximum_ge) —
+        # and we must skip them, not parse. The regex matches only the ReLU shape.
+        rgx_match = match(r"a_layerCount\d+_neuronCount\d+_(\d+)_(\d+)$", bin_name)
+        rgx_match === nothing && continue
+        layer = parse(Int, rgx_match.captures[1])
+        neuron = parse(Int, rgx_match.captures[2])
+        # N2's tightened bounds (global layers_info_dict was rebuilt during N2's
+        # MIP construction with Tech 2's final integration).
+        haskey(layers_info_dict, (layer, neuron)) || continue
+        (u_n2, l_n2, _var_idx) = layers_info_dict[(layer, neuron)]
+        # Tier 1: Tech 2 already eliminated this binary. Should be unreachable
+        # because relu() would not have created the binary — defensive skip.
+        if l_n2 >= 0 || u_n2 <= 0
+            n_tier1_skipped += 1
+            continue
+        end
+        # Dispatch by mode.
+        local hint_val::Int
+        local hint_pri::Int
+        if mode == VH_DIRECT || mode == VH_DIRECT_PGD
+            # DIRECT / DIRECT_PGD: p derived solely from [l_n2, u_n2]; no N1 preact or diff.
+            (hint_val, hint_pri) = compute_varhint_direct(v1_bit, l_n2, u_n2)
+        else  # VH_PREV or VH_PREV_PGD
+            # N1's bounds for this neuron — keys match because both networks share
+            # architecture; n1_layers_info was saved/loaded in Phase 1/2.
+            haskey(n1_layers_info, (layer, neuron)) || continue
+            (u_n1, l_n1, _) = n1_layers_info[(layer, neuron)]
+            # N1's pre-activation scalar. The big-M encoding only fixes hat_z
+            # exactly when the ReLU was active (then x_rect == hat_z). When
+            # inactive, hat_z is free in [l_n1, 0]; take the midpoint as a proxy.
+            if v1_bit == 1
+                # x_rect name differs from a name by one substring: "a_layerCount" → "x_rect_layerCount"
+                x_rect_name = replace(bin_name, "a_layerCount" => "x_rect_layerCount"; count=1)
+                z1_preact = get(value_by_name, x_rect_name, 0.0)
+            else
+                z1_preact = l_n1 / 2  # midpoint of the inactive range [l_n1, 0]
+            end
+            # Diff bound for this neuron. Layer 1..K → org copy (r = layer);
+            # layer K+1..2K → pert copy (r = layer - K). Same diff for both copies.
+            r = (layer <= K) ? layer : (layer - K)
+            if r < 1 || r > K
+                continue  # layer index out of diff-bound range; skip defensively
+            end
+            diff_up_vec   = vec(relu_diff_up_bounds[r])
+            diff_down_vec = vec(relu_diff_down_bounds[r])
+            if neuron < 1 || neuron > length(diff_up_vec)
+                continue
+            end
+            d_hi = diff_up_vec[neuron]
+            d_lo = diff_down_vec[neuron]
+            (hint_val, hint_pri) = compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
+        end
+        if hint_val != v1_bit; flipped += 1; end
+        if mode == VH_DIRECT_PGD || mode == VH_PREV_PGD
+            # Start-consensus: route hint_val through set_start_value, filtered
+            # by PGD. Expect hyper_attack_hints() to have run earlier in Phase 2;
+            # if PGD failed, JuMP.start_value is nothing on every binary and
+            # this mode degrades to "varHint fills every gap".
+            v_pgd_raw = JuMP.start_value(v)
+            if v_pgd_raw === nothing
+                JuMP.set_start_value(v, Float64(hint_val))
+                n_pgd_silent_filled += 1
+            else
+                v_pgd_bit = Int(round(v_pgd_raw))
+                if v_pgd_bit == hint_val
+                    n_pgd_agreed_nop += 1   # leave PGD's Start in place
+                else
+                    JuMP.set_start_value(v, nothing)
+                    n_pgd_disagreed_withdrew += 1
+                end
+            end
+            applied += 1
+        else
+            MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), Float64(hint_val))
+            MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), hint_pri)
+            applied += 1
+        end
     end
-    println("apply_n1_var_hints!: set VarHintVal/VarHintPri on $applied N2 binaries")
+    if mode == VH_DIRECT_PGD || mode == VH_PREV_PGD
+        println("apply_n1_var_hints!: mode=$(mode), Start-consensus on $applied of $n2_binary_count N2 binaries " *
+                "(pgd-silent-filled=$n_pgd_silent_filled, pgd-agreed-nop=$n_pgd_agreed_nop, " *
+                "pgd-disagreed-withdrew=$n_pgd_disagreed_withdrew, flipped=$flipped, " *
+                "no-N1-match=$n_no_match, Tech2-eliminated-but-survived=$n_tier1_skipped)")
+    else
+        println("apply_n1_var_hints!: mode=$(mode), set VarHintVal/VarHintPri on $applied of $n2_binary_count N2 binaries " *
+                "(flipped=$flipped, no-N1-match=$n_no_match, Tech2-eliminated-but-survived=$n_tier1_skipped)")
+    end
+    if n2_binary_count > 0 && applied == 0
+        error("apply_n1_var_hints!: 0 of $n2_binary_count N2 binaries received a hint (mode=$(mode)). " *
+              "Aborting before optimize! so no mislabeled results are produced. " *
+              "Likely cause: variable-name mismatch (regex vs set_name) or missing inputs.")
+    end
 end
 
 mutable struct Results

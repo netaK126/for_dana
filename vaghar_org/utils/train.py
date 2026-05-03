@@ -37,7 +37,30 @@ if __name__ == '__main__':
     parser.add_argument('--loss', type=str, default="Cross", help='Cross, MSE, or L1')
     parser.add_argument('--optimizer', type=str, default="Adam", help='Adam, or SGD')
     parser.add_argument('--seed', type=int, default=None, help='random seed')
+    parser.add_argument('--pgd_training', action='store_true',
+                        help='Train with PGD adversarial examples (Madry et al. 2018)')
+    parser.add_argument('--pgd_epsilon', type=float, default=0.1,
+                        help='L-infinity radius for PGD adversarial training')
+    parser.add_argument('--pgd_alpha', type=float, default=0.01,
+                        help='PGD step size')
+    parser.add_argument('--pgd_steps', type=int, default=7,
+                        help='Number of PGD iterations per batch')
     args = parser.parse_args()
+
+    def pgd_attack(model, images, labels, epsilon, alpha, num_steps, device):
+        adv = images.clone().detach()
+        adv = adv + torch.empty_like(adv).uniform_(-epsilon, epsilon)
+        adv = torch.clamp(adv, 0.0, 1.0)
+        criterion = nn.CrossEntropyLoss()
+        for _ in range(num_steps):
+            adv.requires_grad_(True)
+            outputs = model(adv)
+            loss_val = criterion(outputs, labels)
+            grad = torch.autograd.grad(loss_val, adv)[0]
+            adv = adv.detach() + alpha * grad.sign()
+            delta = torch.clamp(adv - images, -epsilon, epsilon)
+            adv = torch.clamp(images + delta, 0.0, 1.0)
+        return adv.detach()
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -99,10 +122,12 @@ if __name__ == '__main__':
         for i, (batch_images, batch_labels) in enumerate(train_loader):
 
             X = batch_images.view(-1, 1, 28, 28).to(device)
-            # x = attacker.attack(model.to('cuda:0') , optimizer, batch_images.view(-1,1,28,28).to('cuda:0') , batch_labels.to('cuda:0') ).to('cuda:0')
-            # X = atk(batch_images, batch_labels)
-
             Y = batch_labels.to(device)
+            if args.pgd_training:
+                model.eval()
+                X = pgd_attack(model, X, Y, args.pgd_epsilon,
+                               args.pgd_alpha, args.pgd_steps, device)
+                model.train()
             pre = model(X)
             if loss_type == "L1":
                 Y = torch.nn.functional.one_hot(Y, 10).float()

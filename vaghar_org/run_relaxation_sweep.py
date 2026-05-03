@@ -36,19 +36,20 @@ import itertools
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
-    ("contrast(1.5)",      "contrast:1.5"),
+    
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-    ("occ(5,5,5)",        "occ:5,5,5"),
-    ("occ(3,3,5)",        "occ:3,3,5"),
     ("trans(1,1)",        "translation:1,1"),
-    ("trans(1,3)",        "translation:1,3"),
+    # ("trans(1,3)",        "translation:1,3"),
     ("trans(3,1)",        "translation:3,1"),
     ("trans(3,3)",        "translation:3,3"),
-    ("rotation(10)",      "rotation:10"),
-    ("occ(1,1,5)",        "occ:1,1,5"),
-    ("linf(0.05)",        "linf:0.05"),    
+    ("occ(5,5,5)",        "occ:5,5,5"),
+    ("occ(3,3,5)",        "occ:3,3,5"),
+    # ("contrast(1.5)",      "contrast:1.5"),
+    # ("rotation(10)",      "rotation:10"),
+    # ("occ(1,1,5)",        "occ:1,1,5"),
+    # ("linf(0.05)",        "linf:0.05"),    
     ("linf(0.1)",         "linf:0.1"),     
-    ("brightness(0.25)",  "brightness:0.25"), 
+    # ("brightness(0.25)",  "brightness:0.25"), 
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
@@ -85,59 +86,109 @@ def standard_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist"):
     return False
 
 
-def _advstd_result_exists(cwd, dataset, arch, pert_type, eps_str, n1_tag,
-                          base_name_to_save, seed):
-    """Check if an advstd N2 result file already exists for this combo/seed.
+def _parse_c_source_target_pairs(filepath):
+    """Parse a Julia result file and return the set of (c_source, c_target)
+    0-indexed pairs present. Tolerates both key=value and legacy positional
+    CSV lines. Returns an empty set on any parse/IO error rather than raising
+    — a readable-but-empty file is treated as "no pairs covered yet"."""
+    pairs = set()
+    try:
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                fields = {}
+                for tok in line.split(","):
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        fields[k] = v
+                if "c_source" in fields and "c_target" in fields:
+                    try:
+                        pairs.add((int(fields["c_source"]), int(fields["c_target"])))
+                    except ValueError:
+                        pass
+                    continue
+                # Legacy positional CSV: source,target,incumbent_obj,...
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    try:
+                        pairs.add((int(parts[0]), int(parts[1])))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return pairs
+
+
+def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
+                              base_name_to_save, seed, c_tag, c_targets):
+    """Return subset of `c_targets` (Julia 1-indexed) for which no advstd
+    result line `c_source=<c_tag-1>,c_target=<ct-1>` exists in any matching
+    file for (combo=base_name_to_save, seed, c_tag).
 
     Output filenames written by Julia's run.jl follow the pattern:
-      {hash}_n2_{arch}_{pert_type}_{eps_str}_ctag0_{base_name_to_save}_seed{seed}_*.txt
+      {hash}_n2_{arch}_{pert_type}_{eps_str}_ctag{c_tag-1}_{base_name_to_save}_seed{seed}_*.txt
 
-    base_name_to_save captures every technique-flag setting (boundTight,
-    zonoBounds, n1ProbeLP, relaxT{x}, varHint, ...), so matching that exact
-    substring before `_seed{seed}_` uniquely identifies a combo. Returns
-    True if any matching file exists.
+    Julia accumulates all c_target results for one invocation into a single
+    file (results.str is appended across the c_target loop), so we union
+    across every matching file to handle partial crashes — a previous run
+    that timed out after solving some c_targets leaves a file with those
+    lines, and we only need to re-run the c_targets it didn't reach.
     """
+    c_targets = [ct for ct in c_targets if ct != c_tag]
     out_dir = os.path.join(
         cwd, "paper_experiments", dataset, f"{arch}_exp",
         pert_type, f"eps_{eps_str}",
         f"advStd_{arch}_N1_{n1_tag}",
     )
     if not os.path.isdir(out_dir):
-        return False
+        return list(c_targets)
+    src0 = c_tag - 1
     pattern = os.path.join(
         out_dir,
-        f"*_n2_{arch}_{pert_type}_{eps_str}_ctag0_"
+        f"*_n2_{arch}_{pert_type}_{eps_str}_ctag{src0}_"
         f"{base_name_to_save}_seed{seed}_*.txt",
     )
-    return bool(glob.glob(pattern))
+    covered = set()  # 0-indexed c_target values already solved for this c_tag
+    for fpath in glob.glob(pattern):
+        for cs, ct in _parse_c_source_target_pairs(fpath):
+            if cs == src0:
+                covered.add(ct)
+    return [ct for ct in c_targets if (ct - 1) not in covered]
 
 
-def standard_with_perturbed_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist", n2_tag=None):
-    """Check if standard N2 vagharWithPerturbed results exist for this perturbation.
+def _standard_n2_missing_c_targets(pert_spec, cwd, arch, dataset, n2_tag,
+                                   c_tag, c_targets):
+    """Return subset of `c_targets` (Julia 1-indexed) for which no standard-N2
+    (vagharWithPerturbed) result line exists for our c_tag.
 
-    When n2_tag is given (e.g. 'seed42_itr20_sgd_itr1'), checks for that
-    specific tag.  Otherwise checks for any vagharWithPerturbed_*_sgd_itr* dir.
+    Scans every `vagharWithPerturbed_{arch}_{n2_tag}` directory (or the glob
+    `vagharWithPerturbed_*_sgd_itr*` when n2_tag is None) for .txt files
+    containing `ctag{c_tag-1}` in their name, then unions the
+    (c_source, c_target) pairs found so partial-file runs from a crashed
+    previous invocation get their missing c_targets completed rather than
+    silently skipped.
     """
+    c_targets = [ct for ct in c_targets if ct != c_tag]
     pert_type, eps_str = pert_spec.split(":", 1)
-    pert_dir_map = {
-        "patch": "patch", "occ": "occ", "translation": "translation",
-        "rotation": "rotation", "brightness": "brightness", "linf": "linf",
-        "contrast": "contrast",
-    }
-    pert_dir = pert_dir_map.get(pert_type, pert_type)
     eps_dir = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp",
-                           pert_dir, f"eps_{eps_str}")
+                           pert_type, f"eps_{eps_str}")
     if not os.path.isdir(eps_dir):
-        return False
+        return list(c_targets)
     if n2_tag:
-        pattern = f"vagharWithPerturbed_{arch}_{n2_tag}"
+        dir_pattern = f"vagharWithPerturbed_{arch}_{n2_tag}"
     else:
-        pattern = "vagharWithPerturbed_*_sgd_itr*"
-    n2_dirs = glob.glob(os.path.join(eps_dir, pattern))
+        dir_pattern = "vagharWithPerturbed_*_sgd_itr*"
+    n2_dirs = glob.glob(os.path.join(eps_dir, dir_pattern))
+    src0 = c_tag - 1
+    covered = set()
     for d in n2_dirs:
-        if glob.glob(os.path.join(d, "*.txt")):
-            return True
-    return False
+        for fpath in glob.glob(os.path.join(d, f"*ctag{src0}*.txt")):
+            for cs, ct in _parse_c_source_target_pairs(fpath):
+                if cs == src0:
+                    covered.add(ct)
+    return [ct for ct in c_targets if (ct - 1) not in covered]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -153,25 +204,102 @@ def standard_with_perturbed_results_exist(pert_spec, cwd, arch="cnn1", dataset="
 N1_LOCK_FILENAME = ".solving.lock"
 
 
-def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False):
-    """Return True if the N1 state directory already contains everything we need.
+def _parse_c_targets(ct_str):
+    """Parse a Julia --ct string (e.g. "2,3,4,5,6,7,8,9,10") to a sorted
+    deduped list of ints, preserving the caller's order otherwise."""
+    seen = set()
+    out = []
+    for tok in ct_str.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
 
-    The legacy three-file layout (n1_vars / n1_layers / n1_vbasis) is enough
-    when the caller only needs the existing techniques. If any N2 job is
-    going to request bp=pseudocost or var_hint=true, the new
-    n1_pseudocosts_*.bin file must also be present. If any N2 job is going
-    to request --adv_std_n1_probe=lp, the n1_preact_bounds.bin file (added
-    by save_n1_diff_bounds when --adv_std_zono_bounds or the probe flag is
-    active) must also be present.
+
+def _n1_state_missing_c_targets(n1_state_dir, c_tag, c_targets,
+                                need_pseudocosts, need_n1_preact=False):
+    """Return the subset of `c_targets` for which the per-pair N1 state is
+    incomplete and the N1 solve must be (re-)run.
+
+    Per-pair files Julia writes in save_n1_state:
+        n1_vars_{c_tag}_{c_target}.bin, n1_layers_{c_tag}_{c_target}.bin
+    If `need_pseudocosts` is True, a non-empty
+    n1_pseudocosts_{c_tag}_{c_target}.bin is also required.
+
+    Self-pairs (c_target == c_tag) are filtered out — Julia never produces them.
+
+    The shared n1_preact_bounds.bin is written by save_n1_diff_bounds during
+    any N1 solve in this state dir; if `need_n1_preact` and it's missing,
+    re-solving any one c_target rewrites it, so all requested c_targets are
+    reported as missing in that case to force a rebuild.
     """
+    c_targets = [ct for ct in c_targets if ct != c_tag]
+    if not os.path.isdir(n1_state_dir):
+        return list(c_targets)
+    if need_n1_preact and not os.path.isfile(
+            os.path.join(n1_state_dir, "n1_preact_bounds.bin")):
+        return list(c_targets)
+    missing = []
+    for ct in c_targets:
+        vars_path = os.path.join(n1_state_dir, f"n1_vars_{c_tag}_{ct}.bin")
+        layers_path = os.path.join(n1_state_dir, f"n1_layers_{c_tag}_{ct}.bin")
+        if not (os.path.isfile(vars_path) and os.path.isfile(layers_path)):
+            missing.append(ct)
+            continue
+        if need_pseudocosts:
+            pc_path = os.path.join(
+                n1_state_dir, f"n1_pseudocosts_{c_tag}_{ct}.bin")
+            # Empty Julia Dict is ~101 bytes; anything <=150 is empty.
+            # The uniform-priority fallback has been retired, so we treat
+            # empty as incomplete and force a re-solve.
+            if not os.path.isfile(pc_path) or os.path.getsize(pc_path) <= 150:
+                missing.append(ct)
+    return missing
+
+
+def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False,
+                       c_tag=None, c_targets=None):
+    """Return True if the N1 state directory already contains everything we need
+    for the given `c_tag` (Julia 1-indexed source class).
+
+    When `c_targets` is provided, requires a complete per-pair state file set
+    for every requested c_target (delegates to `_n1_state_missing_c_targets`).
+
+    Legacy path (c_targets=None): uses an any-c_target glob — any
+    `n1_vars_{c_tag}_*.bin` file suffices. Kept so callers that haven't been
+    updated to pass c_targets retain their previous behavior.
+    `n1_preact_bounds.bin` is c_tag-agnostic (a single file per state dir).
+
+    If both `c_tag` and `c_targets` are None we fall back further to the
+    pre-multi-ctag behaviour (any `n1_vars_*.bin` file is enough).
+    """
+    if c_targets is not None:
+        if c_tag is None:
+            raise ValueError("c_targets requires c_tag")
+        return not _n1_state_missing_c_targets(
+            n1_state_dir, c_tag, c_targets,
+            need_pseudocosts, need_n1_preact=need_n1_preact)
     if not os.path.isdir(n1_state_dir):
         return False
-    has_vars = bool(glob.glob(os.path.join(n1_state_dir, "n1_vars_*.bin")))
+    if c_tag is None:
+        vars_glob = "n1_vars_*.bin"
+        pc_glob = "n1_pseudocosts_*.bin"
+    else:
+        vars_glob = f"n1_vars_{c_tag}_*.bin"
+        pc_glob = f"n1_pseudocosts_{c_tag}_*.bin"
+    has_vars = bool(glob.glob(os.path.join(n1_state_dir, vars_glob)))
     if not has_vars:
         return False
     if need_pseudocosts:
-        has_pseudocosts = bool(glob.glob(os.path.join(n1_state_dir, "n1_pseudocosts_*.bin")))
-        if not has_pseudocosts:
+        pc_files = glob.glob(os.path.join(n1_state_dir, pc_glob))
+        if not pc_files:
+            return False
+        if not any(os.path.getsize(p) > 150 for p in pc_files):
             return False
     if need_n1_preact:
         has_preact = os.path.isfile(os.path.join(n1_state_dir, "n1_preact_bounds.bin"))
@@ -224,12 +352,14 @@ def _release_n1_solve_lock(lock_path):
         pass
 
 
-def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_interval_sec=30, need_n1_preact=False):
-    """Block until another process finishes solving N1 and the state is ready.
+def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_interval_sec=30, need_n1_preact=False, c_tag=None, c_targets=None):
+    """Block until another process finishes solving N1 and the state is ready
+    for the given `c_tag` / `c_targets` (passed through to `_n1_state_complete`).
 
     Returns True if the state became ready within `wait_timeout_sec`, False
     on timeout or if the other process released its lock but left the state
-    incomplete (indicates the other process crashed or errored).
+    incomplete (indicates the other process crashed or errored, or solved a
+    different c_target subset than the one we need).
     """
     lock_path = os.path.join(n1_state_dir, N1_LOCK_FILENAME)
     start = time.time()
@@ -238,7 +368,7 @@ def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_in
             time.sleep(poll_interval_sec)
             continue
         # Lock gone. Verify the state is actually complete.
-        if _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=need_n1_preact):
+        if _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=c_targets):
             return True
         # Lock released but state incomplete — the other process likely
         # crashed or was killed. Surface this loudly; we do not try to
@@ -812,27 +942,59 @@ def _extract_advstd_file_metadata(filename):
     # which is part of the model name. (?=_) anchors so greedy \d+ can't
     # backtrack and partially match "seed42" as "seed4".
     seed_match = re.search(r"_seed(\d+)(?=_)(?!_itr)", filename)
-    # Branch priorities: distinguish 3 modes. Check the more specific
-    # "branchPriPsd" tag first so it doesn't get masked by "branchPri".
-    if "branchPriPsd" in filename:
-        bp = "pseudocost"
+    # Branch priorities: 'rank' / 'decay' are the active modes. Bare
+    # '_branchPri' (legacy magic-number bounds) and '_branchPriPsd' (legacy
+    # pseudocost) are retired and tagged 'bp_legacy' so the tex updater can
+    # filter them out — old results are not comparable to the new modes.
+    # Order matters: most-specific tag first so the bare 'branchPri' check
+    # (which is a substring of all the others) doesn't mask them.
+    if "branchPriRank" in filename:
+        bp = "rank"
+    elif "branchPriDecay" in filename:
+        bp = "decay"
+    elif "branchPriPsd" in filename:
+        bp = "bp_legacy"
     elif "branchPri" in filename:
-        bp = "bounds"
+        bp = "bp_legacy"
     else:
         bp = "off"
-    relax_match = re.search(r"_relaxT([-0-9.]+)", filename)
+    # _BoundTightPertRelax{τ} subsumes _boundTight and encodes the relaxation
+    # threshold in one tag. The legacy _relaxT{τ} tag is retired — its results
+    # are not comparable to the new BoundTightPertRelax (BTPR) mode because
+    # the relaxation decision now uses N2's per-copy bounds instead of N1's.
+    btpr_match = re.search(r"_BoundTightPertRelax([-0-9.]+)", filename)
     elim_org_match = re.search(r"_elimOrg(\d+)", filename)
     elim_pert_match = re.search(r"_elimPert(\d+)", filename)
+    has_bound_tight = ("boundTight" in filename) or (btpr_match is not None)
     return {
         "mip_start": "yes" if "mipStart" in filename else "no",
         "branch_priorities": bp,
         "lp_basis": "yes" if "lpBasis" in filename else "no",
-        "bound_tightening": "yes" if "boundTight" in filename else "no",
-        "var_hint": "yes" if "varHint" in filename else "no",
-        "var_hint_fix": "yes" if "varHintFix" in filename else "no",
+        "bound_tightening": "yes" if has_bound_tight else "no",
+        # var_hint: 5-valued column.
+        #   'direct_pgd' — Start-consensus variant of direct (tag '_varHintDirectPGD')
+        #   'prev_pgd'   — Start-consensus variant of prev   (tag '_varHintPrevPGD')
+        #   'direct'     — new rule (tag '_varHintDirect')
+        #   'prev'       — previous §4.3 rule (tag '_varHintFixed', the
+        #                  merged-behavior tag; still emitted today)
+        #   'vh_legacy'  — bare '_varHint' or '_varHint_varHintFix' from
+        #                  pre-merger code paths (not directly comparable;
+        #                  excluded from auto-tables)
+        #   'no'         — no varHint tag present
+        # Order matters: most-specific tag first ('varHintDirectPGD' before
+        # 'varHintDirect' because the former is a superstring of the latter;
+        # 'varHintPrevPGD' checked explicitly to not fall through to the
+        # '_varHint' legacy branch; 'varHintFixed' before the legacy fallback).
+        "var_hint": ("direct_pgd" if "varHintDirectPGD" in filename
+                     else "prev_pgd" if "varHintPrevPGD" in filename
+                     else "direct" if "varHintDirect" in filename
+                     else "prev" if "varHintFixed" in filename
+                     else "vh_legacy" if ("varHintFix" in filename or "varHint" in filename)
+                     else "no"),
         "zono_bounds": "yes" if "zonoBounds" in filename else "no",
         "n1_probe": "lp" if "n1ProbeLP" in filename else "off",
-        "relax_threshold": relax_match.group(1) if relax_match else "off",
+        "relax_threshold": btpr_match.group(1) if btpr_match else "off",
+        "relax_mode": "btpr" if btpr_match else "off",
         "elim_org": elim_org_match.group(1) if elim_org_match else "elim not activated",
         "elim_pert": elim_pert_match.group(1) if elim_pert_match else "elim not activated",
         "seed": seed_match.group(1) if seed_match else "0",
@@ -861,7 +1023,7 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
         "delta_advstd_lower_bound", "delta_advstd_upper_bound",
         "delta_error",
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
-        "var_hint", "zono_bounds", "n1_probe", "relax_threshold",
+        "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
         "elim_org", "elim_pert", "relaxed_org", "relaxed_pert",
         "seed",
         "how_much_faster",
@@ -908,21 +1070,6 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
             print(f"  [{pert_name}] No results parsed from standard N2 directories")
             continue
 
-        # Load N1 results to detect incomplete tightening (TIME_LIMIT)
-        if compare_to_with_perturbed:
-            n1_pattern = "vagharWithPerturbed_*"
-        else:
-            n1_pattern = "vagharNoPerturbed_*"
-        n1_dirs = [d for d in sorted(glob.glob(os.path.join(eps_dir, n1_pattern)))
-                    if not re.search(r"_sgd_itr\d+", os.path.basename(d))]
-        n1_results = {}  # (c_source, c_target) -> result_dict
-        for nd in n1_dirs:
-            txt_files = glob.glob(os.path.join(nd, "*.txt"))
-            for tf in txt_files:
-                parsed = parse_result_file(tf)
-                for key, val in parsed.items():
-                    n1_results[key] = val
-
         # Find advanced-standard directories
         advstd_dirs = sorted(glob.glob(os.path.join(eps_dir, "advStd_*")))
         if not advstd_dirs:
@@ -947,11 +1094,6 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                     if s_info.get("solve_status", "") == "INTERRUPTED":
                         continue
                     if a_info.get("solve_status", "") == "INTERRUPTED":
-                        continue
-                    # Skip if N1 tightening didn't finish — incomplete
-                    # tightening makes the advstd comparison unreliable
-                    n1_info = n1_results.get(key)
-                    if n1_info and n1_info.get("solve_status", "") == "TIME_LIMIT":
                         continue
 
                     a_time = a_info["total_time"]
@@ -989,6 +1131,7 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                         "zono_bounds": meta["zono_bounds"],
                         "n1_probe": meta["n1_probe"],
                         "relax_threshold": meta["relax_threshold"],
+                        "relax_mode": meta["relax_mode"],
                         "elim_org": meta["elim_org"],
                         "elim_pert": meta["elim_pert"],
                         "relaxed_org": (a_info.get("n2_org_relaxed_binaries", "")
@@ -1010,20 +1153,19 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                         "advstd_file": tf,
                     }
 
-                    if a_time < s_time * 0.99:  # advstd is faster
+                    s_is_timeout = s_info.get("solve_status", "") == "TIME_LIMIT"
+                    a_is_timeout = a_info.get("solve_status", "") == "TIME_LIMIT"
+                    if s_is_timeout and a_is_timeout:
+                        if a_gap < s_gap * 0.99:
+                            rows_advstd_tighter.append(row)
+                        elif s_gap < a_gap * 0.99:
+                            rows_standard_tighter.append(row)
+                    elif a_time <= s_time:
                         row["how_much_faster"] = f"{a_time / s_time:.2f}x"
                         rows_advstd_faster.append(row)
-                    elif s_time < a_time * 0.99:  # standard is faster
+                    else:
                         row["how_much_faster"] = f"{a_time / s_time:.2f}x"
                         rows_standard_faster.append(row)
-                    else:  # both hit timeout (~same time)
-                        s_is_timeout = s_info.get("solve_status", "") == "TIME_LIMIT"
-                        a_is_timeout = a_info.get("solve_status", "") == "TIME_LIMIT"
-                        if s_is_timeout and a_is_timeout:
-                            if a_gap < s_gap * 0.99:
-                                rows_advstd_tighter.append(row)
-                            elif s_gap < a_gap * 0.99:
-                                rows_standard_tighter.append(row)
 
     # Sort
     def _parse_speed(val):
@@ -1096,7 +1238,7 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
 
     FLAG_FIELDS = (
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
-        "var_hint", "zono_bounds", "n1_probe", "relax_threshold",
+        "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
     )
     TC_FIELDS = ("arch", "perturbation", "perturbation_size", "c_source", "c_target")
 
@@ -1346,7 +1488,8 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
 
 
 def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
-                                compare_to_with_perturbed, combo_ranking_seeds):
+                                compare_to_with_perturbed, combo_ranking_seeds,
+                                combination_table=None):
     """Scan existing per-cell results and write the combo-ranking CSV.
 
     Encapsulates the logic behind --find_advstd_faster_than_standard so the
@@ -1380,7 +1523,7 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
         "delta_advstd_lower_bound", "delta_advstd_upper_bound",
         "delta_error",
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
-        "var_hint", "zono_bounds", "n1_probe", "relax_threshold",
+        "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
         "elim_org", "elim_pert", "relaxed_org", "relaxed_pert",
         "seed",
         "how_much_faster",
@@ -1446,12 +1589,14 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
           + (f" (seeds={combo_ranking_seeds})" if combo_ranking_seeds else ""))
 
     _update_advstd_tex_tables(cwd, combined_base, arch_runs,
-                              compare_to_with_perturbed, combo_ranking_seeds)
+                              compare_to_with_perturbed, combo_ranking_seeds,
+                              combination_table=combination_table)
     return csv_combo_ranking
 
 
 def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
-                              compare_to_with_perturbed, combo_ranking_seeds):
+                              compare_to_with_perturbed, combo_ranking_seeds,
+                              combination_table=None):
     """Rewrite advstd_techniques.tex tables after regenerating CSVs."""
     try:
         sys.path.insert(0, cwd)
@@ -1469,12 +1614,13 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
         print(f"[tex-update] skipped (no rows in {combined_base})")
         return
     archs = [arch for arch, _ in arch_runs]
-    seeds = combo_ranking_seeds or sorted({r["seed"] for r in rows
-                                           if r.get("seed")})
-    seed = seeds[0] if seeds else "4"
-    tau = "0.1"
+    # Pass seed=None / tau=None so the regenerated tables include every
+    # row produced by the sweep (all thresholds, all seeds); tau and seed
+    # are already row columns in the tables.
     try:
-        body = updater.render_all(archs, rows, seed, tau)
+        combination_filter = updater.parse_combination_spec(combination_table)
+        body = updater.render_all(archs, rows, None, None,
+                                  combination_filter=combination_filter)
         updater.update_tex(tex_path, body)
     except SystemExit as exc:
         print(f"[tex-update] {exc}")
@@ -1600,6 +1746,15 @@ def main():
                              "--combo_ranking_seeds 4). Rows from other seeds are dropped before "
                              "aggregation. With a single seed, the STRICT/GENERAL/MIXED/LOSER labels "
                              "are assigned by gm_all thresholds instead of per-seed WIN/LOSE/flip.")
+    parser.add_argument("--combination_table", type=str, default=None,
+                        metavar="BT:VH:TAU",
+                        help="Restrict the per-arch perturbation tables in advstd_techniques.tex "
+                             "(the c_src-tinted green/yellow/pink blocks) to a single combination. "
+                             "Format '<bound_tight>:<varHint>:<tau>', e.g. 'zono:prev_pgd:0.5'. "
+                             "Only takes effect when the tex tables are rewritten "
+                             "(after --find_advstd_faster_than_standard). The blue overall "
+                             "ranking and orange timeout-gap tables are not filtered. "
+                             "'off' is accepted as an alias for varHint='no'.")
     parser.add_argument("--transfer_opt_time_only", action="store_true",
                         help="When comparing times, use only optimization_time for transfer "
                              "(no hyper_attack_time) while standard still uses total_time.")
@@ -1622,8 +1777,9 @@ def main():
     parser.add_argument("--sweep_adv_std_mip_start", nargs="*", type=str, default=None,
                         help="Values for adv_std_mip_start (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_branch_priorities", nargs="*", type=str, default=None,
-                        help="Values for adv_std_branch_priorities: off | bounds | pseudocost "
-                             "(legacy true/false accepted). Default: ['bounds'].")
+                        help="Values for adv_std_branch_priorities: off | rank | decay "
+                             "(legacy true/false accepted; legacy 'bounds'/'pseudocost' map to 'rank' with a warning). "
+                             "Default: ['rank'].")
     parser.add_argument("--sweep_adv_std_lp_basis", nargs="*", type=str, default=None,
                         help="Values for adv_std_lp_basis (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_bound_tightening", nargs="*", type=str, default=None,
@@ -1649,12 +1805,16 @@ def main():
                              "adv_std_bound_tightening=true; combos with bound_tightening=false are "
                              "auto-pruned.")
     parser.add_argument("--sweep_adv_std_var_hint", nargs="*", type=str, default=None,
-                        help="Values for adv_std_var_hint (e.g. 'true false'). Default: ['false']. "
-                             "Variable hints (VarHintVal/VarHintPri) are orthogonal to branch priorities.")
-    parser.add_argument("--sweep_adv_std_var_hint_fix", nargs="*", type=str, default=None,
-                        help="Values for adv_std_var_hint_fix (e.g. 'true false'). Default: ['false']. "
-                             "When true, filter n1_pseudocosts to N2-surviving binaries before "
-                             "rank_to_priority. Combos with vhf=true and vh=false are auto-pruned.")
+                        help="Values for adv_std_var_hint. Modes: off | prev | direct | direct_pgd | prev_pgd. "
+                             "'prev' = previous §4.3 rule (shift ẑ^N1 by diff bound, clip to [l_n2, u_n2]); "
+                             "'direct' = new rule (p derived from [l_n2, u_n2] directly, no ẑ^N1 proxy); "
+                             "'direct_pgd' = same p as 'direct', but hint_val is routed via "
+                             "set_start_value() with PGD consensus filtering (fill-where-silent / "
+                             "leave-where-agree / withdraw-where-disagree) and VarHintVal/VarHintPri "
+                             "are not set; "
+                             "'prev_pgd' = Start-consensus routing applied to 'prev's p_i. "
+                             "Legacy 'true'/'false' still accepted (map to prev/off). Default: ['off']. "
+                             "Variable hints are orthogonal to branch priorities.")
     parser.add_argument("--sweep_gurobi_seed", nargs="*", type=int, default=None,
                         help="Gurobi seeds to sweep (e.g. '0 1 2 3 4') for variance measurement. Default: [0].")
     parser.add_argument("--refresh_ranking_csv", action="store_true",
@@ -1681,6 +1841,11 @@ def main():
     parser.add_argument("--ct", type=str, default=None,
                         help="Comma-separated Julia-indexed c_target values (1-indexed). "
                              "Default: 2,3,4,5,6,7,8,9,10. Use to restrict to specific scenarios.")
+    parser.add_argument("--sweep_ctag", nargs="*", type=int, default=None,
+                        help="Julia-indexed c_tag (source class) values to sweep (e.g. '1 2 3'). "
+                             "Each value is passed to run.jl as --ctag in a separate invocation; "
+                             "N1 state files, advstd result files, and standard-baseline result files "
+                             "are keyed per-ctag (Julia writes ctag{ctag-1} into filenames). Default: [1].")
     args = parser.parse_args()
 
     total_cores = args.max_cores
@@ -1830,7 +1995,8 @@ def main():
     if args.find_advstd_faster_than_standard:
         _generate_combo_ranking_csv(
             arch_runs, cwd, dataset,
-            args.compare_to_with_perturbed, args.combo_ranking_seeds)
+            args.compare_to_with_perturbed, args.combo_ranking_seeds,
+            combination_table=args.combination_table)
         return
 
     cores_per_job = CORES_PER_JOB
@@ -1845,17 +2011,26 @@ def main():
 
             # Resolve technique sweep values
             mip_start_vals = [v.lower() for v in args.sweep_adv_std_mip_start] if args.sweep_adv_std_mip_start else ["true"]
-            # Branch priorities is now a 3-mode enum; normalize legacy true/false.
+            # Branch priorities: rank (uniform-spacing) / decay (magnitude-aware).
+            # Legacy true/false → rank/off. Legacy 'bounds'/'pseudocost' map to 'rank'
+            # with a deprecation warning (so old sweep configs still run, but won't
+            # silently re-execute the retired magic-number heuristic).
             def _norm_bp(v):
                 v = v.lower()
-                if v == "true":  return "bounds"
-                if v == "false": return "off"
+                if v == "true":       return "rank"
+                if v == "false":      return "off"
+                if v == "bounds":
+                    print("WARNING: --sweep_adv_std_branch_priorities=bounds is retired; using 'rank' instead.")
+                    return "rank"
+                if v == "pseudocost":
+                    print("WARNING: --sweep_adv_std_branch_priorities=pseudocost is retired; using 'rank' instead.")
+                    return "rank"
                 return v
-            branch_pri_vals = [_norm_bp(v) for v in args.sweep_adv_std_branch_priorities] if args.sweep_adv_std_branch_priorities else ["bounds"]
+            branch_pri_vals = [_norm_bp(v) for v in args.sweep_adv_std_branch_priorities] if args.sweep_adv_std_branch_priorities else ["rank"]
             for v in branch_pri_vals:
-                if v not in ("off", "bounds", "pseudocost"):
+                if v not in ("off", "rank", "decay"):
                     print(f"ERROR: unknown --sweep_adv_std_branch_priorities value '{v}' "
-                          "(expected off | bounds | pseudocost)")
+                          "(expected off | rank | decay)")
                     sys.exit(1)
             lp_basis_vals = [v.lower() for v in args.sweep_adv_std_lp_basis] if args.sweep_adv_std_lp_basis else ["true"]
             bound_tight_vals = [v.lower() for v in args.sweep_adv_std_bound_tightening] if args.sweep_adv_std_bound_tightening else ["true"]
@@ -1866,24 +2041,38 @@ def main():
                     print(f"ERROR: unknown --sweep_adv_std_n1_probe value '{v}' (expected off | lp)")
                     sys.exit(1)
             relax_t_vals = args.sweep_adv_std_n2_relax_threshold if args.sweep_adv_std_n2_relax_threshold else [-1.0]
-            var_hint_vals = [v.lower() for v in args.sweep_adv_std_var_hint] if args.sweep_adv_std_var_hint else ["false"]
-            var_hint_fix_vals = [v.lower() for v in args.sweep_adv_std_var_hint_fix] if args.sweep_adv_std_var_hint_fix else ["false"]
+            # 5-valued mode: off | prev | direct | direct_pgd | prev_pgd. Legacy true/false
+            # still accepted and normalized to prev/off so historical commands keep working.
+            _vh_alias = {"true": "prev", "false": "off"}
+            var_hint_vals = [_vh_alias.get(v.lower(), v.lower())
+                             for v in (args.sweep_adv_std_var_hint or ["off"])]
+            for v in var_hint_vals:
+                if v not in ("off", "prev", "direct", "direct_pgd", "prev_pgd"):
+                    print(f"ERROR: unknown --sweep_adv_std_var_hint value '{v}' "
+                          f"(expected off | prev | direct | direct_pgd | prev_pgd; legacy true/false also accepted)")
+                    sys.exit(1)
             seed_vals = args.sweep_gurobi_seed if args.sweep_gurobi_seed else [0]
+            sweep_ctag_vals = args.sweep_ctag if args.sweep_ctag else [1]
+            for _ct in sweep_ctag_vals:
+                if _ct < 1:
+                    print(f"ERROR: --sweep_ctag values must be Julia-indexed (>=1); got {_ct}")
+                    sys.exit(1)
 
             # Generate all combinations, excluding the all-off case and any
             # combo where a flag that requires bound_tightening is on while
             # bound_tightening=false (gated on Technique 4's pre-compute block).
+            # Note: var_hint_fix has been merged into var_hint (the "fix" is
+            # always-on now), so the vhf dimension is gone.
             technique_combos = [
-                (ms, bp, lb, bt, zb, np_, rt, vh, vhf)
-                for ms, bp, lb, bt, zb, np_, rt, vh, vhf in itertools.product(
+                (ms, bp, lb, bt, zb, np_, rt, vh)
+                for ms, bp, lb, bt, zb, np_, rt, vh in itertools.product(
                     mip_start_vals, branch_pri_vals, lp_basis_vals, bound_tight_vals,
-                    zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals, var_hint_fix_vals)
+                    zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals)
                 if not (ms == "false" and bp == "off" and lb == "false" and bt == "false"
-                        and zb == "false" and np_ == "off" and rt < 0.0 and vh == "false")
+                        and zb == "false" and np_ == "off" and rt < 0.0 and vh == "off")
                 and not (zb == "true" and bt == "false")
                 and not (np_ != "off" and bt == "false")
                 and not (rt >= 0.0 and bt == "false")
-                and not (vhf == "true" and vh == "false")
             ]
 
             # ── Optional: regenerate the ranking CSV before filtering ──
@@ -1896,7 +2085,8 @@ def main():
                       f"seeds={regen_seeds})")
                 regen_path = _generate_combo_ranking_csv(
                     arch_runs, cwd, dataset,
-                    args.compare_to_with_perturbed, regen_seeds)
+                    args.compare_to_with_perturbed, regen_seeds,
+                    combination_table=args.combination_table)
                 if os.path.realpath(regen_path) != os.path.realpath(args.advstd_safe_combos_only):
                     print(f"  (was: {args.advstd_safe_combos_only})")
                     print(f"  (now: {regen_path})")
@@ -1929,27 +2119,37 @@ def main():
                 safe_keys = set()
                 safe_key_rank = {}
                 unsafe_keys = set()
+                _has_relax_mode_col = False
                 with open(args.advstd_safe_combos_only) as _f:
                     reader = _csv_filter.DictReader(_f, skipinitialspace=True)
+                    if reader.fieldnames is not None:
+                        _has_relax_mode_col = "relax_mode" in reader.fieldnames
                     for _row in reader:
                         _row = {k: (v.strip() if isinstance(v, str) else v) for k, v in _row.items()}
-                        # CSV uses yes/no; sweep uses true/false.
+                        # CSV uses yes/no; sweep uses true/false for binary flags.
                         _yn = {"yes": "true", "no": "false"}
                         _ms = _yn.get(_row["mip_start"], _row["mip_start"])
                         _bp = _row["branch_priorities"]  # off / bounds — same in both
                         _lb = _yn.get(_row["lp_basis"], _row["lp_basis"])
                         _bt = _yn.get(_row["bound_tightening"], _row["bound_tightening"])
-                        _vh = _yn.get(_row["var_hint"], _row["var_hint"])
+                        # var_hint is 5-valued (off/prev/direct/direct_pgd/prev_pgd) in the sweep. CSV
+                        # rows may contain legacy "yes"/"no" (from pre-tri-valued extractor runs)
+                        # or the current tokens ("prev"/"direct"/"direct_pgd"/"prev_pgd"/"no").
+                        # Normalize so both layouts produce a matching combo key.
+                        _vh_map = {"yes": "prev", "no": "off", "true": "prev", "false": "off"}
+                        _vh = _vh_map.get(_row["var_hint"], _row["var_hint"])
                         _zb = _yn.get(_row["zono_bounds"], _row["zono_bounds"])
                         _np = _row["n1_probe"]  # off / lp — same in both
                         _rt_str = _row["relax_threshold"]
                         _rt = float(_rt_str) if _rt_str not in ("off",) else -1.0
-                        # var_hint_fix is a post-hoc column; CSVs written before
-                        # the flag existed don't have it. Default to "false" so
-                        # legacy safe-combos CSVs match vhf=false combos.
-                        _vhf_raw = _row.get("var_hint_fix", "no")
-                        _vhf = _yn.get(_vhf_raw, _vhf_raw)
-                        _key = (_ms, _bp, _lb, _bt, _zb, _np, _rt, _vh, _vhf)
+                        # var_hint_fix has been merged into var_hint (the "fix"
+                        # is always-on now). Old CSV rows that have a
+                        # `var_hint_fix` column are ignored — the var_hint
+                        # value alone determines the combo identity, and old
+                        # `_varHint`/`_varHint_varHintFix` files are tagged
+                        # `vh_legacy` by the extractor and do not match new
+                        # combos.
+                        _key = (_ms, _bp, _lb, _bt, _zb, _np, _rt, _vh)
                         _match_value = _row.get(_match_column, "").lower()
                         if _match_value in _priority_rank:
                             safe_keys.add(_key)
@@ -1960,6 +2160,10 @@ def main():
                         else:
                             unsafe_keys.add(_key)
                 print(f"  safe-set mode: {_mode}")
+                if not _has_relax_mode_col:
+                    print("  [warning] ranking CSV lacks a 'relax_mode' column — "
+                          "all BoundTightPertRelax combos will be treated as 'untested' "
+                          "(permissive). Regenerate the ranking after sweeping to populate it.")
                 pre_filter = len(technique_combos)
                 blocked = [c for c in technique_combos if c in unsafe_keys]
                 technique_combos = [c for c in technique_combos if c not in unsafe_keys]
@@ -1975,280 +2179,346 @@ def main():
                       f"from {args.advstd_safe_combos_only}")
 
             print(f"\nAdvanced-standard: {len(technique_combos)} technique combinations × {len(seed_vals)} seed(s) (all-off + zono/probe/relax-without-boundTight excluded):")
-            for ms, bp, lb, bt, zb, np_, rt, vh, vhf in technique_combos:
-                print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight={bt}  zonoBounds={zb}  n1Probe={np_}  relaxT={rt}  varHint={vh}  varHintFix={vhf}")
+            for ms, bp, lb, bt, zb, np_, rt, vh in technique_combos:
+                # When bt=true and rt>=0, boundTight is subsumed by BoundTightPertRelax in the filename.
+                bt_desc = f"BoundTightPertRelax{rt}" if (bt == "true" and rt >= 0.0) else \
+                          ("boundTight" if bt == "true" else "off")
+                print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}")
             print(f"  seeds: {seed_vals}")
 
             sys.path.insert(0, os.path.join(cwd, 'utils'))
             from run_experiment import ARCH_REGISTRY, DATASET_CONFIG
 
-            # ── Phase 1: Solve N1 once per (arch, perturbation) ──────────
-            n1_jobs = []   # (label, cmd)
-            # Track state dirs so N2 jobs can reference them
-            # Key: (arch, pert_spec) → (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag)
-            n1_info = {}
+            for c_tag in sweep_ctag_vals:
+                print(f"\n{'━' * 60}\nc_tag = {c_tag}  (Julia 1-indexed; Julia writes ctag{c_tag - 1} into filenames)\n{'━' * 60}")
+                # ── Phase 1: Solve N1 once per (arch, perturbation) ──────────
+                n1_jobs = []   # (label, cmd)
+                # Track state dirs so N2 jobs can reference them
+                # Key: (arch, pert_spec) → (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag)
+                n1_info = {}
 
-            # Does any combo in this sweep need pseudo-costs? If so, the
-            # legacy three-file N1 state is not enough and we must either
-            # re-solve N1 or wait for another process that's re-solving.
-            need_pseudocosts = ("pseudocost" in branch_pri_vals) or ("true" in var_hint_vals)
-            if need_pseudocosts:
-                print("This sweep requires N1 pseudo-costs (bp=pseudocost or var_hint=true).")
-            # Does any combo in this sweep need the N1 probe? If so, the
-            # state dir must also contain n1_preact_bounds.bin (written by
-            # save_n1_diff_bounds when it has n1_preact_up_bounds populated
-            # during the Phase-1 save). Legacy state dirs without this
-            # file will trigger an N1 re-solve.
-            need_n1_preact = any(v != "off" for v in n1_probe_vals)
-            if need_n1_preact:
-                print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
+                # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
+                # now uses a continuous transfer-probability signal built from
+                # N1's primal + N1 bounds + diff bounds + N2 bounds — none of
+                # which require per-variable branching stats. The completeness
+                # gate therefore never needs the n1_pseudocosts_*.bin files.
+                need_pseudocosts = False
+                # Does any combo in this sweep need the N1 probe? If so, the
+                # state dir must also contain n1_preact_bounds.bin (written by
+                # save_n1_diff_bounds when it has n1_preact_up_bounds populated
+                # during the Phase-1 save). Legacy state dirs without this
+                # file will trigger an N1 re-solve.
+                need_n1_preact = any(v != "off" for v in n1_probe_vals)
+                if need_n1_preact:
+                    print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
 
-            # Stale lock heuristic: 2× the Gurobi time limit, i.e. generous
-            # enough that a legitimately-long N1 solve is never considered
-            # stale, but short enough that a crashed process clears within
-            # a reasonable window.
-            stale_lock_sec = max(2 * args.timeout, 600)
-            wait_timeout_sec = stale_lock_sec
+                # Stale lock heuristic: 2× the Gurobi time limit, i.e. generous
+                # enough that a legitimately-long N1 solve is never considered
+                # stale, but short enough that a crashed process clears within
+                # a reasonable window.
+                stale_lock_sec = max(2 * args.timeout, 600)
+                wait_timeout_sec = stale_lock_sec
 
-            # Track locks this process acquired so we can release them after
-            # Phase 1 finishes (successfully or otherwise).
-            acquired_n1_locks = []
+                # Track locks this process acquired so we can release them after
+                # Phase 1 finishes (successfully or otherwise).
+                acquired_n1_locks = []
 
-            for arch, model_path in arch_runs:
-                if model_path is None:
-                    print(f"ERROR: --advanced_standard requires --model_path (or --arch_models)")
-                    sys.exit(1)
+                for arch, model_path in arch_runs:
+                    if model_path is None:
+                        print(f"ERROR: --advanced_standard requires --model_path (or --arch_models)")
+                        sys.exit(1)
 
-                print(f"\n{'=' * 60}")
-                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
-                print(f"{'=' * 60}\n")
-                n1_dir, n2_dir = train_extra_epochs(
-                    model_path, arch, dataset,
-                    sgd_epochs=args.sgd_epochs, lr=args.lr)
+                    print(f"\n{'=' * 60}")
+                    print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
+                    print(f"{'=' * 60}\n")
+                    n1_dir, n2_dir = train_extra_epochs(
+                        model_path, arch, dataset,
+                        sgd_epochs=args.sgd_epochs, lr=args.lr)
 
-                _, model_name = ARCH_REGISTRY[arch]
-                _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
-                n1_tag = os.path.basename(os.path.normpath(n1_dir))
-                n2_tag = os.path.basename(os.path.normpath(n2_dir))
-                n1_model_p = os.path.join(n1_dir, "model.p")
-                n2_model_p = os.path.join(n2_dir, "model.p")
+                    _, model_name = ARCH_REGISTRY[arch]
+                    _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+                    n1_tag = os.path.basename(os.path.normpath(n1_dir))
+                    n2_tag = os.path.basename(os.path.normpath(n2_dir))
+                    n1_model_p = os.path.join(n1_dir, "model.p")
+                    n2_model_p = os.path.join(n2_dir, "model.p")
 
-                for pert_name, pert_spec in perts:
-                    pert_type, eps_str = pert_spec.split(":", 1)
-                    arch_prefix = f"[{arch}] "
+                    for pert_name, pert_spec in perts:
+                        pert_type, eps_str = pert_spec.split(":", 1)
+                        arch_prefix = f"[{arch}] "
 
-                    # N1 state directory: one per (arch, perturbation)
-                    n1_state_dir = os.path.join(
-                        cwd, "paper_experiments", dataset, f"{arch}_exp",
-                        pert_type, f"eps_{eps_str}",
-                        f"n1_state_{arch}_{n1_tag}")
+                        # N1 state directory: one per (arch, perturbation)
+                        n1_state_dir = os.path.join(
+                            cwd, "paper_experiments", dataset, f"{arch}_exp",
+                            pert_type, f"eps_{eps_str}",
+                            f"n1_state_{arch}_{n1_tag}")
 
-                    n1_info[(arch, pert_spec)] = (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset)
+                        n1_info[(arch, pert_spec)] = (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset)
 
-                    # ── Smart skip + cross-process lock coordination ─────
-                    # 1. State already complete → skip
-                    # 2. State missing or incomplete (e.g. no pseudocost
-                    #    file when we need it) → try to acquire the lock.
-                    #    If we get it, queue the N1 job and release the
-                    #    lock after the solve finishes.
-                    #    If another process holds it, wait for them to
-                    #    finish and verify the state.
-                    if _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=need_n1_preact):
-                        print(f"  {arch_prefix}{pert_name} N1 state already complete at {n1_state_dir} — skipping N1 solve")
-                        continue
-
-                    got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
-                    if not got_lock:
-                        print(f"  {arch_prefix}{pert_name} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
-                        if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact):
-                            print(f"  {arch_prefix}{pert_name} N1 state now ready — skipping our own N1 solve")
+                        # ── Smart skip + cross-process lock coordination ─────
+                        # 1. State complete for every requested c_target → skip
+                        # 2. State missing or incomplete for some c_targets
+                        #    (missing files, empty pseudocosts, or missing
+                        #    preact bounds) → try to acquire the lock. If we
+                        #    get it, queue an N1 job restricted to only the
+                        #    missing c_targets (so we don't re-solve pairs
+                        #    that are already saved), then release the lock
+                        #    after the solve finishes. If another process
+                        #    holds it, wait for them and re-check only the
+                        #    c_targets we still need.
+                        requested_c_targets = _parse_c_targets(
+                            args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+                        missing_c_targets = _n1_state_missing_c_targets(
+                            n1_state_dir, c_tag, requested_c_targets,
+                            need_pseudocosts, need_n1_preact=need_n1_preact)
+                        if not missing_c_targets:
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state already complete for c_targets={requested_c_targets} at {n1_state_dir} — skipping N1 solve")
                             continue
-                        # Either a timeout or the other process crashed
-                        # without leaving a usable state. Try once to
-                        # acquire the (now-released) lock and solve it
-                        # ourselves, rather than erroring out.
-                        print(f"  {arch_prefix}{pert_name} WARNING: timed out or other process left incomplete state — attempting to solve N1 ourselves")
+
+                        wanted = [ct for ct in requested_c_targets if ct != c_tag]
+                        if len(missing_c_targets) < len(wanted):
+                            have = [ct for ct in wanted if ct not in missing_c_targets]
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state partial — have c_targets={have}, completing missing={missing_c_targets}")
+                        else:
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state missing — solving for c_targets={missing_c_targets}")
+
                         got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
                         if not got_lock:
-                            print(f"  {arch_prefix}{pert_name} ERROR: still unable to acquire N1 solve lock at {lock_path}. Aborting.")
-                            sys.exit(1)
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
+                            if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=missing_c_targets):
+                                print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state now ready — skipping our own N1 solve")
+                                continue
+                            # Either a timeout, the other process crashed,
+                            # or the other process solved a different
+                            # c_target subset than what we need. Try once to
+                            # acquire the (now-released) lock and solve the
+                            # still-missing c_targets ourselves.
+                            print(f"  {arch_prefix}{pert_name} WARNING: timed out or other process left state incomplete for our c_targets — attempting to solve N1 ourselves")
+                            # Recompute — the other process may have filled
+                            # in some pairs even if not all that we need.
+                            missing_c_targets = _n1_state_missing_c_targets(
+                                n1_state_dir, c_tag, requested_c_targets,
+                                need_pseudocosts, need_n1_preact=need_n1_preact)
+                            if not missing_c_targets:
+                                print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state became complete after wait — skipping our own N1 solve")
+                                continue
+                            got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
+                            if not got_lock:
+                                print(f"  {arch_prefix}{pert_name} ERROR: still unable to acquire N1 solve lock at {lock_path}. Aborting.")
+                                sys.exit(1)
 
-                    acquired_n1_locks.append(lock_path)
-                    n1_label = f"{arch_prefix}{pert_name} N1-solve"
-                    n1_cmd = [
-                        "julia", "run.jl",
-                        "--mode", "advanced_standard_n1",
-                        "--dataset", julia_dataset,
-                        "--model_name", model_name,
-                        "--model_path", n1_model_p,
-                        "--model_path2", n2_model_p,
-                        "--perturbation", pert_type,
-                        "--perturbation_size", eps_str,
-                        "--ctag", "1",
-                        "--ct", args.ct if args.ct else "2,3,4,5,6,7,8,9,10",
-                        "--timout", str(args.timeout),
-                        "--output_dir", n1_state_dir + "/",
-                        "--n1_state_dir", n1_state_dir,
-                        "--use_hyper_attack", "true",
-                        "--activate_vaghgar_deps", "true",
-                        "--use_perturbed_intervals", "true",
-                        "--Threads_num", str(Threads_num),
-                    ]
-                    n1_jobs.append((n1_label, n1_cmd))
-
-            # Run all N1 jobs (one per perturbation, in parallel).
-            # Wrap in try/finally so locks this process acquired are always
-            # released — even on KeyboardInterrupt or solver crash — so
-            # other parallel sweep processes aren't blocked indefinitely.
-            if n1_jobs:
-                print(f"\n── Phase 1: {len(n1_jobs)} N1 solve jobs ──")
-                try:
-                    run_pool(n1_jobs, max_slots, cwd, cores_per_job, "Phase 1 (N1 solves)")
-                finally:
-                    for lock_path in acquired_n1_locks:
-                        _release_n1_solve_lock(lock_path)
-                    if acquired_n1_locks:
-                        print(f"Phase 1: released {len(acquired_n1_locks)} N1 solve lock(s)")
-            else:
-                # No jobs — either everything was already complete or another
-                # process is handling it. Still release any locks we somehow
-                # acquired (shouldn't happen, but belt + suspenders).
-                for lock_path in acquired_n1_locks:
-                    _release_n1_solve_lock(lock_path)
-
-            # ── Phase 1.5: Run standard N2 (vagharWithPerturbed) if missing ──
-            # The ranking comparison needs standard results as baseline.
-            # For new perturbation types/sizes these may not exist yet.
-            # Runs with: use_hyper_attack=true, activate_vaghgar_deps=true,
-            #            use_perturbed_intervals=true, use_relaxations=false.
-            std_n2_jobs = []
-            for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
-                pert_type, eps_str = pert_spec.split(":", 1)
-                pert_name = next(pn for pn, ps in perts if ps == pert_spec)
-                arch_prefix = f"[{arch}] "
-
-                if standard_with_perturbed_results_exist(pert_spec, cwd, arch, dataset, n2_tag=n2_tag):
-                    print(f"  {arch_prefix}{pert_name} standard N2 (vagharWithPerturbed {n2_tag}) already exists — skipping")
-                    continue
-
-                std_output_dir = os.path.join(
-                    "paper_experiments", dataset, f"{arch}_exp",
-                    pert_type, f"eps_{eps_str}",
-                    f"vagharWithPerturbed_{arch}_{n2_tag}")
-
-                std_label = f"{arch_prefix}{pert_name} standard-N2 (WithPerturbed)"
-                std_cmd = [
-                    "julia", "run.jl",
-                    "--mode", "standard",
-                    "--dataset", julia_dataset,
-                    "--model_name", model_name,
-                    "--model_path", n2_model_p,
-                    "--perturbation", pert_type,
-                    "--perturbation_size", eps_str,
-                    "--ctag", "1",
-                    "--ct", args.ct if args.ct else "2,3,4,5,6,7,8,9,10",
-                    "--timout", str(args.timeout),
-                    "--output_dir", std_output_dir + "/",
-                    "--c_tag_mode", "false",
-                    "--use_hyper_attack", "true",
-                    "--activate_vaghgar_deps", "true",
-                    "--use_perturbed_intervals", "true",
-                    "--use_relaxations", "false",
-                    "--Threads_num", str(Threads_num),
-                ]
-                std_n2_jobs.append((std_label, std_cmd))
-
-            if std_n2_jobs:
-                print(f"\n── Phase 1.5: {len(std_n2_jobs)} standard N2 jobs (vagharWithPerturbed, missing baselines) ──")
-                run_pool(std_n2_jobs, max_slots, cwd, cores_per_job, "Phase 1.5 (standard N2)")
-            else:
-                print("\n── Phase 1.5: all standard N2 baselines already exist — skipping ──")
-
-            # ── Phase 2: N2 sweep (all technique combos, in parallel) ────
-            n2_jobs = []
-            n2_skipped = 0
-            for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
-                pert_type, eps_str = pert_spec.split(":", 1)
-                pert_name = next(pn for pn, ps in perts if ps == pert_spec)
-                arch_prefix = f"[{arch}] "
-
-                for ms, bp, lb, bt, zb, np_, rt, vh, vhf in technique_combos:
-                    tech_tag = ""
-                    if ms == "true":          tech_tag += "ms"
-                    if bp == "bounds":        tech_tag += "bp"
-                    elif bp == "pseudocost":  tech_tag += "bpPsd"
-                    if lb == "true":          tech_tag += "lb"
-                    if bt == "true":          tech_tag += "bt"
-                    if zb == "true":          tech_tag += "zb"
-                    if np_ == "lp":           tech_tag += "npLP"
-                    if rt >= 0.0:             tech_tag += f"rt{rt}"
-                    if vh == "true":          tech_tag += "vh"
-                    if vh == "true" and vhf == "true": tech_tag += "fix"
-
-                    adv_output_dir = os.path.join(
-                        "paper_experiments", dataset, f"{arch}_exp",
-                        pert_type, f"eps_{eps_str}",
-                        f"advStd_{arch}_N1_{n1_tag}")
-
-                    base_name_to_save = f"{n2_tag}_N2_advStd"
-                    if ms == "true":          base_name_to_save += "_mipStart"
-                    if bp == "bounds":        base_name_to_save += "_branchPri"
-                    elif bp == "pseudocost":  base_name_to_save += "_branchPriPsd"
-                    if lb == "true":          base_name_to_save += "_lpBasis"
-                    if bt == "true":          base_name_to_save += "_boundTight"
-                    if zb == "true":          base_name_to_save += "_zonoBounds"
-                    if np_ == "lp":           base_name_to_save += "_n1ProbeLP"
-                    if rt >= 0.0:             base_name_to_save += f"_relaxT{rt}"
-                    if vh == "true":          base_name_to_save += "_varHint"
-                    if vh == "true" and vhf == "true": base_name_to_save += "_varHintFix"
-
-                    for seed in seed_vals:
-                        if _advstd_result_exists(
-                                cwd, dataset, arch, pert_type, eps_str,
-                                n1_tag, base_name_to_save, seed):
-                            n2_skipped += 1
-                            continue
-                        seed_suffix = f" seed{seed}" if seed != 0 else ""
-                        label = f"{arch_prefix}{pert_name} N2({tech_tag}){seed_suffix}"
-
-                        cmd = [
+                        acquired_n1_locks.append(lock_path)
+                        ct_arg = ",".join(str(ct) for ct in missing_c_targets)
+                        n1_label = f"{arch_prefix}{pert_name} N1-solve"
+                        n1_cmd = [
                             "julia", "run.jl",
-                            "--mode", "advanced_standard_n2",
+                            "--mode", "advanced_standard_n1",
                             "--dataset", julia_dataset,
                             "--model_name", model_name,
                             "--model_path", n1_model_p,
                             "--model_path2", n2_model_p,
                             "--perturbation", pert_type,
                             "--perturbation_size", eps_str,
-                            "--ctag", "1",
-                            "--ct", args.ct if args.ct else "2,3,4,5,6,7,8,9,10",
+                            "--ctag", str(c_tag),
+                            "--ct", ct_arg,
                             "--timout", str(args.timeout),
-                            "--output_dir", adv_output_dir + "/",
-                            "--name_to_save", base_name_to_save,
+                            "--output_dir", n1_state_dir + "/",
                             "--n1_state_dir", n1_state_dir,
                             "--use_hyper_attack", "true",
                             "--activate_vaghgar_deps", "true",
                             "--use_perturbed_intervals", "true",
                             "--Threads_num", str(Threads_num),
-                            "--adv_std_mip_start", ms,
-                            "--adv_std_branch_priorities", bp,
-                            "--adv_std_lp_basis", lb,
-                            "--adv_std_bound_tightening", bt,
-                            "--adv_std_zono_bounds", zb,
-                            "--adv_std_n1_probe", np_,
-                            "--adv_std_n2_relax_threshold", str(rt),
-                            "--adv_std_var_hint", vh,
-                            "--adv_std_var_hint_fix", vhf,
-                            "--gurobi_seed", str(seed),
                         ]
-                        n2_jobs.append((label, cmd))
+                        n1_jobs.append((n1_label, n1_cmd))
 
-            skip_note = f" (skipped {n2_skipped} already-completed)" if n2_skipped else ""
-            print(f"\n── Phase 2: {len(n2_jobs)} N2 jobs ({len(technique_combos)} combos × {len(n1_info)} perturbations){skip_note} ──")
-            if n2_jobs:
-                run_pool(n2_jobs, max_slots, cwd, cores_per_job, "Phase 2 (N2 sweep)")
-            else:
-                print("  nothing to run — every requested combo/seed already has a result file")
+                # Run all N1 jobs (one per perturbation, in parallel).
+                # Wrap in try/finally so locks this process acquired are always
+                # released — even on KeyboardInterrupt or solver crash — so
+                # other parallel sweep processes aren't blocked indefinitely.
+                if n1_jobs:
+                    print(f"\n── Phase 1: {len(n1_jobs)} N1 solve jobs ──")
+                    try:
+                        run_pool(n1_jobs, max_slots, cwd, cores_per_job, "Phase 1 (N1 solves)")
+                    finally:
+                        for lock_path in acquired_n1_locks:
+                            _release_n1_solve_lock(lock_path)
+                        if acquired_n1_locks:
+                            print(f"Phase 1: released {len(acquired_n1_locks)} N1 solve lock(s)")
+                else:
+                    # No jobs — either everything was already complete or another
+                    # process is handling it. Still release any locks we somehow
+                    # acquired (shouldn't happen, but belt + suspenders).
+                    for lock_path in acquired_n1_locks:
+                        _release_n1_solve_lock(lock_path)
+
+                # ── Phase 1.5: Run standard N2 (vagharWithPerturbed) if missing ──
+                # The ranking comparison needs standard results as baseline.
+                # For new perturbation types/sizes these may not exist yet.
+                # Runs with: use_hyper_attack=true, activate_vaghgar_deps=true,
+                #            use_perturbed_intervals=true, use_relaxations=false.
+                std_n2_jobs = []
+                for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
+                    pert_type, eps_str = pert_spec.split(":", 1)
+                    pert_name = next(pn for pn, ps in perts if ps == pert_spec)
+                    arch_prefix = f"[{arch}] "
+
+                    requested_c_targets = _parse_c_targets(
+                        args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+                    missing_std_cts = _standard_n2_missing_c_targets(
+                        pert_spec, cwd, arch, dataset, n2_tag,
+                        c_tag, requested_c_targets)
+                    if not missing_std_cts:
+                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 (vagharWithPerturbed {n2_tag}) complete for c_targets={requested_c_targets} — skipping")
+                        continue
+
+                    wanted_std = [ct for ct in requested_c_targets if ct != c_tag]
+                    if len(missing_std_cts) < len(wanted_std):
+                        have_std = [ct for ct in wanted_std if ct not in missing_std_cts]
+                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 partial — have c_targets={have_std}, completing missing={missing_std_cts}")
+                    else:
+                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 missing — solving for c_targets={missing_std_cts}")
+
+                    std_output_dir = os.path.join(
+                        "paper_experiments", dataset, f"{arch}_exp",
+                        pert_type, f"eps_{eps_str}",
+                        f"vagharWithPerturbed_{arch}_{n2_tag}")
+
+                    std_ct_arg = ",".join(str(ct) for ct in missing_std_cts)
+                    std_label = f"{arch_prefix}{pert_name} c_tag={c_tag} standard-N2 (WithPerturbed)"
+                    std_cmd = [
+                        "julia", "run.jl",
+                        "--mode", "standard",
+                        "--dataset", julia_dataset,
+                        "--model_name", model_name,
+                        "--model_path", n2_model_p,
+                        "--perturbation", pert_type,
+                        "--perturbation_size", eps_str,
+                        "--ctag", str(c_tag),
+                        "--ct", std_ct_arg,
+                        "--timout", str(args.timeout),
+                        "--output_dir", std_output_dir + "/",
+                        "--c_tag_mode", "false",
+                        "--use_hyper_attack", "true",
+                        "--activate_vaghgar_deps", "true",
+                        "--use_perturbed_intervals", "true",
+                        "--use_relaxations", "false",
+                        "--Threads_num", str(Threads_num),
+                    ]
+                    std_n2_jobs.append((std_label, std_cmd))
+
+                if std_n2_jobs:
+                    print(f"\n── Phase 1.5: {len(std_n2_jobs)} standard N2 jobs (vagharWithPerturbed, missing baselines) ──")
+                    run_pool(std_n2_jobs, max_slots, cwd, cores_per_job, "Phase 1.5 (standard N2)")
+                else:
+                    print("\n── Phase 1.5: all standard N2 baselines already exist — skipping ──")
+
+                # ── Phase 2: N2 sweep (all technique combos, in parallel) ────
+                n2_jobs = []
+                n2_skipped = 0
+                for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
+                    pert_type, eps_str = pert_spec.split(":", 1)
+                    pert_name = next(pn for pn, ps in perts if ps == pert_spec)
+                    arch_prefix = f"[{arch}] "
+
+                    for ms, bp, lb, bt, zb, np_, rt, vh in technique_combos:
+                        tech_tag = ""
+                        if ms == "true":          tech_tag += "ms"
+                        if bp == "rank":          tech_tag += "bpRank"
+                        elif bp == "decay":       tech_tag += "bpDecay"
+                        if lb == "true":          tech_tag += "lb"
+                        # _BoundTightPertRelax subsumes _boundTight (see run.jl).
+                        if bt == "true":
+                            if rt >= 0.0:         tech_tag += f"btpr{rt}"
+                            else:                 tech_tag += "bt"
+                        if zb == "true":          tech_tag += "zb"
+                        if np_ == "lp":           tech_tag += "npLP"
+                        if vh == "true":          tech_tag += "vhFixed"
+
+                        adv_output_dir = os.path.join(
+                            "paper_experiments", dataset, f"{arch}_exp",
+                            pert_type, f"eps_{eps_str}",
+                            f"advStd_{arch}_N1_{n1_tag}")
+
+                        base_name_to_save = f"{n2_tag}_N2_advStd"
+                        if ms == "true":          base_name_to_save += "_mipStart"
+                        if bp == "rank":          base_name_to_save += "_branchPriRank"
+                        elif bp == "decay":       base_name_to_save += "_branchPriDecay"
+                        if lb == "true":          base_name_to_save += "_lpBasis"
+                        # _BoundTightPertRelax subsumes _boundTight (see run.jl).
+                        if bt == "true":
+                            if rt >= 0.0:
+                                base_name_to_save += f"_BoundTightPertRelax{rt}"
+                            else:
+                                base_name_to_save += "_boundTight"
+                        if zb == "true":          base_name_to_save += "_zonoBounds"
+                        if np_ == "lp":           base_name_to_save += "_n1ProbeLP"
+                        # VarHint is 5-valued. VH_PREV keeps the legacy
+                        # _varHintFixed tag so historical result files still
+                        # match cleanly; VH_DIRECT uses _varHintDirect;
+                        # VH_DIRECT_PGD uses _varHintDirectPGD;
+                        # VH_PREV_PGD uses _varHintPrevPGD. Legacy
+                        # 'true'/'false' were already normalized to 'prev'/'off'
+                        # upstream.
+                        if vh == "prev":          base_name_to_save += "_varHintFixed"
+                        elif vh == "direct":      base_name_to_save += "_varHintDirect"
+                        elif vh == "direct_pgd":  base_name_to_save += "_varHintDirectPGD"
+                        elif vh == "prev_pgd":    base_name_to_save += "_varHintPrevPGD"
+
+                        requested_c_targets = _parse_c_targets(
+                            args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+                        for seed in seed_vals:
+                            missing_adv_cts = _advstd_missing_c_targets(
+                                cwd, dataset, arch, pert_type, eps_str,
+                                n1_tag, base_name_to_save, seed,
+                                c_tag, requested_c_targets)
+                            if not missing_adv_cts:
+                                n2_skipped += 1
+                                continue
+                            seed_suffix = f" seed{seed}" if seed != 0 else ""
+                            wanted_adv = [ct for ct in requested_c_targets if ct != c_tag]
+                            if len(missing_adv_cts) < len(wanted_adv):
+                                tag_suffix = f" (partial: missing {missing_adv_cts})"
+                            else:
+                                tag_suffix = ""
+                            label = f"{arch_prefix}{pert_name} c_tag={c_tag} N2({tech_tag}){seed_suffix}{tag_suffix}"
+
+                            adv_ct_arg = ",".join(str(ct) for ct in missing_adv_cts)
+                            cmd = [
+                                "julia", "run.jl",
+                                "--mode", "advanced_standard_n2",
+                                "--dataset", julia_dataset,
+                                "--model_name", model_name,
+                                "--model_path", n1_model_p,
+                                "--model_path2", n2_model_p,
+                                "--perturbation", pert_type,
+                                "--perturbation_size", eps_str,
+                                "--ctag", str(c_tag),
+                                "--ct", adv_ct_arg,
+                                "--timout", str(args.timeout),
+                                "--output_dir", adv_output_dir + "/",
+                                "--name_to_save", base_name_to_save,
+                                "--n1_state_dir", n1_state_dir,
+                                "--use_hyper_attack", "true",
+                                "--activate_vaghgar_deps", "true",
+                                "--use_perturbed_intervals", "true",
+                                "--Threads_num", str(Threads_num),
+                                "--adv_std_mip_start", ms,
+                                "--adv_std_branch_priorities", bp,
+                                "--adv_std_lp_basis", lb,
+                                "--adv_std_bound_tightening", bt,
+                                "--adv_std_zono_bounds", zb,
+                                "--adv_std_n1_probe", np_,
+                                "--adv_std_n2_relax_threshold", str(rt),
+                                "--adv_std_var_hint", vh,
+                                "--gurobi_seed", str(seed),
+                            ]
+                            n2_jobs.append((label, cmd))
+
+                skip_note = f" (skipped {n2_skipped} already-completed)" if n2_skipped else ""
+                print(f"\n── Phase 2: {len(n2_jobs)} N2 jobs ({len(technique_combos)} combos × {len(n1_info)} perturbations){skip_note} ──")
+                if n2_jobs:
+                    run_pool(n2_jobs, max_slots, cwd, cores_per_job, "Phase 2 (N2 sweep)")
+                else:
+                    print("  nothing to run — every requested combo/seed already has a result file")
 
         except KeyboardInterrupt:
             print("\nCtrl+C received — terminating all running jobs...")
