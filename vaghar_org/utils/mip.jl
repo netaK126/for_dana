@@ -4,6 +4,11 @@ function mip_reset()
     neurons_names.layer = 0
     first_mip_solution.solution = -1.0
     first_mip_solution.time = 0.0
+    # Technique 4 (SibGate): clear the per-neuron MIP-state cache so a
+    # stale (preact, l, u, x_rect) from the previous c_target build can't
+    # leak into the current one. apply_sibgate_constraints! reads from
+    # this cache, so it must be repopulated freshly for each MIP build.
+    clear_n2_relu_state!()
 end
 
 function mip_set_delta_property(m, perturbation, d)

@@ -117,6 +117,24 @@ global adv_std_n2_relax_threshold = -1.0
 # "cannot set type for global ... it already has a value" at include time.
 global n_n2_relaxed_binaries_org  = 0
 global n_n2_relaxed_binaries_pert = 0
+
+# ── advstd Technique 4 (SibGate): sibling-gated conditional triangle ────────
+# When true, Technique-3's per-copy decision rule is unchanged but the
+# emission switches:
+#   • "both thin" tier: simple triangle on each copy + ONE pre-activation
+#     coupling line linking org and pert pre-acts.
+#   • "one thin" tier: conditional triangle on the relaxed copy, gated on
+#     the kept sibling's binary, with intervals intersected against
+#     Technique-1's unconditional per-copy bound.
+# Activation requires --adv_std_n2_relax_threshold >= 0 (Technique 4 inherits
+# Technique-3's tiered decision rule). Untyped for the same reason as the
+# n_n2_relaxed_binaries_* counters above.
+global adv_std_n2_sibling_gate = false
+# Per-tier neuron counters, tracked at decision time and consumed by the
+# filename composer.
+global n_sibgate_both_thin             = 0
+global n_sibgate_one_thin_org_dropped  = 0
+global n_sibgate_one_thin_pert_dropped = 0
 global output_diff_up_bounds::Vector{Float64}   = Float64[]
 global output_diff_down_bounds::Vector{Float64} = Float64[]
 # N1 output-layer logit bounds (final linear layer of N1 over admissible inputs).
@@ -295,6 +313,29 @@ end
 function clear_n2_relaxed_counters!()
     global n_n2_relaxed_binaries_org  = 0
     global n_n2_relaxed_binaries_pert = 0
+end
+
+function clear_sibgate_tier_counters!()
+    global n_sibgate_both_thin             = 0
+    global n_sibgate_one_thin_org_dropped  = 0
+    global n_sibgate_one_thin_pert_dropped = 0
+end
+
+# ── advstd Technique 4 (SibGate): per-neuron MIP-state cache ───────────────
+# core_ops.jl::relu() records the pre-activation AffExpr `x`, the bounds
+# (l, u) the encoding uses, and the post-ReLU variable `x_rect` for every
+# split N2 neuron in the org/perturbation passes. After both copies are
+# encoded, apply_sibgate_constraints!(model, K) walks this cache + the
+# n2_relax_decision dict and adds the coupling line / conditional-triangle
+# upper bounds. Cleared per c_target by mip_reset (alongside layers_info_dict).
+global n2_relu_state = Dict{Tuple{Int,Int,String},
+                            NamedTuple{(:preact, :l, :u, :x_rect),
+                                       Tuple{Any, Float64, Float64, Any}}}()
+
+function clear_n2_relu_state!()
+    global n2_relu_state = Dict{Tuple{Int,Int,String},
+                                NamedTuple{(:preact, :l, :u, :x_rect),
+                                           Tuple{Any, Float64, Float64, Any}}}()
 end
 
 # ── advstd Technique 6 (BoundTightPertRelax): per-copy relax decision ──────
@@ -937,6 +978,9 @@ function update_results_str(results, c_tag, c_target, d)
           "n2_pert_probe_eliminated_binaries=" * string(n_probe_eliminated_binaries_pert) * "," *
           "n2_org_relaxed_binaries=" * string(n_n2_relaxed_binaries_org) * "," *
           "n2_pert_relaxed_binaries=" * string(n_n2_relaxed_binaries_pert) * "," *
+          "sibgate_both_thin=" * string(n_sibgate_both_thin) * "," *
+          "sibgate_one_thin_org_dropped=" * string(n_sibgate_one_thin_org_dropped) * "," *
+          "sibgate_one_thin_pert_dropped=" * string(n_sibgate_one_thin_pert_dropped) * "," *
           "lp_optimization_time=" * string(n1_probe_lp_time)
     if haskey(d, :adv_std_flags)
         for (k, v) in pairs(d[:adv_std_flags])

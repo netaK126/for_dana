@@ -38,6 +38,7 @@ include("utils/mip.jl")
 include("utils/perturbation_intervals.jl")
 include("utils/n1_probe_lp.jl")
 include("utils/n2_relax_decision.jl")
+include("utils/sibgate_emit.jl")
 
 function parse_commandline()
     s = ArgParseSettings()
@@ -375,11 +376,50 @@ function parse_commandline()
         arg_type = Float64
         required = false
         default = -1.0
+        "--adv_std_n2_sibling_gate"
+        help = "advanced_standard (Technique 4 / SibGate): augment Technique 3's tiered " *
+               "decision rule by emitting a conditional triangle gated on the surviving sibling " *
+               "binary in the 'one thin' tier and a pre-activation coupling line in the 'both " *
+               "thin' tier. Sound over-approximation: delta_relaxed >= delta_exact. Requires " *
+               "--adv_std_n2_relax_threshold >= 0. Filename tag _SibGate with per-tier counts."
+        arg_type = Bool
+        required = false
+        default = false
         "--n1_state_dir"
         help = "Directory with pre-saved N1 solver state (from advanced_standard_n1). When set, skip N1 solve and load state from disk."
         arg_type = String
         required = false
         default = ""
+
+        # ── Standard-mode boosting flags (Boosting Standard Mode, single-network N1) ──
+        # Mirror the advstd techniques but applied to N1's own dual-copy MIP
+        # (org + perturbation). See advstd_techniques.tex §3 (sec:std).
+        "--nn1_zono_bounds"
+        help = "standard mode (Boosting Standard Mode): tighten N1's per-neuron ReLU pre-activation " *
+               "bounds via an absolute zonotope propagated through N1 (Source B). See §3.2 " *
+               "(sec:std_zono) of advstd_techniques.tex. Strictly tighter than interval arithmetic; " *
+               "preserves the integer optimum. Filename tag _stdBoost_zono."
+        arg_type = Bool
+        required = false
+        default = false
+        "--nn1_relax_threshold"
+        help = "standard mode (Boosting Standard Mode): replace N1's org/pert ReLU binaries with a " *
+               "triangle LP relaxation (no binary) when the triangle-gap-area of the intersected " *
+               "per-copy bounds is ≤ this value (tiered per-copy rule). Sound: δ_relaxed ≥ δ_exact. " *
+               "Default -1.0 disables. Requires --nn1_zono_bounds=true to populate Source B. " *
+               "Requires --use_perturbed_intervals=true for soundness on the one-thin tier. " *
+               "Filename tag _stdBoost_BTPR{τ}. See §3.3 (sec:std_btpr)."
+        arg_type = Float64
+        required = false
+        default = -1.0
+        "--nn1_sibling_gate"
+        help = "standard mode (Boosting Standard Mode): augment Per-Copy Triangle Drop with the " *
+               "sibling-gated conditional triangle (one-thin tier) and pre-activation coupling " *
+               "(both-thin tier). Sound: δ_relaxed ≥ δ_exact. Requires --nn1_relax_threshold ≥ 0. " *
+               "Filename tag _stdBoost_SibGate with per-tier counts. See §3.4 (sec:std_sibgate)."
+        arg_type = Bool
+        required = false
+        default = false
 
     end
     return parse_args(s)
@@ -423,6 +463,54 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
     global relaxation_gap_area = args["relaxation_gap_area"]
+
+    # ── Standard-mode boosts (Boosting Standard Mode, single-network N1) ─────
+    # See advstd_techniques.tex §3 (sec:std). These flags are independent of
+    # the advstd transfer machinery and live in standard mode only.
+    nn1_use_zono_bounds   = args["nn1_zono_bounds"]
+    nn1_relax_threshold   = args["nn1_relax_threshold"]
+    nn1_use_sibling_gate  = args["nn1_sibling_gate"]
+    # Reuse the existing advstd dispatch in core_ops.jl::relu() and
+    # n2_relax_decision.jl: relu() activates the Per-Copy Triangle Drop
+    # block when adv_std_n2_relax_threshold ≥ 0, and emits the SibGate
+    # state cache when adv_std_n2_sibling_gate is true. Both globals are
+    # already version-aware (org/perturbation), so wiring the standard-mode
+    # flags through them gives N1 the same boost without code duplication.
+    global adv_std_n2_relax_threshold = nn1_relax_threshold
+    global adv_std_n2_sibling_gate    = nn1_use_sibling_gate
+
+    # Unsound-combination guard (mirrors run.jl:693 for advstd). The Per-Copy
+    # Triangle Drop relies on perturbed-interval coupling to keep the relaxed
+    # copy linked to its exact sibling; without it the LP can drift and
+    # δ_exact is not guaranteed. τ = 0.0 emits no triangle (gap > 0 for every
+    # split neuron), so the guard only fires for τ > 0.
+    if nn1_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
+        println("UNSOUND COMBINATION: --nn1_relax_threshold > 0 (Per-Copy Triangle Drop, " *
+                "standard-mode boost §3.3) requires --use_perturbed_intervals=true for soundness. " *
+                "Without the perturbed-interval coupling constraints the relaxed and exact " *
+                "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
+                "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
+                "the relaxation with --nn1_relax_threshold off (or use τ = 0).")
+        return
+    end
+    if nn1_use_sibling_gate && nn1_relax_threshold < 0.0
+        println("WARNING: --nn1_sibling_gate=true but --nn1_relax_threshold < 0; " *
+                "the sibling-gated emission rides on the per-copy decision dict. " *
+                "SibGate will be inactive (no neurons relaxed).")
+    end
+    if (nn1_relax_threshold >= 0.0 || nn1_use_sibling_gate) && !nn1_use_zono_bounds
+        println("WARNING: --nn1_relax_threshold ≥ 0 or --nn1_sibling_gate=true without " *
+                "--nn1_zono_bounds=true. Per-copy bounds will only come from the encoder's " *
+                "default interval arithmetic (no Source B refinement). Decision/SibGate " *
+                "will still run but will see looser bounds.")
+    end
+
+    println("Standard mode: boosts enabled:")
+    println("  PerturbedIntervals:                 $(args["use_perturbed_intervals"])")
+    println("  Absolute Zonotope (Source B on N1): $(nn1_use_zono_bounds)")
+    println("  Per-Copy Triangle Drop τ:           $(nn1_relax_threshold)")
+    println("  Sibling-Gated Refinement:           $(nn1_use_sibling_gate)")
+
     name_to_save_init = name_to_save
     for c_tag in c_tag_list
         results.str = ""
@@ -432,6 +520,28 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
         w, h, k, c = get_dataset_params( dataset )
         token_signature = string(now().instant.periods.value)
         nn = get_nn(model_path, model_name, w, h, k, c, dataset)
+
+        # ── Source B (absolute zonotope on N1) precompute, once per c_tag ──
+        # n2_abs_*_bounds is the global the encoder's intersect_per_copy_bounds
+        # consumes (see core_ops.jl:222). In standard mode we leave Source A
+        # (n1_neuron_bounds / relu_diff_*) empty so only Source B intersects.
+        clear_n2_abs_bounds()
+        if nn1_use_zono_bounds
+            input_dummy = zeros(Float64, 1, w, h, k)
+            p_size_b = perturbation_size[1]
+            if size(input_dummy)[4] > 1
+                I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy)[4], 1)
+                I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy)[4], 1)
+            else
+                I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy))
+                I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy))
+            end
+            global use_zonotope = true
+            println("Standard-mode boost: computing absolute zonotope bounds (Source B) on N1...")
+            compute_n2_bounds_zonotope_with_n1_tighten(nn, I_pert_up_b, I_pert_down_b)
+            println("  Source B bounds computed: $(length(n2_abs_up_bounds)) ReLU layers")
+        end
+
         for c_target in c_targets
             name_to_save = name_to_save_init
             global relaxation_condition_count = 0
@@ -449,12 +559,48 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             d[:suboptimal_solution] = suboptimal_solution
             d[:suboptimal_time] = suboptimal_time
             mip_reset()
+
+            # ── SibGate prerequisite: org-pert pre-activation diff bounds through N1.
+            # compute_n2_pert_relaxation_bounds populates relu_n2pert_*_bounds
+            # and n2_preact_*_bounds. The encoder side of SibGate (sibgate_emit.jl)
+            # walks these arrays to build the conditional triangle / coupling line.
+            # In standard mode the "second network" passed to this routine is N1 itself.
+            if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
+                input_dummy_s = zeros(Float64, 1, w, h, k)
+                p_size_s = perturbation_size[1]
+                if size(input_dummy_s)[4] > 1
+                    I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s)[4], 1)
+                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s)[4], 1)
+                else
+                    I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s))
+                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
+                end
+                compute_n2_pert_relaxation_bounds(nn, I_pert_up_s, I_pert_down_s)
+            end
+
+            # ── Per-Copy Triangle Drop decision dict (Tech 6 dispatch) ────────
+            # Populated from Source B alone in standard mode (Source A absent).
+            clear_n2_relaxed_counters!()
+            clear_sibgate_tier_counters!()
+            if nn1_relax_threshold >= 0.0
+                compute_n2_relax_decision!(nn1_relax_threshold)
+            else
+                clear_n2_relax_decision!()
+            end
+
             bounds_time = @elapsed begin
                 merge!(d, get_model(w, h, k, perturbation, perturbation_size, nn, zeros(Float64, 1, w, h, k), optimizer,
                 get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
             end
             d[:bounds_time] = bounds_time
             m = d[:Model]
+
+            # ── SibGate emission (post-encoding pass) ────────────────────────
+            # apply_sibgate_constraints! walks n2_relax_decision + n2_relu_state
+            # cache and emits the conditional triangles / coupling lines.
+            # No-op when adv_std_n2_sibling_gate=false.
+            apply_sibgate_constraints!(m)
+
             if use_hyper_attack
                 hyper_attack_hints(m, token_signature, c_tag, c_target)
                 name_to_save = name_to_save*"_HyperAttackHints"
@@ -476,6 +622,22 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 end
                 println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"]) (gap_area=$(args["relaxation_gap_area"]))...")
             end
+
+            # ── Standard-mode boost filename tags (kept distinct from advstd
+            # tags via the _stdBoost_ prefix; advstd uses _N2_advStd_…). ──────
+            if nn1_use_zono_bounds || nn1_relax_threshold >= 0.0 || nn1_use_sibling_gate
+                name_to_save = name_to_save * "_stdBoost"
+                if nn1_use_zono_bounds
+                    name_to_save = name_to_save * "_zono"
+                end
+                if nn1_relax_threshold >= 0.0
+                    name_to_save = name_to_save * "_BTPR" * string(nn1_relax_threshold)
+                end
+                if nn1_use_sibling_gate
+                    name_to_save = name_to_save * "_SibGate"
+                end
+            end
+
             mip_set_delta_property(m, perturbation, d)
             set_optimizer(m, optimizer)
             mip_set_attr(m, perturbation, d, timout)
@@ -487,6 +649,15 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             println(results_path)
             if args["use_relaxations"]
                 name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+            end
+            # Append per-tier neuron counts at the very end, mirroring the
+            # advstd _both/_orgDrop/_pertDrop convention so result-file
+            # name matching can strip them with a single regex.
+            if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
+                name_to_save = name_to_save *
+                               "_both"    * string(n_sibgate_both_thin) *
+                               "_orgDrop" * string(n_sibgate_one_thin_org_dropped) *
+                               "_pertDrop" * string(n_sibgate_one_thin_pert_dropped)
             end
             save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save*"_cTag"*string(c_tag),token_signature)
         end
@@ -652,6 +823,16 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     # Technique 6: N1-gated N2/N2p triangle LP relaxation. Propagated to the
     # core_ops.jl::relu() consumer via the `adv_std_n2_relax_threshold` global.
     global adv_std_n2_relax_threshold = args["adv_std_n2_relax_threshold"]
+    # Technique 4 (SibGate) — read by core_ops.jl::relu() to switch from
+    # the simple Wong-Kolter triangle (Technique 3) to the conditional
+    # triangle gated on the sibling binary (one-thin tier) and the
+    # pre-activation coupling line (both-thin tier).
+    global adv_std_n2_sibling_gate = args["adv_std_n2_sibling_gate"]
+    if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold < 0.0
+        println("WARNING: --adv_std_n2_sibling_gate=true but --adv_std_n2_relax_threshold < 0; " *
+                "Technique 4 inherits Technique 3's tiered decision rule. " *
+                "SibGate will be inactive (no neurons relaxed).")
+    end
     if adv_std_n2_relax_threshold >= 0.0 && !use_bound_tightening
         println("WARNING: --adv_std_n2_relax_threshold >= 0 but --adv_std_bound_tightening is " *
                 "false. The relaxation block needs n1_neuron_bounds to be populated, which only " *
@@ -720,6 +901,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_check = n2_check * "_boundTight"
             end
         end
+        if args["adv_std_n2_sibling_gate"]; n2_check = n2_check * "_SibGate"; end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
         if args["adv_std_n1_probe"] == "lp"; n2_check = n2_check * "_n1ProbeLP"; end
         # Mode-specific varHint filename tag. Keep the legacy "_varHintFixed"
@@ -937,6 +1119,19 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # Technique 6: reset the relaxed-binary counters per c_target so
             # the filename reflects the counts for *this specific* MIP build.
             clear_n2_relaxed_counters!()
+            # Technique 4 (SibGate) per-tier counters reset per c_target.
+            clear_sibgate_tier_counters!()
+
+            # Technique 4 (SibGate): populate the org↔pert pre-activation
+            # diff bound through N2 alone (relu_n2pert_*_bounds) and N2's
+            # per-copy pre-activation bound (n2_preact_*_bounds). These are
+            # the "[l_int, u_int]" and "[l_pre, u_pre]" inputs of the
+            # conditional-triangle / pre-act-coupling derivation in
+            # advstd_techniques.tex §Tech 4. Reuses the existing routine
+            # also used by --no_n1_binaries_and_relaxtions_only_on_n2.
+            if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
+                compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
+            end
 
             # Technique 6 (BoundTightPertRelax): precompute the per-copy
             # relaxation decision using N2's own tightened bounds (Sources
@@ -954,6 +1149,14 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             end
             d_n2[:bounds_time] = bounds_time_n2
             m_n2 = d_n2[:Model]
+
+            # Technique 4 (SibGate): both org and pert copies are now
+            # encoded inside m_n2. Walk n2_relax_decision and emit:
+            #   • coupling lines for both-thin neurons
+            #   • conditional triangles (gated on the sibling binary)
+            #     for one-thin neurons
+            # No-op when --adv_std_n2_sibling_gate=false.
+            apply_sibgate_constraints!(m_n2)
 
             # Technique 1: MIP Start hints from N1's solution
             if use_mip_start
@@ -977,6 +1180,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                         n2_name = n2_name * "_boundTight"
                     end
                 end
+                if args["adv_std_n2_sibling_gate"]; n2_name = n2_name * "_SibGate"; end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
                 if args["adv_std_n1_probe"] == "lp"; n2_name = n2_name * "_n1ProbeLP"; end
                 # See n2_check builder above: VH_PREV keeps the legacy tag,
@@ -994,6 +1198,23 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name *
                           "_elimOrg" * string(n_probe_eliminated_binaries_org) *
                           "_elimPert" * string(n_probe_eliminated_binaries_pert)
+            end
+            # Technique 4 (SibGate): per-tier neuron counts so the filename
+            # encodes how the relaxation actually played out:
+            #   _both<N>     : neurons with BOTH binaries dropped (Tier 1).
+            #   _orgDrop<N>  : neurons with only org binary dropped (Tier 2,
+            #                  pert binary survives → conditional triangle on org
+            #                  gated on a^pert).
+            #   _pertDrop<N> : neurons with only pert binary dropped (Tier 2,
+            #                  org binary survives → conditional triangle on pert
+            #                  gated on a^org).
+            # Counters set by compute_n2_relax_decision!; pre-flight skip uses
+            # n2_check (without these counts), so historical files still match.
+            if args["adv_std_n2_sibling_gate"]
+                n2_name = n2_name *
+                          "_both"     * string(n_sibgate_both_thin) *
+                          "_orgDrop"  * string(n_sibgate_one_thin_org_dropped) *
+                          "_pertDrop" * string(n_sibgate_one_thin_pert_dropped)
             end
 
             if use_hyper_attack && !use_mip_start

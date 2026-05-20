@@ -1,0 +1,561 @@
+# Dana's Group Writing Guidelines
+
+You are helping to write a research paper. Follow the group writing guidelines below strictly. The style is direct, simple, and precise. Avoid flowery, hedged, or AI-sounding prose.
+
+## General Rules
+- A paragraph must contain at least 3-4 sentences. Never write 1-2 sentence paragraphs.
+- Setup vs. results paragraph split: a setup paragraph says *what we measure, on what, how* and ends without any results. The "Table X / Figure X shows the results" sentence belongs to the *next* (results) paragraph, not the setup paragraph.
+- Section/subsection openings must mention only what is actually in the section, no more, no less. If a table doesn't cover topic Y, don't mention Y in the opening.
+- No orphan sentences, ever. Every sentence must belong to a paragraph that develops it. A single sentence sitting alone (between paragraphs, after a heading, or floating in the middle of a section) is a bug.
+- The "In this section, we..." opening pattern applies to subsections (and appendix subsections) too, not only top-level sections.
+
+## Working Mechanics
+- Edit one sentence at a time. Show the user the issue and get explicit approval before editing.
+- Compile the paper after every edit. Don't wait to be asked.
+- No em-dashes anywhere in the paper text. They read as AI-generated.
+- For notes to coauthors, use a visible macro (e.g., `\Name{...}`), not LaTeX `%` comments. Notes need to be visible in the rendered PDF so the coauthor sees them.
+- When writing an appendix or additional-material section, first check the main paper for canonical hyperparameter names, metric names, network names, and methodology terms. The appendix terminology must match the main paper exactly.
+
+## Reference Papers
+The group's papers all follow consistent patterns. Read these to see the style in practice:
+- VHAGaR (OOPSLA 2024): global robustness verification
+- BaVerLy (OOPSLA 2025): mini-batch robustness verification
+- LUCID (OOPSLA 2025): iDP privacy verification
+- CoMPAQt (OOPSLA 2025): quantization with formal guarantees
+- OPPSLA (PLDI 2023): one-pixel attacks via program synthesis
+- DefEnSyn (SAS 2025): robustness repair via program synthesis
+- ExPairT-LLM (AAAI 2026): exact learning for LLM code selection
+- Convex Hull L0 (AAAI 2026): tight L0 robustness certification
+
+## Abstract and Introduction Opening
+The same opening pattern is used for both the first sentence of the abstract and the first sentence of the introduction: start with success, then pivot to the problem. Several forms appear:
+- "Neural networks are successful in various [X] but are also susceptible to [Y]." (VHAGaR, BaVerLy)
+- "Despite the immense success of neural networks, [problem]." (DefEnSyn)
+- "Neural network [classifiers] have achieved remarkable success in various applications. However, [problem]." (CoMPAQt)
+- "[LLMs / DNNs] show remarkable performance in [X]." followed by the problem. (ExPairT-LLM, OPPSLA)
+
+The key invariant: first sentence establishes success, transition (but/however/despite) introduces the problem.
+
+**Citations:**
+- The abstract has *no citations*. Anything that needs a citation belongs in the introduction, not the abstract.
+- In the introduction's first paragraph (the success-then-problem opening), *every* sentence should have citations, and most sentences should have *multiple* citations. The opening claims about "neural networks are successful in $X$" and "but are susceptible to $Y$" must each be backed by several references.
+- The "broader related work" paragraph in the introduction (step 4 below) also has citations on every sentence, often multiple per sentence.
+
+## Introduction Structure
+The intro follows an 11-step flow, consistent across the group's papers:
+
+1. **Opening**: success-then-problem pattern, see "Abstract and Introduction Opening" above. Extend with a brief inline definition of the problem: "Neural networks are successful in [X] but are also susceptible to [Y]: [brief definition of Y]." Every sentence in this opening paragraph carries multiple citations.
+
+2. **Existing approach**: Describe the dominant existing approach in 2-3 sentences with citations. What it does and how.
+
+3. **Limitations of existing approach**: "However, [approach] is limited. This raises several issues. First, [issue]. Second, [issue]. Third, [issue]."
+
+4. **Broader related work**: "These issues gave rise to [broader direction]. Several works [do X]. They can be categorized into [A] and [B]." (2-4 sentences, every sentence has citations and most have multiple)
+
+5. **Limitations of each group**: One sentence per group. "While [group A] achieves [X], it [limitation]. [Group B] [limitation]."
+
+6. **This work**: "In this work, we propose [new property/approach]. Given [inputs], the goal is to [objective]."
+
+7. **Intuition and challenges**: "Intuitively, [concept] is [plain English]." Then enumerate challenges: "This is challenging for [N] reasons. First, [challenge]. Second, [challenge]."
+
+8. **Key ideas**: "We introduce [NAME], a [descriptor] that [function]. [NAME] relies on [N] key ideas. First, [idea]. Second, [idea]. Third, [idea]."
+
+9. **Implementation**: "We implemented our approach in a system called [NAME]." (sometimes merged with step 8)
+
+10. **Main results**: Exact numbers vs. named baseline. "[NAME] is [X]x faster than [Baseline] on [benchmark]."
+
+11. **Additional results**: "We further show [secondary result with numbers]."
+
+**Key transition phrases** (use verbatim or close to it):
+- "These issues gave rise to..."
+- "In this work, we propose..."
+- "Intuitively, [concept] is..."
+- "[NAME] relies on [N] key ideas. First,..."
+- "We implemented our approach in a system called [NAME]."
+- "We further show..."
+
+## Problem Definition Section
+This section is named either "PRELIMINARIES", "PROBLEM DEFINITION", or both merged. It appears right after the Introduction.
+
+**Structure:**
+1. **Opening sentence**: "In this section, we [define our problem / provide background on X]. We begin with [background concepts] and then define our problem."
+
+2. **Background subsections**: Build up the necessary concepts. Each subsection is a bold label on its own line (e.g., "**Image classifiers.**", "**Local robustness.**"). Not formal subsection headings, just bolded inline labels.
+
+3. **Concept introduction pattern**:
+   - Start informally: "A [concept] is [plain English]."
+   - Give the formal definition inline (not always a numbered Definition at this stage, may just be formal notation embedded in prose).
+   - "For example, [concrete instantiation]."
+
+4. **The formal problem definition**: Always a numbered Definition at the end of the background, after all necessary concepts are in place.
+   - Format: "Definition X.Y ([Name]). Given [inputs], [formal statement]."
+   - Immediately followed by: "This problem is challenging [for N reasons]. First, [reason]. Second, [reason]."
+
+5. **Existing approaches subsection** (optional): After the problem definition, a subsection "Existing approaches." describes prior work and their limitations (1-2 sentences each), leading into the paper's solution.
+
+**Key patterns** (verbatim or close):
+- "In this section, we define our problem: [one-line description]."
+- "We begin with background on [X]. We then define our problem and discuss existing approaches."
+- "**[Concept].** [Informal description]. Formally, [definition with notation]."
+- "For example, [concrete instantiation]."
+- "Definition X.Y ([Name]). Given [inputs], [formal statement]."
+- "This problem is challenging [for N reasons / since it requires X]. First, [reason]. Second, [reason]."
+
+**What goes in Preliminaries vs. Problem Definition:**
+- Preliminaries: standard background (neural network structure, activation functions, layer types), no numbered definitions, just formal notation in prose
+- Problem Definition: the paper's new property or problem, gets a numbered Definition
+
+## Overview Section
+This section appears after Problem Definition and before the main technical sections. It is used in longer papers to give intuition before the details.
+
+**Section title**: "OVERVIEW OF KEY IDEAS" (VHAGaR) or "Overview: [Descriptive Name]" (BaVerLy).
+
+**Two variants:**
+
+**Variant A, key ideas list** (VHAGaR style):
+1. "In this section, we present our main ideas to [achieve goal]."
+2. "We begin by introducing [straightforward approach/naive formulation] and explaining why it [fails / is not amenable to standard methods]."
+3. "Then, we introduce the key components of [NAME]. First, [idea 1] (Section X.Y). Second, [idea 2] (Section X.Z). Third, [idea 3] (Section X.W)."
+4. A figure demonstrating the importance of the steps: "Figure X demonstrates the importance of our steps."
+5. Walk through the figure subfigures: "Figure X(a) shows [result for component 1]. While [observation], [limitation]. Figure X(b) shows the improvement from [component 2]: [observation]. Figure X(c) shows [further improvement from component 3]: [observation]."
+6. Each subsection then dives into one component: "In this section, we [present/explain] [specific component]."
+
+**Variant B, questions framing** (BaVerLy style):
+1. "In this section, we describe our approach to [problem]: [one-line description of solution]."
+2. "At high-level, our verification relies on [method], similarly to [prior works]."
+3. "However, to [achieve goal], there are several inherent questions to address: (1) [question], (2) [question], (3) [question]. We next discuss our ideas to address these questions."
+4. Each subsection answers one question. Subsection label is descriptive (e.g., "Abstraction", "Mini-Batches").
+5. Within each subsection: "Our [N]th observation is that [key insight]. Intuitively, [explanation]."
+
+**Key patterns** (verbatim or close):
+- "In this section, we present our main ideas to [goal]."
+- "We begin by introducing [X] and explaining why [it fails]."
+- "First, [idea] (Section X.Y). Second, [idea] (Section X.Z). Third, [idea] (Section X.W)."
+- "Figure X demonstrates the importance of our steps."
+- "Figure X(a) shows [result]. While [observation]. Figure X(b) shows [improvement]."
+- "In this section, we [explain] [component]." (opening of each subsection)
+- "Our [N]th observation is that [insight]. Intuitively, [reason]."
+
+**Overview figure:**
+- The overview figure has one job: show *why* the naive approach fails and *how* each component of your tool fixes it. It is not a result figure, and it is not an architecture diagram.
+- One subfigure per component, in the same order as the Overview section walks through them. Typically 3 subfigures matching the 3 key ideas:
+  - Subfigure (a): the naive baseline / starting point. Shows the problem.
+  - Subfigure (b): result after adding component 1. Shows the partial improvement.
+  - Subfigure (c): result after adding components 1+2. Shows further improvement.
+  - Each subfigure adds *one* component on top of the previous; nothing else changes between them.
+- Use one specific running example (one input, one network, one setting) for all subfigures. The reader should be able to track the same instance across (a), (b), (c). Don't switch examples between subfigures.
+- Each subfigure has a matching sentence in the Overview prose, in the same order as the subfigures.
+- Don't put final evaluation results in the overview figure. Final results go in evaluation figures.
+- Don't include components the reader hasn't been told about yet. Subfigures match the order of the Overview section, not the final paper architecture.
+- Don't use unrelated examples per subfigure.
+
+## Main Technical Section
+This section is named after the tool or approach: "VHAGAR" or "BaVerLy: A Batch Verifier for Local Robustness". It appears after the Overview.
+
+**Opening**: "In this section, we present [our approach / verifier]. We describe [its algorithm] and then [its components]."
+
+**Subsection structure**: Each subsection covers one component. Typical subsections:
+- "[NAME]'s Algorithm", the main algorithm
+- "[Component 1]", e.g., "Batch Verification by MILP"
+- "[Component 2]", e.g., "Constructing Batches by Clustering"
+- "[Component 3]", e.g., "Choosing the Layer"
+- "Complexity Analysis"
+
+**Algorithm box pattern**:
+
+*When to use one:*
+- Only for the *main* algorithm of the paper, and at most one or two component algorithms that are non-trivial. Helper procedures stay in prose. Don't algorithm-box a three-line procedure.
+
+*LaTeX package:*
+- Use `algorithm2e` for algorithm boxes. It gives you `\KwIn`, `\KwOut`, `\For`, `\If`, `\While`, automatic line numbering, and clean indentation:
+  ```latex
+  \usepackage[ruled,linesnumbered]{algorithm2e}
+  ```
+- Don't roll your own with `enumerate` or `tabular`. Don't mix `algorithm2e` with `algorithmic` / `algpseudocode` in the same paper, pick one and stick with it.
+
+*Header format:*
+- `Algorithm X: [Name] ([typed inputs])`
+- `Input: [typed list of inputs, one per line if many]`
+- `Output: [what it returns, with type]`
+
+*Body:*
+- Numbered lines (algorithm2e handles this with `linesnumbered`).
+- Indentation matches control flow: a `\For` body is indented under the `\For`.
+- Use math notation, not pseudocode keywords. `S \gets S \cup \{x\}`, not `S.add(x)`.
+- Inline comments on the right with `// [purpose of the line]`. Keep comments short.
+- Group related lines with a blank line between groups.
+
+*Sub-procedures:*
+- If the algorithm calls a non-trivial sub-procedure, give it its own algorithm box, *not* an inlined block of pseudocode.
+- Refer to it by name, not by line range: `\textsc{Branch}(R)`, not "lines 7-14".
+
+*Loop and termination conditions:*
+- Loop conditions are explicit and bounded. `while not converged` is wrong; `while $|S| > 0$` or `while iteration $< T$` is right.
+- Show the termination condition, even if it seems obvious.
+
+*Notation consistency:*
+- Variable names in the algorithm match the variable names in the prose and in the formal definitions exactly. If the prose calls it $\mathcal{N}$, the algorithm calls it $\mathcal{N}$, not `N` or `net`.
+- Same fonts: math italic for variables, `\textsc{...}` for procedure names, `\textbf{...}` for keywords.
+
+*Prose walkthrough after the box:*
+- Always present, immediately after the algorithm box.
+- Walks through the algorithm in order, by line ranges: "It begins by [step] (Lines 1-3). Then, [step] (Line 4). Accordingly, [step] (Lines 5-9)."
+- Every group of lines in the algorithm is mentioned in the walkthrough. No silent lines.
+- The walkthrough explains *why* each step is there, not just what it does.
+
+*Don't:*
+- Don't put implementation details in the algorithm box (e.g., GPU batching, caching). Those go in an "Implementation Details" paragraph after the walkthrough.
+- Don't include error handling or edge cases. Algorithm boxes show the conceptual algorithm, not production code.
+- Don't repeat the algorithm in pseudocode and again in prose. The walkthrough explains, it doesn't restate.
+
+**Component subsection pattern**:
+- Opening: "In this section, we [describe/present] [component]."
+- "Given [inputs], [component] [does X]."
+- Explain design choices and trade-offs.
+- Often references a figure: "Figure X illustrates [component]."
+- Often has a worked example: "Example. Consider [specific setup]. [Walk-through with concrete values]."
+
+**Complexity analysis subsection**:
+- States complexity as a theorem or proposition: "Theorem X.Y (Complexity). The time complexity of [NAME] is [O(f(n))]."
+- Short proof or sketch, with reference to appendix for full proof.
+
+**Key patterns** (verbatim or close):
+- "In this section, we present [our verifier]. We describe [its algorithm] and then [its components]."
+- "It begins by [step] (Lines X-Y). Then, [step] (Line Z)."
+- "In this section, we [describe] [component]. Given [inputs], [component] [does X]."
+- "Example. Consider [concrete setup with values]. [Walk-through]."
+- "Theorem X.Y (Complexity). The time complexity of [NAME] is [O(f(n))]."
+
+## Correctness Analysis
+Correctness is either a dedicated subsection inside the main technical section (e.g., "Correctness and Running Time" in VHAGaR) or integrated as theorems within component subsections (BaVerLy).
+
+**Subsection opening** (when it is its own subsection):
+"In this section, we discuss correctness and running time analysis."
+
+**Correctness claim**:
+- Always named explicitly: "sound", "complete", or "sound and complete".
+- "Our main theorem is that [NAME] is [sound / complete / sound and complete]: it [plain English statement of the guarantee]. Given enough time, [additional guarantee]."
+
+**Main theorem format**:
+"Theorem X.Y. Given [inputs], [NAME] [returns / computes / guarantees] [formal statement]."
+
+**Proof style**, two variants:
+- **Proof sketch** (longer proofs): "Proof Sketch. We show that (1) [property 1] and (2) [property 2]. [Argument for 1]. [Argument for 2]."
+- **Bullet-point proof** (per component): Each component's soundness is stated separately: "The encoding of [X] is sound as proven by [citation]." "The [dependency] constraints are sound: [argument]." "The [lower bound] is sound since [argument]."
+- Short proofs that fit in the main body end with `\qed`. Longer proofs go to the appendix with "The proof is in Appendix X."
+- If the full proof is in the appendix, the main body must still contain a *proof sketch*. Never have a theorem in the main body with no proof argument at all and only a pointer to the appendix. The sketch states the key idea of the argument so the reader doesn't have to flip to the appendix to know how the proof works.
+
+**Running time** (usually in the same subsection):
+- "The runtime of [NAME] is [T1 + T2 + T3], where T1 is [description], T2 is [description], T3 is [description]."
+- "The dominating factor is [component]."
+- "Our implementation reduces the running time by [technique, e.g., parallelizing on GPUs/CPUs]."
+
+**Key patterns** (verbatim or close):
+- "Our main theorem is that [NAME] is [sound]: it returns [guarantee]."
+- "Theorem X.Y. Given [inputs], [NAME] returns [formal statement]."
+- "Proof Sketch. We show that (1) [property] and (2) [property]."
+- "The [component] is sound as proven by [citation]."
+- "The [component] is sound: if [condition], then [argument]."
+- "The runtime of [NAME] is the sum of [T1 + T2 + ...], where [definitions]."
+- "The dominating factor is [component]."
+
+## Running Experiments
+This section is about how to *do* the experiments, before you write them up. The Evaluation Section below is about how to write them up.
+
+**Design.**
+- Pick the dimension(s) you are varying (e.g., network, $\varepsilon$, batch size). Fix everything else explicitly. Write down both lists in a setup table before you run anything.
+- Don't focus on experiments where the absolute time is too small. Improving 10 seconds to 5 seconds is less impressive than improving 10 hours to 8 hours, even though the speedup ratio is larger. Pick the regime where the problem is actually hard, where the baselines struggle, and where solving it matters. If a benchmark runs in seconds for everything, it is not telling the reviewer anything.
+
+**Baselines.**
+- Always compare against the strongest existing method for the problem, not a weak one.
+- Run the baseline on the same hardware as your method, on the same inputs, with the same timeout. Don't compare your timing on a GPU server to a published number from someone else's machine.
+- If a baseline does not support your exact setting, adapt *your* work to fit *theirs*, not the other way around. Don't touch the baseline's code, except, if you must, the parts that load datasets or networks.
+- Don't tune the baseline's hyperparameters. Use the defaults from their paper or their code. Tuning their hyperparameters opens you up to the criticism that you tuned them badly on purpose.
+
+**Evaluation suite (datasets, models, settings).**
+- Follow the closely related papers. The set of datasets, the model architectures, the model sizes, and the perturbation/setting parameters should match what the closest prior works in your subarea evaluate on.
+- Take the actual model files and dataset loaders from the recent papers, do not retrain or reimplement them yourself. Use the same checkpoints they use, downloaded from their repository or the standard benchmark page. Retraining your own version of "the same network" introduces a confound: your network is not their network even if the architecture matches.
+- This is not about copying for its own sake. It's so that reviewers can compare your numbers directly against published numbers, and so that no reviewer can claim "you only ran on small/easy networks".
+- If you add a new dataset or a new model, keep all the standard ones from the prior works as well. Add, don't replace.
+- If you have to drop a standard benchmark (e.g., a baseline crashes on it, or the network is no longer available), explain why in the experiment setup.
+
+**Sample size and variance.**
+- Run on at least N inputs / neighborhoods (whatever the unit of evaluation is for your problem). Report the unit explicitly in the writeup, e.g., "[N] neighborhoods per network with $\varepsilon$ = [VALUE]".
+- If your method has randomness, repeat each run several times and average. Otherwise the numbers move between runs and the comparison is meaningless.
+- For every approach, measure both the success rate (e.g., the percentage of inputs solved within the timeout) and the running time. One number alone is not enough: a fast method that solves 5\% is not better than a slow method that solves 90\%.
+
+**Timeouts and resource limits.**
+- Set a per-instance timeout (e.g., 1 hour). Use the same timeout for your method and all baselines.
+- Report the timeout in the experiment setup paragraph.
+- A timed-out run is a result, not a missing data point. Count it (e.g., as "did not finish within the timeout") and include it in the totals.
+
+**Recording results.**
+- Save raw outputs as per-instance CSV / JSON / log files, not just the aggregated number. You may want to re-analyze with a different aggregation later.
+- Filenames should include the date, network name, $\varepsilon$, and baseline name, so you can find them again.
+- Never compute a number once and copy-paste it into the paper. Re-derive every number in the paper from the raw files (or at least re-derive every time the table changes), so the paper and the data stay in sync.
+
+**Sanity checks.**
+- Run a tiny version of the experiment end-to-end (one input, smallest network) before launching the full sweep. Catches bugs that would otherwise waste hours of GPU time.
+
+**Reproducibility.**
+- Hardware reported in full: CPU model, GPU model, RAM, OS.
+
+**Fair comparison hygiene.**
+- Same hardware for all approaches.
+- Same set of inputs for all approaches.
+- Same warmup and measurement methodology for all approaches.
+- Don't include your method's compilation or one-time setup time in the timing if you exclude it for baselines (or vice versa).
+
+**When results look too good.**
+- If your speedup is "too good to be true", it usually is. Check: did the baseline crash silently? Are you measuring the same thing? Did you accidentally cache a result across runs? Are you comparing the same input?
+
+## Evaluation Section
+Section title: "EVALUATION" (all caps for OOPSLA/PLDI) or "Evaluation".
+
+**Opening**: "In this section, we evaluate [NAME]. We begin by describing our experiment setup, then describe the baselines, and then present our experiments."
+
+**Experiment setup** (inline bold label, not a subsection):
+- Implementation: "We implemented [NAME] in [language], as [a module in / a wrapper for] [tool] [citation]."
+- Solver details: "[Solver] version X.Y. Timeout is [N] hours. Hyperparameters are [param] = [value], ..."
+- Every hyperparameter that appears in the algorithm pseudocode must have its concrete value reported in the experiment setup. If $T$, $\eta$, $\beta$, $\lambda_1$, $\lambda_2$ appear in the algorithm box, then all five values are listed in the setup. No silent defaults.
+- Hardware: "Experiments ran on [OS] on a [dual/single] [CPU model] server with [RAM] and [N] [GPU model] GPUs."
+- Datasets: Each named with citation and 1-sentence description: "[Dataset] [citation] consists of [description]."
+- Networks: Listed inline in the experiment setup prose, not in a separate table. Give the name, architecture, and a brief annotation for any notable network (e.g., "trained with PGD [citation], an adversarial training defense"). A separate table is only justified if there are many networks and the architecture details don't fit in prose.
+
+**Baselines** (inline bold label):
+- "We compare [NAME] to [Baseline 1] [citation], [one-sentence description], and [Baseline 2] [citation], [description]."
+- For each baseline: what it computes and any limitation. "[Baseline] does not support [X], so we [adaptation]."
+- If code is unavailable: "To date, their code is not available."
+
+**Experiments**:
+- "We begin by evaluating [all approaches] for [list of dimensions / settings]."
+- "For each [X], we run [approach] for [duration] and record [metric 1], [metric 2], [metric 3]."
+- Define each reported metric inline in the experiment paragraph, *before* the "Table/Figure shows the results" sentence. One short clause per metric: what it measures, what units, what direction is better. Don't assume the reader recognizes the metric name.
+- Do *not* have a separate "Metrics" paragraph or subsection. Metric definitions live inside the experiment paragraph that uses them.
+- If the same metric is used in multiple experiments, define it only on first use. Subsequent experiments refer to it by name without redefining.
+- "To put these values in context, we report [normalized metric]."
+- After all metrics are defined, the results sentence: "\Cref{tab:X} / \Cref{fig:X} shows the results."
+- Results enumerated: "Our results show that (1) [exact number], (2) [exact number], (3) [exact number]."
+- OR single-sentence: "Results show that [NAME]'s speedup is [X]x on average and up to [Y]x."
+- "We note that [caveat or additional observation]."
+
+**Ablation / component analysis** (subsections):
+- One subsection per component being ablated.
+- "In this section, we evaluate the contribution of [component] / the importance of [step]."
+- Compare [NAME] to a variant that removes the component: "We compare [NAME] to [NAME-variant], which [description]."
+- "Results show that [component] boosts [NAME] by [X]x."
+
+**Additional evaluation appendices:**
+- When the analyses are short and parallel, structure them as a flat list of `\paragraph{...}` headings under one section, *not* as subsections. Each paragraph follows the same setup → results pattern.
+- Use "We next evaluate..." as the opening (not "In this section, we evaluate..."), since paragraphs aren't sections.
+- Each paragraph must say how many neighborhoods and which $\varepsilon$ value were used, even if it repeats across paragraphs.
+- The setup-then-results split still applies inside a single `\paragraph{...}`: don't combine "Table X shows" with "Results show" in one sentence, but do not introduce a paragraph break in the middle of one `\paragraph{...}` block.
+
+**Key patterns** (verbatim or close):
+- "In this section, we evaluate [NAME]. We begin by describing our experiment setup, then describe the baselines, and then present our experiments."
+- "We implemented [NAME] in [language], as [a module in] [tool]."
+- "Experiments ran on [OS] on a [hardware] with [RAM] and [GPUs]."
+- "We compare [NAME] to [Baseline] [citation], [description]."
+- "Our results show that (1) [number], (2) [number], (3) [number]."
+- "Results show that [NAME]'s speedup is [X]x on average and up to [Y]x."
+- "We further show [secondary result with numbers]."
+
+## Related Work Section
+Section title: "RELATED WORK" (VHAGaR) or "Related Work" (BaVerLy).
+
+**Opening** (optional): "In this section, we discuss related work for [specific topic]." (BaVerLy has it; VHAGaR does not.)
+
+**Structure**: Organized into groups by bold inline labels, same style as Preliminaries subsections. Each label names the relationship to the paper's contribution, not a generic topic. Examples: "Global robustness.", "Multiple network encodings.", "Attack-guided verification.", "Boosting by previous analysis.", "Boosting by learning."
+
+**Per-work format**: 1-2 sentences per work.
+- "[Authors] [action / what it does]. [Limitation or contrast]."
+- Contrast to own work: "In contrast, [NAME] [our approach]."
+- No excessive praise, just what the work does and where it differs.
+
+**Key patterns** (verbatim or close):
+- "[Authors] compute [X] but cannot [Y]."
+- "[Authors] propose [method] for [task]. However, [limitation]."
+- "In contrast, [NAME] [our approach]."
+- "Similarly to [NAME], [related work] [shared aspect]. Unlike [related work], [NAME] [difference]."
+
+## Conclusion Section
+Section title: "CONCLUSION" (VHAGaR) or "Conclusion" (BaVerLy). No opening sentence, begins directly.
+
+**Structure**:
+1. "We present [NAME] for [problem in one phrase]." (or "We present [NAME], a [descriptor] that [does X].")
+2. Key ideas summary: "[NAME] [encodes / relies on / uses] [key idea 1]. [NAME] reduces/improves [metric] by (1) [idea] and (2) [idea]."
+3. Main results with exact numbers: "Our results show that [NAME] [metric] by [Xx] [compared to baseline]."
+4. Additional result: "Additionally, [secondary result with numbers]." or "Our results also show [finding]."
+5. Optional closing: "Finally, [broader insight or use case enabled by the work]."
+
+**After Conclusion** (always present in OOPSLA/PLDI papers):
+- "ACKNOWLEDGEMENTS / Acknowledgements", "We thank [reviewers / collaborators] for [feedback / insights]. This research was supported by [grant]."
+- "DATA-AVAILABILITY STATEMENT / Data-Availability Statement", "Our code is available at [URL]." or "The data and source code that support the findings of this study are openly available."
+
+**Key patterns** (verbatim or close):
+- "We present [NAME] for [problem]."
+- "[NAME] is [sound and complete]. The key idea is to [key idea]."
+- "[NAME] encodes [X]. [NAME] reduces [complexity] by (1) [idea] and (2) [idea]."
+- "Our results show that [NAME] computes [X]x [metric] and is [Y]x faster than [baseline]."
+- "Additionally, [secondary finding with numbers]."
+- "Finally, we [demonstrate / show] [broader impact]."
+
+## Tool Naming
+Always has a catchy acronym. The acronym meaning is explained when introduced.
+Pattern: "We introduce [ACRONYM], a [description]. [ACRONYM] stands for..."
+Or: "We introduce [ACRONYM] ([full name])..."
+
+**LaTeX macro for the tool name:**
+- Define a `\tool` macro in the preamble and use it everywhere instead of typing the tool name literally. This way, if the name changes (very common during writing), you change one place. It also lets you switch the name to a placeholder for double-blind submission.
+- Always include `\xspace` so the macro adds a space after the name when followed by a word but not when followed by punctuation:
+  ```latex
+  \usepackage{xspace}
+  \newcommand{\tool}{SIGNAL\xspace}
+  ```
+- Without `\xspace`, "\tool is" renders as "SIGNALis" because LaTeX swallows the trailing space.
+
+## Contribution List Format
+End of introduction. Two forms appear:
+- Unlabeled bullet list (VHAGaR, BaVerLy)
+- Introduced by "To conclude, our main contributions are:" (OPPSLA) or "Our main contributions are:"
+
+Bullet item formats:
+- "A [noun phrase describing contribution]" (short form)
+- "A [noun phrase]. [1-2 sentence description]." (OPPSLA style, more description per item)
+- "[Verb]ing of [something] (e.g., Integration of X in Y)"
+
+## Results Framing
+- Always specific numbers: multipliers (e.g., "130.6x faster"), percentages, geometric means
+- Always compared against a named baseline
+- Format: "[Method] outperforms [Baseline] by [number] on [benchmark]"
+- Use geometric mean for speedup averages
+- Don't overclaim from mixed data: when reported numbers vary at all (e.g., 11.6-12.3 min across configurations), do not say "no effect", say "minor effect". Be conservative.
+- Verify every numeric range or value in the prose against the table cells. After any edit, re-check that prose numbers still match the data exactly. A "33-40%" in the text against a "33-43%" range in the table is a bug.
+- Interpret the results, but don't oversell. After the number, say what it shows in plain, neutral language. State the number first, then a short observation (e.g., "the mean NMAE is below $0.07\%$ for all networks, so the propagated mean is accurate"). 
+
+## Language Rules
+- Short, direct sentences
+- No flowery language, no AI-sounding words, no dashes (em-dashes are forbidden)
+- Explain or replace jargon on first use. When introducing a statistical test or technical term (e.g., Shapiro-Wilk, excess kurtosis), give a one-line plain-English definition. Avoid words like "corroborates",  "standard test for normality", a reader will ask "what does that mean?".
+- "We propose", "We introduce", "We present", "We show", "We rely on" (prefer these over "we harness", though "leverage" appears occasionally in practice)
+- "The key idea is to..." for explaining the main insight
+- "Given [input], [method] computes [output]"
+- "To [goal], we..." for transitions
+- "While successful, ..." for contrasting existing work
+- "However, existing works..." for stating limitations
+- "This raises the question: Can we [goal]?", rhetorical question to motivate the paper (CoMPAQt)
+- "We draw inspiration from [field] and propose...", when the key idea comes from a different field (OPPSLA, BaVerLy)
+- Technical terms introduced informally before formal definition: "Intuitively, X is Y if..."
+- Use a metric's actual name consistently. KS *distance* is a distance, not an "error". NMAE/MAE are errors. Don't conflate them. After picking the right word, grep the section to make sure no straggler "error" / "distance" is left over.
+- When introducing a metric, define it inline on first use (KS distance, NMAE, MAE, $R^2$, power-law exponent $\alpha$). One short clause is enough: "the KS distance, which is the maximum gap between two cumulative distributions ($0$ is identical)". Do not assume the reader knows.
+- When the high-level mechanism *and* the concrete implementation are both worth saying, use the "mention then explain" pattern: "[Approach] does X because it leverages [high-level concept], i.e., [one-line plain-English]. Concretely, [implementation detail]." Then "In contrast, [other approach] [contrasting behavior]."
+- Use exact values from tables in the prose, not $\approx$. If you wrote $\approx 0.004$, replace with $0.0042$ from the table cell.
+
+
+## Definition/Theorem Style
+- Informal intuition before the formal statement
+- "Intuitively, [concept] is [plain English description]."
+- Then: "Formally, [definition]."
+
+## Paper Structure
+Standard section order (all caps for OOPSLA/PLDI style, title case for other venues):
+1. INTRODUCTION
+2. PRELIMINARIES, background, notation, formal definitions of existing concepts
+3. PROBLEM DEFINITION (sometimes merged with Preliminaries)
+4. OVERVIEW OF KEY IDEAS, high-level description before technical details (used in longer papers)
+5. [Main technical sections], named after the approach/concept, often 2-3 subsections
+6. EVALUATION
+7. RELATED WORK
+8. CONCLUSION
+
+Technical section structure often has subsections:
+- e.g., "Batch Verification by MILP", "Constructing Batches by Clustering", "Choosing the Layer", "Complexity Analysis"
+
+## Theoretical Part
+**Definitions:**
+- Numbered: "Definition X.Y (Name). [Formal statement]."
+- Always preceded by informal intuition: "Intuitively, X is Y if [plain English]."
+- Concrete example immediately after: "For example, [specific instantiation]."
+
+**Problems:**
+- Stated formally as an optimization or decision problem after the relevant definitions
+- "Problem X. [Formal statement]."
+
+**Lemmas:**
+- Support the main theorem; one per key technical step
+- "Lemma X.Y. [Statement]. Proof. [1-3 sentences or 'The proof follows from [key fact].']"
+- Main body has short proof or proof sketch; detailed proofs go to appendix
+- Proof of biconditional: prove each direction separately, each in 1-2 sentences
+
+**Theorems:**
+- State the main result
+- "Theorem X.Y. [Statement]."
+- Proof in main body if short (2-5 sentences); otherwise appendix with a sketch
+- For iff proofs: "Proof. (Direction 1): [argument]. (Direction 2): [argument]."
+
+**Proof style:**
+- Short and direct, no unnecessary words
+- State the key insight first, then the derivation
+- Reference earlier lemmas: "By Lemma X.Y, [fact]. Therefore, [conclusion]."
+- Use contradiction when natural: "Assume for contradiction that [assumption]. Then [derivation], contradicting [fact]."
+
+
+## Examples
+- Always concrete and specific, never vague
+- "For example, [specific instantiation with actual numbers or values]."
+- Use "e.g.," for parenthetical lists: "e.g., p = 0, 1, 2, inf"
+- Examples are used to: (1) illustrate a definition with a concrete case, (2) show a specific result vs. baseline with numbers, (3) explain a constraint or range
+- Pattern: "For example, on [benchmark], given [setting], [method] obtains [X]%, while [baseline] obtains [Y]%."
+- Examples in definitions: "For example, if [concrete instantiation], then [result]."
+
+## Figures
+**Captions:**
+- Short and descriptive, keep captions to a single line. Push details into the prose, not the caption.
+- For subfigures: "(a) [description]. (b) [description]."
+- State what is shown, not what the reader should conclude
+- Example: "Fig. 1. (a) The perturbations supported by VHAGaR. (b) VHAGaR's upper and lower bounds vs. Marabou and a MIP-only variant."
+
+**References in text:**
+- Always state specifically what the figure shows and the key takeaway
+- "Figure X shows [specific result or concept]. [Key observation from the figure]."
+- "Figure X illustrates [approach/concept]."
+- "Figure X demonstrates the importance of [step]. Figure X(a) shows [specific aspect]..."
+- Never just say "see Figure X", always explain what it shows
+
+**What figures are used for:**
+- Experimental results: bounds or speedup as a function of time
+- Approach illustration: a visual of the algorithm/pipeline
+- Input data properties (e.g., similarity histograms)
+
+**The figure itself (not the caption):**
+- No title on top of the plot. The caption carries that role; an in-figure title duplicates it.
+- Axis labels must be explicit and human-readable, not raw variable names. "Batch size $B$" not "B"; "Overhead per iteration (s)" not "time".
+- Units belong on the axis label, in parentheses: "(s)", "(\%)", "(MB)".
+- Pick units so the numbers stay small. If the data is in seconds and reaches the hundreds, switch to minutes. If minutes reach the hundreds, switch to hours. If hours go above $48$, switch to days. The same rule applies to running times in the prose and tables, not just axis labels: write "$3$ hours", not "$10{,}800$ seconds".
+- Legends must name the *thing* being plotted, not an internal code name. If lines correspond to networks, the legend entries must be the network names exactly as used in the prose and tables.
+- Avoid legend entries like "ours", "v1", "var2". Use the tool name and the variant name from the paper.
+- Use linear axes. Don't use log or log-log axes — they hide the absolute scale and let small differences look big. If the data spans many orders of magnitude, that's what the unit-switching rule above is for (seconds → minutes → hours → days).
+
+
+**Float placement:**
+- A figure should ideally appear on the same page as the text that describes it. If that's not possible, it should appear on the next page. A figure that lands several pages away from its describing text forces the reader to flip back and forth and is a bug.
+- Figures pushed to their own page (one figure per page) usually mean the figure is too big or `[t]` placement is forcing a page-only float. Try `[ht]` placement and shrink to `0.5\linewidth` before considering bigger restructuring.
+- After any reorganization that affects float order, recompile and visually scan for orphan floats and broken cross-references. Cross-reference numbers may take a second compile pass to settle.
+
+## Tables
+- One-line caption, same rule as figures.
+- If a section has two paragraphs covering different aspects, prefer two tables (one per paragraph) over a single merged table.
+- Column order in a table must match the order topics appear in the paragraph that references it.
+- Every table must be referenced in the prose by its label. First, state what the table shows in one sentence. Then, in a separate sentence, state what the results show. Never combine these into a single sentence.
+- Side-by-side tables via `minipage` are fragile: if the tables are too wide for the chosen widths, the columns overlap visually even if the LaTeX compiles. Always compile and visually verify the PDF. If they overlap, split into separate `\begin{table}` floats and let LaTeX flow them.
+- When comparing the actual approach to a hypothetical alternative, name the actual approach by its tool name (not by its mechanism), and call only the hypothetical one a "variant". For example: "We compare \tool to a variant that uses the full covariance", not "We compare two variants of \tool". The tool *is* its mechanism; the alternative is the variant.
+- Don't put a metric name (e.g., "Dec. Time \%") as a column header when there is only one such column. Move the metric description into the caption and leave the column unlabeled or use the dimension being varied (e.g., the network name).
+
+## Vocabulary Preferences
+The group's writing favors clarity over fancy vocabulary. Prefer:
+- Simple subject-verb-object sentences
+- Common academic vocabulary over fancy alternatives
+- Avoid: "harness", "unprecedented", "crucial", "pivotal", "compelling"
+- Prefer: "use", "rely on", "show", "propose", "introduce", "compute"
+- "leverage" appears occasionally in practice but is not the preferred word
+

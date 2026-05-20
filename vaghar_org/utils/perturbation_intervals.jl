@@ -1771,14 +1771,19 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
     n2_abs_up_bounds   = Array{Float64}[]
     n2_abs_down_bounds = Array{Float64}[]
 
-    # Check prerequisite: Source A must have been run first.
-    if isempty(n1_preact_up_bounds) || isempty(relu_diff_up_bounds)
-        println("compute_n2_bounds_zonotope_with_n1_tighten: Source A bounds not populated, skipping (Source B disabled)")
-        return
+    # Standard-mode reuse: when Source A globals are empty (no N1→N2 diff to
+    # intersect against), still propagate the absolute zonotope through the
+    # network and store per-ReLU-layer bounds. The intersection step at the
+    # ReLU loop already falls through to (u_hull, l_hull) when n1_preact /
+    # relu_diff are empty (see the relu_layer_idx <= length(n1_preact_up_bounds)
+    # guard below), so the zonotope-only output is sound.
+    source_a_available = !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+    if source_a_available && length(n1_preact_up_bounds) != length(relu_diff_up_bounds)
+        println("compute_n2_bounds_zonotope_with_n1_tighten: n1_preact and relu_diff layer counts differ ($(length(n1_preact_up_bounds)) vs $(length(relu_diff_up_bounds))), skipping Source A intersect (Source B = absolute zonotope only)")
+        source_a_available = false
     end
-    if length(n1_preact_up_bounds) != length(relu_diff_up_bounds)
-        println("compute_n2_bounds_zonotope_with_n1_tighten: n1_preact and relu_diff layer counts differ ($(length(n1_preact_up_bounds)) vs $(length(relu_diff_up_bounds))), skipping Source B")
-        return
+    if !source_a_available
+        println("compute_n2_bounds_zonotope_with_n1_tighten: Source A absent — propagating absolute zonotope only (standard-mode nn1 boost path)")
     end
 
     # Seed the absolute-N2 input zonotope from [0-ε, 1+ε]. We conservatively

@@ -121,6 +121,30 @@ def _parse_c_source_target_pairs(filepath):
     return pairs
 
 
+def _eps_str_variants(eps_str):
+    """Return the set of filename eps fragments that should match `eps_str`.
+
+    Julia formats numeric perturbation sizes via its default Float64 printer
+    when writing result filenames, so an integer comma component becomes a
+    float-with-".0" form: `3,3,5` -> `3.0,3.0,5.0`, `1,14,14,3` ->
+    `1.0,14.0,14.0,3.0`, `0.1` stays `0.1`. The Python skip-check globs
+    must match BOTH the raw `eps_str` (in case any caller writes in that
+    form) AND the Julia float form (which is what run.jl actually emits).
+
+    Returns at least {eps_str}; for parseable numeric-comma strings it also
+    includes the Julia-style float form. Non-numeric eps strings fall back
+    to the single-variant set.
+    """
+    try:
+        floats = [float(tok) for tok in eps_str.split(",")]
+    except ValueError:
+        return {eps_str}
+    julia_form = ",".join(
+        (f"{int(v)}.0" if v == int(v) else repr(v)) for v in floats
+    )
+    return {eps_str, julia_form}
+
+
 def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
                               base_name_to_save, seed, c_tag, c_targets):
     """Return subset of `c_targets` (Julia 1-indexed) for which no advstd
@@ -130,11 +154,14 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
     Output filenames written by Julia's run.jl follow the pattern:
       {hash}_n2_{arch}_{pert_type}_{eps_str}_ctag{c_tag-1}_{base_name_to_save}_seed{seed}_*.txt
 
-    Julia accumulates all c_target results for one invocation into a single
-    file (results.str is appended across the c_target loop), so we union
-    across every matching file to handle partial crashes — a previous run
-    that timed out after solving some c_targets leaves a file with those
-    lines, and we only need to re-run the c_targets it didn't reach.
+    Julia formats `{eps_str}` in the filename via its Float64 printer, so we
+    match both the raw and float-normalized variants via _eps_str_variants
+    (see that helper). Julia accumulates all c_target results for one
+    invocation into a single file (results.str is appended across the
+    c_target loop), so we union across every matching file to handle
+    partial crashes — a previous run that timed out after solving some
+    c_targets leaves a file with those lines, and we only need to re-run
+    the c_targets it didn't reach.
     """
     c_targets = [ct for ct in c_targets if ct != c_tag]
     out_dir = os.path.join(
@@ -145,16 +172,104 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
     if not os.path.isdir(out_dir):
         return list(c_targets)
     src0 = c_tag - 1
-    pattern = os.path.join(
-        out_dir,
-        f"*_n2_{arch}_{pert_type}_{eps_str}_ctag{src0}_"
-        f"{base_name_to_save}_seed{seed}_*.txt",
-    )
     covered = set()  # 0-indexed c_target values already solved for this c_tag
-    for fpath in glob.glob(pattern):
-        for cs, ct in _parse_c_source_target_pairs(fpath):
-            if cs == src0:
-                covered.add(ct)
+    for variant in _eps_str_variants(eps_str):
+        pattern = os.path.join(
+            out_dir,
+            f"*_n2_{arch}_{pert_type}_{variant}_ctag{src0}_"
+            f"{base_name_to_save}_seed{seed}_*.txt",
+        )
+        for fpath in glob.glob(pattern):
+            for cs, ct in _parse_c_source_target_pairs(fpath):
+                if cs == src0:
+                    covered.add(ct)
+    return [ct for ct in c_targets if (ct - 1) not in covered]
+
+
+def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag):
+    """Build a regex matching the exact name_to_save tail Julia's main_standard
+    writes for a given (zb, sg, rt, pi) combo. The tail starts right after the
+    user-provided --name_to_save base and runs through `_cTag{c_tag}`.
+
+    The same regex applies to both N1 and N2 stdBoost runs — the boost machinery
+    in main_standard is network-agnostic (it operates on whatever --model_path
+    is passed).
+
+    Order in main_standard (run.jl:459-665):
+      base
+      + `_seed{seed}` if seed != 0                          (added in main())
+      + `_HyperAttackHints` if use_hyper_attack             (line 606)
+      + `_VagharDeps` if activate_vaghgar_deps              (line 609)
+      + `_PertruebedIntervals` if use_perturbed_intervals   (line 614) [note typo]
+      + `_stdBoost` + sub-tags if any boost flag is on      (line 628-638)
+          - `_zono`                if nn1_zono_bounds=true
+          - `_BTPR{rt}`            if nn1_relax_threshold ≥ 0
+          - `_SibGate`             if nn1_sibling_gate=true
+      + `_both{X}_orgDrop{Y}_pertDrop{Z}` if sg && rt ≥ 0   (line 656-660)
+      + `_cTag{c_tag}`                                      (line 662 save_results)
+
+    The sweep always passes use_hyper_attack=true and activate_vaghgar_deps=true,
+    so those two tags are constants here.
+    """
+    parts = [re.escape(base_name_to_save)]
+    if seed != 0:
+        parts.append(re.escape(f"_seed{seed}"))
+    parts.append(re.escape("_HyperAttackHints_VagharDeps"))
+    if pi == "true":
+        parts.append(re.escape("_PertruebedIntervals"))
+    has_boost = (zb == "true") or (rt >= 0.0) or (sg == "true")
+    if has_boost:
+        parts.append(re.escape("_stdBoost"))
+        if zb == "true":
+            parts.append(re.escape("_zono"))
+        if rt >= 0.0:
+            parts.append(re.escape(f"_BTPR{rt}"))
+        if sg == "true":
+            parts.append(re.escape("_SibGate"))
+    if sg == "true" and rt >= 0.0:
+        parts.append(r"_both\d+_orgDrop\d+_pertDrop\d+")
+    parts.append(re.escape(f"_cTag{c_tag}"))
+    parts.append(r"\.txt$")
+    return re.compile("".join(parts))
+
+
+def _stdboost_missing_c_targets(out_dir, arch, pert_type, eps_str,
+                                base_name_to_save, seed, zb, sg, rt, pi,
+                                c_tag, c_targets):
+    """Return subset of `c_targets` (Julia 1-indexed) for which no
+    standard-mode boost (Boosting Standard Mode §3 of advstd_techniques.tex)
+    result file in `out_dir` matches the exact (zb, sg, rt, pi, seed, c_tag)
+    combo for this network.
+
+    Works for both N1 and N2 stdBoost — the caller passes the role-specific
+    out_dir and base_name_to_save (e.g. N1stdBoost_{arch}_{n1_tag}/ with
+    base=`{n1_tag}_N1`, or N2stdBoost_{arch}_{n2_tag}/ with base=`{n2_tag}_N2`).
+    The discriminator regex from _stdboost_filename_regex is network-agnostic.
+
+    We glob broadly by (arch, pert_type, eps_variant, ctag, base_name_to_save)
+    and then filter on the filename's tag tail so files written for a
+    different (zb/sg/rt/pi) configuration in the same out_dir don't
+    false-skip our combo. eps_str is matched via _eps_str_variants because
+    Julia writes float-form filenames.
+    """
+    c_targets = [ct for ct in c_targets if ct != c_tag]
+    if not os.path.isdir(out_dir):
+        return list(c_targets)
+    src0 = c_tag - 1
+    tail_re = _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag)
+    covered = set()
+    for variant in _eps_str_variants(eps_str):
+        pattern = os.path.join(
+            out_dir,
+            f"*_{arch}_{pert_type}_{variant}_ctag{src0}_{base_name_to_save}_*.txt",
+        )
+        for fpath in glob.glob(pattern):
+            fname = os.path.basename(fpath)
+            if tail_re.search(fname) is None:
+                continue  # different combo's file
+            for cs, ct in _parse_c_source_target_pairs(fpath):
+                if cs == src0:
+                    covered.add(ct)
     return [ct for ct in c_targets if (ct - 1) not in covered]
 
 
@@ -378,14 +493,19 @@ def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_in
     return False
 
 
-def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="", locked_jobs=None):
+def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
+             locked_jobs=None, on_job_done=None):
     """Run jobs with CPU-pinned slot pooling.
 
     ready_jobs:  list of (label, cmd) that can start immediately.
-    locked_jobs: dict of  standard_label -> [(label, cmd), ...]
-                 Transfer jobs that become eligible only after the standard job
-                 with the matching label finishes. Pass None (default) for no
+    locked_jobs: dict of  unlocker_label -> [(label, cmd), ...]
+                 Dependent jobs that become eligible only after the job with
+                 the matching label finishes. Pass None (default) for no
                  dependencies (original single-phase behaviour).
+    on_job_done: optional callable(label) invoked once for every job as it
+                 finishes (used e.g. to release per-job resources like the
+                 N1 solve lock the moment its N1 job is done, rather than
+                 holding the lock until the entire pool drains).
     """
     if locked_jobs is None:
         locked_jobs = {}
@@ -432,35 +552,59 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="", locked_jo
             label, cmd = job_queue.pop(0)
             launch_in_slot(i, label, cmd)
 
-    # Poll for finished jobs, unlock transfer jobs, refill slots.
+    # Poll for finished jobs, unlock dependents, refill slots.
+    #
+    # Two passes per cycle:
+    #   1. Reap finished jobs (mark their slot as None, unlock dependents,
+    #      run on_job_done).
+    #   2. Unified refill — fill *every* empty slot from job_queue, not just
+    #      the slot that happened to finish. Without this second pass, any
+    #      slot that started the cycle empty (because initial ready_jobs <
+    #      max_slots, or because a previous finish had nothing in the queue
+    #      yet) would stay empty for the rest of the run — even after a
+    #      later unlock dumps many jobs into the queue.
     while any(s is not None for s in slots) or job_queue:
+        # Pass 1: reap.
         for i in range(max_slots):
             if slots[i] is None:
                 continue
             label, proc, log_file = slots[i]
             ret = proc.poll()
-            if ret is not None:
-                log_file.close()
-                status = "OK" if ret == 0 else f"EXIT {ret}"
-                finished += 1
+            if ret is None:
+                continue
+            log_file.close()
+            status = "OK" if ret == 0 else f"EXIT {ret}"
+            finished += 1
 
-                # Unlock transfer jobs that were waiting on this standard job.
-                if label in locked_jobs:
-                    unlocked = locked_jobs.pop(label)
-                    job_queue.extend(unlocked)
-                    print(f"  [{label:<50s}] finished ({status})  "
-                          f"[{finished}/{total_jobs}]  "
-                          f"-> unlocked {len(unlocked)} transfer job(s)")
-                else:
-                    print(f"  [{label:<50s}] finished ({status})  "
-                          f"[{finished}/{total_jobs}]")
+            # Unlock dependent jobs that were waiting on this job.
+            if label in locked_jobs:
+                unlocked = locked_jobs.pop(label)
+                job_queue.extend(unlocked)
+                print(f"  [{label:<50s}] finished ({status})  "
+                      f"[{finished}/{total_jobs}]  "
+                      f"-> unlocked {len(unlocked)} dependent job(s)")
+            else:
+                print(f"  [{label:<50s}] finished ({status})  "
+                      f"[{finished}/{total_jobs}]")
 
-                if ret != 0:
-                    print(f"    -> see log: {log_file.name}")
-                slots[i] = None
-                if job_queue:
-                    next_label, next_cmd = job_queue.pop(0)
-                    launch_in_slot(i, next_label, next_cmd)
+            if on_job_done is not None:
+                try:
+                    on_job_done(label)
+                except Exception as e:
+                    print(f"    -> on_job_done({label!r}) raised: {e}")
+
+            if ret != 0:
+                print(f"    -> see log: {log_file.name}")
+            slots[i] = None
+
+        # Pass 2: refill every empty slot from the queue. Keeps all cores
+        # busy whenever there is work waiting, regardless of which slots
+        # freed up this cycle (or were never filled in the first place).
+        for i in range(max_slots):
+            if slots[i] is None and job_queue:
+                next_label, next_cmd = job_queue.pop(0)
+                launch_in_slot(i, next_label, next_cmd)
+
         time.sleep(1)
 
     print(f"\n{phase_name}: all {total_jobs} jobs done.")
@@ -593,6 +737,12 @@ def parse_result_file(filepath):
                         "solve_status": fields.get("solve_status", ""),
                         "n2_org_relaxed_binaries": fields.get("n2_org_relaxed_binaries", ""),
                         "n2_pert_relaxed_binaries": fields.get("n2_pert_relaxed_binaries", ""),
+                        "sibgate_both_thin":
+                            fields.get("sibgate_both_thin", ""),
+                        "sibgate_one_thin_org_dropped":
+                            fields.get("sibgate_one_thin_org_dropped", ""),
+                        "sibgate_one_thin_pert_dropped":
+                            fields.get("sibgate_one_thin_pert_dropped", ""),
                     }
                 except (KeyError, ValueError):
                     continue
@@ -995,6 +1145,11 @@ def _extract_advstd_file_metadata(filename):
         "n1_probe": "lp" if "n1ProbeLP" in filename else "off",
         "relax_threshold": btpr_match.group(1) if btpr_match else "off",
         "relax_mode": "btpr" if btpr_match else "off",
+        # Technique 4 (SibGate): tag is bare '_SibGate' (no payload). Per-tier
+        # neuron counts live as separate fields in the per-cell CSV — keep
+        # this dict's value boolean so combo identity stays orthogonal to
+        # neuron-population details.
+        "sibling_gate": "yes" if "_SibGate" in filename else "no",
         "elim_org": elim_org_match.group(1) if elim_org_match else "elim not activated",
         "elim_pert": elim_pert_match.group(1) if elim_pert_match else "elim not activated",
         "seed": seed_match.group(1) if seed_match else "0",
@@ -1024,7 +1179,10 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
         "delta_error",
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
         "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
+        "sibling_gate",
         "elim_org", "elim_pert", "relaxed_org", "relaxed_pert",
+        "sibgate_both_thin", "sibgate_one_thin_org_dropped",
+        "sibgate_one_thin_pert_dropped",
         "seed",
         "how_much_faster",
         "lp_optimization_time", "time_advstd_with_lp", "how_much_faster_with_lp",
@@ -1132,6 +1290,7 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                         "n1_probe": meta["n1_probe"],
                         "relax_threshold": meta["relax_threshold"],
                         "relax_mode": meta["relax_mode"],
+                        "sibling_gate": meta["sibling_gate"],
                         "elim_org": meta["elim_org"],
                         "elim_pert": meta["elim_pert"],
                         "relaxed_org": (a_info.get("n2_org_relaxed_binaries", "")
@@ -1140,6 +1299,14 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                         "relaxed_pert": (a_info.get("n2_pert_relaxed_binaries", "")
                                          if meta["relax_threshold"] != "off"
                                          else "relax not activated"),
+                        # Per-tier SibGate neuron counts (blank when SibGate
+                        # is off — Julia only writes them when the flag is on).
+                        "sibgate_both_thin":
+                            a_info.get("sibgate_both_thin", ""),
+                        "sibgate_one_thin_org_dropped":
+                            a_info.get("sibgate_one_thin_org_dropped", ""),
+                        "sibgate_one_thin_pert_dropped":
+                            a_info.get("sibgate_one_thin_pert_dropped", ""),
                         "seed": meta["seed"],
                         "how_much_faster": "",
                         "lp_optimization_time": f"{a_lp_time:.2f}" if a_lp_time is not None else "",
@@ -1221,24 +1388,27 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
 def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv_path, seeds=None):
     """Aggregate per-cell sweep rows into one row per flag combination.
 
-    Each combo = the 8-tuple (mip_start, branch_priorities, lp_basis,
-    bound_tightening, var_hint, zono_bounds, n1_probe, relax_threshold).
+    Each combo = the 9-tuple (mip_start, branch_priorities, lp_basis,
+    bound_tightening, var_hint, zono_bounds, n1_probe, relax_threshold,
+    sibling_gate).
     Within a combo we group the per-cell rows by (arch, perturbation, size,
-    c_source, c_target, seed), dedupe duplicate runs of the same cell via
-    geometric mean of `time_advstd / time_standard`, then compute win/loss
-    counts and geomean speedups (gm_win, gm_lose, gm_all).
+    c_source, c_target, seed), dedupe duplicate runs of the same cell by
+    averaging `time_advstd` and `time_standard` separately, then compute
+    win/loss counts and the aggregate speedups (gm_win, gm_lose, gm_all)
+    as sum(time_advstd) / sum(time_standard) over the cells in the combo
+    (over the winning subset, losing subset, and all cells respectively).
 
     The row is classified per seed (WIN / LOSE / flip / miss) and given an
     overall label (STRICT / GENERAL / MIXED / LOSER). See the docstring of
     the calling branch for the definitions.
     """
     import csv as _csv
-    import math
     from collections import defaultdict
 
     FLAG_FIELDS = (
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
         "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
+        "sibling_gate",
     )
     TC_FIELDS = ("arch", "perturbation", "perturbation_size", "c_source", "c_target")
 
@@ -1248,9 +1418,9 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
     def _tc_key(row):
         return tuple(row[f] for f in TC_FIELDS)
 
-    # cells[(combo, tc, seed)] -> list of speedup values
-    cells = defaultdict(list)
-    cells_with_lp = defaultdict(list)  # same but using total_time_with_lp
+    # cell_times[(combo, tc, seed)] -> list of (t_adv, t_std) pairs
+    cell_times = defaultdict(list)
+    cell_times_with_lp = defaultdict(list)  # (t_adv_with_lp, t_std) pairs
     archs_per_combo = defaultdict(set)
     perts_per_combo = defaultdict(set)
     ctargets_per_combo = defaultdict(set)
@@ -1269,14 +1439,14 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
             continue
         combo = _combo_key(row)
         cell_key = (combo, _tc_key(row), row["seed"])
-        cells[cell_key].append(t_adv / t_std)
-        # Collect with-LP speedup when LP time is available
+        cell_times[cell_key].append((t_adv, t_std))
+        # Collect with-LP times when LP time is available
         t_adv_with_lp_str = row.get("time_advstd_with_lp", "")
         if t_adv_with_lp_str:
             try:
                 t_adv_with_lp = float(t_adv_with_lp_str)
                 if t_adv_with_lp > 0:
-                    cells_with_lp[cell_key].append(t_adv_with_lp / t_std)
+                    cell_times_with_lp[cell_key].append((t_adv_with_lp, t_std))
             except (TypeError, ValueError):
                 pass
         archs_per_combo[combo].add(row["arch"])
@@ -1297,29 +1467,38 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
         except ValueError:
             pass
 
-    def _geomean(xs):
+    def _mean(xs):
         xs = list(xs)
         if not xs:
             return None
-        return math.exp(sum(math.log(x) for x in xs) / len(xs))
+        return sum(xs) / len(xs)
 
-    # Dedupe each (combo, tc, seed) cell via geomean, then bucket per combo.
-    combo_cells = defaultdict(list)  # combo -> list of (tc, seed, speedup)
-    for (combo, tc, seed), sp_list in cells.items():
-        combo_cells[combo].append((tc, seed, _geomean(sp_list)))
+    def _ratio(num, den):
+        return (num / den) if (den and den > 0) else None
 
-    # Same dedup for with-LP speedups
+    # Dedupe each (combo, tc, seed) cell by averaging t_adv and t_std
+    # separately, then bucket per combo. Each entry is
+    # (tc, seed, t_adv_avg, t_std_avg, sp) where sp = t_adv_avg / t_std_avg.
+    combo_cells = defaultdict(list)
+    for (combo, tc, seed), pairs in cell_times.items():
+        avg_adv = _mean(p[0] for p in pairs)
+        avg_std = _mean(p[1] for p in pairs)
+        combo_cells[combo].append((tc, seed, avg_adv, avg_std, avg_adv / avg_std))
+
+    # Same dedup for with-LP times
     combo_cells_with_lp = defaultdict(list)
-    for (combo, tc, seed), sp_list in cells_with_lp.items():
-        combo_cells_with_lp[combo].append((tc, seed, _geomean(sp_list)))
+    for (combo, tc, seed), pairs in cell_times_with_lp.items():
+        avg_adv_lp = _mean(p[0] for p in pairs)
+        avg_std = _mean(p[1] for p in pairs)
+        combo_cells_with_lp[combo].append((tc, seed, avg_adv_lp, avg_std))
 
     if seeds is None:
-        seeds = sorted({k[2] for k in cells.keys()},
+        seeds = sorted({k[2] for k in cell_times.keys()},
                        key=lambda s: int(s) if s.isdigit() else s)
 
     def _classify_combo(cells_list):
         by_seed = defaultdict(list)
-        for _tc, seed, sp in cells_list:
+        for _tc, seed, _adv, _std, sp in cells_list:
             by_seed[seed].append(sp)
         per_seed = {}
         for seed in seeds:
@@ -1339,15 +1518,23 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
 
     agg_rows = []
     for combo, cells_list in combo_cells.items():
-        wins = [sp for _, _, sp in cells_list if sp < 1]
-        losses = [sp for _, _, sp in cells_list if sp >= 1]
-        all_sp = [sp for _, _, sp in cells_list]
+        win_cells = [(adv, std) for _, _, adv, std, sp in cells_list if sp < 1]
+        lose_cells = [(adv, std) for _, _, adv, std, sp in cells_list if sp >= 1]
+        all_cells = [(adv, std) for _, _, adv, std, _ in cells_list]
+        all_sp = [sp for _, _, _, _, sp in cells_list]
         per_seed = _classify_combo(cells_list)
         n_win_seeds = sum(1 for v in per_seed.values() if v == "WIN")
         n_flip_seeds = sum(1 for v in per_seed.values() if v == "flip")
         n_lose_seeds = sum(1 for v in per_seed.values() if v == "LOSE")
 
-        gm_all_raw = _geomean(all_sp)
+        sum_adv_all = sum(adv for adv, _ in all_cells)
+        sum_std_all = sum(std for _, std in all_cells)
+        sum_adv_win = sum(adv for adv, _ in win_cells)
+        sum_std_win = sum(std for _, std in win_cells)
+        sum_adv_lose = sum(adv for adv, _ in lose_cells)
+        sum_std_lose = sum(std for _, std in lose_cells)
+
+        gm_all_raw = _ratio(sum_adv_all, sum_std_all)
         min_speedup_raw = max(all_sp) if all_sp else None
 
         # ── Coverage tier: how varied was the test slice? ──
@@ -1361,7 +1548,7 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
             coverage_tier = "narrow"
 
         # ── Performance tier: aggregate speedup × worst-case regression ──
-        n_lose_cells = len(losses)
+        n_lose_cells = len(lose_cells)
         if gm_all_raw is None:
             perf_tier = "unknown"
         elif n_lose_cells == 0 and gm_all_raw < 1.0 / 1.05:
@@ -1401,18 +1588,20 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
         agg["_coverage_tier"] = coverage_tier
         agg["_perf_tier"] = perf_tier
         agg["n_tested"] = len(all_sp)
-        agg["n_win"] = len(wins)
-        agg["n_lose"] = len(losses)
-        agg["gm_win"] = _fmt_gm(_geomean(wins))
-        agg["gm_lose"] = _fmt_gm(_geomean(losses))
-        agg["gm_all"] = _fmt_gm(_geomean(all_sp))
-        # With-LP speedup: geomean over cells that have LP time data
+        agg["n_win"] = len(win_cells)
+        agg["n_lose"] = len(lose_cells)
+        agg["gm_win"] = _fmt_gm(_ratio(sum_adv_win, sum_std_win))
+        agg["gm_lose"] = _fmt_gm(_ratio(sum_adv_lose, sum_std_lose))
+        agg["gm_all"] = _fmt_gm(gm_all_raw)
+        # With-LP speedup: sum(t_advstd_with_lp) / sum(t_standard) over cells
+        # that have LP time data.
         lp_cells = combo_cells_with_lp.get(combo, [])
-        all_sp_with_lp = [sp for _, _, sp in lp_cells]
-        agg["gm_all_with_lp"] = _fmt_gm(_geomean(all_sp_with_lp))
+        sum_adv_lp = sum(adv for _, _, adv, _ in lp_cells)
+        sum_std_lp = sum(std for _, _, _, std in lp_cells)
+        agg["gm_all_with_lp"] = _fmt_gm(_ratio(sum_adv_lp, sum_std_lp))
         agg["max_speed_up"] = _fmt_gm(min(all_sp)) if all_sp else ""
         agg["min_speed_up"] = _fmt_gm(max(all_sp)) if all_sp else ""
-        agg["_gm_all_raw"] = _geomean(all_sp) or 0.0
+        agg["_gm_all_raw"] = gm_all_raw or 0.0
         agg["n_win_seeds"] = n_win_seeds
         agg["n_flip_seeds"] = n_flip_seeds
         agg["n_lose_seeds"] = n_lose_seeds
@@ -1524,7 +1713,10 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
         "delta_error",
         "mip_start", "branch_priorities", "lp_basis", "bound_tightening",
         "var_hint", "zono_bounds", "n1_probe", "relax_threshold", "relax_mode",
+        "sibling_gate",
         "elim_org", "elim_pert", "relaxed_org", "relaxed_pert",
+        "sibgate_both_thin", "sibgate_one_thin_org_dropped",
+        "sibgate_one_thin_pert_dropped",
         "seed",
         "how_much_faster",
         "lp_optimization_time", "time_advstd_with_lp", "how_much_faster_with_lp",
@@ -1626,6 +1818,26 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
         print(f"[tex-update] {exc}")
     except Exception as exc:
         print(f"[tex-update] error: {exc}")
+
+    # ── Standard-mode nn1-boost section (sec:safe_nn1) ──
+    # Scan _stdBoost_* result files, pair each cell with its
+    # with-perturbed-intervals baseline, and rewrite the
+    # % BEGIN AUTO: nn1_safe_tables block. Independent of the
+    # advstd CSVs above — uses its own filename matcher and
+    # iterates the same arch_runs.
+    try:
+        dataset_guess = os.path.basename(combined_base) or "mnist"
+        if hasattr(updater, "regenerate_nn1_section"):
+            updater.regenerate_nn1_section(
+                tex_path, cwd, dataset_guess, arch_runs,
+                parse_result_file,
+                seeds_filter=combo_ranking_seeds)
+        else:
+            print("[tex-update] updater missing regenerate_nn1_section "
+                  "— upgrade update_advstd_tex_tables.py to populate "
+                  "the nn1 boosting section.")
+    except Exception as exc:
+        print(f"[tex-update] nn1 block error: {exc}")
 
 
 def main():
@@ -1747,14 +1959,17 @@ def main():
                              "aggregation. With a single seed, the STRICT/GENERAL/MIXED/LOSER labels "
                              "are assigned by gm_all thresholds instead of per-seed WIN/LOSE/flip.")
     parser.add_argument("--combination_table", type=str, default=None,
-                        metavar="BT:VH:TAU",
-                        help="Restrict the per-arch perturbation tables in advstd_techniques.tex "
-                             "(the c_src-tinted green/yellow/pink blocks) to a single combination. "
-                             "Format '<bound_tight>:<varHint>:<tau>', e.g. 'zono:prev_pgd:0.5'. "
-                             "Only takes effect when the tex tables are rewritten "
-                             "(after --find_advstd_faster_than_standard). The blue overall "
-                             "ranking and orange timeout-gap tables are not filtered. "
-                             "'off' is accepted as an alias for varHint='no'.")
+                        metavar="BT:VH:TAU[,BT:VH:TAU,...]",
+                        help="Restrict the advstd tables in advstd_techniques.tex (overall "
+                             "ranking, per-arch c_src-tinted green/yellow/pink blocks, and "
+                             "per-arch TIME_LIMIT gap-comparison tables) to one or more "
+                             "combinations. Format '<bound_tight>:<varHint>:<tau>' per combo, "
+                             "comma-separated. Examples: 'zono:prev_pgd:0.5' or "
+                             "'interval:prev_pgd:0.5+sg,zono:prev_pgd:0.5+sg'. Use the '+sg' "
+                             "suffix on tau to select SibGate (Technique 4) rows. Only takes "
+                             "effect when the tex tables are rewritten (after "
+                             "--find_advstd_faster_than_standard). 'off' is accepted as an "
+                             "alias for varHint='no'.")
     parser.add_argument("--transfer_opt_time_only", action="store_true",
                         help="When comparing times, use only optimization_time for transfer "
                              "(no hyper_attack_time) while standard still uses total_time.")
@@ -1804,6 +2019,14 @@ def main():
                              "approximation: delta_relaxed >= delta_exact. Requires "
                              "adv_std_bound_tightening=true; combos with bound_tightening=false are "
                              "auto-pruned.")
+    parser.add_argument("--sweep_adv_std_n2_sibling_gate", nargs="*", type=str, default=None,
+                        help="Values for adv_std_n2_sibling_gate (booleans 'true'/'false'). "
+                             "Default: ['false']. When 'true', Technique 4 augments Technique 3's "
+                             "tiered relaxation with a sibling-gated conditional triangle (one-thin "
+                             "tier) and a pre-activation coupling line (both-thin tier). Sound "
+                             "over-approximation: delta_relaxed >= delta_exact. Requires "
+                             "adv_std_n2_relax_threshold >= 0; combos that pair sibling_gate=true "
+                             "with relax_threshold=off are auto-pruned.")
     parser.add_argument("--sweep_adv_std_var_hint", nargs="*", type=str, default=None,
                         help="Values for adv_std_var_hint. Modes: off | prev | direct | direct_pgd | prev_pgd. "
                              "'prev' = previous §4.3 rule (shift ẑ^N1 by diff bound, clip to [l_n2, u_n2]); "
@@ -1817,6 +2040,38 @@ def main():
                              "Variable hints are orthogonal to branch priorities.")
     parser.add_argument("--sweep_gurobi_seed", nargs="*", type=int, default=None,
                         help="Gurobi seeds to sweep (e.g. '0 1 2 3 4') for variance measurement. Default: [0].")
+    parser.add_argument("--include_nn1_boost", action="store_true",
+                        help="In --advanced_standard mode: also queue N1 standard-mode boost jobs "
+                             "alongside the advstd-N2 sweep. Each job runs --mode standard on the N1 "
+                             "model. The boost grid is controlled by --sweep_stdboost_* flags (zono "
+                             "bounds, sibling gate, perturbed intervals) plus the non-negative entries "
+                             "of --sweep_adv_std_n2_relax_threshold for the per-copy triangle drop. "
+                             "Mirrors Section 3 (Boosting Standard Mode) of advstd_techniques.tex. "
+                             "Results land in N1stdBoost_{arch}_{n1_tag}/ dirs. Skip-check uses "
+                             "_stdboost_missing_c_targets, which discriminates between combos by the "
+                             "exact filename tag sequence.")
+    parser.add_argument("--include_nn2_boost", action="store_true",
+                        help="In --advanced_standard mode: also queue N2 standard-mode boost jobs "
+                             "(same boost machinery as --include_nn1_boost, but applied to the N2 model, "
+                             "i.e. N1 + sgd_epochs). Identical combo grid via --sweep_stdboost_* and "
+                             "non-negative entries of --sweep_adv_std_n2_relax_threshold. Results land "
+                             "in N2stdBoost_{arch}_{n2_tag}/ dirs. Independent of --include_nn1_boost; "
+                             "enable either or both.")
+    parser.add_argument("--sweep_stdboost_zono_bounds", nargs="*", type=str, default=None,
+                        help="Values for nn1_zono_bounds ('true'/'false') used in the stdBoost sweep "
+                             "for BOTH --include_nn1_boost and --include_nn2_boost. The Julia flag is "
+                             "named --nn1_zono_bounds in run.jl but its mechanics are network-agnostic "
+                             "(it operates on whatever --model_path is passed). Default: ['true']. "
+                             "See §3.2 of advstd_techniques.tex (Absolute Zonotope Bound Tightening).")
+    parser.add_argument("--sweep_stdboost_sibling_gate", nargs="*", type=str, default=None,
+                        help="Values for nn1_sibling_gate ('true'/'false') used in the stdBoost sweep "
+                             "for BOTH --include_nn1_boost and --include_nn2_boost. Default: ['true']. "
+                             "See §3.4 of advstd_techniques.tex (SibGate).")
+    parser.add_argument("--sweep_stdboost_perturbed_intervals", nargs="*", type=str, default=None,
+                        help="Values for use_perturbed_intervals ('true'/'false') used in the stdBoost "
+                             "sweep for BOTH --include_nn1_boost and --include_nn2_boost. Default: "
+                             "['true']. Required true for soundness when nn1_relax_threshold > 0 "
+                             "(unsound combo guard at run.jl:487-494) — those combos are auto-pruned.")
     parser.add_argument("--refresh_ranking_csv", action="store_true",
                         help="Before applying --advstd_safe_combos_only, regenerate the combo-ranking "
                              "CSV from the latest per-cell results (equivalent to running "
@@ -2041,6 +2296,16 @@ def main():
                     print(f"ERROR: unknown --sweep_adv_std_n1_probe value '{v}' (expected off | lp)")
                     sys.exit(1)
             relax_t_vals = args.sweep_adv_std_n2_relax_threshold if args.sweep_adv_std_n2_relax_threshold else [-1.0]
+            # Technique 4 (SibGate) — boolean flag. Augments Technique 3's
+            # tiered relaxation with a sibling-gated conditional triangle
+            # (one-thin tier) and a pre-act coupling line (both-thin tier).
+            # No effect when adv_std_n2_relax_threshold < 0; combos are
+            # auto-pruned below.
+            sg_vals = [v.lower() for v in args.sweep_adv_std_n2_sibling_gate] if args.sweep_adv_std_n2_sibling_gate else ["false"]
+            for v in sg_vals:
+                if v not in ("true", "false"):
+                    print(f"ERROR: unknown --sweep_adv_std_n2_sibling_gate value '{v}' (expected true | false)")
+                    sys.exit(1)
             # 5-valued mode: off | prev | direct | direct_pgd | prev_pgd. Legacy true/false
             # still accepted and normalized to prev/off so historical commands keep working.
             _vh_alias = {"true": "prev", "false": "off"}
@@ -2064,15 +2329,17 @@ def main():
             # Note: var_hint_fix has been merged into var_hint (the "fix" is
             # always-on now), so the vhf dimension is gone.
             technique_combos = [
-                (ms, bp, lb, bt, zb, np_, rt, vh)
-                for ms, bp, lb, bt, zb, np_, rt, vh in itertools.product(
+                (ms, bp, lb, bt, zb, np_, rt, vh, sg)
+                for ms, bp, lb, bt, zb, np_, rt, vh, sg in itertools.product(
                     mip_start_vals, branch_pri_vals, lp_basis_vals, bound_tight_vals,
-                    zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals)
+                    zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals, sg_vals)
                 if not (ms == "false" and bp == "off" and lb == "false" and bt == "false"
-                        and zb == "false" and np_ == "off" and rt < 0.0 and vh == "off")
+                        and zb == "false" and np_ == "off" and rt < 0.0 and vh == "off"
+                        and sg == "false")
                 and not (zb == "true" and bt == "false")
                 and not (np_ != "off" and bt == "false")
                 and not (rt >= 0.0 and bt == "false")
+                and not (sg == "true" and rt < 0.0)
             ]
 
             # ── Optional: regenerate the ranking CSV before filtering ──
@@ -2149,7 +2416,12 @@ def main():
                         # `_varHint`/`_varHint_varHintFix` files are tagged
                         # `vh_legacy` by the extractor and do not match new
                         # combos.
-                        _key = (_ms, _bp, _lb, _bt, _zb, _np, _rt, _vh)
+                        # Back-compat: existing ranking CSVs predate Technique 4
+                        # and have no sibling_gate column. Treat such rows as
+                        # describing the sg="false" combos. New CSV layouts can
+                        # add a "sibling_gate" column to disambiguate.
+                        _sg = _yn.get(_row.get("sibling_gate", "no"), _row.get("sibling_gate", "false"))
+                        _key = (_ms, _bp, _lb, _bt, _zb, _np, _rt, _vh, _sg)
                         _match_value = _row.get(_match_column, "").lower()
                         if _match_value in _priority_rank:
                             safe_keys.add(_key)
@@ -2178,93 +2450,91 @@ def main():
                       f"({n_safe} safe, {n_untested} untested, {len(blocked)} blocked) "
                       f"from {args.advstd_safe_combos_only}")
 
-            print(f"\nAdvanced-standard: {len(technique_combos)} technique combinations × {len(seed_vals)} seed(s) (all-off + zono/probe/relax-without-boundTight excluded):")
-            for ms, bp, lb, bt, zb, np_, rt, vh in technique_combos:
+            print(f"\nAdvanced-standard: {len(technique_combos)} technique combinations × {len(seed_vals)} seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):")
+            for ms, bp, lb, bt, zb, np_, rt, vh, sg in technique_combos:
                 # When bt=true and rt>=0, boundTight is subsumed by BoundTightPertRelax in the filename.
                 bt_desc = f"BoundTightPertRelax{rt}" if (bt == "true" and rt >= 0.0) else \
                           ("boundTight" if bt == "true" else "off")
-                print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}")
+                print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}")
             print(f"  seeds: {seed_vals}")
 
             sys.path.insert(0, os.path.join(cwd, 'utils'))
             from run_experiment import ARCH_REGISTRY, DATASET_CONFIG
 
+            # ── Phase 0: Train N2 = N1 + sgd_epochs for each arch (once) ─
+            # Hoisted out of the c_tag loop — training only depends on
+            # (arch, sgd_epochs, lr) and is idempotent if N2 already exists.
+            arch_meta = {}  # arch -> (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
+            for arch, model_path in arch_runs:
+                if model_path is None:
+                    print(f"ERROR: --advanced_standard requires --model_path (or --arch_models)")
+                    sys.exit(1)
+                print(f"\n{'=' * 60}")
+                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
+                print(f"{'=' * 60}\n")
+                n1_dir, n2_dir = train_extra_epochs(
+                    model_path, arch, dataset,
+                    sgd_epochs=args.sgd_epochs, lr=args.lr)
+                _, model_name = ARCH_REGISTRY[arch]
+                _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+                n1_tag = os.path.basename(os.path.normpath(n1_dir))
+                n2_tag = os.path.basename(os.path.normpath(n2_dir))
+                n1_model_p = os.path.join(n1_dir, "model.p")
+                n2_model_p = os.path.join(n2_dir, "model.p")
+                arch_meta[arch] = (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
+
+            # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
+            # now uses a continuous transfer-probability signal built from
+            # N1's primal + N1 bounds + diff bounds + N2 bounds — none of
+            # which require per-variable branching stats. The completeness
+            # gate therefore never needs the n1_pseudocosts_*.bin files.
+            need_pseudocosts = False
+            # Does any combo in this sweep need the N1 probe? If so, the
+            # state dir must also contain n1_preact_bounds.bin.
+            need_n1_preact = any(v != "off" for v in n1_probe_vals)
+            if need_n1_preact:
+                print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
+
+            # Stale lock heuristic: 2× the Gurobi time limit.
+            stale_lock_sec = max(2 * args.timeout, 600)
+            wait_timeout_sec = stale_lock_sec
+
+            # Cross-c_tag / cross-pert tracking. The (arch, pert_spec) lock is
+            # acquired once (at the first c_tag that needs N1 for that pert),
+            # held while ALL chained N1 jobs for it run sequentially, and
+            # released the moment the last N1 in the chain finishes.
+            n1_lock_by_pert = {}              # (arch, pert_spec) -> lock_path
+            n1_pending_count_per_pert = {}    # (arch, pert_spec) -> int (countdown)
+            n1_last_label_per_pert = {}       # (arch, pert_spec) -> label of most-recent N1 job queued (next c_tag chains behind it)
+            n1_pert_by_label = {}             # n1_label -> (arch, pert_spec) reverse lookup for on_job_done
+            n1_label_by_pert_ctag = {}        # (arch, pert_spec, c_tag) -> n1_label (None if no N1 queued for that triple)
+
+            ready_n1_jobs = []
+            ready_std_n2_jobs = []
+            ready_advstd_jobs = []
+            locked_jobs_by_label = {}         # unlocker_label -> [(label, cmd), ...]  (N1 chains + N1→advstd unlocks)
+            n2_skipped = 0
+            std_skipped = 0
+
+            # ── Build phase: iterate c_tag × arch × pert_spec × combos.
+            # Within each c_tag iteration, build N1 jobs (chained per pert),
+            # std-N2 jobs (always ready), and advstd jobs (locked behind the
+            # corresponding c_tag's N1 if our process is solving it).
             for c_tag in sweep_ctag_vals:
                 print(f"\n{'━' * 60}\nc_tag = {c_tag}  (Julia 1-indexed; Julia writes ctag{c_tag - 1} into filenames)\n{'━' * 60}")
-                # ── Phase 1: Solve N1 once per (arch, perturbation) ──────────
-                n1_jobs = []   # (label, cmd)
-                # Track state dirs so N2 jobs can reference them
-                # Key: (arch, pert_spec) → (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag)
-                n1_info = {}
 
-                # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
-                # now uses a continuous transfer-probability signal built from
-                # N1's primal + N1 bounds + diff bounds + N2 bounds — none of
-                # which require per-variable branching stats. The completeness
-                # gate therefore never needs the n1_pseudocosts_*.bin files.
-                need_pseudocosts = False
-                # Does any combo in this sweep need the N1 probe? If so, the
-                # state dir must also contain n1_preact_bounds.bin (written by
-                # save_n1_diff_bounds when it has n1_preact_up_bounds populated
-                # during the Phase-1 save). Legacy state dirs without this
-                # file will trigger an N1 re-solve.
-                need_n1_preact = any(v != "off" for v in n1_probe_vals)
-                if need_n1_preact:
-                    print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
-
-                # Stale lock heuristic: 2× the Gurobi time limit, i.e. generous
-                # enough that a legitimately-long N1 solve is never considered
-                # stale, but short enough that a crashed process clears within
-                # a reasonable window.
-                stale_lock_sec = max(2 * args.timeout, 600)
-                wait_timeout_sec = stale_lock_sec
-
-                # Track locks this process acquired so we can release them after
-                # Phase 1 finishes (successfully or otherwise).
-                acquired_n1_locks = []
-
+                # Phase 1 (this c_tag): N1 jobs.
                 for arch, model_path in arch_runs:
-                    if model_path is None:
-                        print(f"ERROR: --advanced_standard requires --model_path (or --arch_models)")
-                        sys.exit(1)
-
-                    print(f"\n{'=' * 60}")
-                    print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
-                    print(f"{'=' * 60}\n")
-                    n1_dir, n2_dir = train_extra_epochs(
-                        model_path, arch, dataset,
-                        sgd_epochs=args.sgd_epochs, lr=args.lr)
-
-                    _, model_name = ARCH_REGISTRY[arch]
-                    _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
-                    n1_tag = os.path.basename(os.path.normpath(n1_dir))
-                    n2_tag = os.path.basename(os.path.normpath(n2_dir))
-                    n1_model_p = os.path.join(n1_dir, "model.p")
-                    n2_model_p = os.path.join(n2_dir, "model.p")
-
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
                     for pert_name, pert_spec in perts:
                         pert_type, eps_str = pert_spec.split(":", 1)
                         arch_prefix = f"[{arch}] "
 
-                        # N1 state directory: one per (arch, perturbation)
                         n1_state_dir = os.path.join(
                             cwd, "paper_experiments", dataset, f"{arch}_exp",
                             pert_type, f"eps_{eps_str}",
                             f"n1_state_{arch}_{n1_tag}")
 
-                        n1_info[(arch, pert_spec)] = (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset)
-
-                        # ── Smart skip + cross-process lock coordination ─────
-                        # 1. State complete for every requested c_target → skip
-                        # 2. State missing or incomplete for some c_targets
-                        #    (missing files, empty pseudocosts, or missing
-                        #    preact bounds) → try to acquire the lock. If we
-                        #    get it, queue an N1 job restricted to only the
-                        #    missing c_targets (so we don't re-solve pairs
-                        #    that are already saved), then release the lock
-                        #    after the solve finishes. If another process
-                        #    holds it, wait for them and re-check only the
-                        #    c_targets we still need.
                         requested_c_targets = _parse_c_targets(
                             args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
                         missing_c_targets = _n1_state_missing_c_targets(
@@ -2281,34 +2551,33 @@ def main():
                         else:
                             print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state missing — solving for c_targets={missing_c_targets}")
 
-                        got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
-                        if not got_lock:
-                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
-                            if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=missing_c_targets):
-                                print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state now ready — skipping our own N1 solve")
-                                continue
-                            # Either a timeout, the other process crashed,
-                            # or the other process solved a different
-                            # c_target subset than what we need. Try once to
-                            # acquire the (now-released) lock and solve the
-                            # still-missing c_targets ourselves.
-                            print(f"  {arch_prefix}{pert_name} WARNING: timed out or other process left state incomplete for our c_targets — attempting to solve N1 ourselves")
-                            # Recompute — the other process may have filled
-                            # in some pairs even if not all that we need.
-                            missing_c_targets = _n1_state_missing_c_targets(
-                                n1_state_dir, c_tag, requested_c_targets,
-                                need_pseudocosts, need_n1_preact=need_n1_preact)
-                            if not missing_c_targets:
-                                print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state became complete after wait — skipping our own N1 solve")
-                                continue
+                        # Acquire the (arch, pert_spec) lock if we don't
+                        # already hold it from an earlier c_tag in this build
+                        # phase. The lock is held until the LAST chained N1
+                        # for this pert finishes (released via on_job_done).
+                        if (arch, pert_spec) not in n1_lock_by_pert:
                             got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
                             if not got_lock:
-                                print(f"  {arch_prefix}{pert_name} ERROR: still unable to acquire N1 solve lock at {lock_path}. Aborting.")
-                                sys.exit(1)
+                                print(f"  {arch_prefix}{pert_name} c_tag={c_tag} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
+                                if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=missing_c_targets):
+                                    print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state now ready — skipping our own N1 solve")
+                                    continue
+                                print(f"  {arch_prefix}{pert_name} WARNING: timed out or other process left state incomplete for our c_targets — attempting to solve N1 ourselves")
+                                missing_c_targets = _n1_state_missing_c_targets(
+                                    n1_state_dir, c_tag, requested_c_targets,
+                                    need_pseudocosts, need_n1_preact=need_n1_preact)
+                                if not missing_c_targets:
+                                    print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state became complete after wait — skipping our own N1 solve")
+                                    continue
+                                got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
+                                if not got_lock:
+                                    print(f"  {arch_prefix}{pert_name} ERROR: still unable to acquire N1 solve lock at {lock_path}. Aborting.")
+                                    sys.exit(1)
+                            n1_lock_by_pert[(arch, pert_spec)] = lock_path
+                        # else: lock already held from an earlier c_tag — reuse.
 
-                        acquired_n1_locks.append(lock_path)
                         ct_arg = ",".join(str(ct) for ct in missing_c_targets)
-                        n1_label = f"{arch_prefix}{pert_name} N1-solve"
+                        n1_label = f"{arch_prefix}{pert_name} N1-solve c_tag={c_tag}"
                         n1_cmd = [
                             "julia", "run.jl",
                             "--mode", "advanced_standard_n1",
@@ -2328,197 +2597,377 @@ def main():
                             "--use_perturbed_intervals", "true",
                             "--Threads_num", str(Threads_num),
                         ]
-                        n1_jobs.append((n1_label, n1_cmd))
 
-                # Run all N1 jobs (one per perturbation, in parallel).
-                # Wrap in try/finally so locks this process acquired are always
-                # released — even on KeyboardInterrupt or solver crash — so
-                # other parallel sweep processes aren't blocked indefinitely.
-                if n1_jobs:
-                    print(f"\n── Phase 1: {len(n1_jobs)} N1 solve jobs ──")
-                    try:
-                        run_pool(n1_jobs, max_slots, cwd, cores_per_job, "Phase 1 (N1 solves)")
-                    finally:
-                        for lock_path in acquired_n1_locks:
-                            _release_n1_solve_lock(lock_path)
-                        if acquired_n1_locks:
-                            print(f"Phase 1: released {len(acquired_n1_locks)} N1 solve lock(s)")
-                else:
-                    # No jobs — either everything was already complete or another
-                    # process is handling it. Still release any locks we somehow
-                    # acquired (shouldn't happen, but belt + suspenders).
-                    for lock_path in acquired_n1_locks:
-                        _release_n1_solve_lock(lock_path)
+                        # First N1 for this (arch, pert_spec) goes into ready;
+                        # subsequent c_tags chain behind the previous N1 so
+                        # they serialize on the shared state-dir (n1_preact_bounds.bin
+                        # and the lock file).
+                        prev_label = n1_last_label_per_pert.get((arch, pert_spec))
+                        if prev_label is None:
+                            ready_n1_jobs.append((n1_label, n1_cmd))
+                        else:
+                            locked_jobs_by_label.setdefault(prev_label, []).append((n1_label, n1_cmd))
 
-                # ── Phase 1.5: Run standard N2 (vagharWithPerturbed) if missing ──
-                # The ranking comparison needs standard results as baseline.
-                # For new perturbation types/sizes these may not exist yet.
-                # Runs with: use_hyper_attack=true, activate_vaghgar_deps=true,
-                #            use_perturbed_intervals=true, use_relaxations=false.
-                std_n2_jobs = []
-                for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
-                    pert_type, eps_str = pert_spec.split(":", 1)
-                    pert_name = next(pn for pn, ps in perts if ps == pert_spec)
-                    arch_prefix = f"[{arch}] "
+                        n1_last_label_per_pert[(arch, pert_spec)] = n1_label
+                        n1_pending_count_per_pert[(arch, pert_spec)] = n1_pending_count_per_pert.get((arch, pert_spec), 0) + 1
+                        n1_pert_by_label[n1_label] = (arch, pert_spec)
+                        n1_label_by_pert_ctag[(arch, pert_spec, c_tag)] = n1_label
 
-                    requested_c_targets = _parse_c_targets(
-                        args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
-                    missing_std_cts = _standard_n2_missing_c_targets(
-                        pert_spec, cwd, arch, dataset, n2_tag,
-                        c_tag, requested_c_targets)
-                    if not missing_std_cts:
-                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 (vagharWithPerturbed {n2_tag}) complete for c_targets={requested_c_targets} — skipping")
-                        continue
-
-                    wanted_std = [ct for ct in requested_c_targets if ct != c_tag]
-                    if len(missing_std_cts) < len(wanted_std):
-                        have_std = [ct for ct in wanted_std if ct not in missing_std_cts]
-                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 partial — have c_targets={have_std}, completing missing={missing_std_cts}")
-                    else:
-                        print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 missing — solving for c_targets={missing_std_cts}")
-
-                    std_output_dir = os.path.join(
-                        "paper_experiments", dataset, f"{arch}_exp",
-                        pert_type, f"eps_{eps_str}",
-                        f"vagharWithPerturbed_{arch}_{n2_tag}")
-
-                    std_ct_arg = ",".join(str(ct) for ct in missing_std_cts)
-                    std_label = f"{arch_prefix}{pert_name} c_tag={c_tag} standard-N2 (WithPerturbed)"
-                    std_cmd = [
-                        "julia", "run.jl",
-                        "--mode", "standard",
-                        "--dataset", julia_dataset,
-                        "--model_name", model_name,
-                        "--model_path", n2_model_p,
-                        "--perturbation", pert_type,
-                        "--perturbation_size", eps_str,
-                        "--ctag", str(c_tag),
-                        "--ct", std_ct_arg,
-                        "--timout", str(args.timeout),
-                        "--output_dir", std_output_dir + "/",
-                        "--c_tag_mode", "false",
-                        "--use_hyper_attack", "true",
-                        "--activate_vaghgar_deps", "true",
-                        "--use_perturbed_intervals", "true",
-                        "--use_relaxations", "false",
-                        "--Threads_num", str(Threads_num),
-                    ]
-                    std_n2_jobs.append((std_label, std_cmd))
-
-                if std_n2_jobs:
-                    print(f"\n── Phase 1.5: {len(std_n2_jobs)} standard N2 jobs (vagharWithPerturbed, missing baselines) ──")
-                    run_pool(std_n2_jobs, max_slots, cwd, cores_per_job, "Phase 1.5 (standard N2)")
-                else:
-                    print("\n── Phase 1.5: all standard N2 baselines already exist — skipping ──")
-
-                # ── Phase 2: N2 sweep (all technique combos, in parallel) ────
-                n2_jobs = []
-                n2_skipped = 0
-                for (arch, pert_spec), (n1_state_dir, n1_model_p, n2_model_p, n1_tag, n2_tag, model_name, julia_dataset) in n1_info.items():
-                    pert_type, eps_str = pert_spec.split(":", 1)
-                    pert_name = next(pn for pn, ps in perts if ps == pert_spec)
-                    arch_prefix = f"[{arch}] "
-
-                    for ms, bp, lb, bt, zb, np_, rt, vh in technique_combos:
-                        tech_tag = ""
-                        if ms == "true":          tech_tag += "ms"
-                        if bp == "rank":          tech_tag += "bpRank"
-                        elif bp == "decay":       tech_tag += "bpDecay"
-                        if lb == "true":          tech_tag += "lb"
-                        # _BoundTightPertRelax subsumes _boundTight (see run.jl).
-                        if bt == "true":
-                            if rt >= 0.0:         tech_tag += f"btpr{rt}"
-                            else:                 tech_tag += "bt"
-                        if zb == "true":          tech_tag += "zb"
-                        if np_ == "lp":           tech_tag += "npLP"
-                        if vh == "true":          tech_tag += "vhFixed"
-
-                        adv_output_dir = os.path.join(
-                            "paper_experiments", dataset, f"{arch}_exp",
-                            pert_type, f"eps_{eps_str}",
-                            f"advStd_{arch}_N1_{n1_tag}")
-
-                        base_name_to_save = f"{n2_tag}_N2_advStd"
-                        if ms == "true":          base_name_to_save += "_mipStart"
-                        if bp == "rank":          base_name_to_save += "_branchPriRank"
-                        elif bp == "decay":       base_name_to_save += "_branchPriDecay"
-                        if lb == "true":          base_name_to_save += "_lpBasis"
-                        # _BoundTightPertRelax subsumes _boundTight (see run.jl).
-                        if bt == "true":
-                            if rt >= 0.0:
-                                base_name_to_save += f"_BoundTightPertRelax{rt}"
-                            else:
-                                base_name_to_save += "_boundTight"
-                        if zb == "true":          base_name_to_save += "_zonoBounds"
-                        if np_ == "lp":           base_name_to_save += "_n1ProbeLP"
-                        # VarHint is 5-valued. VH_PREV keeps the legacy
-                        # _varHintFixed tag so historical result files still
-                        # match cleanly; VH_DIRECT uses _varHintDirect;
-                        # VH_DIRECT_PGD uses _varHintDirectPGD;
-                        # VH_PREV_PGD uses _varHintPrevPGD. Legacy
-                        # 'true'/'false' were already normalized to 'prev'/'off'
-                        # upstream.
-                        if vh == "prev":          base_name_to_save += "_varHintFixed"
-                        elif vh == "direct":      base_name_to_save += "_varHintDirect"
-                        elif vh == "direct_pgd":  base_name_to_save += "_varHintDirectPGD"
-                        elif vh == "prev_pgd":    base_name_to_save += "_varHintPrevPGD"
+                # Phase 1.5 (this c_tag): standard-N2 (vagharWithPerturbed)
+                # baselines — independent of N1 state, always ready.
+                for arch, model_path in arch_runs:
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                    for pert_name, pert_spec in perts:
+                        pert_type, eps_str = pert_spec.split(":", 1)
+                        arch_prefix = f"[{arch}] "
 
                         requested_c_targets = _parse_c_targets(
                             args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
-                        for seed in seed_vals:
-                            missing_adv_cts = _advstd_missing_c_targets(
-                                cwd, dataset, arch, pert_type, eps_str,
-                                n1_tag, base_name_to_save, seed,
-                                c_tag, requested_c_targets)
-                            if not missing_adv_cts:
-                                n2_skipped += 1
-                                continue
-                            seed_suffix = f" seed{seed}" if seed != 0 else ""
-                            wanted_adv = [ct for ct in requested_c_targets if ct != c_tag]
-                            if len(missing_adv_cts) < len(wanted_adv):
-                                tag_suffix = f" (partial: missing {missing_adv_cts})"
-                            else:
-                                tag_suffix = ""
-                            label = f"{arch_prefix}{pert_name} c_tag={c_tag} N2({tech_tag}){seed_suffix}{tag_suffix}"
+                        missing_std_cts = _standard_n2_missing_c_targets(
+                            pert_spec, cwd, arch, dataset, n2_tag,
+                            c_tag, requested_c_targets)
+                        if not missing_std_cts:
+                            std_skipped += 1
+                            continue
 
-                            adv_ct_arg = ",".join(str(ct) for ct in missing_adv_cts)
-                            cmd = [
-                                "julia", "run.jl",
-                                "--mode", "advanced_standard_n2",
-                                "--dataset", julia_dataset,
-                                "--model_name", model_name,
-                                "--model_path", n1_model_p,
-                                "--model_path2", n2_model_p,
-                                "--perturbation", pert_type,
-                                "--perturbation_size", eps_str,
-                                "--ctag", str(c_tag),
-                                "--ct", adv_ct_arg,
-                                "--timout", str(args.timeout),
-                                "--output_dir", adv_output_dir + "/",
-                                "--name_to_save", base_name_to_save,
-                                "--n1_state_dir", n1_state_dir,
-                                "--use_hyper_attack", "true",
-                                "--activate_vaghgar_deps", "true",
-                                "--use_perturbed_intervals", "true",
-                                "--Threads_num", str(Threads_num),
-                                "--adv_std_mip_start", ms,
-                                "--adv_std_branch_priorities", bp,
-                                "--adv_std_lp_basis", lb,
-                                "--adv_std_bound_tightening", bt,
-                                "--adv_std_zono_bounds", zb,
-                                "--adv_std_n1_probe", np_,
-                                "--adv_std_n2_relax_threshold", str(rt),
-                                "--adv_std_var_hint", vh,
-                                "--gurobi_seed", str(seed),
-                            ]
-                            n2_jobs.append((label, cmd))
+                        wanted_std = [ct for ct in requested_c_targets if ct != c_tag]
+                        if len(missing_std_cts) < len(wanted_std):
+                            have_std = [ct for ct in wanted_std if ct not in missing_std_cts]
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 partial — have c_targets={have_std}, completing missing={missing_std_cts}")
+                        else:
+                            print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 missing — solving for c_targets={missing_std_cts}")
 
-                skip_note = f" (skipped {n2_skipped} already-completed)" if n2_skipped else ""
-                print(f"\n── Phase 2: {len(n2_jobs)} N2 jobs ({len(technique_combos)} combos × {len(n1_info)} perturbations){skip_note} ──")
-                if n2_jobs:
-                    run_pool(n2_jobs, max_slots, cwd, cores_per_job, "Phase 2 (N2 sweep)")
+                        std_output_dir = os.path.join(
+                            "paper_experiments", dataset, f"{arch}_exp",
+                            pert_type, f"eps_{eps_str}",
+                            f"vagharWithPerturbed_{arch}_{n2_tag}")
+
+                        std_ct_arg = ",".join(str(ct) for ct in missing_std_cts)
+                        std_label = f"{arch_prefix}{pert_name} c_tag={c_tag} standard-N2 (WithPerturbed)"
+                        std_cmd = [
+                            "julia", "run.jl",
+                            "--mode", "standard",
+                            "--dataset", julia_dataset,
+                            "--model_name", model_name,
+                            "--model_path", n2_model_p,
+                            "--perturbation", pert_type,
+                            "--perturbation_size", eps_str,
+                            "--ctag", str(c_tag),
+                            "--ct", std_ct_arg,
+                            "--timout", str(args.timeout),
+                            "--output_dir", std_output_dir + "/",
+                            "--c_tag_mode", "false",
+                            "--use_hyper_attack", "true",
+                            "--activate_vaghgar_deps", "true",
+                            "--use_perturbed_intervals", "true",
+                            "--use_relaxations", "false",
+                            "--Threads_num", str(Threads_num),
+                        ]
+                        ready_std_n2_jobs.append((std_label, std_cmd))
+
+                # Phase 2 (this c_tag): advstd jobs.
+                for arch, model_path in arch_runs:
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                    for pert_name, pert_spec in perts:
+                        pert_type, eps_str = pert_spec.split(":", 1)
+                        arch_prefix = f"[{arch}] "
+
+                        n1_state_dir = os.path.join(
+                            cwd, "paper_experiments", dataset, f"{arch}_exp",
+                            pert_type, f"eps_{eps_str}",
+                            f"n1_state_{arch}_{n1_tag}")
+
+                        for ms, bp, lb, bt, zb, np_, rt, vh, sg in technique_combos:
+                            tech_tag = ""
+                            if ms == "true":          tech_tag += "ms"
+                            if bp == "rank":          tech_tag += "bpRank"
+                            elif bp == "decay":       tech_tag += "bpDecay"
+                            if lb == "true":          tech_tag += "lb"
+                            # _BoundTightPertRelax subsumes _boundTight (see run.jl).
+                            if bt == "true":
+                                if rt >= 0.0:         tech_tag += f"btpr{rt}"
+                                else:                 tech_tag += "bt"
+                            if sg == "true":          tech_tag += "sg"
+                            if zb == "true":          tech_tag += "zb"
+                            if np_ == "lp":           tech_tag += "npLP"
+                            if vh == "true":          tech_tag += "vhFixed"
+
+                            adv_output_dir = os.path.join(
+                                "paper_experiments", dataset, f"{arch}_exp",
+                                pert_type, f"eps_{eps_str}",
+                                f"advStd_{arch}_N1_{n1_tag}")
+
+                            base_name_to_save = f"{n2_tag}_N2_advStd"
+                            if ms == "true":          base_name_to_save += "_mipStart"
+                            if bp == "rank":          base_name_to_save += "_branchPriRank"
+                            elif bp == "decay":       base_name_to_save += "_branchPriDecay"
+                            if lb == "true":          base_name_to_save += "_lpBasis"
+                            if bt == "true":
+                                if rt >= 0.0:
+                                    base_name_to_save += f"_BoundTightPertRelax{rt}"
+                                else:
+                                    base_name_to_save += "_boundTight"
+                            if sg == "true":          base_name_to_save += "_SibGate"
+                            if zb == "true":          base_name_to_save += "_zonoBounds"
+                            if np_ == "lp":           base_name_to_save += "_n1ProbeLP"
+                            if vh == "prev":          base_name_to_save += "_varHintFixed"
+                            elif vh == "direct":      base_name_to_save += "_varHintDirect"
+                            elif vh == "direct_pgd":  base_name_to_save += "_varHintDirectPGD"
+                            elif vh == "prev_pgd":    base_name_to_save += "_varHintPrevPGD"
+
+                            requested_c_targets = _parse_c_targets(
+                                args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+                            for seed in seed_vals:
+                                missing_adv_cts = _advstd_missing_c_targets(
+                                    cwd, dataset, arch, pert_type, eps_str,
+                                    n1_tag, base_name_to_save, seed,
+                                    c_tag, requested_c_targets)
+                                if not missing_adv_cts:
+                                    n2_skipped += 1
+                                    continue
+                                seed_suffix = f" seed{seed}" if seed != 0 else ""
+                                wanted_adv = [ct for ct in requested_c_targets if ct != c_tag]
+                                if len(missing_adv_cts) < len(wanted_adv):
+                                    tag_suffix = f" (partial: missing {missing_adv_cts})"
+                                else:
+                                    tag_suffix = ""
+                                label = f"{arch_prefix}{pert_name} c_tag={c_tag} N2({tech_tag}){seed_suffix}{tag_suffix}"
+
+                                adv_ct_arg = ",".join(str(ct) for ct in missing_adv_cts)
+                                cmd = [
+                                    "julia", "run.jl",
+                                    "--mode", "advanced_standard_n2",
+                                    "--dataset", julia_dataset,
+                                    "--model_name", model_name,
+                                    "--model_path", n1_model_p,
+                                    "--model_path2", n2_model_p,
+                                    "--perturbation", pert_type,
+                                    "--perturbation_size", eps_str,
+                                    "--ctag", str(c_tag),
+                                    "--ct", adv_ct_arg,
+                                    "--timout", str(args.timeout),
+                                    "--output_dir", adv_output_dir + "/",
+                                    "--name_to_save", base_name_to_save,
+                                    "--n1_state_dir", n1_state_dir,
+                                    "--use_hyper_attack", "true",
+                                    "--activate_vaghgar_deps", "true",
+                                    "--use_perturbed_intervals", "true",
+                                    "--Threads_num", str(Threads_num),
+                                    "--adv_std_mip_start", ms,
+                                    "--adv_std_branch_priorities", bp,
+                                    "--adv_std_lp_basis", lb,
+                                    "--adv_std_bound_tightening", bt,
+                                    "--adv_std_zono_bounds", zb,
+                                    "--adv_std_n1_probe", np_,
+                                    "--adv_std_n2_relax_threshold", str(rt),
+                                    "--adv_std_n2_sibling_gate", sg,
+                                    "--adv_std_var_hint", vh,
+                                    "--gurobi_seed", str(seed),
+                                ]
+                                n1_label_for_advstd = n1_label_by_pert_ctag.get((arch, pert_spec, c_tag))
+                                if n1_label_for_advstd is None:
+                                    ready_advstd_jobs.append((label, cmd))
+                                else:
+                                    locked_jobs_by_label.setdefault(n1_label_for_advstd, []).append((label, cmd))
+
+                # Phase 2.5 (this c_tag): N1 standard-mode boost jobs
+                # (Section 3 of advstd_techniques.tex). Sweep the full grid
+                # of (zb × sg × rt × pi) where:
+                #   zb = nn1_zono_bounds        (from --sweep_stdboost_zono_bounds, default ['true'])
+                #   sg = nn1_sibling_gate       (from --sweep_stdboost_sibling_gate, default ['true'])
+                #   rt = nn1_relax_threshold    (non-negative entries of --sweep_adv_std_n2_relax_threshold)
+                #   pi = use_perturbed_intervals (from --sweep_stdboost_perturbed_intervals, default ['true'])
+                #
+                # Unsound-combo filter (mirrors run.jl:487-494):
+                #   rt > 0 requires pi=true.   Combos that violate are dropped.
+                # No-op SibGate filter (mirrors run.jl:496):
+                #   sg=true with rt<0 emits SibGate inactive; we drop it to
+                #   avoid burning solve time on a no-op SibGate setup.
+                #
+                # These jobs have NO inter-job dependency — main_standard reads
+                # only its --model_path, so they go straight into
+                # ready_advstd_jobs and share the slot pool with everything else.
+                # Same boost grid applies to whichever network is targeted
+                # (--include_nn1_boost runs on N1; --include_nn2_boost runs on
+                # the same boost grid applied to N2). Both can be enabled
+                # simultaneously.
+                stdboost_targets = []
+                if args.include_nn1_boost:
+                    stdboost_targets.append("N1")
+                if args.include_nn2_boost:
+                    stdboost_targets.append("N2")
+                if stdboost_targets:
+                    nn_rt_vals = [r for r in relax_t_vals if r >= 0.0]
+                    nn_zb_vals = (args.sweep_stdboost_zono_bounds
+                                  if args.sweep_stdboost_zono_bounds else ["true"])
+                    nn_sg_vals = (args.sweep_stdboost_sibling_gate
+                                  if args.sweep_stdboost_sibling_gate else ["true"])
+                    nn_pi_vals = (args.sweep_stdboost_perturbed_intervals
+                                  if args.sweep_stdboost_perturbed_intervals else ["true"])
+                    nn_zb_vals = [v.lower() for v in nn_zb_vals]
+                    nn_sg_vals = [v.lower() for v in nn_sg_vals]
+                    nn_pi_vals = [v.lower() for v in nn_pi_vals]
+                    for arch, model_path in arch_runs:
+                        n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                        for pert_name, pert_spec in perts:
+                            pert_type, eps_str = pert_spec.split(":", 1)
+                            arch_prefix = f"[{arch}] "
+
+                            requested_c_targets = _parse_c_targets(
+                                args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+
+                            for role in stdboost_targets:
+                                if role == "N1":
+                                    target_model_p = n1_model_p
+                                    target_tag     = n1_tag
+                                else:
+                                    target_model_p = n2_model_p
+                                    target_tag     = n2_tag
+                                nn_output_dir = os.path.join(
+                                    "paper_experiments", dataset, f"{arch}_exp",
+                                    pert_type, f"eps_{eps_str}",
+                                    f"{role}stdBoost_{arch}_{target_tag}")
+                                base_name_to_save_nn = f"{target_tag}_{role}"
+
+                                for zb in nn_zb_vals:
+                                    for sg in nn_sg_vals:
+                                        for rt in nn_rt_vals:
+                                            for pi in nn_pi_vals:
+                                                # Soundness/no-op filters.
+                                                if rt > 0.0 and pi == "false":
+                                                    continue  # unsound: rt>0 requires PI
+                                                if sg == "true" and rt < 0.0:
+                                                    continue  # SibGate would be inactive
+                                                for seed in seed_vals:
+                                                    missing_nn_cts = _stdboost_missing_c_targets(
+                                                        os.path.join(cwd, nn_output_dir),
+                                                        arch, pert_type, eps_str,
+                                                        base_name_to_save_nn, seed,
+                                                        zb, sg, rt, pi,
+                                                        c_tag, requested_c_targets)
+                                                    if not missing_nn_cts:
+                                                        n2_skipped += 1
+                                                        continue
+                                                    seed_suffix = f" seed{seed}" if seed != 0 else ""
+                                                    wanted_nn = [ct for ct in requested_c_targets if ct != c_tag]
+                                                    if len(missing_nn_cts) < len(wanted_nn):
+                                                        tag_suffix = f" (partial: missing {missing_nn_cts})"
+                                                    else:
+                                                        tag_suffix = ""
+                                                    combo_tag = ""
+                                                    if zb == "true": combo_tag += "zb"
+                                                    if rt >= 0.0:    combo_tag += f"btpr{rt}"
+                                                    if sg == "true": combo_tag += "sg"
+                                                    if pi == "true": combo_tag += "pi"
+                                                    if not combo_tag: combo_tag = "plain"
+                                                    nn_label = f"{arch_prefix}{pert_name} c_tag={c_tag} {role}stdBoost({combo_tag}){seed_suffix}{tag_suffix}"
+                                                    nn_ct_arg = ",".join(str(ct) for ct in missing_nn_cts)
+                                                    nn_cmd = [
+                                                        "julia", "run.jl",
+                                                        "--mode", "standard",
+                                                        "--dataset", julia_dataset,
+                                                        "--model_name", model_name,
+                                                        "--model_path", target_model_p,
+                                                        "--perturbation", pert_type,
+                                                        "--perturbation_size", eps_str,
+                                                        "--ctag", str(c_tag),
+                                                        "--ct", nn_ct_arg,
+                                                        "--timout", str(args.timeout),
+                                                        "--output_dir", nn_output_dir + "/",
+                                                        "--name_to_save", base_name_to_save_nn,
+                                                        "--c_tag_mode", "false",
+                                                        "--use_hyper_attack", "true",
+                                                        "--activate_vaghgar_deps", "true",
+                                                        "--use_perturbed_intervals", pi,
+                                                        "--use_relaxations", "false",
+                                                        "--Threads_num", str(Threads_num),
+                                                        "--nn1_zono_bounds", zb,
+                                                        "--nn1_relax_threshold", str(rt),
+                                                        "--nn1_sibling_gate", sg,
+                                                        "--gurobi_seed", str(seed),
+                                                    ]
+                                                    ready_advstd_jobs.append((nn_label, nn_cmd))
+
+            # Move stdBoost jobs with --use_perturbed_intervals=false to the
+            # tail of the ready queue so they execute last. Stable sort on a
+            # boolean key (False<True) preserves the relative order of every
+            # other job (advstd-N2, std-N2, and pi=true stdBoost stay where
+            # the build loop placed them).
+            def _is_pi_false(job):
+                cmd = job[1]
+                try:
+                    idx = cmd.index("--use_perturbed_intervals")
+                    return cmd[idx + 1] == "false"
+                except (ValueError, IndexError):
+                    return False
+            ready_advstd_jobs.sort(key=_is_pi_false)
+
+            # ── Run phase: single merged pool across all c_tags ─────────
+            # Count N1 vs advstd within locked_jobs_by_label so the banner is
+            # meaningful even when N1→N1 chain entries are present.
+            n1_locked_count = sum(
+                1 for v in locked_jobs_by_label.values()
+                for j in v if j[0] in n1_pert_by_label)
+            advstd_locked_count = sum(
+                len(v) for v in locked_jobs_by_label.values()) - n1_locked_count
+            total_n1 = len(ready_n1_jobs) + n1_locked_count
+            total_advstd = len(ready_advstd_jobs) + advstd_locked_count
+
+            skip_note = ""
+            if n2_skipped:
+                skip_note += f" advstd-skipped={n2_skipped}"
+            if std_skipped:
+                skip_note += f" std-skipped={std_skipped}"
+            skip_note = (" " + skip_note.strip()) if skip_note else ""
+
+            print(f"\n── Phase 1+1.5+2 merged across c_tags={list(sweep_ctag_vals)}: "
+                  f"{total_n1} N1 ({len(ready_n1_jobs)} ready, {n1_locked_count} chained) + "
+                  f"{len(ready_std_n2_jobs)} std-N2 + "
+                  f"{total_advstd} advstd ({len(ready_advstd_jobs)} ready, {advstd_locked_count} waiting on N1)"
+                  f"{skip_note} ──")
+
+            def _on_pool_job_done(label):
+                """Decrement the per-pert N1 pending count when an N1 job
+                finishes; release that pert's lock when the chain is done.
+                Non-N1 labels are a no-op."""
+                pert_key = n1_pert_by_label.get(label)
+                if pert_key is None:
+                    return
+                remaining = n1_pending_count_per_pert.get(pert_key, 0) - 1
+                if remaining <= 0:
+                    n1_pending_count_per_pert.pop(pert_key, None)
+                    lock_path = n1_lock_by_pert.pop(pert_key, None)
+                    if lock_path is not None:
+                        _release_n1_solve_lock(lock_path)
                 else:
-                    print("  nothing to run — every requested combo/seed already has a result file")
+                    n1_pending_count_per_pert[pert_key] = remaining
+
+            ready_jobs_all = ready_n1_jobs + ready_std_n2_jobs + ready_advstd_jobs
+            if ready_jobs_all or locked_jobs_by_label:
+                try:
+                    run_pool(
+                        ready_jobs_all, max_slots, cwd, cores_per_job,
+                        "Phase 1+1.5+2 (all c_tags)",
+                        locked_jobs=locked_jobs_by_label,
+                        on_job_done=_on_pool_job_done,
+                    )
+                finally:
+                    # Defensive: release any (arch, pert_spec) locks still
+                    # held (e.g. an N1 job crashed before its on_job_done
+                    # fired, or the pool was interrupted).
+                    leftover_pert_locks = list(n1_lock_by_pert.items())
+                    for pert_key, lock_path in leftover_pert_locks:
+                        _release_n1_solve_lock(lock_path)
+                        n1_lock_by_pert.pop(pert_key, None)
+                    if leftover_pert_locks:
+                        print(f"Phase 1+1.5+2: released {len(leftover_pert_locks)} leftover N1 solve lock(s) at shutdown")
+            else:
+                # Nothing to run at all. Still release any locks we somehow
+                # acquired (shouldn't happen but belt+suspenders).
+                for pert_key, lock_path in list(n1_lock_by_pert.items()):
+                    _release_n1_solve_lock(lock_path)
+                    n1_lock_by_pert.pop(pert_key, None)
+                print("\n── Phase 1+1.5+2: nothing to run — N1 state, standard-N2, and advstd all complete ──")
 
         except KeyboardInterrupt:
             print("\nCtrl+C received — terminating all running jobs...")
