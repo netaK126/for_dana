@@ -273,6 +273,28 @@ def _stdboost_missing_c_targets(out_dir, arch, pert_type, eps_str,
     return [ct for ct in c_targets if (ct - 1) not in covered]
 
 
+def _delta_max_missing_c_srcs(out_dir, c_srcs):
+    """Return subset of `c_srcs` (Julia 1-indexed) for which no delta_max
+    (run.jl --perturbation max) result file exists in `out_dir`.
+
+    delta_max is a per-source-class quantity (no c_target), so we glob
+    every `*ctag{c_src-1}*.txt` file in the role-specific delta_max dir
+    and count the c_src as covered as soon as any file contains a
+    `c_source={c_src-1}` row. Used by the delta_max pre-phase to skip
+    re-running cells whose value has already been computed and persisted.
+    """
+    c_srcs = list(c_srcs)
+    if not os.path.isdir(out_dir):
+        return c_srcs
+    covered = set()
+    for fpath in glob.glob(os.path.join(out_dir, "*.txt")):
+        if os.path.basename(fpath) == "_filename_legend.txt":
+            continue
+        for cs, _ct in _parse_c_source_target_pairs(fpath):
+            covered.add(cs)
+    return [c for c in c_srcs if (c - 1) not in covered]
+
+
 def _standard_n2_missing_c_targets(pert_spec, cwd, arch, dataset, n2_tag,
                                    c_tag, c_targets):
     """Return subset of `c_targets` (Julia 1-indexed) for which no standard-N2
@@ -1834,10 +1856,27 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                 seeds_filter=combo_ranking_seeds)
         else:
             print("[tex-update] updater missing regenerate_nn1_section "
-                  "— upgrade update_advstd_tex_tables.py to populate "
+                  "-- upgrade update_advstd_tex_tables.py to populate "
                   "the nn1 boosting section.")
     except Exception as exc:
         print(f"[tex-update] nn1 block error: {exc}")
+
+    # Per-arch wide comparison section (sec:safe_wide). Scans both
+    # vaghar*/N{1,2}stdBoost dirs and emits one table per arch covering
+    # the 2 baselines + 6 non-duplicate stdBoost combos.
+    try:
+        if hasattr(updater, "regenerate_wide_perarch_section"):
+            updater.regenerate_wide_perarch_section(
+                tex_path, cwd, dataset_guess, arch_runs,
+                parse_result_file,
+                seeds_filter=combo_ranking_seeds)
+        else:
+            print("[tex-update] updater missing "
+                  "regenerate_wide_perarch_section -- upgrade "
+                  "update_advstd_tex_tables.py to populate the per-arch "
+                  "wide comparison section.")
+    except Exception as exc:
+        print(f"[tex-update] wide_perarch block error: {exc}")
 
 
 def main():
@@ -2482,6 +2521,63 @@ def main():
                 n1_model_p = os.path.join(n1_dir, "model.p")
                 n2_model_p = os.path.join(n2_dir, "model.p")
                 arch_meta[arch] = (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
+
+            # ── Phase 0.5: delta_max for N1 and N2 (single-network, no perturbation) ─
+            # Runs run.jl with --perturbation max once per (arch, network, c_src).
+            # The objective is max over the clean input box of
+            # N(x)[c_src] - max_{k!=c_src} N(x)[k], so it depends only on c_src
+            # (no c_target). We still pass a non-self --ct because run.jl skips
+            # the c_target==c_tag iteration; the c_target value is unused for
+            # "max" perturbation (mip_set_delta_property skips set_max_indexes).
+            # Results are cached per (arch, network) under a sibling
+            # delta_max_{arch}_{network}_{tag}/ dir; cells whose c_src already
+            # has a result line are skipped.
+            ready_delta_max_jobs = []
+            for arch, model_path in arch_runs:
+                n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                for role, role_tag, role_model_p in (("N1", n1_tag, n1_model_p),
+                                                     ("N2", n2_tag, n2_model_p)):
+                    dm_out_dir = os.path.join(
+                        cwd, "paper_experiments", dataset, f"{arch}_exp",
+                        "delta_max", f"delta_max_{arch}_{role}_{role_tag}")
+                    missing_c_srcs = _delta_max_missing_c_srcs(dm_out_dir, sweep_ctag_vals)
+                    if not missing_c_srcs:
+                        print(f"  [{arch}] {role} delta_max already complete for c_srcs={list(sweep_ctag_vals)} at {dm_out_dir} — skipping")
+                        continue
+                    have = [c for c in sweep_ctag_vals if c not in missing_c_srcs]
+                    if have:
+                        print(f"  [{arch}] {role} delta_max partial — have c_srcs={have}, computing missing={missing_c_srcs}")
+                    else:
+                        print(f"  [{arch}] {role} delta_max missing — computing for c_srcs={missing_c_srcs}")
+                    for c_src in missing_c_srcs:
+                        dummy_ct = c_src + 1 if c_src < 10 else 1
+                        dm_label = f"[{arch}] {role} delta_max c_src={c_src}"
+                        dm_cmd = [
+                            "julia", "run.jl",
+                            "--mode", "standard",
+                            "--dataset", julia_dataset,
+                            "--model_name", model_name,
+                            "--model_path", role_model_p,
+                            "--perturbation", "max",
+                            "--perturbation_size", "0",
+                            "--ctag", str(c_src),
+                            "--ct", str(dummy_ct),
+                            "--timout", str(args.timeout),
+                            "--output_dir", dm_out_dir + "/",
+                            "--c_tag_mode", "false",
+                            "--use_hyper_attack", "false",
+                            "--activate_vaghgar_deps", "false",
+                            "--use_perturbed_intervals", "false",
+                            "--use_relaxations", "false",
+                            "--Threads_num", str(Threads_num),
+                        ]
+                        ready_delta_max_jobs.append((dm_label, dm_cmd))
+
+            if ready_delta_max_jobs:
+                run_pool(
+                    ready_delta_max_jobs, max_slots, cwd, cores_per_job,
+                    "Phase 0.5 (delta_max)",
+                )
 
             # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
             # now uses a continuous transfer-probability signal built from

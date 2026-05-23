@@ -331,12 +331,33 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
         end
     end
 
-    # Perturbation interval bounds:
-    #   border (zeroed) pixels: Δ ∈ [-1, 0]
-    #   interior (shifted) pixels: Δ = x[src] - x[dst] ∈ [-1, 1]
+    # Per-pixel perturbation intervals:
+    #   interior (shifted) pixels: Δ[dst] = x[src] - x[dst] ∈ [-1, 1]
+    #     (both source and destination pixel values are unknown in [0,1],
+    #      so the trivial bound is tight per-pixel)
+    #   border (zero-padded) pixels: x'[j] = 0 ⟹ Δ[j] = -x[j] ∈ [-1, 0]
+    #     (upper bound tightens from 1 to 0; sound because the @constraint
+    #      blocks above pin exactly these indices to v_x0[j] = 0)
+    flat_up   = ones(Float64,  Int(w*h*k))
+    flat_down = -ones(Float64, Int(w*h*k))
+    channel_offsets = (k == 3) ? (0, res, 2*res) : (0,)
+    for ch_off in channel_offsets
+        # Top t_down rows of each channel (pinned by the j=1:t_down loop above)
+        for jj = 1:t_down
+            for ii in jj:w:res
+                flat_up[ii + ch_off] = 0.0
+            end
+        end
+        # Left t_right columns of each channel (pinned by the j=1:t_right loop)
+        for jj = 1:t_right
+            for ii in (1+w*(jj-1)):(w*jj)
+                flat_up[ii + ch_off] = 0.0
+            end
+        end
+    end
     global I_pert_prev_up, I_pert_prev_down
-    I_pert_prev_up = ones(Float64, size(input))
-    I_pert_prev_down = -ones(Float64, size(input))
+    I_pert_prev_up   = reshape(flat_up,   size(input))
+    I_pert_prev_down = reshape(flat_down, size(input))
 
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
@@ -360,6 +381,41 @@ function get_perturbation_specific_keys_filter_v(perturbation_size, nn::NeuralNe
     end
     @constraint(m,[i=28:28:784],v_x0[i]== 0.1*v_in[i-1]+0.8*v_in[i])
     @constraint(m,[i=1:28:756],v_x0[i]== 0.8*v_in[i]+0.1*v_in[i+1])
+
+    # Per-pixel perturbation intervals (filter_v is deterministic given v_in,
+    # hard-coded for 28x28 MNIST). With every v_in[·] ∈ [0,1]:
+    #   Interior i ∈ 28j+1..28j+27 (j=1..27):
+    #       Δ = 0.01·v[i-1] − 0.01·v[i] + 0.01·v[i+1] ∈ [-0.01, +0.02]
+    #   Right edge i ∈ 28:28:784:
+    #       Δ = 0.1·v[i-1] − 0.2·v[i] ∈ [-0.2, +0.1]
+    #   Left edge i ∈ 1:28:756:
+    #       Δ = −0.2·v[i] + 0.1·v[i+1] ∈ [-0.2, +0.1]
+    #   Uncovered (i ∈ 2..27, pre-existing): v_x0 free in [0,1] ⟹ Δ ∈ [-1, +1].
+    # Overlap: i ∈ {29, 57, …, 729} appears in both the interior and the
+    # left-edge @constraint blocks; both hold simultaneously in every
+    # feasible solution, so the tighter interior bound is sound — we apply
+    # interior LAST so it overrides the left-edge bound at those indices.
+    global I_pert_prev_up, I_pert_prev_down
+    N = prod(size(input))
+    flat_up   =  ones(Float64, N)
+    flat_down = -ones(Float64, N)
+    for i in 1:28:756            # left edge
+        flat_up[i]   =  0.1
+        flat_down[i] = -0.2
+    end
+    for i in 28:28:784           # right edge (no overlap with interior)
+        flat_up[i]   =  0.1
+        flat_down[i] = -0.2
+    end
+    for j = 1:27                 # interior (overrides left-edge on overlap)
+        for i in (28*j+1):(28*(j+1)-1)
+            flat_up[i]   =  0.02
+            flat_down[i] = -0.01
+        end
+    end
+    I_pert_prev_up   = reshape(flat_up,   size(input))
+    I_pert_prev_down = reshape(flat_down, size(input))
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
@@ -894,9 +950,27 @@ function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturb
         end
     end
 
-    # Δ[j] ∈ [-1, 1] — conservative uniform bound covering all pixel cases
-    I_pert_up   =  ones(Float64, size(input))
-    I_pert_down = -ones(Float64, size(input))
+    # Per-pixel perturbation intervals:
+    #   interior (shifted) pixels: Δ[dst] = x[src] - x[dst] ∈ [-1, 1]
+    #   border (zero-padded) pixels: x'[j] = 0 ⟹ Δ[j] = -x[j] ∈ [-1, 0]
+    # The masked indices match the @constraint(m, v_x0[i] == 0) blocks above.
+    flat_up   = ones(Float64,  Int(w*h*k))
+    flat_down = -ones(Float64, Int(w*h*k))
+    channel_offsets = (k == 3) ? (0, res, 2*res) : (0,)
+    for ch_off in channel_offsets
+        for jj = 1:t_down
+            for ii in jj:w:res
+                flat_up[ii + ch_off] = 0.0
+            end
+        end
+        for jj = 1:t_right
+            for ii in (1+w*(jj-1)):(w*jj)
+                flat_up[ii + ch_off] = 0.0
+            end
+        end
+    end
+    I_pert_up   = reshape(flat_up,   size(input))
+    I_pert_down = reshape(flat_down, size(input))
 
     v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
@@ -1154,12 +1228,23 @@ function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn
         @constraint(m,v_x0[tt] == 0)
     end
 
-    # Perturbation interval bounds:
-    #   rotated (interior) pixels: bilinear interp, Δ ∈ [-1, 1]
-    #   border (zeroed) pixels: Δ ∈ [-1, 0]
+    # Per-pixel perturbation intervals:
+    #   rotated (interior) pixels: Δ ∈ [-1, 1] (bilinear interp of unknowns)
+    #   zero-padded pixels: x' = 0 ⟹ Δ = -x ∈ [-1, 0] (tighter up bound)
+    # The zero-padding @constraint loop above iterates only 1:res_, so only
+    # channel-1 indices not in `l` are actually pinned to 0. For k=3 the
+    # other channels are not pinned by that loop, so we conservatively leave
+    # their upper bound at 1 to keep this initialization sound.
+    flat_up   = ones(Float64,  Int(w_*h_*k_))
+    flat_down = -ones(Float64, Int(w_*h_*k_))
+    for tt in 1:res_
+        if !(tt in l)
+            flat_up[tt] = 0.0
+        end
+    end
     global I_pert_prev_up, I_pert_prev_down
-    I_pert_prev_up = ones(Float64, size(input))
-    I_pert_prev_down = -ones(Float64, size(input))
+    I_pert_prev_up   = reshape(flat_up,   size(input))
+    I_pert_prev_down = reshape(flat_down, size(input))
 
     global layer_counter, nueron_counter, network_version
     layer_counter = 0

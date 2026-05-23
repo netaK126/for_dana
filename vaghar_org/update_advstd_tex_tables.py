@@ -424,29 +424,62 @@ def _emit_block_rows(out, ps, block, head_first=True, row_color="green!15"):
         prefix = (f"\\rowcolor{{{row_color}}} " if np_ != "lp" else "")
         pert, psize = ps
         combo_head = True
-        # Per-c_src aggregate sp = sum(t_std) / sum(t_adv) across all tested
-        # c_tgt cells for that c_src in the combo. Shown as an extra column
-        # on the first row of each c_src group within a combo.
+        # Per-c_src clipped averages of wall-clock:
+        #   $\bar t^{c}_{c\_src} = \frac{1}{|C|-1}\sum_{j\neq c\_src}
+        #     \min(t_{c\_src, j, c},\, T_{\text{block}})$
+        # for $c \in \{\text{std}, \text{adv}\}$, where $|C|$ is the count
+        # of distinct classes that appear (as c_src or c_tgt) anywhere in
+        # this (combo, pert, p_size) block and $T_{\text{block}}$ is the
+        # max wall-clock observed in any timeout-flagged cell of the block
+        # (no clip if no cell timed out). The new sp_mean for the c_src
+        # group is $\bar t^{\text{std}}/\bar t^{\text{adv}}$; the two
+        # clipped averages are also shown so the reader can see what went
+        # into the ratio. Mismatched-timeout cells (c[10]) are excluded
+        # because their `--timout` caps differ across modes.
+        mean_t_std_by_csrc = {}
+        mean_t_adv_by_csrc = {}
         mean_sp_by_csrc = {}
         mean_dd_by_csrc = {}
         seen_csrc_in_combo = set()
         by_csrc = defaultdict(list)
         for cell in cells:
             by_csrc[cell[0]].append(cell)
+        # T_block: max wall-clock from any non-mismatched timeout cell in
+        # the block. +inf when nothing timed out (i.e., min(t, T) is a
+        # no-op). c[6] is the per-cell timeout flag.
+        timeout_walls = [max(g[2], g[3]) for g in cells
+                         if g[6] and not g[10]
+                         and g[2] is not None and g[3] is not None]
+        T_block = max(timeout_walls) if timeout_walls else float("inf")
+        # |C|: distinct classes appearing as c_src or c_tgt anywhere in
+        # the block (after dropping mismatched-timeout cells, which we
+        # exclude from the totals anyway).
+        block_classes = set()
+        for g in cells:
+            if g[10]:
+                continue
+            block_classes.add(g[0])
+            block_classes.add(g[1])
+        denom = max(len(block_classes) - 1, 1)
         for c_src_key, group in by_csrc.items():
-            # Exclude mismatched-timeout cells from the per-c_src aggregate.
-            # Their wall-clock comparison is meaningless (different
-            # `--timout` caps), so including them would skew the ratio and
-            # the user couldn't tell whether a low value reflects real
-            # slowdowns or just an unfair budget.
-            pairs = [(g[2], g[3]) for g in group
-                     if g[3] > 0 and not g[10]]
-            if pairs:
-                sum_std = sum(p[0] for p in pairs)
-                sum_adv = sum(p[1] for p in pairs)
+            # Sum of min(t, T_block) over this c_src's non-mismatched
+            # cells (i.e., the j \neq c_src tested pairs). Missing pairs
+            # contribute 0; the denom is the full |C|-1 so coverage gaps
+            # bias the row average down rather than being silently dropped.
+            std_terms = [min(g[2], T_block) for g in group
+                         if g[3] > 0 and not g[10]]
+            adv_terms = [min(g[3], T_block) for g in group
+                         if g[3] > 0 and not g[10]]
+            if std_terms and adv_terms:
+                mean_t_std_by_csrc[c_src_key] = sum(std_terms) / denom
+                mean_t_adv_by_csrc[c_src_key] = sum(adv_terms) / denom
+                tot_std = sum(std_terms)
+                tot_adv = sum(adv_terms)
                 mean_sp_by_csrc[c_src_key] = (
-                    sum_std / sum_adv if sum_adv > 0 else float("nan"))
+                    tot_std / tot_adv if tot_adv > 0 else float("nan"))
             else:
+                mean_t_std_by_csrc[c_src_key] = float("nan")
+                mean_t_adv_by_csrc[c_src_key] = float("nan")
                 mean_sp_by_csrc[c_src_key] = float("nan")
             dds = [g[9] for g in group
                    if g[9] is not None and not g[10]]
@@ -466,18 +499,21 @@ def _emit_block_rows(out, ps, block, head_first=True, row_color="green!15"):
                     if isinstance(n_relax, int) else "  ---")
             if _tom:
                 # Mismatched `--timout` caps on this cell — replace the
-                # last 3 columns (sp, mean-sp, mean-delta-diff) with a
-                # single \multicolumn warning that records both wall-clocks
-                # so the reader knows the comparison is unsound and which
-                # leg needs a 2nd attempt under the matching cap. We do
-                # NOT add c_src to `seen_csrc_in_combo`, so the per-c_src
-                # avg display defers to the next non-mismatched cell.
+                # last 5 columns (sp, $\bar t^{std}_{c\_src}$,
+                # $\bar t^{adv}_{c\_src}$, $\overline{sp}_{c\_src}$,
+                # $\overline{|\delta_{std}-\delta_{adv}|}_{c\_src}$) with
+                # a single \multicolumn warning that records both
+                # wall-clocks so the reader knows the comparison is
+                # unsound and which leg needs a 2nd attempt under the
+                # matching cap. We do NOT add c_src to
+                # `seen_csrc_in_combo`, so the per-c_src avg display
+                # defers to the next non-mismatched cell.
                 warn_inner = (
                     r"\itshape\bfseries timeouts differ; 2nd attempt "
                     rf"required ($T_{{\mathrm{{std}}}}={ts:.0f}\,$s, "
                     rf"$T_{{\mathrm{{adv}}}}={ta:.0f}\,$s)")
                 warning_cell = (
-                    r"\multicolumn{3}{l}{" + warn_inner + r"}")
+                    r"\multicolumn{5}{l}{" + warn_inner + r"}")
                 out.append(
                     f"{prefix}{pert_c:11s} & {size_c:20s} & {bt_c:11s} & "
                     f"{vh_c:3s} & {rt_c:4s} & "
@@ -489,7 +525,13 @@ def _emit_block_rows(out, ps, block, head_first=True, row_color="green!15"):
             su_c = (f"\\textbf{{{su:.3f}}}"
                     if (su == su and su > 1.0) else f"{su:.3f}")
             if c_src not in seen_csrc_in_combo:
+                mts = mean_t_std_by_csrc[c_src]
+                mta = mean_t_adv_by_csrc[c_src]
                 msp = mean_sp_by_csrc[c_src]
+                mt_std_c = (f"\\textit{{{mts:7.2f}}}"
+                            if mts == mts else "  ---")
+                mt_adv_c = (f"\\textit{{{mta:7.2f}}}"
+                            if mta == mta else "  ---")
                 if msp == msp and msp > 1.0:
                     avg_sp_c = f"\\textit{{\\textbf{{{msp:.3f}}}}}"
                 elif msp == msp:
@@ -501,13 +543,16 @@ def _emit_block_rows(out, ps, block, head_first=True, row_color="green!15"):
                         if mdd is not None else "  ----")
                 seen_csrc_in_combo.add(c_src)
             else:
+                mt_std_c = "       "
+                mt_adv_c = "       "
                 avg_sp_c = "       "
                 dd_c = "       "
             out.append(
                 f"{prefix}{pert_c:11s} & {size_c:20s} & {bt_c:11s} & "
                 f"{vh_c:3s} & {rt_c:4s} & "
                 f"{c_src:>5s} & {c_tgt:>5s} & {nr_c} & "
-                f"{ts:7.2f} & {ta:7.2f} & {su_c} & {avg_sp_c} & "
+                f"{ts:7.2f} & {ta:7.2f} & {su_c} & "
+                f"{mt_std_c} & {mt_adv_c} & {avg_sp_c} & "
                 f"{dd_c} \\\\")
             combo_head = False
         block_head = False
@@ -527,12 +572,14 @@ def _emit_table_header(out, clear_page=True):
     out.append(r"\scriptsize")
     out.append(r"\setlength{\tabcolsep}{4pt}")
     out.append(r"\begin{adjustbox}{max width=\textwidth,center}%")
-    out.append(r"\begin{tabular}{@{}l l l l l | r r r r r r r r@{}}")
+    out.append(r"\begin{tabular}{@{}l l l l l | r r r r r r r r r r@{}}")
     out.append(r"\hline")
     out.append(r"p\_type & p\_size & \tech{bound\_tight} & "
                r"\tech{varHint} & $\tau$ & "
                r"c\_src & c\_tgt & n\_relax & "
                r"t\_std & t\_adv & $\text{sp}$ & "
+               r"$\overline{t}^{\mathrm{std}}_{c\_\mathrm{src}}$ & "
+               r"$\overline{t}^{\mathrm{adv}}_{c\_\mathrm{src}}$ & "
                r"$\overline{\text{sp}}_{c\_\mathrm{src}}$ & "
                r"$\overline{|\delta_\mathrm{std}-\delta_\mathrm{adv}|}_{c\_\mathrm{src}}$ \\")
     out.append(r"\hline")
@@ -1532,7 +1579,7 @@ def render_perturbation_histograms_section(per_arch_combos, seed, tau,
         r"its timeout cells (the same criterion used to bold rows in "
         r"Table~\ref{tab:timeout_gap_cnn1} and siblings); a p\_size "
         r"with cells of both kinds is judged \emph{per cell} and wins "
-        r"iff a majority of cells win on their own type — each "
+        r"iff a majority of cells win on their own type---each "
         r"non-timeout cell votes \emph{yes} when $\text{sp}>1$, each "
         r"timeout cell votes \emph{yes} when its $u-l$ gap on advstd "
         r"is tighter than on standard. So a combo that won on every "
@@ -1543,7 +1590,7 @@ def render_perturbation_histograms_section(per_arch_combos, seed, tau,
         r"\textbf{Combo columns "
         r"occupy a stable x position across every chart of an arch} "
         r"(alphabetical order on the combo abbreviation), so a "
-        r"given combo lives in the same column on every chart — "
+        r"given combo lives in the same column on every chart---"
         r"the reader can follow that column down the page and "
         r"watch the combo's mean speed-up change as the "
         r"perturbation type changes. The "
@@ -2167,7 +2214,7 @@ def render_perturbation_combined_section_all_archs(
         r"\text{seed})$ cell across \emph{all} measured architectures, "
         r"so each paired row reports a combo's behaviour on one "
         r"perturbation type aggregated over every arch we ran. Bar "
-        r"definitions, the ★ best-combo marker, and the rules used to "
+        r"definitions, the $\star$ best-combo marker, and the rules used to "
         r"split each bar into solid + hatched segments are exactly "
         r"the same as in the per-arch section above. Architecture is "
         r"shown as \textbf{ALL} in each chart's caption.")
@@ -2319,7 +2366,7 @@ def render_perturbation_combined_section_all(
     lines.append(
         r"This section pools every $(c_\mathrm{src}, c_\mathrm{tgt}, "
         r"\text{seed})$ cell across \emph{all} architectures \emph{and} "
-        r"\emph{all} perturbation types into a single paired row — one "
+        r"\emph{all} perturbation types into a single paired row---one "
         r"bar per combo summarising every cell on record. Bar "
         r"definitions are the same as in the sections above; both the "
         r"architecture and the perturbation are shown as \textbf{ALL} "
@@ -2870,8 +2917,17 @@ def render_overall_combo_summary(per_arch_combos, seed, tau,
                 if ta > 0 and ts > 0:
                     ratio = ts / ta
                     agg[key]["sps"].append(ratio)
+                    # Store (t_std, t_adv) pairs so the per-c_src
+                    # aggregate below matches the
+                    # $\overline{\text{sp}}_{c\_\mathrm{src}}$ column
+                    # rendered in the per-arch tables, which uses
+                    # $\sum t_\mathrm{std} / \sum t_\mathrm{adv}$ (see
+                    # `mean_sp_by_csrc` above) rather than the mean of
+                    # per-cell ratios. Keeps the loser / winner verdict
+                    # consistent with the number a reader sees in the
+                    # per-arch table.
                     agg[key]["sub_sps"][
-                        (arch, pert, psize, c_src)].append(ratio)
+                        (arch, pert, psize, c_src)].append((ts, ta))
                     # Track what (pert, psize) each arch was exercised
                     # on (universe) and what each (arch, c_src) actually
                     # got measured on, so the winner column can flag
@@ -2902,8 +2958,11 @@ def render_overall_combo_summary(per_arch_combos, seed, tau,
         by_triple = defaultdict(list)
         for (a, p, ps, cs), sub_sps in d["sub_sps"].items():
             if sub_sps:
-                by_triple[(a, p, ps)].append(
-                    (cs, sum(sub_sps) / len(sub_sps)))
+                sum_ts = sum(ts for ts, _ in sub_sps)
+                sum_ta = sum(ta for _, ta in sub_sps)
+                if sum_ta > 0:
+                    by_triple[(a, p, ps)].append(
+                        (cs, sum_ts / sum_ta))
         by_pert_size = defaultdict(list)  # (p, ps) -> [(arch, worst_sp)]
         for (a, p, ps), cs_means in by_triple.items():
             if not cs_means:
@@ -2935,8 +2994,11 @@ def render_overall_combo_summary(per_arch_combos, seed, tau,
         by_pair = defaultdict(list)  # (arch, c_src) -> [(p, ps, mean_sp)]
         for (a, p, ps, cs), sub_sps in d["sub_sps"].items():
             if sub_sps:
-                by_pair[(a, cs)].append(
-                    (p, ps, sum(sub_sps) / len(sub_sps)))
+                sum_ts = sum(ts for ts, _ in sub_sps)
+                sum_ta = sum(ta for _, ta in sub_sps)
+                if sum_ta > 0:
+                    by_pair[(a, cs)].append(
+                        (p, ps, sum_ts / sum_ta))
         # Bucket key now also tracks `tied`: True when at least one
         # contributing (pert, psize) subgroup had sp ≤ 1 but qualified
         # via the TIME_LIMIT-tied predicate (every cell timed out and
@@ -3302,10 +3364,11 @@ NN1_END_MARK   = "% END AUTO: nn1_safe_tables"
 def _classify_stdboost_filename(name):
     """Map a standard-mode boost result filename to a combo tuple.
 
-    Returns a dict with the four flag fields the nn1 tables key on:
+    Returns a dict with the flag fields the nn1 tables key on:
       zono_bounds: yes / no
       relax_threshold: stringified τ or 'off'
       sibling_gate: yes / no
+      perturbed_intervals: yes / no
       seed: gurobi seed (default '0')
     A None return means the filename does not encode an nn1-boosting run.
     The presence of '_stdBoost_' is the discriminator — files written by
@@ -3317,11 +3380,27 @@ def _classify_stdboost_filename(name):
     seed_match = re.search(r"_seed(\d+)(?=_)(?!_itr)", name)
     btpr_match = re.search(r"_BTPR([-0-9.]+)", name)
     return {
-        "zono_bounds":     "yes" if "_stdBoost_zono" in name or "_zono_" in name else "no",
-        "relax_threshold": btpr_match.group(1) if btpr_match else "off",
-        "sibling_gate":    "yes" if "_SibGate" in name else "no",
-        "seed":            seed_match.group(1) if seed_match else "0",
+        "zono_bounds":         "yes" if "_stdBoost_zono" in name or "_zono_" in name else "no",
+        "relax_threshold":     btpr_match.group(1) if btpr_match else "off",
+        "sibling_gate":        "yes" if "_SibGate" in name else "no",
+        "perturbed_intervals": "yes" if "_PertruebedIntervals" in name else "no",
+        "seed":                seed_match.group(1) if seed_match else "0",
     }
+
+
+def _role_of_stdboost_dir(cd):
+    """Map a cell directory to the model role (N1 or N2) it stores results
+    for. Directories use these conventions:
+      * vagharWithPerturbed_{arch}_{tag}                   → N1 baseline
+      * vagharWithPerturbed_{arch}_{tag}_sgd_itr*          → N2 baseline
+      * N1stdBoost_{arch}_{tag}                            → N1 boost
+      * N2stdBoost_{arch}_{tag}_sgd_itr*                   → N2 boost
+    Falls back to N1 for legacy 'vaghar_*' dirs.
+    """
+    base = os.path.basename(cd.rstrip(os.sep))
+    if base.startswith("N2stdBoost_") or "_sgd_itr" in base:
+        return "N2"
+    return "N1"
 
 
 def _is_baseline_stdname(name):
@@ -3361,39 +3440,59 @@ def _collect_stdboost_cells(arch_runs, cwd, dataset, parse_result_file,
                 # Standard-mode result directories are keyed by the
                 # 'vaghar*' prefix run_experiment.py uses. Both the
                 # baseline run and the boost runs live under that tree.
-                cell_dirs = sorted(
+                # "vagharWithPerturbed_*" matches both the N1 baseline
+                # (no _sgd_itr suffix) and the N2 baseline (_sgd_itr*).
+                # "vaghar_*" is kept for legacy dirs that begin with
+                # 'vaghar_' but are not 'vagharWithPerturbed*'. dedupe via
+                # set() since the two patterns can both match the same dir.
+                cell_dirs = sorted(set(
                     glob.glob(os.path.join(eps_dir,
-                                           "vagharWithPerturbed_*_sgd_itr*"))
+                                           "vagharWithPerturbed_*"))
                     + glob.glob(os.path.join(eps_dir,
                                              "vaghar_*"))
-                )
+                    + glob.glob(os.path.join(eps_dir,
+                                             "N1stdBoost_*"))
+                    + glob.glob(os.path.join(eps_dir,
+                                             "N2stdBoost_*"))
+                ))
+                # baseline_by_cell is (role, cs, ct) -> (info, fname) so the
+                # N1 baseline (vagharWithPerturbed_{arch}_{tag}) does not
+                # collide with the N2 baseline (..._sgd_itr*).
                 baseline_by_cell = {}
-                boost_by_cell = {}  # combo_key -> {(cs,ct): (info, fname)}
+                # combo_key carries role and perturbed_intervals so N1/N2
+                # boost rows and pi=true / pi=false boost rows stay distinct.
+                boost_by_cell = {}
                 for cd in cell_dirs:
+                    role = _role_of_stdboost_dir(cd)
                     for tf in glob.glob(os.path.join(cd, "*.txt")):
                         fname = os.path.basename(tf)
                         if _is_baseline_stdname(fname):
                             parsed = parse_result_file(tf)
                             for key, val in parsed.items():
-                                baseline_by_cell.setdefault(key,
-                                                            (val, fname))
+                                cs, ct = key
+                                baseline_by_cell.setdefault(
+                                    (role, cs, ct), (val, fname))
                             continue
                         combo = _classify_stdboost_filename(fname)
                         if combo is None:
                             continue
                         if seeds_filter and combo["seed"] not in seeds_filter:
                             continue
-                        combo_key = (combo["zono_bounds"],
+                        combo_key = (role,
+                                     combo["zono_bounds"],
                                      combo["relax_threshold"],
-                                     combo["sibling_gate"])
+                                     combo["sibling_gate"],
+                                     combo["perturbed_intervals"])
                         parsed = parse_result_file(tf)
                         for key, val in parsed.items():
-                            boost_by_cell.setdefault(combo_key, {})[key] = \
-                                (val, fname, combo)
+                            cs, ct = key
+                            boost_by_cell.setdefault(
+                                combo_key, {})[(cs, ct)] = (val, fname, combo)
 
                 for combo_key, cells in boost_by_cell.items():
+                    role = combo_key[0]
                     for (cs, ct), (b_info, b_name, combo) in cells.items():
-                        base = baseline_by_cell.get((cs, ct))
+                        base = baseline_by_cell.get((role, cs, ct))
                         if base is None:
                             continue
                         s_info, s_name = base
@@ -3403,6 +3502,7 @@ def _collect_stdboost_cells(arch_runs, cwd, dataset, parse_result_file,
                             continue
                         rows.append({
                             "arch": arch,
+                            "role": role,
                             "perturbation": pert_dir,
                             "perturbation_size":
                                 os.path.basename(eps_dir).replace(
@@ -3411,6 +3511,8 @@ def _collect_stdboost_cells(arch_runs, cwd, dataset, parse_result_file,
                             "zono_bounds": combo["zono_bounds"],
                             "relax_threshold": combo["relax_threshold"],
                             "sibling_gate": combo["sibling_gate"],
+                            "perturbed_intervals":
+                                combo["perturbed_intervals"],
                             "seed": combo["seed"],
                             "t_baseline": t_base,
                             "t_boost": t_boost,
@@ -3441,19 +3543,26 @@ def _render_nn1_body(rows, archs):
                 "flags enabled to populate this section.}")
 
     # Aggregate by combo: mean sp, win count, n_cells.
+    # Combo key spans (role, zono, τ, sg, pi) — role and pi are kept
+    # separate so N1 vs N2 boost stats don't collapse, and the same combo
+    # with perturbed_intervals on vs off doesn't either.
     from collections import defaultdict
     by_combo = defaultdict(list)
     for r in rows:
-        key = (r["zono_bounds"], r["relax_threshold"], r["sibling_gate"])
+        key = (r.get("role", "N1"),
+               r["zono_bounds"], r["relax_threshold"], r["sibling_gate"],
+               r.get("perturbed_intervals", "yes"))
         by_combo[key].append(r)
 
     def _combo_label(key):
-        z, t, sg = key
-        parts = []
+        role, z, t, sg, pi = key
+        parts = [role]
         parts.append("zono" if z == "yes" else "no-zono")
-        parts.append(f"τ={t}" if t != "off" else "no-BTPR")
+        parts.append(f"$\\tau$={t}" if t != "off" else "no-BTPR")
         if sg == "yes":
             parts.append("SibGate")
+        if pi == "no":
+            parts.append("no-PI")
         return ", ".join(parts)
 
     overall = []
@@ -3464,13 +3573,14 @@ def _render_nn1_body(rows, archs):
         mean_sp = sum(sps) / len(sps)
         n_wins  = sum(1 for s in sps if s > 1.0)
         overall.append({
+            "role": key[0],
             "label": _combo_label(key),
             "mean_sp": mean_sp,
             "n_wins": n_wins,
             "n_cells": len(sps),
             "win_rate": n_wins / len(sps),
         })
-    overall.sort(key=lambda r: (-r["win_rate"], -r["mean_sp"]))
+    overall.sort(key=lambda r: (r["role"], -r["win_rate"], -r["mean_sp"]))
 
     lines = []
     lines.append("Tables below summarise every recorded standard-mode "
@@ -3561,6 +3671,906 @@ def regenerate_nn1_section(tex_path, cwd, dataset, arch_runs,
 # `re` is used by _classify_stdboost_filename above; import it locally so
 # the existing module's top-of-file imports stay minimal.
 import re
+
+
+# ===== Per-architecture wide comparison section =====
+# Mirrors the structure of the nn1_safe_tables block but reports the raw
+# per-cell wall-clock time of every standard-mode configuration produced by
+# the boost sweep, side-by-side. Each table covers one architecture; rows
+# are one per (arch, role, pert, p_size, c_src) with the displayed time
+# being the mean over c_tgt and Gurobi seed.
+
+WIDE_BEGIN_MARK = "% BEGIN AUTO: wide_perarch_tables"
+WIDE_END_MARK   = "% END AUTO: wide_perarch_tables"
+
+
+def _wide_combo_of_dir(cd):
+    """Classify a cell directory by which timing column it contributes to.
+    Returns 'vaghar' (no-PI baseline), 'PI' (with-PI baseline), 'boost'
+    (a stdBoost variant whose flags are read from the filename), or None.
+    """
+    base = os.path.basename(cd.rstrip(os.sep))
+    if base.startswith("vagharNoPerturbed_"):
+        return "vaghar"
+    if base.startswith("vagharWithPerturbed_"):
+        return "PI"
+    if base.startswith("N1stdBoost_") or base.startswith("N2stdBoost_"):
+        return "boost"
+    return None
+
+
+def _wide_boost_key(combo):
+    """4-tuple (z, SG, PI, tau) key for a stdBoost cell. z/SG/PI are '0'/'1'
+    bits; tau is a string like '0' or '0.5' ('off' if the threshold tag was
+    absent). Each (z, SG, PI, tau) tuple becomes its own table column so that
+    a same-MIP-but-different-Gurobi-seed boost cell can be compared
+    side-by-side against its baseline."""
+    z  = "1" if combo["zono_bounds"]         == "yes" else "0"
+    sg = "1" if combo["sibling_gate"]        == "yes" else "0"
+    pi = "1" if combo["perturbed_intervals"] == "yes" else "0"
+    tau = combo["relax_threshold"]
+    return (z, sg, pi, tau)
+
+
+# Build the ordered column list. Layout: PI=off block first (baseline +
+# 4 boost variants at tau=0; the sweep filter at run_relaxation_sweep.py:
+# 2854 drops PI=off + tau>0, so those 4 cells don't exist), then PI=on
+# block (baseline + 4 boost variants x 2 tau values = 8). Cells where
+# the relaxation does not actually fire (tau=0 across all combos, plus
+# any (z=F, SG=F, PI=*, tau=*) cell where no binary is dropped) are
+# left in so the reader can see the seed-induced wall-clock variance.
+_WIDE_TAU_VALUES = ("0", "0.5")
+_WIDE_ZSG_VARIANTS = (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1"))
+
+
+# Two advstd N2 combos surfaced as extra rightmost columns. Each entry is
+# (column_key, zono_bounds, var_hint, relax_threshold, sibling_gate); we
+# match against the per-cell CSVs produced by --find_advstd_faster_than
+# _standard. role is always N2 because advstd is a transfer-mode (N1->N2)
+# technique.
+_ADVSTD_WIDE_COMBOS = (
+    ("adv_zono_prevpgd_0.0+sg", "yes", "prev_pgd", "0.0", "yes"),
+    ("adv_zono_prevpgd_0.5+sg", "yes", "prev_pgd", "0.5", "yes"),
+)
+
+
+def _wide_column_order():
+    """Yield the columns in the order they appear in the table.
+    A column is either a baseline tag ('vaghar' or 'PI') or a tuple
+    (z, sg, pi, tau). The 'all-off' boost cells (z=0, SG=0, PI=*, tau=0)
+    are pooled into the corresponding baseline column at collection time
+    (see _collect_wide_perarch_cells), so they don't appear as separate
+    columns here."""
+    yield "vaghar"
+    for z, sg in _WIDE_ZSG_VARIANTS:
+        if (z, sg) == ("0", "0"):
+            continue  # merged into 'vaghar'
+        yield (z, sg, "0", "0")  # PI=off, tau=0
+    yield "PI"
+    for z, sg in _WIDE_ZSG_VARIANTS:
+        for tau in _WIDE_TAU_VALUES:
+            if (z, sg, tau) == ("0", "0", "0"):
+                continue  # merged into 'PI'
+            yield (z, sg, "1", tau)
+    # advstd N2 columns (transfer-mode, zono + prev_pgd + SibGate)
+    for label, *_ in _ADVSTD_WIDE_COMBOS:
+        yield label
+
+
+def _wide_column_header(col):
+    """LaTeX label for a column key, formatted as a `+`-joined feature
+    list (e.g. \"zono+pi+tau=0.5\") rather than a subscripted/super-
+    scripted $t^{\\tau=..}_..$ glyph."""
+    if col == "vaghar":
+        return r"\textsf{vaghar}"
+    if col == "PI":
+        return r"\textsf{pi}"
+    if isinstance(col, str) and col.startswith("adv_"):
+        for label, _zb, _vh, rt, _sg in _ADVSTD_WIDE_COMBOS:
+            if label == col:
+                return (r"\textsf{adv+zono+prev\_pgd+sg+tau="
+                        + rt + r"}")
+        return col
+    z, sg, pi, tau = col
+    parts = []
+    if z  == "1": parts.append("zono")
+    if sg == "1": parts.append("sg")
+    if pi == "1": parts.append("pi")
+    parts.append(f"tau={tau}")
+    return r"\textsf{" + "+".join(parts) + r"}"
+
+
+def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
+                                 seeds_filter=None):
+    """Walk each arch's results dir and yield per-cell timing rows for the
+    per-arch wide comparison section. One row per (.txt file, cs, ct) cell.
+    The combo field is 'vaghar', 'PI', or one of the 8 boost masks.
+    """
+    import glob
+    rows = []
+    seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
+
+    pert_subdirs = ["patch", "occ", "translation", "rotation",
+                    "brightness", "linf", "contrast"]
+    for arch, _ in arch_runs:
+        exp_base = os.path.join(cwd, "paper_experiments", dataset,
+                                f"{arch}_exp")
+        if not os.path.isdir(exp_base):
+            continue
+        for pert_dir in pert_subdirs:
+            pert_path = os.path.join(exp_base, pert_dir)
+            if not os.path.isdir(pert_path):
+                continue
+            for eps_dir in sorted(glob.glob(os.path.join(pert_path,
+                                                         "eps_*"))):
+                p_size = os.path.basename(eps_dir).replace("eps_", "")
+                cell_dirs = sorted(set(
+                    glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*"))
+                    + glob.glob(os.path.join(eps_dir, "vagharWithPerturbed_*"))
+                    + glob.glob(os.path.join(eps_dir, "N1stdBoost_*"))
+                    + glob.glob(os.path.join(eps_dir, "N2stdBoost_*"))
+                ))
+                for cd in cell_dirs:
+                    src_kind = _wide_combo_of_dir(cd)
+                    if src_kind is None:
+                        continue
+                    role = _role_of_stdboost_dir(cd)
+                    for tf in glob.glob(os.path.join(cd, "*.txt")):
+                        fname = os.path.basename(tf)
+                        if src_kind == "boost":
+                            combo = _classify_stdboost_filename(fname)
+                            if combo is None:
+                                continue
+                            if seeds_filter and combo["seed"] not in seeds_filter:
+                                continue
+                            combo_label = _wide_boost_key(combo)
+                            seed_val = combo["seed"]
+                            # An 'all-off' boost cell (z=F, SG=F, tau=0)
+                            # encodes a MIP that is identical to the
+                            # corresponding baseline (vaghar if PI=F,
+                            # PI if PI=T); the only wall-clock
+                            # difference is Gurobi's seed. Pool it into
+                            # the baseline bucket so the user can read
+                            # the baseline column directly without
+                            # remembering which boost cell is also
+                            # the baseline.
+                            z, sg, pi, tau = combo_label
+                            if z == "0" and sg == "0" and tau == "0":
+                                combo_label = "PI" if pi == "1" else "vaghar"
+                        else:
+                            # Baseline files (vagharNoPerturbed_*,
+                            # vagharWithPerturbed_*) generally do not carry
+                            # an explicit Gurobi-seed tag in the filename,
+                            # so the seeds_filter from --combo_ranking_seeds
+                            # would otherwise filter them out. Treat the
+                            # baselines as always passing seed_filter; their
+                            # purpose is as a same-MIP reference for each
+                            # boost row regardless of seed.
+                            if "_stdBoost_" in fname:
+                                continue
+                            combo_label = src_kind
+                            sm = re.search(r"_seed(\d+)(?=_)(?!_itr)", fname)
+                            seed_val = sm.group(1) if sm else "0"
+                        parsed = parse_result_file(tf)
+                        for key, val in parsed.items():
+                            cs, ct = key
+                            t = val.get("total_time", 0.0) or 0.0
+                            if t <= 0:
+                                continue
+                            rows.append({
+                                "arch": arch,
+                                "role": role,
+                                "perturbation": pert_dir,
+                                "perturbation_size": p_size,
+                                "c_source": cs, "c_target": ct,
+                                "seed": seed_val,
+                                "combo": combo_label,
+                                "t_total": t,
+                                "lb_total": val.get("lower_bound"),
+                                "ub_total": val.get("upper_bound"),
+                                "solve_status": val.get("solve_status", ""),
+                            })
+    return rows
+
+
+def _load_delta_max_values(cwd, dataset, archs):
+    """Scan paper_experiments/{dataset}/{arch}_exp/delta_max/ for the
+    pre-phase delta_max result files and return
+        {(arch, role, c_src_0indexed): {'lower': lb, 'upper': ub,
+                                        'status': str}}.
+
+    delta_max files are written by run_relaxation_sweep.py's Phase 0.5
+    via `julia run.jl --perturbation max --ctag <c_src>` and contain
+    standard c_source=,c_target=,lower_bound=,upper_bound=,... lines.
+    For the "max" perturbation the c_target is a dummy unused inside
+    the MIP, so we key only by c_source. When multiple files cover the
+    same (arch, role, c_src) we keep the one with the tightest gap.
+    """
+    import glob
+    out = {}
+    for arch in archs:
+        base = os.path.join(cwd, "paper_experiments", dataset,
+                            f"{arch}_exp", "delta_max")
+        if not os.path.isdir(base):
+            continue
+        for role in ("N1", "N2"):
+            for d in glob.glob(os.path.join(base,
+                                            f"delta_max_{arch}_{role}_*")):
+                for fpath in glob.glob(os.path.join(d, "*.txt")):
+                    fname = os.path.basename(fpath)
+                    if fname == "_filename_legend.txt":
+                        continue
+                    try:
+                        f = open(fpath)
+                    except OSError:
+                        continue
+                    with f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or "c_source=" not in line:
+                                continue
+                            fields = {}
+                            for pair in line.split(","):
+                                if "=" in pair:
+                                    k, v = pair.split("=", 1)
+                                    fields[k] = v
+                            try:
+                                cs = int(fields["c_source"])
+                                lb = float(fields.get("lower_bound", "nan"))
+                                ub = float(fields.get("upper_bound", "nan"))
+                            except (KeyError, ValueError):
+                                continue
+                            status = fields.get("solve_status", "")
+                            key = (arch, role, cs)
+                            entry = {"lower": lb, "upper": ub,
+                                     "status": status}
+                            prev = out.get(key)
+                            # Keep the file whose [lb, ub] interval is
+                            # tightest. nan-safe via math.isfinite.
+                            def _gap(e):
+                                if not (math.isfinite(e["lower"])
+                                        and math.isfinite(e["upper"])):
+                                    return float("inf")
+                                return e["upper"] - e["lower"]
+                            if prev is None or _gap(entry) < _gap(prev):
+                                out[key] = entry
+    return out
+
+
+def _format_delta_max_for_cell(entry):
+    """Render a delta_max entry as a short LaTeX fragment for the model cell."""
+    if entry is None:
+        return r"$\delta_{\max}$=?"
+    lb = entry.get("lower")
+    ub = entry.get("upper")
+    if not (lb is not None and math.isfinite(lb)
+            and ub is not None and math.isfinite(ub)):
+        return r"$\delta_{\max}$=?"
+    # Reported value is the sound upper bound on the maximum.
+    # Show as "<=" prefix when the optimality gap is non-trivial,
+    # else just the bare value.
+    gap_abs = abs(ub - lb)
+    denom = max(1e-9, abs(ub))
+    rel_gap = gap_abs / denom
+    if gap_abs < 1e-3 or rel_gap < 1e-2:
+        return r"$\delta_{\max}$=" + f"{ub:.2f}"
+    return r"$\delta_{\max}\!\le\!" + f"{ub:.2f}$"
+
+
+# Architecture -> PyTorch model class for the dataset-empirical delta_d
+# computation. Mirrors utils/train.py's dispatch.
+_ARCH_TO_MODEL_CLASS_NAME = {
+    "3x10": "FNN_3_10",
+    "4x10": "FNN_4_10",
+    "5x10": "FNN_5_10",
+    "10x10": "FNN_10_10",
+    "3x50": "FNN_3_50",
+    "5x50": "FNN_5_50",
+    "3x100": "FNN_3_100",
+    "6x100": "FNN_6_100",
+    "9x200": "FNN_9_200",
+    "cnn0": "CNN0",
+    "cnn1": "CNN1",
+    "cnn2": "CNN2",
+    "cnn3": "CNN3",
+}
+
+
+def _find_mnist_data_root(cwd):
+    """Return a directory containing MNIST/raw/{train,t10k}-*-ubyte so
+    torchvision.datasets.MNIST(root=..., download=False) succeeds.
+    torchvision expects the layout {root}/MNIST/raw/*."""
+    cands = [
+        os.path.dirname(os.path.dirname(cwd)),  # for_dana/
+        cwd,
+        os.path.join(cwd, "data"),
+        os.path.join(cwd, "..", "MNIST"),
+    ]
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "MNIST", "raw",
+                                       "train-images-idx3-ubyte")):
+            return c
+    return None
+
+
+def _compute_delta_d_for_arch_role(arch, model_pth_path, c_srcs, cwd):
+    """Forward-pass MNIST train+test through the .pth model and return
+        {c_src_0indexed: max_x (N(x)[c_src] - max_{k!=c_src} N(x)[k])}
+    over both dataset splits. Returns None if PyTorch/MNIST/the model
+    file isn't available — caller treats that as 'unknown' and renders '?'.
+    """
+    try:
+        import torch
+        import torchvision.datasets as dsets
+        import torchvision.transforms as transforms
+    except ImportError:
+        return None
+    if not os.path.isfile(model_pth_path):
+        return None
+    cls_name = _ARCH_TO_MODEL_CLASS_NAME.get(arch)
+    if cls_name is None:
+        return None
+    utils_dir = os.path.join(cwd, "utils")
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    try:
+        import models as _models_mod
+    except ImportError:
+        return None
+    cls = getattr(_models_mod, cls_name, None)
+    if cls is None:
+        return None
+    data_root = _find_mnist_data_root(cwd)
+    if data_root is None:
+        return None
+    try:
+        state = torch.load(model_pth_path, map_location="cpu")
+        model = cls()
+        model.load_state_dict(state)
+        model.eval()
+    except Exception:
+        return None
+    tx = transforms.Compose([transforms.ToTensor()])
+    try:
+        train_ds = dsets.MNIST(root=data_root, train=True,
+                                transform=tx, download=False)
+        test_ds = dsets.MNIST(root=data_root, train=False,
+                               transform=tx, download=False)
+    except Exception:
+        return None
+    deltas = {c: -float("inf") for c in c_srcs}
+    with torch.no_grad():
+        for ds in (train_ds, test_ds):
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=2048, shuffle=False)
+            for imgs, _ in loader:
+                out = model(imgs)
+                for c_src in c_srcs:
+                    own = out[:, c_src]
+                    if out.shape[1] > 1:
+                        mask = torch.ones(out.shape[1], dtype=torch.bool)
+                        mask[c_src] = False
+                        other_max = out[:, mask].max(dim=1).values
+                    else:
+                        other_max = torch.zeros_like(own)
+                    m = (own - other_max).max().item()
+                    if m > deltas[c_src]:
+                        deltas[c_src] = m
+    return {c: v for c, v in deltas.items() if math.isfinite(v)}
+
+
+def _load_delta_d_values(cwd, dataset, archs, c_srcs=range(10)):
+    """For each (arch, role, tag) discovered under the delta_max sibling
+    dir, compute (or load from JSON cache) the dataset-empirical
+        delta_d(c_src) = max over MNIST(train+test) of
+                         N(x)[c_src] - max_{k!=c_src} N(x)[k]
+    using the model.pth at
+        paper_experiments/{dataset}/{arch}_exp/{tag}/model.pth.
+    Cache lives at
+        paper_experiments/{dataset}/{arch}_exp/delta_d/
+            delta_d_{arch}_{role}_{tag}.json.
+    Returns {(arch, role, c_src_0indexed): float}.
+    """
+    import glob, json
+    out = {}
+    c_srcs_list = list(c_srcs)
+    for arch in archs:
+        dm_base = os.path.join(cwd, "paper_experiments", dataset,
+                               f"{arch}_exp", "delta_max")
+        if not os.path.isdir(dm_base):
+            continue
+        cache_base = os.path.join(cwd, "paper_experiments", dataset,
+                                  f"{arch}_exp", "delta_d")
+        os.makedirs(cache_base, exist_ok=True)
+        for role in ("N1", "N2"):
+            for d in glob.glob(os.path.join(dm_base,
+                                            f"delta_max_{arch}_{role}_*")):
+                tag = os.path.basename(d)[len(f"delta_max_{arch}_{role}_"):]
+                if not tag:
+                    continue
+                cache_fp = os.path.join(
+                    cache_base, f"delta_d_{arch}_{role}_{tag}.json")
+                deltas = None
+                if os.path.isfile(cache_fp):
+                    try:
+                        with open(cache_fp) as f:
+                            raw = json.load(f)
+                        deltas = {int(k): float(v) for k, v in raw.items()}
+                    except (OSError, ValueError):
+                        deltas = None
+                if deltas is None:
+                    # Two on-disk layouts in this repo:
+                    #   cnn1: {arch}_exp/{tag}/model.pth
+                    #     (tag is e.g. model_seed42_itr20)
+                    #   3x10/3x50: {arch}_exp/model_seed42_itr20/{tag}/model.pth
+                    #     (tag is an SGD iteration like 19 or 19_sgd_itr1)
+                    # Try the flat layout first, then the nested fallback,
+                    # then any model.pth one level deeper as a last resort.
+                    import glob as _glob
+                    arch_root = os.path.join(
+                        cwd, "paper_experiments", dataset, f"{arch}_exp")
+                    candidates = [
+                        os.path.join(arch_root, tag, "model.pth"),
+                        os.path.join(arch_root, "model_seed42_itr20",
+                                     tag, "model.pth"),
+                    ]
+                    candidates += _glob.glob(os.path.join(
+                        arch_root, "*", tag, "model.pth"))
+                    model_pth = next(
+                        (c for c in candidates if os.path.isfile(c)),
+                        candidates[0])
+                    deltas = _compute_delta_d_for_arch_role(
+                        arch, model_pth, c_srcs_list, cwd)
+                    if deltas is not None:
+                        try:
+                            with open(cache_fp, "w") as f:
+                                json.dump({str(k): v
+                                           for k, v in deltas.items()}, f)
+                        except OSError:
+                            pass
+                if deltas is None:
+                    continue
+                for cs, v in deltas.items():
+                    out[(arch, role, cs)] = v
+    return out
+
+
+def _format_delta_d_for_cell(value, delta_max_entry=None):
+    """Render delta_d as a percentage of delta_max: (delta_d/delta_max)*100.
+    Label is "$\\delta_d$" (the ratio scale is implicit in the % unit).
+    delta_max is read from the delta_max_entry's upper bound (the sound
+    upper bound). Falls back to '?' if either value is missing or the
+    ratio cannot be computed."""
+    if value is None or not math.isfinite(value):
+        return r"$\delta_d$=?"
+    dmax = None
+    if delta_max_entry is not None:
+        ub = delta_max_entry.get("upper")
+        if ub is not None and math.isfinite(ub) and abs(ub) > 1e-9:
+            dmax = ub
+    if dmax is None:
+        return r"$\delta_d$=?"
+    pct = (value / dmax) * 100.0
+    return r"$\delta_d$=" + f"{pct:.1f}\\%"
+
+
+def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
+                               delta_d_by_key=None):
+    """One table per architecture. Rows: (arch, role, pert, p_size, c_src).
+    Displayed time per cell: mean of t_total over c_tgt and Gurobi seed.
+
+    The model column groups by (arch, role, c_src) — each block shows
+    arch / dataset / role / c_src / delta_max for that c_src — instead
+    of (arch, role) alone, so the per-c_src delta_max from the Phase 0.5
+    pre-phase can be displayed alongside the timings. delta_max_by_key
+    is the dict returned by _load_delta_max_values (may be empty/None,
+    in which case the delta_max line shows '?')."""
+    if not rows:
+        return ("\\noindent\\textit{No \\texttt{stdBoost} or "
+                "\\texttt{vaghar*} result files were found under "
+                "\\texttt{paper\\_experiments/<arch>\\_exp/}. Re-run the "
+                "sweep with \\texttt{--include\\_nn1\\_boost "
+                "--include\\_nn2\\_boost} and the "
+                "\\texttt{--sweep\\_stdboost\\_*} flags.}")
+
+    from collections import defaultdict
+    buckets = defaultdict(lambda: defaultdict(
+        lambda: {"t": [], "lb": [], "ub": [], "status": []}))
+    for r in rows:
+        key = (r["arch"], r["role"], r["perturbation"],
+               r["perturbation_size"], r["c_source"])
+        cell = buckets[key][r["combo"]]
+        cell["t"].append(r["t_total"])
+        lb = r.get("lb_total")
+        if lb is not None and math.isfinite(lb):
+            cell["lb"].append(lb)
+        ub = r.get("ub_total")
+        if ub is not None and math.isfinite(ub):
+            cell["ub"].append(ub)
+        cell["status"].append(str(r.get("solve_status", "") or ""))
+
+    columns = list(_wide_column_order())
+
+    lines = []
+    lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
+                 f"total_cell_rows={len(rows)}")
+
+    for arch in archs:
+        # Sort by (arch, role, c_src, pert, p_size) so all (pert, p_size)
+        # rows for one (role, c_src) are consecutive — the multirow span
+        # in the model column relies on this contiguity.
+        arch_keys = sorted(
+            (k for k in buckets if k[0] == arch),
+            key=lambda k: (k[0], k[1], k[4], k[2], k[3]),
+        )
+        if not arch_keys:
+            continue
+        lines.append("\\begin{table}[!htbp]")
+        lines.append("\\centering")
+        lines.append("\\scriptsize")
+        lines.append("\\setlength{\\tabcolsep}{3pt}")
+        lines.append("\\begin{adjustbox}{max width=\\textwidth,center}%")
+        # Each technique-combo column is now a group of 3 sub-columns:
+        # delta_l (%), delta_u (%), time. Separate groups with a "|".
+        col_spec = ("@{}l l | "
+                    + " | ".join(["r r r"] * len(columns))
+                    + "@{}")
+        lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
+        lines.append("\\hline")
+        # Two-row header: top row carries the combo title spanning 3
+        # sub-columns; bottom row labels the sub-columns themselves.
+        top = ["\\multirow{2}{*}{model}",
+               "\\multirow{2}{*}{pert (size)}"]
+        for c in columns:
+            top.append("\\multicolumn{3}{c"
+                       + ("|" if c is not columns[-1] else "")
+                       + "}{" + _wide_column_header(c) + "}")
+        lines.append(" & ".join(top) + r" \\")
+        sub = ["", ""]
+        for _ in columns:
+            sub += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
+        lines.append(" & ".join(sub) + r" \\")
+        lines.append("\\hline")
+
+        # Pre-group keys by (role, c_src) so we know each block's row
+        # count up front — the model label is spread across the block's
+        # consecutive rows (line 1 = arch/role, line 2 = c_src,
+        # line 3 = delta_max) instead of stacked in a \shortstack on
+        # the first row, which had left rows 2-3 of the model column
+        # next to empty whitespace in every other column. If a block
+        # has fewer rows than label lines, the remaining label parts
+        # are collapsed onto the last available row as a \shortstack.
+        from itertools import groupby
+        block_groups = []
+        for role_csrc, gkeys in groupby(arch_keys,
+                                         key=lambda k: (k[1], k[4])):
+            block_groups.append((role_csrc, list(gkeys)))
+
+        for bi, (role_csrc, block_keys) in enumerate(block_groups):
+            role, c_src = role_csrc
+            if bi > 0:
+                # Horizontal separator between every (role, c_src) block.
+                lines.append("\\hline")
+            dm_entry = None
+            if delta_max_by_key is not None:
+                dm_entry = delta_max_by_key.get((arch, role, c_src))
+            dm_str = _format_delta_max_for_cell(dm_entry)
+            dd_val = None
+            if delta_d_by_key is not None:
+                dd_val = delta_d_by_key.get((arch, role, c_src))
+            dd_str = _format_delta_d_for_cell(dd_val, dm_entry)
+            # delta_max + delta_d share one line (per user); dataset on
+            # its own line below.
+            label_parts = [
+                r"\textbf{" + arch + r"/" + role + r"}",
+                r"$c_s$=" + str(c_src),
+                dm_str + r", " + dd_str,
+                r"dataset: \texttt{" + dataset.replace("_", r"\_") + r"}",
+            ]
+            n_rows = len(block_keys)
+            # Distribute label_parts across rows. If we have more rows
+            # than parts, later rows have an empty model cell. If we
+            # have fewer rows than parts (very small blocks), pack the
+            # leftover parts into the last available row via \shortstack.
+            row_labels = [""] * n_rows
+            for i in range(min(n_rows, len(label_parts))):
+                if i == n_rows - 1 and n_rows < len(label_parts):
+                    leftover = label_parts[i:]
+                    row_labels[i] = (r"\shortstack[l]{"
+                                     + r"\\".join(leftover) + r"}")
+                else:
+                    row_labels[i] = label_parts[i]
+
+            prev_pert_key = None  # re-emit pert on (pert,p_size) change
+            for ri, key in enumerate(block_keys):
+                _, role, pert, p_size, c_src = key
+                cell_dict = buckets[key]
+                model_str = row_labels[ri]
+                pert_key = (role, c_src, pert, p_size)
+                if pert_key != prev_pert_key:
+                    pert_str = (f"{pert} ({p_size})").replace("_", "\\_")
+                    prev_pert_key = pert_key
+                else:
+                    pert_str = ""
+                row = [model_str, pert_str]
+                # delta_max upper-bound for this (arch, role, c_src) cell
+                # — divisor for the delta_l / delta_u percentages.
+                dmax_ub = None
+                if dm_entry is not None:
+                    ub_dm = dm_entry.get("upper")
+                    if (ub_dm is not None and math.isfinite(ub_dm)
+                            and abs(ub_dm) > 1e-9):
+                        dmax_ub = ub_dm
+                # Per-combo aggregates for this row: mean time (min),
+                # mean delta_l/delta_u (% of delta_max), whether every
+                # underlying cell hit TIME_LIMIT (so the displayed time
+                # is not a real finish — disqualifies the combo from
+                # time-based wins per the user's rule).
+                stats = {}
+                for c, cell in cell_dict.items():
+                    s = {}
+                    if cell["t"]:
+                        s["t"] = sum(cell["t"]) / len(cell["t"]) / 60.0
+                    if cell["lb"] and dmax_ub is not None:
+                        s["lb_pct"] = (sum(cell["lb"]) / len(cell["lb"])
+                                       / dmax_ub) * 100.0
+                    if cell["ub"] and dmax_ub is not None:
+                        s["ub_pct"] = (sum(cell["ub"]) / len(cell["ub"])
+                                       / dmax_ub) * 100.0
+                    # all-timeout if every recorded status is TIME_LIMIT
+                    # (case-insensitive, also matches the "TIME LIMIT"
+                    # spelling). Empty status strings are treated as
+                    # "unknown, not timeout" so a missing solve_status
+                    # field doesn't accidentally disqualify a combo.
+                    if cell["status"]:
+                        norm = [st.upper().replace(" ", "_")
+                                for st in cell["status"] if st]
+                        s["all_timeout"] = (bool(norm) and all(
+                            "TIME_LIMIT" in n for n in norm))
+                    else:
+                        s["all_timeout"] = False
+                    stats[c] = s
+                # Pick winners: shortest time among combos whose time
+                # is real (not all-timeout). Ties are decided at the
+                # same 1-decimal precision the reader sees, so any
+                # combo whose `f"{t:.1f}"` equals the row minimum's
+                # also wins. If no combo qualifies, fall back to
+                # combos sharing the smallest delta_u-delta_l gap
+                # among those with both bounds.
+                winners = set()
+                time_candidates = [
+                    (c, s["t"]) for c, s in stats.items()
+                    if "t" in s and not s.get("all_timeout")]
+                if time_candidates:
+                    min_t = min(t for _, t in time_candidates)
+                    min_t_disp = f"{min_t:.1f}"
+                    winners = {c for c, t in time_candidates
+                               if f"{t:.1f}" == min_t_disp}
+                else:
+                    gap_candidates = [
+                        (c, s["ub_pct"] - s["lb_pct"])
+                        for c, s in stats.items()
+                        if "lb_pct" in s and "ub_pct" in s]
+                    if gap_candidates:
+                        min_g = min(g for _, g in gap_candidates)
+                        min_g_disp = f"{min_g:.1f}"
+                        winners = {c for c, g in gap_candidates
+                                   if f"{g:.1f}" == min_g_disp}
+                # Emit the 3 sub-cells per combo. Every winning combo's
+                # 3 cells get \cellcolor{green!25}; everyone else is
+                # plain.
+                def _paint(val, is_winner):
+                    if is_winner:
+                        return "\\cellcolor{green!25}" + val
+                    return val
+                for c in columns:
+                    is_win = (c in winners)
+                    s = stats.get(c)
+                    if s is None:
+                        row += [_paint("---", is_win)] * 3
+                        continue
+                    row.append(_paint(
+                        f"{s['lb_pct']:.1f}" if "lb_pct" in s else "---",
+                        is_win))
+                    row.append(_paint(
+                        f"{s['ub_pct']:.1f}" if "ub_pct" in s else "---",
+                        is_win))
+                    row.append(_paint(
+                        f"{s['t']:.1f}" if "t" in s else "---",
+                        is_win))
+                lines.append(" & ".join(row) + r" \\")
+        lines.append("\\hline")
+        lines.append("\\end{tabular}")
+        lines.append("\\end{adjustbox}")
+        cap = (f"Architecture \\textbf{{{arch}}} (dataset {dataset}) "
+               f"--- per technique-combo, each cell is a 3-tuple "
+               f"$(\\delta_l, \\delta_u, t)$: "
+               f"$\\delta_l = 100 \\cdot \\mathrm{{lower\\_bound}}/"
+               f"\\delta_{{\\max}}$ and "
+               f"$\\delta_u = 100 \\cdot \\mathrm{{upper\\_bound}}/"
+               f"\\delta_{{\\max}}$ are the MIP-returned bounds rescaled "
+               f"into per-cent units of the $\\delta_{{\\max}}$ in the "
+               f"model column; $t$ is the wall-clock time (minutes), "
+               f"mean over $c_\\mathrm{{tgt}}$ and Gurobi seed. "
+               f"Each model cell groups by ($c_\\mathrm{{src}}$) and reports "
+               f"$\\delta_{{\\max}}$ for that source class, as computed "
+               f"by Phase~0.5 of the sweep "
+               f"(\\texttt{{run.jl --perturbation max --ctag $c_\\mathrm{{src}}$}} "
+               f"per network) and cached under "
+               f"\\texttt{{paper\\_experiments/{dataset}/<arch>\\_exp/delta\\_max/}}. "
+               f"$\\delta_{{\\max}}$ is the sound upper bound on "
+               f"$\\max_x N(x)[c_s] - \\max_{{k \\ne c_s}} N(x)[k]$ "
+               f"over the clean input box; rows where the pre-phase "
+               f"finished optimally show a bare value, rows where it "
+               f"hit \\texttt{{TIME\\_LIMIT}} show "
+               f"$\\delta_{{\\max}} \\le Y$ (Gurobi upper bound). "
+               f"The two baselines "
+               f"\\textsf{{vaghar}} (PI=off, no boosts) and "
+               f"\\textsf{{pi}} (PI=on, no boosts) each pool together "
+               f"the standalone vaghar baseline runs "
+               f"(\\texttt{{vagharNoPerturbed\\_*}} / "
+               f"\\texttt{{vagharWithPerturbed\\_*}}) \\emph{{and}} the "
+               f"\\texttt{{stdBoost}} cells with all options off "
+               f"(zono=off, sg=off, tau=0 and matching pi value), "
+               f"since those cells "
+               f"encode an identical MIP and only differ in Gurobi seed. "
+               f"The remaining columns are the actual boosts. In the "
+               f"column labels, \\textsf{{zono}} stands for "
+               f"\\tech{{nn1\\_zono\\_bounds}}, \\textsf{{sg}} for "
+               f"\\tech{{nn1\\_sibling\\_gate}}, \\textsf{{pi}} for "
+               f"\\cli{{use\\_perturbed\\_intervals}}, and "
+               f"\\textsf{{tau=$x$}} is \\tech{{nn1\\_relax\\_threshold}}. "
+               f"Combinations the sweep filter excludes ((pi=off, "
+               f"tau$>0$); see "
+               f"\\texttt{{run\\_relaxation\\_sweep.py:2854}}) appear as "
+               f"\\textsf{{---}}. The two rightmost columns "
+               f"\\textsf{{adv+zono+prev\\_pgd+sg+tau=0.0}} and "
+               f"\\textsf{{adv+zono+prev\\_pgd+sg+tau=0.5}} "
+               f"report the advstd N2 transfer-mode runs for the two "
+               f"\\texttt{{zono:prev\\_pgd:0.0+sg}} and "
+               f"\\texttt{{zono:prev\\_pgd:0.5+sg}} combinations (loaded "
+               f"directly from the per-cell advstd CSVs that back "
+               f"Section~\\ref{{sec:safe}}); these rows only populate on "
+               f"the $N_2$ block since advstd is a transfer technique. "
+               f"In each row, every winning combo's three sub-cells "
+               f"are shaded \\cellcolor{{green!25}}~light~green: a "
+               f"combo wins if its mean $t$ ties the row-minimum (at "
+               f"the displayed 0.1-min precision) \\emph{{and}} its "
+               f"underlying cells did \\emph{{not}} all hit "
+               f"\\texttt{{TIME\\_LIMIT}}; if every combo on the row "
+               f"is timed out, winners are instead all combos sharing "
+               f"the smallest $\\delta_u - \\delta_l$ gap.")
+        lines.append(f"\\caption{{{cap}}}")
+        safe_arch = arch.replace("_", "")
+        lines.append(f"\\label{{tab:safe_wide_{safe_arch}}}")
+        lines.append("\\end{table}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def update_wide_perarch_tex(tex_path, body):
+    """Rewrite the % BEGIN AUTO: wide_perarch_tables block in tex_path."""
+    with open(tex_path) as f:
+        text = f.read()
+    if WIDE_BEGIN_MARK not in text or WIDE_END_MARK not in text:
+        raise SystemExit(
+            f"wide_perarch markers not found in {tex_path}; expected lines "
+            f"containing '{WIDE_BEGIN_MARK}' and '{WIDE_END_MARK}'")
+    pre, rest = text.split(WIDE_BEGIN_MARK, 1)
+    _body, post = rest.split(WIDE_END_MARK, 1)
+    updated = f"{pre}{WIDE_BEGIN_MARK}\n{body}\n{WIDE_END_MARK}{post}"
+    if updated == text:
+        print("[update_advstd_tex_tables] no changes to wide_perarch block")
+        return
+    with open(tex_path, "w") as f:
+        f.write(updated)
+    print(f"[update_advstd_tex_tables] wrote wide_perarch block in {tex_path}")
+
+
+def _load_advstd_rows_for_wide(cwd, dataset, archs, seeds_filter=None,
+                                vs_with_perturbed=True):
+    """Read the advstd per-cell CSVs and return rows in the same shape as
+    _collect_wide_perarch_cells, filtered to the two advstd N2 combos
+    listed in _ADVSTD_WIDE_COMBOS. role is always 'N2' because advstd is
+    transfer mode (N1 -> N2)."""
+    suffix = "_vs_withPerturbed" if vs_with_perturbed else ""
+    combined_base = os.path.join(cwd, "paper_experiments", dataset)
+    csv_paths = [
+        os.path.join(combined_base,
+                     f"advstd_faster_than_standard{suffix}.csv"),
+        os.path.join(combined_base,
+                     f"standard_faster_than_advstd{suffix}.csv"),
+        os.path.join(combined_base,
+                     f"advstd_tighter_at_timeout{suffix}.csv"),
+        os.path.join(combined_base,
+                     f"standard_tighter_at_timeout_vs_advstd{suffix}.csv"),
+    ]
+    seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
+    arch_set = set(archs) if archs else None
+    rows = []
+    for p in csv_paths:
+        if not os.path.exists(p):
+            continue
+        with open(p) as f:
+            for r in csv.DictReader(f):
+                if not r.get("arch"):
+                    continue
+                if arch_set is not None and r["arch"] not in arch_set:
+                    continue
+                if seeds_filter and r.get("seed") not in seeds_filter:
+                    continue
+                if (r.get("bound_tightening") != "yes"
+                        or r.get("branch_priorities") != "off"
+                        or r.get("n1_probe", "off") != "off"):
+                    continue
+                combo_label = None
+                for label, zb, vh, rt, sg in _ADVSTD_WIDE_COMBOS:
+                    if (r.get("zono_bounds") == zb
+                            and r.get("var_hint") == vh
+                            and r.get("relax_threshold") == rt
+                            and r.get("sibling_gate", "no") == sg):
+                        combo_label = label
+                        break
+                if combo_label is None:
+                    continue
+                try:
+                    t = float(r["time_advstd"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if t <= 0:
+                    continue
+                try:
+                    cs_val = int(r["c_source"])
+                    ct_val = int(r["c_target"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                def _f(k):
+                    try:
+                        x = float(r.get(k, ""))
+                        return x if math.isfinite(x) else None
+                    except (ValueError, TypeError):
+                        return None
+                rows.append({
+                    "arch": r["arch"],
+                    "role": "N2",
+                    "perturbation": r["perturbation"],
+                    "perturbation_size": r["perturbation_size"],
+                    "c_source": cs_val,
+                    "c_target": ct_val,
+                    "seed": r.get("seed", "0"),
+                    "combo": combo_label,
+                    "t_total": t,
+                    "lb_total": _f("delta_advstd_lower_bound"),
+                    "ub_total": _f("delta_advstd_upper_bound"),
+                    "solve_status": r.get("solve_status_advstd", ""),
+                })
+    return rows
+
+
+def regenerate_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
+                                     parse_result_file, seeds_filter=None):
+    """End-to-end: scan vaghar* + stdBoost results, layer in two advstd
+    N2 combos from the per-cell CSVs, render the per-arch wide
+    comparison body, rewrite the AUTO block in tex_path."""
+    try:
+        rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
+                                            parse_result_file,
+                                            seeds_filter=seeds_filter)
+        archs = [a for a, _ in arch_runs]
+        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                            seeds_filter=seeds_filter)
+        delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
+        delta_d_by_key = _load_delta_d_values(cwd, dataset, archs)
+        body = _render_wide_perarch_body(rows, archs, dataset,
+                                          delta_max_by_key=delta_max_by_key,
+                                          delta_d_by_key=delta_d_by_key)
+        update_wide_perarch_tex(tex_path, body)
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] wide_perarch block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] wide_perarch block error: {exc}")
 
 
 def main():
