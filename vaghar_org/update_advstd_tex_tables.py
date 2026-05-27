@@ -3719,7 +3719,7 @@ def _wide_boost_key(combo):
 # the relaxation does not actually fire (tau=0 across all combos, plus
 # any (z=F, SG=F, PI=*, tau=*) cell where no binary is dropped) are
 # left in so the reader can see the seed-induced wall-clock variance.
-_WIDE_TAU_VALUES = ("0", "0.5")
+_WIDE_TAU_VALUES = ("0.0", "0.5")
 _WIDE_ZSG_VARIANTS = (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1"))
 
 
@@ -3745,11 +3745,11 @@ def _wide_column_order():
     for z, sg in _WIDE_ZSG_VARIANTS:
         if (z, sg) == ("0", "0"):
             continue  # merged into 'vaghar'
-        yield (z, sg, "0", "0")  # PI=off, tau=0
+        yield (z, sg, "0", "0.0")  # PI=off, tau=0
     yield "PI"
     for z, sg in _WIDE_ZSG_VARIANTS:
         for tau in _WIDE_TAU_VALUES:
-            if (z, sg, tau) == ("0", "0", "0"):
+            if (z, sg, tau) == ("0", "0", "0.0"):
                 continue  # merged into 'PI'
             yield (z, sg, "1", tau)
     # advstd N2 columns (transfer-mode, zono + prev_pgd + SibGate)
@@ -3778,6 +3778,30 @@ def _wide_column_header(col):
     if pi == "1": parts.append("pi")
     parts.append(f"tau={tau}")
     return r"\textsf{" + "+".join(parts) + r"}"
+
+
+def _wide_column_short_label(col):
+    """Compact label for a column key, suitable for inline use inside the
+    \"missing c\\_targets\" cell where space is tight. Uses single-letter
+    flag mnemonics (z/sg/pi) and a bare tau= value; does not wrap in
+    \\textsf.
+    """
+    if col == "vaghar":
+        return "vaghar"
+    if col == "PI":
+        return "pi"
+    if isinstance(col, str) and col.startswith("adv_"):
+        for label, _zb, _vh, rt, _sg in _ADVSTD_WIDE_COMBOS:
+            if label == col:
+                return f"adv{rt}+sg"
+        return col
+    z, sg, pi, tau = col
+    parts = []
+    if z  == "1": parts.append("z")
+    if sg == "1": parts.append("sg")
+    if pi == "1": parts.append("pi")
+    parts.append(f"t={tau}")
+    return "+".join(parts)
 
 
 def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
@@ -3835,7 +3859,7 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                             # remembering which boost cell is also
                             # the baseline.
                             z, sg, pi, tau = combo_label
-                            if z == "0" and sg == "0" and tau == "0":
+                            if z == "0" and sg == "0" and tau in ("0", "0.0"):
                                 combo_label = "PI" if pi == "1" else "vaghar"
                         else:
                             # Baseline files (vagharNoPerturbed_*,
@@ -3856,6 +3880,17 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                             cs, ct = key
                             t = val.get("total_time", 0.0) or 0.0
                             if t <= 0:
+                                continue
+                            # Skip externally-killed runs (e.g., Julia
+                            # process killed by the sweep supervisor or
+                            # OOM-killer). Their wall-clock is below the
+                            # Gurobi time cap but the bounds are
+                            # partial, so including them would pull the
+                            # mean `t` under 60 min while leaving the
+                            # mean lb/ub gap wide. The CSV builder in
+                            # run_relaxation_sweep.py applies the same
+                            # filter at lines 1000 and 1274.
+                            if (val.get("solve_status", "") or "").upper() == "INTERRUPTED":
                                 continue
                             rows.append({
                                 "arch": arch,
@@ -4175,7 +4210,8 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
 
     from collections import defaultdict
     buckets = defaultdict(lambda: defaultdict(
-        lambda: {"t": [], "lb": [], "ub": [], "status": []}))
+        lambda: {"t": [], "lb": [], "ub": [], "status": [],
+                  "c_targets": set()}))
     for r in rows:
         key = (r["arch"], r["role"], r["perturbation"],
                r["perturbation_size"], r["c_source"])
@@ -4188,6 +4224,12 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
         if ub is not None and math.isfinite(ub):
             cell["ub"].append(ub)
         cell["status"].append(str(r.get("solve_status", "") or ""))
+        ct = r.get("c_target")
+        if ct is not None:
+            try:
+                cell["c_targets"].add(int(ct))
+            except (TypeError, ValueError):
+                pass
 
     columns = list(_wide_column_order())
 
@@ -4212,7 +4254,12 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
         lines.append("\\begin{adjustbox}{max width=\\textwidth,center}%")
         # Each technique-combo column is now a group of 3 sub-columns:
         # delta_l (%), delta_u (%), time. Separate groups with a "|".
-        col_spec = ("@{}l l | "
+        # An extra "missing c_targets" column sits between "pert (size)"
+        # and the combo groups; it lists any c_target the sweep should
+        # have run for this (arch, role, pert, p_size, c_src) row but
+        # didn't (union across all combos). Per-combo gaps are signalled
+        # by a `*` on the combo's $t$ sub-cell.
+        col_spec = ("@{}l l l | "
                     + " | ".join(["r r r"] * len(columns))
                     + "@{}")
         lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
@@ -4220,13 +4267,14 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
         # Two-row header: top row carries the combo title spanning 3
         # sub-columns; bottom row labels the sub-columns themselves.
         top = ["\\multirow{2}{*}{model}",
-               "\\multirow{2}{*}{pert (size)}"]
+               "\\multirow{2}{*}{pert (size)}",
+               "\\multirow{2}{*}{missing c\\_targets}"]
         for c in columns:
             top.append("\\multicolumn{3}{c"
                        + ("|" if c is not columns[-1] else "")
                        + "}{" + _wide_column_header(c) + "}")
         lines.append(" & ".join(top) + r" \\")
-        sub = ["", ""]
+        sub = ["", "", ""]
         for _ in columns:
             sub += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
         lines.append(" & ".join(sub) + r" \\")
@@ -4281,6 +4329,14 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                 else:
                     row_labels[i] = label_parts[i]
 
+            # Expected c_targets per row: all class indices in the
+            # dataset except c_src. The sweep is supposed to fan out
+            # over every other class, so anything missing is a gap
+            # worth surfacing. Class counts are dataset-specific.
+            _DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10,
+                                     "fashion_mnist": 10}
+            n_classes = _DATASET_NUM_CLASSES.get(dataset, 10)
+
             prev_pert_key = None  # re-emit pert on (pert,p_size) change
             for ri, key in enumerate(block_keys):
                 _, role, pert, p_size, c_src = key
@@ -4292,7 +4348,32 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                     prev_pert_key = pert_key
                 else:
                     pert_str = ""
-                row = [model_str, pert_str]
+                # Row-level missing-c_target set: a c_target appears iff
+                # some combo on the row has a partial result (data on
+                # this row) that didn't include that c_target. Combos
+                # with no data at all on the row don't contribute — they
+                # simply weren't run, which is different from "started
+                # but skipped this c_target". Per-combo gaps are also
+                # signalled via a `*` on the combo's $t$ sub-cell below.
+                expected_cts = {ct for ct in range(n_classes)
+                                if ct != c_src}
+                per_combo_missing = {}
+                for c in columns:
+                    cell = cell_dict.get(c)
+                    if not cell or not cell.get("t"):
+                        continue
+                    seen = cell.get("c_targets", set())
+                    per_combo_missing[c] = expected_cts - seen
+                row_missing = set()
+                for miss in per_combo_missing.values():
+                    row_missing |= miss
+                if row_missing:
+                    missing_str = ("(" + ",".join(str(ct)
+                                                   for ct in sorted(row_missing))
+                                   + ")")
+                else:
+                    missing_str = ""
+                row = [model_str, pert_str, missing_str]
                 # delta_max upper-bound for this (arch, role, c_src) cell
                 # — divisor for the delta_l / delta_u percentages.
                 dmax_ub = None
@@ -4337,10 +4418,16 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                 # also wins. If no combo qualifies, fall back to
                 # combos sharing the smallest delta_u-delta_l gap
                 # among those with both bounds.
+                # Only combos that actually map to a rendered column are
+                # eligible to win — otherwise a "ghost" combo whose key
+                # never appears in the table could carry the minimum
+                # time/gap and silently leave the row with no green cells.
+                columns_set = set(columns)
                 winners = set()
                 time_candidates = [
                     (c, s["t"]) for c, s in stats.items()
-                    if "t" in s and not s.get("all_timeout")]
+                    if c in columns_set and "t" in s
+                    and not s.get("all_timeout")]
                 if time_candidates:
                     min_t = min(t for _, t in time_candidates)
                     min_t_disp = f"{min_t:.1f}"
@@ -4350,7 +4437,8 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                     gap_candidates = [
                         (c, s["ub_pct"] - s["lb_pct"])
                         for c, s in stats.items()
-                        if "lb_pct" in s and "ub_pct" in s]
+                        if c in columns_set
+                        and "lb_pct" in s and "ub_pct" in s]
                     if gap_candidates:
                         min_g = min(g for _, g in gap_candidates)
                         min_g_disp = f"{min_g:.1f}"
@@ -4367,23 +4455,45 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                     is_win = (c in winners)
                     s = stats.get(c)
                     if s is None:
+                        # No data at all for this (row, combo) — the
+                        # row-level "missing c_targets" column already
+                        # reflects this; the `*` would just add noise.
                         row += [_paint("---", is_win)] * 3
                         continue
+                    combo_gap = bool(per_combo_missing.get(c))
+                    star = "$^*$" if combo_gap else ""
                     row.append(_paint(
                         f"{s['lb_pct']:.1f}" if "lb_pct" in s else "---",
                         is_win))
                     row.append(_paint(
                         f"{s['ub_pct']:.1f}" if "ub_pct" in s else "---",
                         is_win))
-                    row.append(_paint(
-                        f"{s['t']:.1f}" if "t" in s else "---",
-                        is_win))
+                    t_str = f"{s['t']:.1f}" if "t" in s else "---"
+                    row.append(_paint(t_str + star, is_win))
                 lines.append(" & ".join(row) + r" \\")
         lines.append("\\hline")
         lines.append("\\end{tabular}")
         lines.append("\\end{adjustbox}")
         cap = (f"Architecture \\textbf{{{arch}}} (dataset {dataset}) "
-               f"--- per technique-combo, each cell is a 3-tuple "
+               f"--- the \\textsf{{missing c\\_targets}} column lists "
+               f"any $c_\\mathrm{{tgt}}$ value (every class index except "
+               f"$c_\\mathrm{{src}}$) that \\emph{{some}} combo with a "
+               f"partial result on this row didn't cover. Equivalently: "
+               f"the union of per-combo missing sets restricted to "
+               f"combos that actually ran something on this row. Combos "
+               f"that never ran on the row (all-\\textsf{{---}}) "
+               f"contribute nothing here. An empty cell therefore means "
+               f"every combo that has data on the row covered every "
+               f"expected $c_\\mathrm{{tgt}}$. Per-combo partial "
+               f"coverage is also marked with a \\textsuperscript{{*}} "
+               f"after that combo's $t$ sub-cell: \\texttt{{t.t$^*$}} "
+               f"means this particular combo has data on this row but "
+               f"was not exercised on every expected "
+               f"$c_\\mathrm{{tgt}}$ (so its mean time / $\\delta$ "
+               f"aggregates over fewer cells than its un-starred "
+               f"peers). Combos with no data on a row show plain "
+               f"\\textsf{{---}} with no star. "
+               f"Per technique-combo, each cell is a 3-tuple "
                f"$(\\delta_l, \\delta_u, t)$: "
                f"$\\delta_l = 100 \\cdot \\mathrm{{lower\\_bound}}/"
                f"\\delta_{{\\max}}$ and "
@@ -4519,6 +4629,10 @@ def _load_advstd_rows_for_wide(cwd, dataset, archs, seeds_filter=None,
                 except (KeyError, ValueError, TypeError):
                     continue
                 if t <= 0:
+                    continue
+                # Skip INTERRUPTED runs (same rationale as
+                # _collect_wide_perarch_cells).
+                if (r.get("solve_status_advstd", "") or "").upper() == "INTERRUPTED":
                     continue
                 try:
                     cs_val = int(r["c_source"])

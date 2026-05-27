@@ -28,10 +28,78 @@ import signal
 import sys
 import os
 import argparse
+import atexit
 import time
 import re
 import glob
 import itertools
+
+# ── Child-process lifecycle ──────────────────────────────────────────────
+# Goal: a Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM) of this supervisor
+# tears down every descendant — including grand-children like julia spawned
+# from utils/run_experiment.py — rather than leaving them orphaned and
+# burning CPU for days.
+#
+# Two layers:
+#   1. Each child is started with start_new_session=True, putting it (and
+#      anything it spawns) into a fresh process group. Our signal handler
+#      sends SIGTERM / SIGKILL to those groups, which propagates to julia
+#      regardless of how deep it sits in the tree.
+#   2. preexec_fn sets PR_SET_PDEATHSIG so the kernel itself signals each
+#      direct child if the supervisor is SIGKILL'd (no chance to run a
+#      handler). The grandchildren survive that path — only the direct
+#      children get pdeathsig — but it at least prevents the python
+#      run_experiment.py layer from outliving us silently.
+try:
+    import ctypes
+    import ctypes.util as _ctypes_util
+    _libc = ctypes.CDLL(_ctypes_util.find_library("c"), use_errno=True)
+    _PR_SET_PDEATHSIG = 1
+    def _pdeathsig_preexec():
+        _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+except Exception:
+    def _pdeathsig_preexec():
+        pass
+
+# Every live child Popen handle. Populated by launch_in_slot, drained by
+# the reaper loop and by the signal handler.
+_ACTIVE_CHILDREN = set()
+
+def _kill_descendants(grace_secs=3):
+    """Terminate every tracked child's process group, escalate to SIGKILL."""
+    pgids = []
+    for proc in list(_ACTIVE_CHILDREN):
+        if proc.poll() is not None:
+            continue
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            pgids.append(pgid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + grace_secs
+    while time.time() < deadline:
+        if all(proc.poll() is not None for proc in list(_ACTIVE_CHILDREN)):
+            return
+        time.sleep(0.2)
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+def _signal_handler(signum, frame):
+    try:
+        sig_name = signal.Signals(signum).name
+    except (AttributeError, ValueError):
+        sig_name = str(signum)
+    live = sum(1 for p in _ACTIVE_CHILDREN if p.poll() is None)
+    print(f"\n[supervisor] Received {sig_name}; terminating {live} live "
+          f"child job(s) and their descendants...", flush=True)
+    _kill_descendants()
+    sys.exit(128 + signum)
+
+atexit.register(_kill_descendants)
 
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
@@ -90,7 +158,15 @@ def _parse_c_source_target_pairs(filepath):
     """Parse a Julia result file and return the set of (c_source, c_target)
     0-indexed pairs present. Tolerates both key=value and legacy positional
     CSV lines. Returns an empty set on any parse/IO error rather than raising
-    — a readable-but-empty file is treated as "no pairs covered yet"."""
+    — a readable-but-empty file is treated as "no pairs covered yet".
+
+    Lines whose `solve_status` is `INTERRUPTED` are excluded: the Julia
+    process was killed mid-solve (sweep supervisor, OOM, etc.) so the
+    line carries only partial Gurobi bounds, not a real completion. Every
+    caller uses this set to skip already-done cells when rebuilding the
+    run list, so leaving these lines in would make INTERRUPTED cells
+    stick across sweep invocations.
+    """
     pairs = set()
     try:
         with open(filepath) as f:
@@ -104,12 +180,17 @@ def _parse_c_source_target_pairs(filepath):
                         k, v = tok.split("=", 1)
                         fields[k] = v
                 if "c_source" in fields and "c_target" in fields:
+                    status = (fields.get("solve_status", "") or "").upper()
+                    if status == "INTERRUPTED":
+                        continue
                     try:
                         pairs.add((int(fields["c_source"]), int(fields["c_target"])))
                     except ValueError:
                         pass
                     continue
                 # Legacy positional CSV: source,target,incumbent_obj,...
+                # (no solve_status field, so we cannot detect INTERRUPTED
+                # here — legacy runs always count as covered.)
                 parts = line.split(",")
                 if len(parts) >= 2:
                     try:
@@ -565,7 +646,10 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
         proc = subprocess.Popen(
             full_cmd, cwd=cwd,
             stdout=log_file, stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=_pdeathsig_preexec,
         )
+        _ACTIVE_CHILDREN.add(proc)
         slots[slot_idx] = (label, proc, log_file)
 
     # Fill initial slots from the ready queue.
@@ -617,6 +701,7 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
 
             if ret != 0:
                 print(f"    -> see log: {log_file.name}")
+            _ACTIVE_CHILDREN.discard(proc)
             slots[i] = None
 
         # Pass 2: refill every empty slot from the queue. Keeps all cores
@@ -3271,5 +3356,6 @@ def main():
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
     main()
