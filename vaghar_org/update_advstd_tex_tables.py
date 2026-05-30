@@ -4462,11 +4462,14 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                         continue
                     combo_gap = bool(per_combo_missing.get(c))
                     star = "$^*$" if combo_gap else ""
+                    # delta_l is a percentage of delta_max, so a negative
+                    # value (margin below 0) is clamped to 0; delta_u above
+                    # 100% is clamped to 100 for display.
                     row.append(_paint(
-                        f"{s['lb_pct']:.1f}" if "lb_pct" in s else "---",
+                        f"{max(0.0, s['lb_pct']):.1f}" if "lb_pct" in s else "---",
                         is_win))
                     row.append(_paint(
-                        f"{s['ub_pct']:.1f}" if "ub_pct" in s else "---",
+                        f"{min(100.0, s['ub_pct']):.1f}" if "ub_pct" in s else "---",
                         is_win))
                     t_str = f"{s['t']:.1f}" if "t" in s else "---"
                     row.append(_paint(t_str + star, is_win))
@@ -4576,6 +4579,399 @@ def update_wide_perarch_tex(tex_path, body):
     with open(tex_path, "w") as f:
         f.write(updated)
     print(f"[update_advstd_tex_tables] wrote wide_perarch block in {tex_path}")
+
+
+## ---------------------------------------------------------------------------
+## AAAI slim variant: same data, but only the four safe-combo columns and
+## table* (full-width) floats so it fits the AAAI 2026 two-column layout.
+## ---------------------------------------------------------------------------
+
+AAAI_WIDE_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_tables"
+AAAI_WIDE_END_MARK   = "% END AUTO: aaai_safe_wide_tables"
+
+# 3 columns: the original VHAGaR baseline (PI=off, no boosts), the
+# standard-mode safe combo zono+SibGate+PI at tau=0.5, and the
+# transfer-mode safe combo adv+zono+prev_pgd+SibGate at tau=0.5.
+# Each entry: (column_key, multicolumn header label).
+_AAAI_WIDE_COLUMNS = (
+    ("vaghar",                   r"vaghar"),
+    (("1", "1", "1", "0.5"),     r"standard ($\tau{=}0.5$)"),
+    ("adv_zono_prevpgd_0.5+sg",  r"transfer ($\tau{=}0.5$)"),
+)
+
+
+_AAAI_TIMEOUT_STATUSES = frozenset({
+    "TIME_LIMIT", "TIME LIMIT", "USER_OBJ_LIMIT", "USER_LIMIT",
+    "ITERATION_LIMIT", "NODE_LIMIT", "SOLUTION_LIMIT",
+    "MEMORY_LIMIT", "WORK_LIMIT",
+})
+
+
+def _aaai_is_timeout_mismatch(row, force_timeout, eps):
+    """True iff this row's Gurobi run hit a termination limit at a wall-clock
+    cap different from `force_timeout` (within ±eps seconds). Non-timeout
+    rows always return False (they're included regardless)."""
+    if force_timeout is None:
+        return False
+    status = str(row.get("solve_status", "") or "").upper().replace(" ", "_")
+    if not any(tag in status for tag in _AAAI_TIMEOUT_STATUSES):
+        return False
+    t = row.get("t_total")
+    if t is None:
+        return True  # timeout with unknown wall-clock; conservatively drop
+    try:
+        return abs(float(t) - float(force_timeout)) > float(eps)
+    except (TypeError, ValueError):
+        return True
+
+
+def _fmt_trim(x):
+    """Format a number with one decimal, dropping a trailing '.0' so a
+    whole value renders as '180' rather than '180.0' while '29.5' stays
+    '29.5'. Used for the delta_max and time cells in the neta_s_paper
+    tables."""
+    s = f"{x:.1f}"
+    return s[:-2] if s.endswith(".0") else s
+
+
+def _fmt_sig(x, sig=2):
+    """Format x to `sig` significant figures, never in scientific
+    notation, with trailing zeros and a bare trailing '.' removed. This
+    mirrors the VHAGaR bound columns where the digit count tracks the
+    magnitude: 99.2->'99', 28.8->'29', 1.6->'1.6', 0.6->'0.6',
+    100->'100', 2.0->'2'. Used for the delta_l / delta_u / delta_d
+    columns in the neta_s_paper tables."""
+    if not math.isfinite(x) or x == 0:
+        return "0"
+    d = math.floor(math.log10(abs(x)))
+    decimals = max(0, sig - 1 - d)
+    s = f"{x:.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _render_aaai_wide_perarch_body(rows, archs, dataset,
+                                    delta_max_by_key=None,
+                                    delta_d_by_key=None,
+                                    force_timeout=None,
+                                    rerun_timeout_eps=30.0):
+    """Slim version of _render_wide_perarch_body: only the four safe-combo
+    columns and table* (two-column-spanning) floats, suitable for inclusion
+    in the AAAI 2026 paper's evaluation section.
+
+    Data shape and column semantics are identical to the full table; only
+    the column subset and the surrounding LaTeX shell differ. When
+    `force_timeout` is set (in seconds), rows whose Gurobi run hit a
+    termination limit at a different wall-clock cap (outside
+    ±rerun_timeout_eps seconds) are dropped before bucketing.
+    """
+    if not rows:
+        return ("\\noindent\\textit{No data available.}")
+    if force_timeout is not None:
+        before = len(rows)
+        rows = [r for r in rows
+                if not _aaai_is_timeout_mismatch(r, force_timeout,
+                                                  rerun_timeout_eps)]
+        dropped = before - len(rows)
+        if dropped:
+            print(f"[update_advstd_tex_tables] aaai_safe_wide: dropped "
+                  f"{dropped}/{before} timeout-mismatched cells "
+                  f"(force_timeout={force_timeout}s "
+                  f"\\pm {rerun_timeout_eps}s)")
+
+    from collections import defaultdict
+    buckets = defaultdict(lambda: defaultdict(
+        lambda: {"t": [], "lb": [], "ub": [], "status": [],
+                  "c_targets": set()}))
+    for r in rows:
+        key = (r["arch"], r["role"], r["perturbation"],
+               r["perturbation_size"], r["c_source"])
+        cell = buckets[key][r["combo"]]
+        cell["t"].append(r["t_total"])
+        lb = r.get("lb_total")
+        if lb is not None and math.isfinite(lb):
+            cell["lb"].append(lb)
+        ub = r.get("ub_total")
+        if ub is not None and math.isfinite(ub):
+            cell["ub"].append(ub)
+        cell["status"].append(str(r.get("solve_status", "") or ""))
+        ct = r.get("c_target")
+        if ct is not None:
+            try:
+                cell["c_targets"].add(int(ct))
+            except (TypeError, ValueError):
+                pass
+
+    columns = [col for col, _hdr in _AAAI_WIDE_COLUMNS]
+
+    lines = []
+    lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
+                 f"total_cell_rows={len(rows)}")
+    # Shared header macro so the three per-arch tables stay in sync.
+    header_cells = ["\\multirow{2}{*}{model}",
+                    "\\multirow{2}{*}{pert (size)}"]
+    for _col, hdr in _AAAI_WIDE_COLUMNS:
+        sep = "|" if (_col, hdr) != _AAAI_WIDE_COLUMNS[-1] else ""
+        header_cells.append("\\multicolumn{3}{c" + sep + "}{" + hdr + "}")
+    sub_cells = ["", ""]
+    for _ in _AAAI_WIDE_COLUMNS:
+        sub_cells += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
+    lines.append(r"\newcommand{\aaaisafewideheader}{%")
+    lines.append(" & ".join(header_cells) + r" \\")
+    lines.append(" & ".join(sub_cells) + r" \\}")
+    lines.append("")
+
+    for arch in archs:
+        arch_keys = sorted(
+            (k for k in buckets if k[0] == arch),
+            key=lambda k: (k[1], k[4], k[2], k[3]),  # role, c_src, pert, p_size
+        )
+        if not arch_keys:
+            continue
+        # Drop rows where every one of the 4 columns has no data
+        arch_keys = [
+            k for k in arch_keys
+            if any(buckets[k].get(c) and buckets[k][c].get("t")
+                   for c in columns)
+        ]
+        if not arch_keys:
+            continue
+        safe_arch = arch.replace("_", "")
+        lines.append(r"\begin{table*}[!tbp]")
+        lines.append(r"\centering")
+        lines.append(r"\scriptsize")
+        lines.append(r"\setlength{\tabcolsep}{3pt}")
+        lines.append(r"\begin{adjustbox}{max width=\textwidth,center}%")
+        col_spec = ("@{}l l | " + " | ".join(["r r r"] * len(columns))
+                    + "@{}")
+        lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
+        lines.append(r"\toprule")
+        lines.append(r"\aaaisafewideheader")
+        lines.append(r"\midrule")
+
+        # Group by (role, c_src) for the multicolumn section heading
+        from itertools import groupby
+        for (role, c_src), gkeys in groupby(arch_keys,
+                                             key=lambda k: (k[1], k[4])):
+            dm_entry = None
+            if delta_max_by_key is not None:
+                dm_entry = delta_max_by_key.get((arch, role, c_src))
+            dmax_ub = None
+            dmax_str = "?"
+            if dm_entry is not None:
+                ub_dm = dm_entry.get("upper")
+                if (ub_dm is not None and math.isfinite(ub_dm)
+                        and abs(ub_dm) > 1e-9):
+                    dmax_ub = ub_dm
+                    dmax_str = _fmt_trim(ub_dm)
+            # delta_d is the dataset-empirical max margin as a percentage
+            # of the sound delta_max upper bound: (delta_d / delta_max)*100.
+            # Same definition as the full advstd_techniques.tex tables.
+            dd_str = "?"
+            dd_val = None
+            if delta_d_by_key is not None:
+                dd_val = delta_d_by_key.get((arch, role, c_src))
+            if (dd_val is not None and math.isfinite(dd_val)
+                    and dmax_ub is not None):
+                dd_str = _fmt_sig((dd_val / dmax_ub) * 100.0) + "\\%"
+            # role is stored as "N1"/"N2"; render with a subscript so
+            # the model cell reads "cnn1 / N_1" / "cnn1 / N_2" rather
+            # than the italic-bare "N1"/"N2".
+            role_tex = "N_" + role[1:] if role.startswith("N") else role
+            # The model value is distributed down the first column, one
+            # part per row, across the block's rows (rather than a wide
+            # full-width heading that overflows into the data columns).
+            label_parts = [
+                r"\textbf{" + arch.replace("_", r"\_")
+                + r" / $" + role_tex + r"$}",
+                r"$c_s{=}" + str(c_src) + r"$",
+                r"$\delta_{\max}{=}" + dmax_str + r"$",
+                r"$\delta_d{=}" + dd_str + r"$",
+            ]
+
+            # Expected c_targets for every row in this block: every class
+            # index except c_src. A combo whose actually-recorded set of
+            # c_targets is a strict subset of this gets a red asterisk
+            # next to its time cell so the reader knows the mean was
+            # taken over a partial sweep.
+            _DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10,
+                                     "fashion_mnist": 10}
+            n_classes = _DATASET_NUM_CLASSES.get(dataset, 10)
+            expected_cts_block = {ct for ct in range(n_classes)
+                                  if ct != int(c_src)}
+
+            # First pass: build the data cells (everything except the
+            # model column) for every row that actually has data, so the
+            # model label can be spread across exactly the rendered rows.
+            block_rows = []
+            for key in list(gkeys):
+                _, role, pert, p_size, c_src = key
+                cell_dict = buckets[key]
+                # Pre-compute stats for each rendered column
+                stats = {}
+                partial = {}
+                for c in columns:
+                    cell = cell_dict.get(c)
+                    if not cell or not cell.get("t"):
+                        continue
+                    s = {}
+                    s["t"] = sum(cell["t"]) / len(cell["t"]) / 60.0
+                    if cell["lb"] and dmax_ub is not None:
+                        s["lb_pct"] = (sum(cell["lb"]) / len(cell["lb"])
+                                       / dmax_ub) * 100.0
+                    if cell["ub"] and dmax_ub is not None:
+                        s["ub_pct"] = (sum(cell["ub"]) / len(cell["ub"])
+                                       / dmax_ub) * 100.0
+                    stats[c] = s
+                    seen_cts = cell.get("c_targets", set())
+                    # The cell is partial iff at least one expected
+                    # c_target wasn't run. Don't penalise extra
+                    # c_targets that fell outside expected_cts_block
+                    # (e.g. dataset-specific quirks).
+                    partial[c] = bool(expected_cts_block - seen_cts)
+                # Drop the row if no rendered column has data
+                if not stats:
+                    continue
+                pert_str = f"{pert} ({p_size})".replace("_", r"\_")
+                # Replace "linf" textual key with the math glyph
+                pert_str = pert_str.replace("linf", r"$\ell_\infty$")
+                data_cells = [pert_str]
+                for c in columns:
+                    s = stats.get(c)
+                    if s is None:
+                        data_cells += ["---", "---", "---"]
+                        continue
+                    # Clamp for display: delta_l (% of delta_max) below 0
+                    # shows 0, delta_u above 100 shows 100.
+                    data_cells.append(_fmt_sig(max(0.0, s['lb_pct'])) if "lb_pct" in s else "---")
+                    data_cells.append(_fmt_sig(min(100.0, s['ub_pct'])) if "ub_pct" in s else "---")
+                    # Time is in minutes; when --force_timeout is set the
+                    # rows that survived the timeout-mismatch filter all
+                    # ran under that cap, so a mean above it is overhead
+                    # beyond the solver limit and is clamped to the forced
+                    # timeout (force_timeout is in seconds).
+                    if "t" in s:
+                        t_val = s["t"]
+                        if force_timeout is not None:
+                            t_val = min(t_val, force_timeout / 60.0)
+                        t_str = _fmt_trim(t_val)
+                    else:
+                        t_str = "---"
+                    if partial.get(c) and t_str != "---":
+                        t_str = t_str + r"\textcolor{red}{$^*$}"
+                    data_cells.append(t_str)
+                block_rows.append(data_cells)
+
+            if not block_rows:
+                continue
+
+            # Distribute the model label parts down the first column.
+            # More rows than parts -> trailing rows get an empty model
+            # cell. Fewer rows than parts -> pack the leftover parts into
+            # the last row via a left-aligned \shortstack so nothing is
+            # dropped.
+            n_rows = len(block_rows)
+            row_labels = [""] * n_rows
+            for i in range(min(n_rows, len(label_parts))):
+                if i == n_rows - 1 and n_rows < len(label_parts):
+                    leftover = label_parts[i:]
+                    row_labels[i] = (r"\shortstack[l]{"
+                                     + r"\\".join(leftover) + r"}")
+                else:
+                    row_labels[i] = label_parts[i]
+
+            for lbl, data_cells in zip(row_labels, block_rows):
+                lines.append(" & ".join([lbl] + data_cells) + r" \\")
+            lines.append(r"\midrule")
+
+        # Trailing \midrule -> \bottomrule
+        if lines[-1].rstrip() == r"\midrule":
+            lines[-1] = r"\bottomrule"
+        lines.append(r"\end{tabular}%")
+        lines.append(r"\end{adjustbox}")
+        cap = (
+            f"{arch} --- per-cell comparison of the original VHAGaR "
+            r"baseline against our standard- and transfer-mode safe "
+            r"combinations at $\tau{=}0.5$. \emph{vaghar} is the "
+            r"VHAGaR baseline (no boosts). \emph{Standard} is the "
+            r"\emph{zono + SibGate} combo with perturbed-interval "
+            r"constraints. \emph{Transfer} adds the \emph{adv + "
+            r"prev\_pgd} variable-hint pipeline that reuses $N_1$'s "
+            r"solver state; transfer columns are blank on $N_1$ rows "
+            r"since transfer-mode is $N_2$-only. Each cell is "
+            r"$(\delta_l, \delta_u, t)$ with $\delta_l$ and $\delta_u$ "
+            r"in per-cent of $\delta_{\max}$ and $t$ in wall-clock "
+            r"minutes (mean over $c_t$ and Gurobi seeds). Each block "
+            r"heading reports $\delta_{\max}$, the sound upper bound on "
+            r"the maximum margin, and $\delta_d$, the dataset-empirical "
+            r"maximum margin over MNIST as a per-cent of $\delta_{\max}$. "
+            r"A dash means "
+            r"the combo was not exercised on the cell; a red "
+            r"\textcolor{red}{$^*$} on the time means the cell aggregates "
+            r"over only some of the expected target classes."
+        )
+        lines.append(f"\\caption{{{cap}}}")
+        lines.append(f"\\label{{tab:safe-wide-{safe_arch}}}")
+        lines.append(r"\end{table*}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def update_aaai_wide_perarch_tex(tex_path, body):
+    """Rewrite the % BEGIN AUTO: aaai_safe_wide_tables block in tex_path."""
+    with open(tex_path) as f:
+        text = f.read()
+    if AAAI_WIDE_BEGIN_MARK not in text or AAAI_WIDE_END_MARK not in text:
+        raise SystemExit(
+            f"aaai_safe_wide markers not found in {tex_path}; expected lines "
+            f"containing '{AAAI_WIDE_BEGIN_MARK}' and "
+            f"'{AAAI_WIDE_END_MARK}'")
+    pre, rest = text.split(AAAI_WIDE_BEGIN_MARK, 1)
+    _body, post = rest.split(AAAI_WIDE_END_MARK, 1)
+    updated = (f"{pre}{AAAI_WIDE_BEGIN_MARK}\n{body}\n"
+               f"{AAAI_WIDE_END_MARK}{post}")
+    if updated == text:
+        print("[update_advstd_tex_tables] no changes to aaai_safe_wide block")
+        return
+    with open(tex_path, "w") as f:
+        f.write(updated)
+    print(f"[update_advstd_tex_tables] wrote aaai_safe_wide block "
+          f"in {tex_path}")
+
+
+def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
+                                          parse_result_file,
+                                          seeds_filter=None,
+                                          force_timeout=None,
+                                          rerun_timeout_eps=30.0):
+    """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
+    AAAI variant into the neta_s_paper evaluation section. When
+    `force_timeout` is set (in seconds), cells whose Gurobi run hit a
+    termination limit under a different wall-clock cap are excluded."""
+    try:
+        rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
+                                            parse_result_file,
+                                            seeds_filter=seeds_filter)
+        archs = [a for a, _ in arch_runs]
+        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                            seeds_filter=seeds_filter)
+        delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
+        delta_d_by_key = _load_delta_d_values(cwd, dataset, archs)
+        body = _render_aaai_wide_perarch_body(
+            rows, archs, dataset,
+            delta_max_by_key=delta_max_by_key,
+            delta_d_by_key=delta_d_by_key,
+            force_timeout=force_timeout,
+            rerun_timeout_eps=rerun_timeout_eps)
+        update_aaai_wide_perarch_tex(tex_path, body)
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_safe_wide block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_safe_wide block error: "
+              f"{exc}")
 
 
 def _load_advstd_rows_for_wide(cwd, dataset, archs, seeds_filter=None,

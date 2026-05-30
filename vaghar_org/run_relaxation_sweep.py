@@ -101,6 +101,20 @@ def _signal_handler(signum, frame):
 
 atexit.register(_kill_descendants)
 
+# ── Rerun-on-timeout filter ──────────────────────────────────────────────
+# Module-level config set from --rerun_timeouts in main(). When enabled,
+# `_parse_c_source_target_pairs` excludes any result row whose solve_status
+# indicates a Gurobi time-limit termination (TIME_LIMIT / USER_LIMIT) — and
+# additionally any row whose optimization_time is within a small epsilon of
+# a previously-used timeout (for legacy result lines that lack solve_status).
+_RERUN_TIMEOUTS = False
+# Timeout values (in seconds) that should be treated as "this row was a
+# timeout" when matched against optimization_time. Populated in main():
+# always includes a configurable list of common historical caps (1800, 3600)
+# plus the current --timeout. The match tolerance is ±_TIMEOUT_MATCH_EPS s.
+_TIMEOUT_VALUES = ()  # type: tuple[float, ...]
+_TIMEOUT_MATCH_EPS = 30.0  # seconds
+
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
@@ -160,12 +174,20 @@ def _parse_c_source_target_pairs(filepath):
     CSV lines. Returns an empty set on any parse/IO error rather than raising
     — a readable-but-empty file is treated as "no pairs covered yet".
 
-    Lines whose `solve_status` is `INTERRUPTED` are excluded: the Julia
-    process was killed mid-solve (sweep supervisor, OOM, etc.) so the
-    line carries only partial Gurobi bounds, not a real completion. Every
-    caller uses this set to skip already-done cells when rebuilding the
-    run list, so leaving these lines in would make INTERRUPTED cells
-    stick across sweep invocations.
+    Lines whose `solve_status` is `INTERRUPTED` are always excluded: the
+    Julia process was killed mid-solve (sweep supervisor, OOM, etc.) so the
+    line carries only partial Gurobi bounds, not a real completion.
+
+    When --rerun_timeouts is enabled (module-level `_RERUN_TIMEOUTS`),
+    additionally exclude rows that look like Gurobi timeouts so the caller's
+    "missing c_targets" set picks them up for a fresh solve under the new
+    --timeout. A row counts as a timeout if either:
+      - solve_status ∈ {TIME_LIMIT, USER_OBJ_LIMIT, USER_LIMIT,
+        ITERATION_LIMIT, NODE_LIMIT, SOLUTION_LIMIT, MEMORY_LIMIT,
+        WORK_LIMIT}; or
+      - optimization_time is within ±_TIMEOUT_MATCH_EPS seconds of any
+        entry in `_TIMEOUT_VALUES` (catches legacy rows that lack
+        solve_status — see the docstring note below about positional CSV).
     """
     pairs = set()
     try:
@@ -183,20 +205,47 @@ def _parse_c_source_target_pairs(filepath):
                     status = (fields.get("solve_status", "") or "").upper()
                     if status == "INTERRUPTED":
                         continue
+                    if _RERUN_TIMEOUTS:
+                        timeout_statuses = {
+                            "TIME_LIMIT", "USER_OBJ_LIMIT", "USER_LIMIT",
+                            "ITERATION_LIMIT", "NODE_LIMIT",
+                            "SOLUTION_LIMIT", "MEMORY_LIMIT", "WORK_LIMIT",
+                        }
+                        if status in timeout_statuses:
+                            continue
+                        opt_t = fields.get("optimization_time", "")
+                        if opt_t:
+                            try:
+                                tval = float(opt_t)
+                                if any(abs(tval - cap) <= _TIMEOUT_MATCH_EPS
+                                       for cap in _TIMEOUT_VALUES):
+                                    continue
+                            except ValueError:
+                                pass
                     try:
                         pairs.add((int(fields["c_source"]), int(fields["c_target"])))
                     except ValueError:
                         pass
                     continue
-                # Legacy positional CSV: source,target,incumbent_obj,...
-                # (no solve_status field, so we cannot detect INTERRUPTED
-                # here — legacy runs always count as covered.)
+                # Legacy positional CSV: source,target,incumbent_obj,solve_time,...
+                # No solve_status field, so we fall back to a wall-clock match
+                # against _TIMEOUT_VALUES when --rerun_timeouts is set.
                 parts = line.split(",")
                 if len(parts) >= 2:
                     try:
-                        pairs.add((int(parts[0]), int(parts[1])))
+                        cs = int(parts[0]); ct = int(parts[1])
                     except ValueError:
-                        pass
+                        continue
+                    if _RERUN_TIMEOUTS and len(parts) >= 5:
+                        # Common legacy schema: source,target,incumbent,best_bound,solve_time
+                        try:
+                            tval = float(parts[4])
+                            if any(abs(tval - cap) <= _TIMEOUT_MATCH_EPS
+                                   for cap in _TIMEOUT_VALUES):
+                                continue
+                        except ValueError:
+                            pass
+                    pairs.add((cs, ct))
     except OSError:
         pass
     return pairs
@@ -1785,7 +1834,9 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
 
 def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
                                 compare_to_with_perturbed, combo_ranking_seeds,
-                                combination_table=None):
+                                combination_table=None,
+                                force_timeout=None,
+                                rerun_timeout_eps=30.0):
     """Scan existing per-cell results and write the combo-ranking CSV.
 
     Encapsulates the logic behind --find_advstd_faster_than_standard so the
@@ -1889,13 +1940,17 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
 
     _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                               compare_to_with_perturbed, combo_ranking_seeds,
-                              combination_table=combination_table)
+                              combination_table=combination_table,
+                              force_timeout=force_timeout,
+                              rerun_timeout_eps=rerun_timeout_eps)
     return csv_combo_ranking
 
 
 def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                               compare_to_with_perturbed, combo_ranking_seeds,
-                              combination_table=None):
+                              combination_table=None,
+                              force_timeout=None,
+                              rerun_timeout_eps=30.0):
     """Rewrite advstd_techniques.tex tables after regenerating CSVs."""
     try:
         sys.path.insert(0, cwd)
@@ -1962,6 +2017,66 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                   "wide comparison section.")
     except Exception as exc:
         print(f"[tex-update] wide_perarch block error: {exc}")
+
+    # AAAI paper companion: same per-arch wide tables, sliced down to
+    # the 4 safe-combo columns (standard zono+sg+pi at tau=0/0.5 plus
+    # advstd transfer zono+prev_pgd+sg at tau=0/0.5). The block lives
+    # between AUTO markers in neta-s-paper/sections/sec_evaluation.tex
+    # so it stays in sync with the main advstd_techniques.tex tables.
+    try:
+        aaai_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                                  "sec_evaluation.tex")
+        if not os.path.exists(aaai_tex):
+            # Silently skip if the AAAI paper isn't checked out next to
+            # the sweep; the main advstd_techniques.tex tables are still
+            # regenerated above.
+            pass
+        elif hasattr(updater, "regenerate_aaai_wide_perarch_section"):
+            updater.regenerate_aaai_wide_perarch_section(
+                aaai_tex, cwd, dataset_guess, arch_runs,
+                parse_result_file,
+                seeds_filter=combo_ranking_seeds,
+                force_timeout=force_timeout,
+                rerun_timeout_eps=rerun_timeout_eps)
+        else:
+            print("[tex-update] updater missing "
+                  "regenerate_aaai_wide_perarch_section -- upgrade "
+                  "update_advstd_tex_tables.py to populate the AAAI "
+                  "paper's safe-wide tables.")
+    except Exception as exc:
+        print(f"[tex-update] aaai_safe_wide block error: {exc}")
+
+    # Recompile the AAAI paper so main.pdf reflects the freshly
+    # regenerated sec_evaluation.tex tables.
+    _recompile_neta_s_paper(cwd)
+
+
+def _recompile_neta_s_paper(cwd):
+    """Rebuild neta-s-paper/main.pdf with pdflatex+bibtex (latexmk absent)."""
+    paper_dir = os.path.join(cwd, "neta-s-paper")
+    main_tex = os.path.join(paper_dir, "main.tex")
+    if not os.path.exists(main_tex):
+        print(f"[paper-build] skipped (missing {main_tex})")
+        return
+    pdflatex = ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+                "main.tex"]
+    steps = [pdflatex, ["bibtex", "main"], pdflatex, pdflatex]
+    for step in steps:
+        try:
+            proc = subprocess.run(step, cwd=paper_dir,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            print(f"[paper-build] skipped ({step[0]} not installed)")
+            return
+        if proc.returncode != 0:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            print(f"[paper-build] {' '.join(step)} failed "
+                  f"(exit {proc.returncode}); last lines:")
+            for line in tail:
+                print(f"  {line}")
+            return
+    print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
 
 
 def main():
@@ -2082,6 +2197,17 @@ def main():
                              "--combo_ranking_seeds 4). Rows from other seeds are dropped before "
                              "aggregation. With a single seed, the STRICT/GENERAL/MIXED/LOSER labels "
                              "are assigned by gm_all thresholds instead of per-seed WIN/LOSE/flip.")
+    parser.add_argument("--force_timeout", type=int, default=None,
+                        metavar="SECS",
+                        help="When set, the AAAI wide-comparison tables in "
+                             "neta-s-paper/sections/sec_evaluation.tex exclude any "
+                             "cell whose Gurobi run hit TIME_LIMIT under a different "
+                             "wall-clock cap than this value (in seconds). Cells that "
+                             "finished optimally are always included regardless. The "
+                             "match tolerance is ±--rerun_timeout_eps seconds (default "
+                             "30s). Useful when re-running the sweep after lowering "
+                             "--timeout so older 1-hour timed-out cells don't pollute "
+                             "the means.")
     parser.add_argument("--combination_table", type=str, default=None,
                         metavar="BT:VH:TAU[,BT:VH:TAU,...]",
                         help="Restrict the advstd tables in advstd_techniques.tex (overall "
@@ -2196,6 +2322,42 @@ def main():
                              "sweep for BOTH --include_nn1_boost and --include_nn2_boost. Default: "
                              "['true']. Required true for soundness when nn1_relax_threshold > 0 "
                              "(unsound combo guard at run.jl:487-494) — those combos are auto-pruned.")
+    parser.add_argument("--stdboost_combos", type=str, default=None,
+                        metavar="ROLE:ZB:SG:RT:PI[,ROLE:ZB:SG:RT:PI...]",
+                        help="Explicit comma-separated list of stdBoost combos to run, "
+                             "bypassing the Cartesian product of --sweep_stdboost_* and "
+                             "--include_nn{1,2}_boost. Each entry is "
+                             "<role>:<zb>:<sg>:<rt>:<pi> with role in {N1,N2}, zb/sg/pi in "
+                             "{true,false}, rt a float (>=0). Soundness filters still apply "
+                             "(rt>0 requires pi=true; sg=true requires rt>=0). Example: "
+                             "'N1:false:false:0:false,N2:false:false:0:false,"
+                             "N1:true:true:0:true,N1:true:true:0.5:true'.")
+    parser.add_argument("--skip_std_n2_baseline", action="store_true",
+                        help="In --advanced_standard mode, skip Phase 1.5 (the auto-launched "
+                             "vagharWithPerturbed N2 standard baseline). Use when you only want "
+                             "the N1-solve, advstd, and stdBoost jobs and don't need the "
+                             "wide-table 'pi' baseline.")
+    parser.add_argument("--rerun_timeouts", action="store_true",
+                        help="Treat existing result rows that hit a Gurobi termination "
+                             "limit (solve_status in {TIME_LIMIT, USER_OBJ_LIMIT, "
+                             "ITERATION_LIMIT, NODE_LIMIT, SOLUTION_LIMIT, MEMORY_LIMIT, "
+                             "WORK_LIMIT}) as NOT done, so they get re-solved under the "
+                             "current --timeout. Also catches legacy/positional rows whose "
+                             "optimization_time falls within ±--rerun_timeout_eps seconds of "
+                             "a known cap (--rerun_timeout_values). Affects all skip-check "
+                             "phases that scan .txt result files (Phases 1.5, 2, 2.5, 0.5). "
+                             "Phase 1 (N1 state) uses .bin files instead — delete those "
+                             "manually if you also need to re-solve the N1 state.")
+    parser.add_argument("--rerun_timeout_values", nargs="*", type=float, default=None,
+                        metavar="SECS",
+                        help="Wall-clock optimization_time caps (in seconds) to treat as "
+                             "timeouts for the legacy/positional-row fallback in "
+                             "--rerun_timeouts. Default: [1800, 3600] plus the current "
+                             "--timeout. Only consulted when --rerun_timeouts is set.")
+    parser.add_argument("--rerun_timeout_eps", type=float, default=30.0,
+                        metavar="SECS",
+                        help="Tolerance (in seconds) used when matching a row's "
+                             "optimization_time against --rerun_timeout_values. Default: 30.")
     parser.add_argument("--refresh_ranking_csv", action="store_true",
                         help="Before applying --advstd_safe_combos_only, regenerate the combo-ranking "
                              "CSV from the latest per-cell results (equivalent to running "
@@ -2226,6 +2388,26 @@ def main():
                              "N1 state files, advstd result files, and standard-baseline result files "
                              "are keyed per-ctag (Julia writes ctag{ctag-1} into filenames). Default: [1].")
     args = parser.parse_args()
+
+    # Wire the rerun-on-timeout filter into module globals so
+    # _parse_c_source_target_pairs can consult them without threading the
+    # flag through every caller.
+    global _RERUN_TIMEOUTS, _TIMEOUT_VALUES, _TIMEOUT_MATCH_EPS
+    _RERUN_TIMEOUTS = bool(args.rerun_timeouts)
+    if _RERUN_TIMEOUTS:
+        default_caps = [1800.0, 3600.0, float(args.timeout)]
+        if args.rerun_timeout_values:
+            caps = list(args.rerun_timeout_values)
+        else:
+            caps = default_caps
+        # De-dupe while preserving order.
+        seen = set(); _TIMEOUT_VALUES = tuple(
+            c for c in caps if not (c in seen or seen.add(c))
+        )
+        _TIMEOUT_MATCH_EPS = float(args.rerun_timeout_eps)
+        print(f"[rerun_timeouts] enabled — treating rows with "
+              f"solve_status ∈ timeout-set OR optimization_time within "
+              f"±{_TIMEOUT_MATCH_EPS}s of {list(_TIMEOUT_VALUES)} as not done")
 
     total_cores = args.max_cores
     thresholds = args.thresholds if args.thresholds else THRESHOLDS
@@ -2375,7 +2557,9 @@ def main():
         _generate_combo_ranking_csv(
             arch_runs, cwd, dataset,
             args.compare_to_with_perturbed, args.combo_ranking_seeds,
-            combination_table=args.combination_table)
+            combination_table=args.combination_table,
+            force_timeout=args.force_timeout,
+            rerun_timeout_eps=args.rerun_timeout_eps)
         return
 
     cores_per_job = CORES_PER_JOB
@@ -2796,7 +2980,12 @@ def main():
 
                 # Phase 1.5 (this c_tag): standard-N2 (vagharWithPerturbed)
                 # baselines — independent of N1 state, always ready.
-                for arch, model_path in arch_runs:
+                # Skipped entirely when --skip_std_n2_baseline is passed.
+                if args.skip_std_n2_baseline:
+                    arch_iter_phase1_5 = []
+                else:
+                    arch_iter_phase1_5 = arch_runs
+                for arch, model_path in arch_iter_phase1_5:
                     n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
                     for pert_name, pert_spec in perts:
                         pert_type, eps_str = pert_spec.split(":", 1)
@@ -2972,22 +3161,76 @@ def main():
                 # (--include_nn1_boost runs on N1; --include_nn2_boost runs on
                 # the same boost grid applied to N2). Both can be enabled
                 # simultaneously.
-                stdboost_targets = []
-                if args.include_nn1_boost:
-                    stdboost_targets.append("N1")
-                if args.include_nn2_boost:
-                    stdboost_targets.append("N2")
-                if stdboost_targets:
-                    nn_rt_vals = [r for r in relax_t_vals if r >= 0.0]
-                    nn_zb_vals = (args.sweep_stdboost_zono_bounds
-                                  if args.sweep_stdboost_zono_bounds else ["true"])
-                    nn_sg_vals = (args.sweep_stdboost_sibling_gate
-                                  if args.sweep_stdboost_sibling_gate else ["true"])
-                    nn_pi_vals = (args.sweep_stdboost_perturbed_intervals
-                                  if args.sweep_stdboost_perturbed_intervals else ["true"])
-                    nn_zb_vals = [v.lower() for v in nn_zb_vals]
-                    nn_sg_vals = [v.lower() for v in nn_sg_vals]
-                    nn_pi_vals = [v.lower() for v in nn_pi_vals]
+                # Build the (role, zb, sg, rt, pi) combo list either from the
+                # explicit --stdboost_combos override or from the legacy
+                # Cartesian sweep of --sweep_stdboost_* × --include_nn{1,2}_boost.
+                explicit_stdboost_combos = []  # list of (role, zb, sg, rt, pi)
+                if args.stdboost_combos:
+                    for spec in args.stdboost_combos.split(","):
+                        spec = spec.strip()
+                        if not spec:
+                            continue
+                        parts = spec.split(":")
+                        if len(parts) != 5:
+                            print(f"ERROR: --stdboost_combos entry '{spec}' must have 5 colon-separated "
+                                  f"fields: <role>:<zb>:<sg>:<rt>:<pi>")
+                            sys.exit(1)
+                        c_role, c_zb, c_sg, c_rt_str, c_pi = parts
+                        c_role = c_role.upper()
+                        if c_role not in ("N1", "N2"):
+                            print(f"ERROR: --stdboost_combos role '{c_role}' must be N1 or N2 "
+                                  f"(in entry '{spec}')")
+                            sys.exit(1)
+                        c_zb = c_zb.lower(); c_sg = c_sg.lower(); c_pi = c_pi.lower()
+                        for fld, name in ((c_zb, "zb"), (c_sg, "sg"), (c_pi, "pi")):
+                            if fld not in ("true", "false"):
+                                print(f"ERROR: --stdboost_combos field {name}='{fld}' must be "
+                                      f"true|false (in entry '{spec}')")
+                                sys.exit(1)
+                        try:
+                            c_rt = float(c_rt_str)
+                        except ValueError:
+                            print(f"ERROR: --stdboost_combos rt='{c_rt_str}' must be a float "
+                                  f"(in entry '{spec}')")
+                            sys.exit(1)
+                        if c_rt > 0.0 and c_pi == "false":
+                            print(f"ERROR: --stdboost_combos entry '{spec}' is unsound: "
+                                  f"rt>0 requires pi=true (run.jl:487-494).")
+                            sys.exit(1)
+                        if c_sg == "true" and c_rt < 0.0:
+                            print(f"ERROR: --stdboost_combos entry '{spec}' is no-op: "
+                                  f"sg=true with rt<0 emits inactive SibGate.")
+                            sys.exit(1)
+                        explicit_stdboost_combos.append((c_role, c_zb, c_sg, c_rt, c_pi))
+                else:
+                    stdboost_targets = []
+                    if args.include_nn1_boost:
+                        stdboost_targets.append("N1")
+                    if args.include_nn2_boost:
+                        stdboost_targets.append("N2")
+                    if stdboost_targets:
+                        nn_rt_vals = [r for r in relax_t_vals if r >= 0.0]
+                        nn_zb_vals = (args.sweep_stdboost_zono_bounds
+                                      if args.sweep_stdboost_zono_bounds else ["true"])
+                        nn_sg_vals = (args.sweep_stdboost_sibling_gate
+                                      if args.sweep_stdboost_sibling_gate else ["true"])
+                        nn_pi_vals = (args.sweep_stdboost_perturbed_intervals
+                                      if args.sweep_stdboost_perturbed_intervals else ["true"])
+                        nn_zb_vals = [v.lower() for v in nn_zb_vals]
+                        nn_sg_vals = [v.lower() for v in nn_sg_vals]
+                        nn_pi_vals = [v.lower() for v in nn_pi_vals]
+                        for role in stdboost_targets:
+                            for zb in nn_zb_vals:
+                                for sg in nn_sg_vals:
+                                    for rt in nn_rt_vals:
+                                        for pi in nn_pi_vals:
+                                            if rt > 0.0 and pi == "false":
+                                                continue
+                                            if sg == "true" and rt < 0.0:
+                                                continue
+                                            explicit_stdboost_combos.append((role, zb, sg, rt, pi))
+
+                if explicit_stdboost_combos:
                     for arch, model_path in arch_runs:
                         n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
                         for pert_name, pert_spec in perts:
@@ -2997,7 +3240,7 @@ def main():
                             requested_c_targets = _parse_c_targets(
                                 args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
 
-                            for role in stdboost_targets:
+                            for role, zb, sg, rt, pi in explicit_stdboost_combos:
                                 if role == "N1":
                                     target_model_p = n1_model_p
                                     target_tag     = n1_tag
@@ -3010,64 +3253,55 @@ def main():
                                     f"{role}stdBoost_{arch}_{target_tag}")
                                 base_name_to_save_nn = f"{target_tag}_{role}"
 
-                                for zb in nn_zb_vals:
-                                    for sg in nn_sg_vals:
-                                        for rt in nn_rt_vals:
-                                            for pi in nn_pi_vals:
-                                                # Soundness/no-op filters.
-                                                if rt > 0.0 and pi == "false":
-                                                    continue  # unsound: rt>0 requires PI
-                                                if sg == "true" and rt < 0.0:
-                                                    continue  # SibGate would be inactive
-                                                for seed in seed_vals:
-                                                    missing_nn_cts = _stdboost_missing_c_targets(
-                                                        os.path.join(cwd, nn_output_dir),
-                                                        arch, pert_type, eps_str,
-                                                        base_name_to_save_nn, seed,
-                                                        zb, sg, rt, pi,
-                                                        c_tag, requested_c_targets)
-                                                    if not missing_nn_cts:
-                                                        n2_skipped += 1
-                                                        continue
-                                                    seed_suffix = f" seed{seed}" if seed != 0 else ""
-                                                    wanted_nn = [ct for ct in requested_c_targets if ct != c_tag]
-                                                    if len(missing_nn_cts) < len(wanted_nn):
-                                                        tag_suffix = f" (partial: missing {missing_nn_cts})"
-                                                    else:
-                                                        tag_suffix = ""
-                                                    combo_tag = ""
-                                                    if zb == "true": combo_tag += "zb"
-                                                    if rt >= 0.0:    combo_tag += f"btpr{rt}"
-                                                    if sg == "true": combo_tag += "sg"
-                                                    if pi == "true": combo_tag += "pi"
-                                                    if not combo_tag: combo_tag = "plain"
-                                                    nn_label = f"{arch_prefix}{pert_name} c_tag={c_tag} {role}stdBoost({combo_tag}){seed_suffix}{tag_suffix}"
-                                                    nn_ct_arg = ",".join(str(ct) for ct in missing_nn_cts)
-                                                    nn_cmd = [
-                                                        "julia", "run.jl",
-                                                        "--mode", "standard",
-                                                        "--dataset", julia_dataset,
-                                                        "--model_name", model_name,
-                                                        "--model_path", target_model_p,
-                                                        "--perturbation", pert_type,
-                                                        "--perturbation_size", eps_str,
-                                                        "--ctag", str(c_tag),
-                                                        "--ct", nn_ct_arg,
-                                                        "--timout", str(args.timeout),
-                                                        "--output_dir", nn_output_dir + "/",
-                                                        "--name_to_save", base_name_to_save_nn,
-                                                        "--c_tag_mode", "false",
-                                                        "--use_hyper_attack", "true",
-                                                        "--activate_vaghgar_deps", "true",
-                                                        "--use_perturbed_intervals", pi,
-                                                        "--use_relaxations", "false",
-                                                        "--Threads_num", str(Threads_num),
-                                                        "--nn1_zono_bounds", zb,
-                                                        "--nn1_relax_threshold", str(rt),
-                                                        "--nn1_sibling_gate", sg,
-                                                        "--gurobi_seed", str(seed),
-                                                    ]
-                                                    ready_advstd_jobs.append((nn_label, nn_cmd))
+                                for seed in seed_vals:
+                                    missing_nn_cts = _stdboost_missing_c_targets(
+                                        os.path.join(cwd, nn_output_dir),
+                                        arch, pert_type, eps_str,
+                                        base_name_to_save_nn, seed,
+                                        zb, sg, rt, pi,
+                                        c_tag, requested_c_targets)
+                                    if not missing_nn_cts:
+                                        n2_skipped += 1
+                                        continue
+                                    seed_suffix = f" seed{seed}" if seed != 0 else ""
+                                    wanted_nn = [ct for ct in requested_c_targets if ct != c_tag]
+                                    if len(missing_nn_cts) < len(wanted_nn):
+                                        tag_suffix = f" (partial: missing {missing_nn_cts})"
+                                    else:
+                                        tag_suffix = ""
+                                    combo_tag = ""
+                                    if zb == "true": combo_tag += "zb"
+                                    if rt >= 0.0:    combo_tag += f"btpr{rt}"
+                                    if sg == "true": combo_tag += "sg"
+                                    if pi == "true": combo_tag += "pi"
+                                    if not combo_tag: combo_tag = "plain"
+                                    nn_label = f"{arch_prefix}{pert_name} c_tag={c_tag} {role}stdBoost({combo_tag}){seed_suffix}{tag_suffix}"
+                                    nn_ct_arg = ",".join(str(ct) for ct in missing_nn_cts)
+                                    nn_cmd = [
+                                        "julia", "run.jl",
+                                        "--mode", "standard",
+                                        "--dataset", julia_dataset,
+                                        "--model_name", model_name,
+                                        "--model_path", target_model_p,
+                                        "--perturbation", pert_type,
+                                        "--perturbation_size", eps_str,
+                                        "--ctag", str(c_tag),
+                                        "--ct", nn_ct_arg,
+                                        "--timout", str(args.timeout),
+                                        "--output_dir", nn_output_dir + "/",
+                                        "--name_to_save", base_name_to_save_nn,
+                                        "--c_tag_mode", "false",
+                                        "--use_hyper_attack", "true",
+                                        "--activate_vaghgar_deps", "true",
+                                        "--use_perturbed_intervals", pi,
+                                        "--use_relaxations", "false",
+                                        "--Threads_num", str(Threads_num),
+                                        "--nn1_zono_bounds", zb,
+                                        "--nn1_relax_threshold", str(rt),
+                                        "--nn1_sibling_gate", sg,
+                                        "--gurobi_seed", str(seed),
+                                    ]
+                                    ready_advstd_jobs.append((nn_label, nn_cmd))
 
             # Move stdBoost jobs with --use_perturbed_intervals=false to the
             # tail of the ready queue so they execute last. Stable sort on a
