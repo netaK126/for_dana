@@ -4589,6 +4589,13 @@ def update_wide_perarch_tex(tex_path, body):
 AAAI_WIDE_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_tables"
 AAAI_WIDE_END_MARK   = "% END AUTO: aaai_safe_wide_tables"
 
+# Body-section summary table (Table 2 in the paper): one row per architecture
+# with the transfer-mode bound gap vs. the exact VHAGaR bound and the
+# transfer-mode speedup over VHAGaR. Lives between these markers in
+# sec_evaluation.tex; derived from the SAME per-cell rows as the appendix.
+AAAI_SUMMARY_BEGIN_MARK = "% BEGIN AUTO: aaai_summary_table"
+AAAI_SUMMARY_END_MARK   = "% END AUTO: aaai_summary_table"
+
 # 3 columns: the original VHAGaR baseline (PI=off, no boosts), the
 # standard-mode safe combo zono+SibGate+PI at tau=0.5, and the
 # transfer-mode safe combo adv+zono+prev_pgd+SibGate at tau=0.5.
@@ -4971,6 +4978,218 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
               f"{exc}")
     except Exception as exc:
         print(f"[update_advstd_tex_tables] aaai_safe_wide block error: "
+              f"{exc}")
+
+
+# Combo keys for the summary aggregation. Must match _AAAI_WIDE_COLUMNS:
+# 'vaghar' is the exact VHAGaR baseline, the transfer column is the
+# adv+zono+prev_pgd+SibGate combo at tau=0.5.
+_AAAI_SUMMARY_VAGHAR_COMBO   = "vaghar"
+_AAAI_SUMMARY_TRANSFER_COMBO = "adv_zono_prevpgd_0.5+sg"
+# A VHAGaR cell counts as "exact" (so its bound can anchor the bound gap)
+# only when its MIP closed to within this relative gap. MIPGap is 0.01;
+# 0.05 leaves margin for the mean over seeds/targets.
+_AAAI_SUMMARY_EXACT_REL_GAP = 0.05
+
+# Display names: internal arch key -> the name used in the paper body.
+_AAAI_ARCH_DISPLAY = {
+    "cnn1": r"\emph{conv1}",
+    "cnn2": r"\emph{conv2}",
+    "3x50": r"3$\times$50",
+    "3x10": r"3$\times$10",
+}
+
+
+_AAAI_SUMMARY_NUM_CLASSES = {"mnist": 10, "cifar10": 10, "fashion_mnist": 10}
+
+
+def _aaai_summary_stats(rows, archs, dataset="mnist", force_timeout=None,
+                        rerun_timeout_eps=30.0):
+    """Aggregate the per-cell rows into per-architecture summary metrics.
+
+    Returns {arch: {"gap": float|None, "mean_sp": float|None,
+                    "max_sp": float|None, "n_sp": int, "n_gap": int,
+                    "star": bool}} plus an "__overall__" entry pooled across
+    all archs.
+
+    Bound gap (per cell) = 100*(transfer_ub - vaghar_ub)/vaghar_ub, kept only
+    where the VHAGaR cell is exact (converged). Speedup (per cell) =
+    vaghar_time / transfer_time, kept where both ran. Per arch the gap is the
+    arithmetic mean and the speedup is the geometric mean (max is the max).
+
+    "star" marks incomplete results: an architecture is starred when any of
+    its three metrics has no data, or when a contributing cell did not cover
+    every expected target class (same partial-coverage notion the per-cell
+    appendix tables flag with a red asterisk on the time).
+    """
+    import math as _math
+    from collections import defaultdict
+
+    if force_timeout is not None:
+        rows = [r for r in rows
+                if not _aaai_is_timeout_mismatch(r, force_timeout,
+                                                 rerun_timeout_eps)]
+
+    n_classes = _AAAI_SUMMARY_NUM_CLASSES.get(dataset, 10)
+
+    # Same bucketing as _render_aaai_wide_perarch_body, plus c_targets so we
+    # can detect partial target-class coverage.
+    buckets = defaultdict(lambda: defaultdict(
+        lambda: {"t": [], "lb": [], "ub": [], "c_targets": set()}))
+    for r in rows:
+        key = (r["arch"], r["role"], r["perturbation"],
+               r["perturbation_size"], r["c_source"])
+        cell = buckets[key][r["combo"]]
+        if r.get("t_total"):
+            cell["t"].append(r["t_total"])
+        lb = r.get("lb_total")
+        if lb is not None and _math.isfinite(lb):
+            cell["lb"].append(lb)
+        ub = r.get("ub_total")
+        if ub is not None and _math.isfinite(ub):
+            cell["ub"].append(ub)
+        ct = r.get("c_target")
+        if ct is not None:
+            try:
+                cell["c_targets"].add(int(ct))
+            except (TypeError, ValueError):
+                pass
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    per_arch_sp = defaultdict(list)
+    per_arch_gap = defaultdict(list)
+    per_arch_partial = defaultdict(bool)
+    for key, combos in buckets.items():
+        arch, c_src = key[0], key[4]
+        vag = combos.get(_AAAI_SUMMARY_VAGHAR_COMBO)
+        tra = combos.get(_AAAI_SUMMARY_TRANSFER_COMBO)
+        if not vag or not tra:
+            continue
+        try:
+            expected = {ct for ct in range(n_classes) if ct != int(c_src)}
+        except (TypeError, ValueError):
+            expected = set()
+
+        vt, tt = _mean(vag["t"]), _mean(tra["t"])
+        contributes = False
+        if vt and tt and tt > 0:
+            per_arch_sp[arch].append(vt / tt)
+            contributes = True
+        vub, vlb, tub = _mean(vag["ub"]), _mean(vag["lb"]), _mean(tra["ub"])
+        if (vub and vub > 0 and tub is not None and vlb is not None
+                and (vub - vlb) / vub <= _AAAI_SUMMARY_EXACT_REL_GAP):
+            per_arch_gap[arch].append(max(0.0, 100.0 * (tub - vub) / vub))
+            contributes = True
+        # A contributing cell is partial if either combo it used missed an
+        # expected target class.
+        if contributes and (
+                (expected - vag["c_targets"]) or (expected - tra["c_targets"])):
+            per_arch_partial[arch] = True
+
+    def _geomean(xs):
+        return _math.exp(sum(_math.log(x) for x in xs) / len(xs)) if xs else None
+
+    out = {}
+    all_sp, all_gap = [], []
+    any_star = False
+    for arch in archs:
+        sp, gap = per_arch_sp.get(arch, []), per_arch_gap.get(arch, [])
+        all_sp += sp
+        all_gap += gap
+        gap_m = _mean(gap)
+        msp = _geomean(sp)
+        xsp = max(sp) if sp else None
+        star = (gap_m is None or msp is None or xsp is None
+                or per_arch_partial.get(arch, False))
+        any_star = any_star or star
+        out[arch] = {"gap": gap_m, "mean_sp": msp, "max_sp": xsp,
+                     "n_sp": len(sp), "n_gap": len(gap), "star": star}
+    ov_gap, ov_msp = _mean(all_gap), _geomean(all_sp)
+    ov_xsp = max(all_sp) if all_sp else None
+    # Overall is starred if any architecture is incomplete, or it has no data.
+    out["__overall__"] = {"gap": ov_gap, "mean_sp": ov_msp, "max_sp": ov_xsp,
+                          "n_sp": len(all_sp), "n_gap": len(all_gap),
+                          "star": any_star or ov_gap is None
+                          or ov_msp is None or ov_xsp is None}
+    return out
+
+
+def _render_aaai_summary_body(stats, archs):
+    """Render the data rows (conv1/3x50/3x10/Overall) for the body summary
+    table from _aaai_summary_stats output. Missing values render as a red
+    dash so an incomplete sweep is visible."""
+    miss = r"\textcolor{red}{--}"
+
+    def _gap(v):
+        return _fmt_sig(v) if v is not None else miss
+
+    def _sp(v):
+        return (_fmt_sig(v) + r"$\times$") if v is not None else (miss + r"$\times$")
+
+    def _row(label, s):
+        # A red asterisk on the network name marks incomplete results.
+        if s.get("star"):
+            label = label + r"\textcolor{red}{$^*$}"
+        return (f"{label} & {_gap(s['gap'])} & {_sp(s['mean_sp'])} "
+                f"& {_sp(s['max_sp'])} \\\\")
+
+    lines = []
+    for arch in archs:
+        label = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
+        lines.append(_row(label, stats[arch]))
+    lines.append(r"\midrule")
+    lines.append(_row("Overall", stats["__overall__"]))
+    return "\n".join(lines)
+
+
+def update_aaai_summary_tex(tex_path, body):
+    """Rewrite the % BEGIN AUTO: aaai_summary_table block in tex_path."""
+    with open(tex_path) as f:
+        text = f.read()
+    if (AAAI_SUMMARY_BEGIN_MARK not in text
+            or AAAI_SUMMARY_END_MARK not in text):
+        raise SystemExit(
+            f"aaai_summary markers not found in {tex_path}; expected lines "
+            f"containing '{AAAI_SUMMARY_BEGIN_MARK}' and "
+            f"'{AAAI_SUMMARY_END_MARK}'")
+    pre, rest = text.split(AAAI_SUMMARY_BEGIN_MARK, 1)
+    _body, post = rest.split(AAAI_SUMMARY_END_MARK, 1)
+    updated = (f"{pre}{AAAI_SUMMARY_BEGIN_MARK}\n{body}\n"
+               f"{AAAI_SUMMARY_END_MARK}{post}")
+    if updated == text:
+        print("[update_advstd_tex_tables] no changes to aaai_summary block")
+        return
+    with open(tex_path, "w") as f:
+        f.write(updated)
+    print(f"[update_advstd_tex_tables] wrote aaai_summary block "
+          f"in {tex_path}")
+
+
+def regenerate_aaai_summary_section(tex_path, cwd, dataset, arch_runs,
+                                    parse_result_file, seeds_filter=None,
+                                    force_timeout=None,
+                                    rerun_timeout_eps=30.0):
+    """Compute the per-architecture summary (Table 2) from the same per-cell
+    rows as the appendix tables and rewrite the aaai_summary AUTO block."""
+    try:
+        rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
+                                           parse_result_file,
+                                           seeds_filter=seeds_filter)
+        archs = [a for a, _ in arch_runs]
+        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                           seeds_filter=seeds_filter)
+        stats = _aaai_summary_stats(rows, archs, dataset=dataset,
+                                    force_timeout=force_timeout,
+                                    rerun_timeout_eps=rerun_timeout_eps)
+        body = _render_aaai_summary_body(stats, archs)
+        update_aaai_summary_tex(tex_path, body)
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_summary block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_summary block error: "
               f"{exc}")
 
 

@@ -2021,11 +2021,12 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
     # AAAI paper companion: same per-arch wide tables, sliced down to
     # the 4 safe-combo columns (standard zono+sg+pi at tau=0/0.5 plus
     # advstd transfer zono+prev_pgd+sg at tau=0/0.5). The block lives
-    # between AUTO markers in neta-s-paper/sections/sec_evaluation.tex
-    # so it stays in sync with the main advstd_techniques.tex tables.
+    # between AUTO markers in neta-s-paper/sections/sec_appendix_percell.tex
+    # (the Per-Cell Evaluation Results appendix) so it stays in sync with
+    # the main advstd_techniques.tex tables.
     try:
         aaai_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                  "sec_evaluation.tex")
+                                  "sec_appendix_percell.tex")
         if not os.path.exists(aaai_tex):
             # Silently skip if the AAAI paper isn't checked out next to
             # the sweep; the main advstd_techniques.tex tables are still
@@ -2045,6 +2046,29 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                   "paper's safe-wide tables.")
     except Exception as exc:
         print(f"[tex-update] aaai_safe_wide block error: {exc}")
+
+    # Body summary table (Table 2 in sec_evaluation.tex): per-architecture
+    # bound gap vs. the exact VHAGaR bound and transfer-mode speedup,
+    # aggregated from the same per-cell rows as the appendix tables.
+    try:
+        summary_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                                   "sec_evaluation.tex")
+        if not os.path.exists(summary_tex):
+            pass
+        elif hasattr(updater, "regenerate_aaai_summary_section"):
+            updater.regenerate_aaai_summary_section(
+                summary_tex, cwd, dataset_guess, arch_runs,
+                parse_result_file,
+                seeds_filter=combo_ranking_seeds,
+                force_timeout=force_timeout,
+                rerun_timeout_eps=rerun_timeout_eps)
+        else:
+            print("[tex-update] updater missing "
+                  "regenerate_aaai_summary_section -- upgrade "
+                  "update_advstd_tex_tables.py to populate the AAAI "
+                  "paper's summary table.")
+    except Exception as exc:
+        print(f"[tex-update] aaai_summary block error: {exc}")
 
     # Recompile the AAAI paper so main.pdf reflects the freshly
     # regenerated sec_evaluation.tex tables.
@@ -2200,7 +2224,7 @@ def main():
     parser.add_argument("--force_timeout", type=int, default=None,
                         metavar="SECS",
                         help="When set, the AAAI wide-comparison tables in "
-                             "neta-s-paper/sections/sec_evaluation.tex exclude any "
+                             "neta-s-paper/sections/sec_appendix_percell.tex exclude any "
                              "cell whose Gurobi run hit TIME_LIMIT under a different "
                              "wall-clock cap than this value (in seconds). Cells that "
                              "finished optimally are always included regardless. The "
