@@ -646,7 +646,7 @@ def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_in
 
 
 def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
-             locked_jobs=None, on_job_done=None):
+             locked_jobs=None, on_job_done=None, priority=None):
     """Run jobs with CPU-pinned slot pooling.
 
     ready_jobs:  list of (label, cmd) that can start immediately.
@@ -658,6 +658,10 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
                  finishes (used e.g. to release per-job resources like the
                  N1 solve lock the moment its N1 job is done, rather than
                  holding the lock until the entire pool drains).
+    priority:    optional callable(job)->sortable-key. When given, the ready
+                 queue is sorted by this key before every slot-fill so the
+                 lowest-key job is dispatched first (including jobs that have
+                 just been unlocked). Pass None (default) for FIFO dispatch.
     """
     if locked_jobs is None:
         locked_jobs = {}
@@ -702,6 +706,8 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
         slots[slot_idx] = (label, proc, log_file)
 
     # Fill initial slots from the ready queue.
+    if priority:
+        job_queue.sort(key=priority)
     for i in range(max_slots):
         if job_queue:
             label, cmd = job_queue.pop(0)
@@ -756,6 +762,8 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
         # Pass 2: refill every empty slot from the queue. Keeps all cores
         # busy whenever there is work waiting, regardless of which slots
         # freed up this cycle (or were never filled in the first place).
+        if priority:
+            job_queue.sort(key=priority)
         for i in range(max_slots):
             if slots[i] is None and job_queue:
                 next_label, next_cmd = job_queue.pop(0)
@@ -2382,6 +2390,11 @@ def main():
                         metavar="SECS",
                         help="Tolerance (in seconds) used when matching a row's "
                              "optimization_time against --rerun_timeout_values. Default: 30.")
+    parser.add_argument("--prioritize_rows", action="store_true",
+                        help="In --advanced_standard mode, dispatch jobs in row-priority "
+                             "order (row = (arch, perturbation)) so earlier rows finish "
+                             "first while still running several rows concurrently, instead "
+                             "of even FIFO spread. N1->N2 advstd dependency is unaffected.")
     parser.add_argument("--refresh_ranking_csv", action="store_true",
                         help="Before applying --advstd_safe_combos_only, regenerate the combo-ranking "
                              "CSV from the latest per-cell results (equivalent to running "
@@ -3339,7 +3352,52 @@ def main():
                     return cmd[idx + 1] == "false"
                 except (ValueError, IndexError):
                     return False
-            ready_advstd_jobs.sort(key=_is_pi_false)
+
+            # Row-priority dispatch is opt-in (--prioritize_rows). In the
+            # default (FIFO) path we keep the global pi=false tail-sort. In the
+            # row-priority path the pi=false ordering is folded into the
+            # priority key, so the global sort is skipped and run_pool sorts the
+            # queue by (row_index, phase_rank, pi_false) before every slot-fill.
+            row_priority = None
+            if args.prioritize_rows:
+                # Row = (arch, pert_spec), ordered as built (arch outer, pert
+                # inner). Lower row index dispatches first, so earlier rows
+                # finish before later rows get going (spare slots still run
+                # later-row work). Within a row: N1 (which unlocks advstd)
+                # before std/stdBoost before advstd-N2, and pi=false last.
+                row_order = [(arch, pert_spec)
+                             for arch, _ in arch_runs
+                             for _, pert_spec in perts]
+                row_index = {rk: i for i, rk in enumerate(row_order)}
+                _arch_exp_re = re.compile(r"/([^/]+)_exp/")
+
+                def _cmd_opt(cmd, name):
+                    try:
+                        return cmd[cmd.index(name) + 1]
+                    except (ValueError, IndexError):
+                        return None
+
+                def _job_priority(job):
+                    cmd = job[1]
+                    pert = _cmd_opt(cmd, "--perturbation")
+                    psize = _cmd_opt(cmd, "--perturbation_size")
+                    pert_spec = f"{pert}:{psize}" if pert and psize else None
+                    out_dir = _cmd_opt(cmd, "--output_dir") or ""
+                    m = _arch_exp_re.search(out_dir)
+                    arch = m.group(1) if m else None
+                    ridx = row_index.get((arch, pert_spec), len(row_order))
+                    mode = _cmd_opt(cmd, "--mode")
+                    if mode == "advanced_standard_n1":
+                        phase_rank = 0
+                    elif mode == "advanced_standard_n2":
+                        phase_rank = 2
+                    else:
+                        phase_rank = 1
+                    return (ridx, phase_rank, _is_pi_false(job))
+
+                row_priority = _job_priority
+            else:
+                ready_advstd_jobs.sort(key=_is_pi_false)
 
             # ── Run phase: single merged pool across all c_tags ─────────
             # Count N1 vs advstd within locked_jobs_by_label so the banner is
@@ -3359,7 +3417,8 @@ def main():
                 skip_note += f" std-skipped={std_skipped}"
             skip_note = (" " + skip_note.strip()) if skip_note else ""
 
-            print(f"\n── Phase 1+1.5+2 merged across c_tags={list(sweep_ctag_vals)}: "
+            order_note = " [row-priority]" if row_priority else ""
+            print(f"\n── Phase 1+1.5+2 merged across c_tags={list(sweep_ctag_vals)}{order_note}: "
                   f"{total_n1} N1 ({len(ready_n1_jobs)} ready, {n1_locked_count} chained) + "
                   f"{len(ready_std_n2_jobs)} std-N2 + "
                   f"{total_advstd} advstd ({len(ready_advstd_jobs)} ready, {advstd_locked_count} waiting on N1)"
@@ -3389,6 +3448,7 @@ def main():
                         "Phase 1+1.5+2 (all c_tags)",
                         locked_jobs=locked_jobs_by_label,
                         on_job_done=_on_pool_job_done,
+                        priority=row_priority,
                     )
                 finally:
                     # Defensive: release any (arch, pert_spec) locks still

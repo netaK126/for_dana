@@ -1,0 +1,1063 @@
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 2 target: 0 model_arch: cnn1 perturbation type: translation perturbation size: [0, 3.0, 1.0] dataset: mnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<01:36,  5.15it/s]Attack:   6%|▌         | 28/500 [00:00<00:04, 116.41it/s]Attack:  12%|█▏        | 58/500 [00:00<00:02, 183.02it/s]Attack:  18%|█▊        | 88/500 [00:00<00:01, 223.06it/s]Attack:  24%|██▍       | 119/500 [00:00<00:01, 249.94it/s]Attack:  30%|███       | 150/500 [00:00<00:01, 268.44it/s]Attack:  36%|███▌      | 181/500 [00:00<00:01, 280.76it/s]Attack:  42%|████▏     | 212/500 [00:00<00:01, 287.77it/s]Attack:  49%|████▊     | 243/500 [00:01<00:00, 292.83it/s]Attack:  55%|█████▍    | 274/500 [00:01<00:00, 296.12it/s]Attack:  61%|██████    | 305/500 [00:01<00:00, 298.63it/s]Attack:  67%|██████▋   | 336/500 [00:01<00:00, 301.40it/s]Attack:  73%|███████▎  | 367/500 [00:01<00:00, 302.38it/s]Attack:  80%|███████▉  | 398/500 [00:01<00:00, 303.67it/s]Attack:  86%|████████▌ | 429/500 [00:01<00:00, 302.56it/s]Attack:  92%|█████████▏| 460/500 [00:01<00:00, 254.67it/s]Attack:  97%|█████████▋| 487/500 [00:01<00:00, 208.12it/s]Attack: 100%|█████████▉| 499/500 [00:02<00:00, 241.04it/s]
+best_val 59.25925064086914
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Advanced-standard mode: techniques enabled:
+  Technique 1 (MIP Start):          false
+  Technique 2 (Branch Priorities):   off
+  Technique 3 (LP Basis):            false
+  Technique 4 (Bound Tightening):    true
+  Technique 4+ (Zono Bounds):        true
+  Technique 4+ (N1 Probe):           off
+  Technique 5 (Variable Hints):      prev_pgd
+  Technique 6 (N2 Relax Threshold):  0.5
+Model accuracy: 0.9583
+load_n1_diff_bounds!: loaded 3 ReLU layers (+ n1_preact_bounds.bin) from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20
+Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...
+compute_n2_bounds_zonotope_with_n1_tighten: populated 3 ReLU layers
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=1) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=1, 3620 vars, 767 neurons, 0 basis)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=1) ══
+set_n1_neuron_bounds: loaded 767 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=82 org-only=0 pert-only=35 none=271 (plus 162 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.9259250640869141e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.9259250640869141e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Warning for adding constraints: zero or small (< 1e-13) coefficients, ignored
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  5.9259250640869141e+01
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 4967 rows, 3439 columns and 66306 nonzeros (Max)
+Model fingerprint: 0x5eb308cf
+Model has 1 linear objective coefficients
+Variable types: 2862 continuous, 577 integer (577 binary)
+Coefficient statistics:
+  Matrix range     [9e-13, 2e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [2e-02, 2e+02]
+  RHS range        [2e-06, 1e+03]
+Warning: Model contains large matrix coefficient range
+         Consider reformulating model or setting NumericFocus parameter
+         to avoid numerical issues.
+
+User MIP start produced solution with objective 73.1893 (0.67s)
+User MIP start produced solution with objective 73.1898 (0.87s)
+User MIP start produced solution with objective 73.1898 (1.16s)
+Loaded user MIP start with objective 73.1898
+Processed MIP start in 1.16 seconds (0.49 work units)
+
+Presolve removed 2752 rows and 1224 columns
+Presolve time: 0.24s
+Presolved: 2215 rows, 2215 columns, 47392 nonzeros
+Variable types: 1638 continuous, 577 integer (577 binary)
+Root relaxation presolve removed 577 rows and 577 columns
+Root relaxation presolved: 1638 rows, 1638 columns, 45704 nonzeros
+
+
+Root relaxation: objective 1.426370e+02, 1558 iterations, 0.26 seconds (0.14 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0  142.63702    0  175   73.18976  142.63702  94.9%     -    2s
+     0     0  125.80431    0  196   73.18976  125.80431  71.9%     -    2s
+     0     0  125.80431    0  176   73.18976  125.80431  71.9%     -    3s
+     0     0  103.66811    0  173   73.18976  103.66811  41.6%     -    4s
+     0     0  103.66811    0  178   73.18976  103.66811  41.6%     -    4s
+     0     0  103.37292    0  178   73.18976  103.37292  41.2%     -    4s
+     0     0   99.81576    0  180   73.18976   99.81576  36.4%     -    5s
+     0     0   99.81576    0  180   73.18976   99.81576  36.4%     -    5s
+     0     0   99.81576    0  163   73.18976   99.81576  36.4%     -    6s
+     0     0   98.31353    0  179   73.18976   98.31353  34.3%     -    7s
+     0     0   98.13518    0  184   73.18976   98.13518  34.1%     -    7s
+     0     0   98.13518    0  186   73.18976   98.13518  34.1%     -    8s
+     0     0   98.08015    0  188   73.18976   98.08015  34.0%     -    8s
+     0     0   97.53930    0  192   73.18976   97.53930  33.3%     -    9s
+     0     0   97.53930    0  192   73.18976   97.53930  33.3%     -    9s
+     0     0   97.53930    0  173   73.18976   97.53930  33.3%     -   10s
+     0     0   97.28489    0  173   73.18976   97.28489  32.9%     -   11s
+     0     0   97.28489    0  173   73.18976   97.28489  32.9%     -   12s
+     0     2   97.28489    0  173   73.18976   97.28489  32.9%     -   15s
+     7     8   97.28489    4  192   73.18976   97.28489  32.9%  2778   20s
+    19    24   94.77660    6  196   73.18976   96.15090  31.4%  3615   26s
+    31    32   84.65205    7  225   73.18976   94.80504  29.5%  3651   30s
+    87    71   86.46942    9  173   73.18976   87.11976  19.0%  4080   39s
+   122   102   84.74013   10  170   73.18976   86.46043  18.1%  3430   43s
+   157   116   84.19319   11  185   73.18976   85.03237  16.2%  3372   46s
+   192   132   83.90381   12  171   73.18976   84.17608  15.0%  3399   50s
+   224   157   83.53916   13  161   73.18976   83.89886  14.6%  3294   57s
+   257   189   83.28726   14  160   73.18976   83.53452  14.1%  3302   62s
+   289   222   83.09455   15  184   73.18976   83.28260  13.8%  3339   66s
+H  291   222                      73.1898148   83.25064  13.7%  3327   66s
+   322   254   82.76175   16  174   73.18981   83.09260  13.5%  3335   72s
+   354   326   78.39893   17  184   73.18981   82.78906  13.1%  3369   78s
+H  381   326                      73.1901452   82.56309  12.8%  3251   78s
+   426   358   81.82656   18  197   73.19015   82.55976  12.8%  3121   83s
+   458   393   78.77146   19  175   73.19015   81.82599  11.8%  3224   89s
+H  481   393                      73.1901454   81.38391  11.2%  3202   89s
+   493   425   80.12799   20  180   73.19015   81.38329  11.2%  3225   96s
+   525   472   80.57845   21  152   73.19015   80.65594  10.2%  3207  101s
+   572   545   80.01847   22  146   73.19015   80.54963  10.1%  3035  108s
+   645   582   77.03511   23  180   73.19015   80.04209  9.36%  2845  117s
+   682   624   76.56195   25  176   73.19015   79.72247  8.93%  2906  125s
+   726   686   78.61654   23  182   73.19015   79.33256  8.39%  2890  132s
+   788   720   79.08531   21  174   73.19015   79.18732  8.19%  2846  140s
+   822   770   76.42681   22  192   73.19015   79.08383  8.05%  2893  148s
+H  859   770                      73.1905847   79.02187  7.97%  2873  148s
+   874   800   75.39977   24  175   73.19058   78.99614  7.93%  2882  155s
+   908   851   78.65736   25  161   73.19058   78.94228  7.86%  2919  160s
+   963   888   74.68192   23  184   73.19058   78.80046  7.66%  2941  165s
+  1000   952   78.51526   15  181   73.19058   78.70997  7.54%  2964  172s
+  1078   982     cutoff   16        73.19058   78.61384  7.41%  2919  178s
+  1122  1071   78.39862   21  160   73.19058   78.51406  7.27%  2931  185s
+  1253  1095     cutoff   25        73.19058   78.41510  7.14%  2839  193s
+  1305  1145   77.09307   26  157   73.19058   78.23467  6.89%  2846  201s
+  1393  1186   73.51103   11  201   73.19058   78.14693  6.77%  2837  212s
+  1450  1254   76.57604   24  172   73.19058   78.04585  6.63%  2860  221s
+  1580  1304   77.76985   29  143   73.19058   77.93134  6.48%  2805  230s
+  1658  1373   76.92128   23  175   73.19058   77.82824  6.34%  2795  240s
+  1785  1436   73.79654   24  178   73.19058   77.73875  6.21%  2769  251s
+  1896  1485     cutoff   20        73.19058   77.61780  6.05%  2771  262s
+H 1900  1485                      73.2179239   77.60565  5.99%  2773  262s
+H 1979  1485                      73.2229978   77.55257  5.91%  2765  262s
+  2013  1528   76.88371   28  152   73.22300   77.47174  5.80%  2773  273s
+  2083  1606   75.05228   20  181   73.22300   77.41216  5.72%  2792  279s
+  2229  1669     cutoff   20        73.22300   77.28809  5.55%  2758  287s
+  2378  1743     cutoff   10        73.22300   77.13462  5.34%  2729  298s
+  2536  1794   76.63385   24  149   73.22300   77.03002  5.20%  2702  308s
+  2631  1895     cutoff   19        73.22300   76.96831  5.11%  2709  321s
+  2808  1991   76.09847   29  189   73.22300   76.82331  4.92%  2676  333s
+H 2980  2104                      73.2229978   76.72473  4.78%  2662  347s
+H 2985  2104                      73.2281867   76.71857  4.77%  2664  347s
+H 3024  2103                      73.2299355   76.70776  4.75%  2649  347s
+  3175  2168   76.24066   24  163   73.22994   76.61307  4.62%  2634  361s
+  3311  2249     cutoff   17        73.22994   76.55104  4.54%  2616  374s
+  3473  2380   76.17616   31  145   73.22994   76.42958  4.37%  2620  389s
+  3706  2509   75.89811   33  146   73.22994   76.31163  4.21%  2589  402s
+  3945  2672     cutoff   19        73.22994   76.22275  4.09%  2561  412s
+  4212  2798   75.68400   21  174   73.22994   76.05924  3.86%  2527  420s
+H 4248  2798                      73.2299355   76.03744  3.83%  2526  420s
+H 4359  2798                      73.2304348   76.00943  3.79%  2507  420s
+  4426  2965   74.38926   30  143   73.23043   75.97148  3.74%  2500  428s
+  4687  3117   75.17300   34  151   73.23043   75.83124  3.55%  2480  442s
+  4963  3300   73.66809   30  150   73.23043   75.71652  3.39%  2461  458s
+  5258  3462     cutoff   28        73.23043   75.60928  3.25%  2439  476s
+H 5560  3591                      73.2309424   75.49925  3.10%  2417  495s
+H 5582  3591                      73.2309432   75.47514  3.06%  2414  495s
+H 5616  3569                      73.2711943   75.46413  2.99%  2414  495s
+  5869  3684   74.94142   33  158   73.27119   75.37750  2.87%  2401  513s
+  6160  3819     cutoff   31        73.27119   75.27769  2.74%  2376  531s
+H 6573  3931                      73.2721788   75.18034  2.60%  2335  551s
+H 6753  3930                      73.2729766   75.13945  2.55%  2321  551s
+  6855  4177   74.73457   31  167   73.27298   75.12482  2.53%  2307  569s
+  7360  4578   74.64653   36  138   73.27298   74.98622  2.34%  2250  586s
+  8011  4743     cutoff   18        73.27298   74.87648  2.19%  2160  609s
+H 8117  4720                      73.2914565   74.86375  2.15%  2149  609s
+H 8122  4718                      73.2922215   74.86375  2.14%  2149  609s
+H 8334  4718                      73.2923142   74.85286  2.13%  2128  754s
+  8335  4719   73.30912   20  173   73.29231   74.85286  2.13%  2128  966s
+  8338  4721   74.52050   16  153   73.29231   74.85286  2.13%  2127  970s
+  8342  4724   74.28243   21  187   73.29231   74.85286  2.13%  2126  975s
+  8343  4724   74.67228   36  171   73.29231   74.85286  2.13%  2126  980s
+  8345  4726   74.40765   21  201   73.29231   74.85286  2.13%  2125  985s
+  8347  4727   73.78757   20  188   73.29231   74.85286  2.13%  2125  994s
+  8348  4728   74.69033   32  188   73.29231   74.85286  2.13%  2125  996s
+  8357  4729   74.85286   17  207   73.29231   74.85286  2.13%  2128 1004s
+  8359  4732   74.85286   18  210   73.29231   74.85286  2.13%  2129 1005s
+  8387  4753   74.85286   21  190   73.29231   74.85286  2.13%  2132 1012s
+  8443  4746   74.85286   23  203   73.29231   74.85286  2.13%  2136 1017s
+H 8454  4505                      73.2923142   74.85286  2.13%  2138 1017s
+  8477  4529   74.85286   24  178   73.29231   74.85286  2.13%  2139 1021s
+  8526  4526   74.85286   25  185   73.29231   74.85286  2.13%  2138 1025s
+  8560  4532   74.85286   27  189   73.29231   74.85286  2.13%  2141 1030s
+  8595  4553   74.85286   28  180   73.29231   74.85286  2.13%  2147 1035s
+  8682  4580   74.85286   29  202   73.29231   74.85286  2.13%  2152 1042s
+  8729  4601   74.85286   30  170   73.29231   74.85286  2.13%  2154 1046s
+  8775  4616   74.85286   31  162   73.29231   74.85286  2.13%  2151 1050s
+  8863  4654   74.85286   33  159   73.29231   74.85286  2.13%  2146 1060s
+  8896  4667   74.85286   34  152   73.29231   74.85286  2.13%  2148 1069s
+  8952  4663   74.85286   35  140   73.29231   74.85286  2.13%  2145 1075s
+  8985  4686   74.85286   36  138   73.29231   74.85286  2.13%  2148 1081s
+  9039  4694   74.85286   38  137   73.29231   74.85286  2.13%  2145 1089s
+H 9047  4467                      73.2923143   74.85286  2.13%  2146 1089s
+  9071  4478   74.85286   38  165   73.29231   74.85286  2.13%  2148 1093s
+H 9086  4260                      73.2923207   74.85286  2.13%  2150 1093s
+  9116  4291   74.85286   39  142   73.29232   74.85286  2.13%  2154 1099s
+  9167  4288     cutoff   39        73.29232   74.85286  2.13%  2154 1103s
+  9203  4300   74.52680   39  169   73.29232   74.85286  2.13%  2155 1107s
+  9253  4305     cutoff   40        73.29232   74.85286  2.13%  2161 1112s
+  9304  4311   74.85286   39  149   73.29232   74.85286  2.13%  2162 1122s
+  9349  4310   74.85286   39  163   73.29232   74.85286  2.13%  2165 1129s
+  9389  4310     cutoff   39        73.29232   74.85286  2.13%  2172 1138s
+  9424  4318   74.71088   38  158   73.29232   74.85286  2.13%  2176 1145s
+  9472  4316   74.37822   36  168   73.29232   74.85286  2.13%  2185 1156s
+H 9499  4104                      73.2923209   74.85286  2.13%  2186 1156s
+  9514  4108     cutoff   37        73.29232   74.85286  2.13%  2187 1165s
+  9563  4119   74.45512   35  152   73.29232   74.85286  2.13%  2199 1174s
+  9612  4110   74.21599   44  130   73.29232   74.85286  2.13%  2203 1183s
+  9658  4109   74.73807   36  153   73.29232   74.85286  2.13%  2208 1192s
+  9721  4096   74.85286   35  136   73.29232   74.85286  2.13%  2219 1202s
+  9789  4090   74.57756   43  135   73.29232   74.85286  2.13%  2221 1213s
+  9852  4076   74.34860   35  164   73.29232   74.85286  2.13%  2224 1230s
+  9900  4068   74.49281   40  145   73.29232   74.85286  2.13%  2234 1249s
+  9960  4048     cutoff   35        73.29232   74.85286  2.13%  2236 1264s
+ 10027  4030     cutoff   44        73.29232   74.79629  2.05%  2237 1279s
+ 10109  4003     cutoff   43        73.29232   74.70591  1.93%  2244 1293s
+H10134  3801                      73.2923209   74.66526  1.87%  2245 1293s
+ 10199  3792     cutoff   34        73.29232   74.62872  1.82%  2241 1309s
+ 10289  3775     cutoff   27        73.29232   74.53567  1.70%  2248 1322s
+ 10367  3773     cutoff   43        73.29232   74.42787  1.55%  2253 1335s
+ 10488  3744   73.55470   36  160   73.29232   74.34891  1.44%  2253 1353s
+ 10616  3701   74.12156   48  132   73.29232   74.26968  1.33%  2250 1367s
+ 10753  3662   74.08933   49  127   73.29232   74.15761  1.18%  2247 1382s
+H10876  3438                      73.2923211   74.10717  1.11%  2240 1382s
+ 10922  3476   73.73591   50  122   73.29232   74.08848  1.09%  2240 1394s
+
+Cutting planes:
+  Gomory: 45
+  Projected implied bound: 654
+  MIR: 2542
+  Mixing: 4
+  Flow cover: 444
+  RLT: 123
+  Relax-and-lift: 2448
+
+Explored 11131 nodes (24738362 simplex iterations) in 1395.09 seconds (1365.29 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 10: 73.2923 73.2923 73.2923 ... 73.2712
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 7.329232105733e+01, best bound 7.398103486615e+01, gap 0.9397%
+
+User-callback calls 265217, time in user-callback 0.65 sec
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 2 target: 1 model_arch: cnn1 perturbation type: translation perturbation size: [0, 3.0, 1.0] dataset: mnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<02:27,  3.38it/s]Attack:   3%|▎         | 13/500 [00:00<00:11, 41.06it/s]Attack:   5%|▌         | 25/500 [00:00<00:07, 65.81it/s]Attack:   7%|▋         | 37/500 [00:00<00:05, 82.26it/s]Attack:  10%|▉         | 49/500 [00:00<00:04, 93.11it/s]Attack:  12%|█▏        | 61/500 [00:00<00:04, 100.43it/s]Attack:  15%|█▍        | 73/500 [00:00<00:04, 105.37it/s]Attack:  17%|█▋        | 85/500 [00:01<00:03, 108.78it/s]Attack:  19%|█▉        | 97/500 [00:01<00:03, 111.17it/s]Attack:  22%|██▏       | 109/500 [00:01<00:03, 112.68it/s]Attack:  24%|██▍       | 121/500 [00:01<00:03, 114.04it/s]Attack:  27%|██▋       | 133/500 [00:01<00:03, 114.86it/s]Attack:  29%|██▉       | 145/500 [00:01<00:03, 115.48it/s]Attack:  31%|███▏      | 157/500 [00:01<00:02, 115.77it/s]Attack:  34%|███▍      | 169/500 [00:01<00:02, 115.88it/s]Attack:  36%|███▌      | 181/500 [00:01<00:02, 115.69it/s]Attack:  39%|███▊      | 193/500 [00:01<00:02, 115.79it/s]Attack:  41%|████      | 205/500 [00:02<00:02, 116.40it/s]Attack:  43%|████▎     | 217/500 [00:02<00:02, 116.52it/s]Attack:  46%|████▌     | 229/500 [00:02<00:02, 116.82it/s]Attack:  48%|████▊     | 241/500 [00:02<00:02, 113.42it/s]Attack:  51%|█████     | 253/500 [00:02<00:02, 114.24it/s]Attack:  53%|█████▎    | 265/500 [00:02<00:02, 115.31it/s]Attack:  55%|█████▌    | 277/500 [00:02<00:01, 116.17it/s]Attack:  58%|█████▊    | 289/500 [00:02<00:01, 117.10it/s]Attack:  60%|██████    | 301/500 [00:02<00:01, 117.64it/s]Attack:  63%|██████▎   | 313/500 [00:02<00:01, 117.87it/s]Attack:  65%|██████▌   | 325/500 [00:03<00:01, 117.50it/s]Attack:  67%|██████▋   | 337/500 [00:03<00:01, 117.13it/s]Attack:  70%|██████▉   | 349/500 [00:03<00:01, 117.59it/s]Attack:  72%|███████▏  | 362/500 [00:03<00:01, 118.35it/s]Attack:  75%|███████▍  | 374/500 [00:03<00:01, 118.22it/s]Attack:  77%|███████▋  | 386/500 [00:03<00:00, 118.12it/s]Attack:  80%|███████▉  | 398/500 [00:03<00:00, 117.95it/s]Attack:  82%|████████▏ | 410/500 [00:03<00:00, 118.00it/s]Attack:  84%|████████▍ | 422/500 [00:03<00:00, 118.17it/s]Attack:  87%|████████▋ | 434/500 [00:03<00:00, 118.68it/s]Attack:  89%|████████▉ | 446/500 [00:04<00:00, 118.69it/s]Attack:  92%|█████████▏| 458/500 [00:04<00:00, 118.53it/s]Attack:  94%|█████████▍| 470/500 [00:04<00:00, 118.82it/s]Attack:  96%|█████████▋| 482/500 [00:04<00:00, 118.84it/s]Attack:  99%|█████████▉| 494/500 [00:04<00:00, 119.16it/s]Attack: 100%|█████████▉| 499/500 [00:04<00:00, 109.76it/s]
+best_val 57.34187316894531
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 73 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 35 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 577 of 577 N2 binaries (pgd-silent-filled=387, pgd-agreed-nop=164, pgd-disagreed-withdrew=26, flipped=8, no-N1-match=0, Tech2-eliminated-but-survived=0)
+73.292321057334  73.98103486615265  1395.1062750816345
+Clean sample classification: 3
+Perturbed sample classification: 6
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=2) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=2, 3104 vars, 767 neurons, 0 basis)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=2) ══
+set_n1_neuron_bounds: loaded 767 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=82 org-only=0 pert-only=35 none=271 (plus 162 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.7341873168945312e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.7341873168945312e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Warning for adding constraints: zero or small (< 1e-13) coefficients, ignored
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  5.7341873168945312e+01
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 4967 rows, 3439 columns and 66306 nonzeros (Max)
+Model fingerprint: 0xd8dbab01
+Model has 1 linear objective coefficients
+Variable types: 2862 continuous, 577 integer (577 binary)
+Coefficient statistics:
+  Matrix range     [9e-13, 2e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [2e-02, 2e+02]
+  RHS range        [2e-06, 1e+03]
+Warning: Model contains large matrix coefficient range
+         Consider reformulating model or setting NumericFocus parameter
+         to avoid numerical issues.
+
+User MIP start produced solution with objective 73.1512 (0.48s)
+User MIP start produced solution with objective 73.1541 (0.64s)
+User MIP start produced solution with objective 73.1541 (0.66s)
+Loaded user MIP start with objective 73.1541
+
+Presolve removed 2752 rows and 1224 columns
+Presolve time: 0.18s
+Presolved: 2215 rows, 2215 columns, 47392 nonzeros
+Variable types: 1638 continuous, 577 integer (577 binary)
+Root relaxation presolve removed 578 rows and 577 columns
+Root relaxation presolved: 1637 rows, 1638 columns, 45649 nonzeros
+
+
+Root relaxation: objective 1.426370e+02, 1341 iterations, 0.25 seconds (0.16 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0  142.63702    0  175   73.15413  142.63702  95.0%     -    1s
+     0     0  125.84576    0  192   73.15413  125.84576  72.0%     -    2s
+     0     0  125.84576    0  192   73.15413  125.84576  72.0%     -    2s
+     0     0  125.84576    0  175   73.15413  125.84576  72.0%     -    2s
+     0     0  116.07024    0  166   73.15413  116.07024  58.7%     -    3s
+     0     0  116.07024    0  170   73.15413  116.07024  58.7%     -    3s
+     0     0  116.07024    0  173   73.15413  116.07024  58.7%     -    3s
+     0     0  116.07024    0  173   73.15413  116.07024  58.7%     -    3s
+     0     0  106.20273    0  178   73.15413  106.20273  45.2%     -    4s
+     0     0  106.20273    0  178   73.15413  106.20273  45.2%     -    4s
+     0     0  106.20273    0  167   73.15413  106.20273  45.2%     -    5s
+     0     0   99.81576    0  187   73.15413   99.81576  36.4%     -    5s
+     0     0   99.33151    0  186   73.15413   99.33151  35.8%     -    6s
+     0     0   98.92337    0  186   73.15413   98.92337  35.2%     -    6s
+     0     0   98.86775    0  188   73.15413   98.86775  35.1%     -    6s
+     0     0   97.94620    0  188   73.15413   97.94620  33.9%     -    7s
+     0     0   97.94620    0  188   73.15413   97.94620  33.9%     -    7s
+     0     0   97.94620    0  174   73.15413   97.94620  33.9%     -    8s
+     0     0   97.76635    0  174   73.15413   97.76635  33.6%     -    8s
+     0     0   97.76635    0  174   73.15413   97.76635  33.6%     -    9s
+     0     2   97.76635    0  174   73.15413   97.76635  33.6%     -   13s
+     1     2     cutoff    1        73.15413   97.76635  33.6%  6290   15s
+    15    16   88.51685    6  208   73.15413   91.28005  24.8%  2441   20s
+    39    36   85.43152    8  176   73.15413   87.40424  19.5%  1930   26s
+   110   107   84.61387   10  203   73.15413   85.34071  16.7%  1991   33s
+   142   139   84.16733   11  180   73.15413   84.85607  16.0%  2530   42s
+   174   171   84.03322   12  197   73.15413   84.16543  15.1%  2771   45s
+H  230   203                      73.1585169   83.76834  14.5%  2696   49s
+   238   239   83.74769   14  183   73.15852   83.76416  14.5%  2694   53s
+   274   277   83.42291   15  189   73.15852   83.74491  14.5%  2480   59s
+H  302   277                      73.1649753   83.42209  14.0%  2563   59s
+   312   349   82.97100   16  193   73.16498   83.42167  14.0%  2550   64s
+   384   438   81.27157   17  172   73.16498   83.02451  13.5%  2432   69s
+   473   507   78.42646   15  185   73.16498   82.91793  13.3%  2205   73s
+   542   543   78.07914   15  184   73.16498   82.73992  13.1%  2123   77s
+   622   619   77.58560   14  204   73.16498   82.08848  12.2%  2255   82s
+   654   651   77.24687   16  192   73.16498   81.83432  11.8%  2359   85s
+H  701   684                      73.1786233   81.60762  11.5%  2441   87s
+   719   716   80.82055   20  163   73.17862   81.54990  11.4%  2462   90s
+   783   780   77.20149   20  198   73.17862   81.37547  11.2%  2507   99s
+   815   815   80.01444   20  161   73.17862   81.23472  11.0%  2542  104s
+   850   847   77.35738   20  208   73.17862   81.17529  10.9%  2573  111s
+   882   883   81.03252   17  152   73.17862   81.10208  10.8%  2627  119s
+   918   915   80.67288   18  152   73.17862   81.03146  10.7%  2634  124s
+   950   948   73.93038   18  155   73.17862   80.96026  10.6%  2662  132s
+   983   987   80.36089   18  163   73.17862   80.83005  10.5%  2689  141s
+  1022  1023   80.03948   21  178   73.17862   80.70051  10.3%  2668  148s
+  1058  1058   80.16549   23  177   73.17862   80.62354  10.2%  2697  156s
+  1093  1157   80.07113   19  165   73.17862   80.54319  10.1%  2716  165s
+H 1162  1157                      73.1786233   80.49794  10.0%  2617  165s
+  1192  1199   74.17645   21  164   73.17862   80.47335  10.0%  2578  171s
+  1236  1251   77.42551   20  150   73.17862   80.40078  9.87%  2599  178s
+  1288  1358   75.98576   15  209   73.17862   80.35522  9.81%  2590  185s
+  1397  1403   75.91499   15  180   73.17862   80.31632  9.75%  2514  193s
+  1446  1524   79.32800   15  196   73.17862   80.18757  9.58%  2504  203s
+  1569  1679   79.65285   15  179   73.17862   80.09413  9.45%  2447  210s
+  1728  1819   79.54325   19  165   73.17862   79.98951  9.31%  2368  218s
+  1886  1918   79.52613   22  153   73.17862   79.89080  9.17%  2313  226s
+H 1989  1918                      73.1885309   79.79394  9.03%  2288  226s
+  1991  2026     cutoff   20        73.18853   79.78389  9.01%  2288  236s
+  2105  2196   73.55100   15  183   73.18853   79.71110  8.91%  2252  243s
+  2301  2411   74.06338   14  194   73.18853   79.58901  8.75%  2186  252s
+  2522  2505   74.94024   15  177   73.18853   79.43520  8.54%  2125  260s
+  2624  2737   78.35336   23  152   73.18853   79.34929  8.42%  2112  268s
+  2865  2900   77.38772   22  163   73.18853   79.20787  8.22%  2053  277s
+H 3044  2900                      73.1951155   79.05147  8.00%  2042  332s
+H 3044  2899                      73.2000424   79.05147  7.99%  2042  347s
+H 3044  2895                      73.2501421   79.05147  7.92%  2042  444s
+  3045  2896   77.84002   15  174   73.25014   79.05147  7.92%  2042  487s
+  3050  2899   77.23431   28  190   73.25014   79.05147  7.92%  2038  490s
+  3052  2901   77.04087   25  177   73.25014   79.05147  7.92%  2037  495s
+  3055  2903   77.82010   17  203   73.25014   79.05147  7.92%  2035  502s
+H 3055  2757                      73.2501422   79.05147  7.92%  2035  505s
+  3057  2758   77.61344   23  187   73.25014   79.05147  7.92%  2034  511s
+  3058  2759   74.88587   17  187   73.25014   79.05147  7.92%  2033  515s
+  3061  2762   79.05147   15  208   73.25014   79.05147  7.92%  2045  520s
+  3069  2759   79.05147   17  214   73.25014   79.05147  7.92%  2043  527s
+  3075  2765   79.05147   19  206   73.25014   79.05147  7.92%  2045  534s
+  3081  2769   79.05147   20  199   73.25014   79.05147  7.92%  2046  537s
+  3093  2776   79.05147   21  215   73.25014   79.05147  7.92%  2049  541s
+  3111  2788   79.05147   22  212   73.25014   79.05147  7.92%  2051  545s
+  3179  2829   79.05147   24  184   73.25014   79.05147  7.92%  2061  552s
+  3220  2844   79.05147   25  199   73.25014   79.05147  7.92%  2063  555s
+  3257  2858   79.05147   26  192   73.25014   79.05147  7.92%  2072  560s
+H 3296  2730                      73.2555126   79.05147  7.91%  2082  564s
+  3327  2746   79.05147   28  179   73.25551   79.05147  7.91%  2097  568s
+  3363  2747   79.05147   29  170   73.25551   79.05147  7.91%  2098  572s
+  3403  2748   74.18106   30  172   73.25551   79.05147  7.91%  2100  577s
+  3435  2771   79.05147   32  167   73.25551   79.05147  7.91%  2105  581s
+H 3463  2631                      73.2558118   79.05147  7.91%  2104  581s
+  3469  2667   79.05147   33  173   73.25581   79.05147  7.91%  2106  585s
+  3517  2716   78.69536   34  164   73.25581   79.05147  7.91%  2113  590s
+  3584  2726   75.12814   35  155   73.25581   78.67120  7.39%  2111  595s
+  3617  2760   77.20295   37  157   73.25581   77.85318  6.28%  2125  601s
+  3663  2774   73.52783   34  147   73.25581   77.40342  5.66%  2138  608s
+  3695  2795   74.98481   36  195   73.25581   77.25751  5.46%  2148  613s
+  3730  2810   76.68925   35  150   73.25581   77.09469  5.24%  2161  620s
+  3763  2825   74.68663   28  205   73.25581   76.95286  5.05%  2181  626s
+H 3784  2693                      73.2558214   76.92066  5.00%  2191  626s
+  3795  2716   76.46011   38  144   73.25582   76.89132  4.96%  2200  634s
+  3830  2723     cutoff   35        73.25582   76.74246  4.76%  2208  640s
+  3867  2730   75.73820   27  199   73.25582   76.64763  4.63%  2222  647s
+  3902  2737   74.09394   37  179   73.25582   76.55853  4.51%  2241  654s
+  3942  2735   75.75158   38  156   73.25582   76.47815  4.40%  2255  664s
+  3983  2739   75.68559   35  178   73.25582   76.37299  4.26%  2262  671s
+H 4016  2610                      73.2568178   76.30400  4.16%  2273  671s
+  4022  2623   75.72907   39  146   73.25682   76.28940  4.14%  2277  678s
+  4066  2627   75.76178   33  128   73.25682   76.20826  4.03%  2282  684s
+  4118  2650   74.68568   26  185   73.25682   76.14752  3.95%  2296  688s
+  4197  2626     cutoff   39        73.25682   76.05497  3.82%  2307  697s
+H 4226  2503                      73.2568178   75.96390  3.70%  2317  697s
+  4237  2517   75.56727   39  155   73.25682   75.93358  3.65%  2324  715s
+H 4255  2404                      73.2568178   75.89887  3.61%  2333  715s
+  4285  2417   75.10333   37  178   73.25682   75.85322  3.54%  2341  733s
+H 4312  2306                      73.2568178   75.82662  3.51%  2345  733s
+H 4335  2202                      73.2568178   75.80236  3.47%  2350  733s
+  4337  2218   73.77704   35  176   73.25682   75.79114  3.46%  2354  765s
+H 4356  2120                      73.2568178   75.75067  3.40%  2361  765s
+  4380  2146   73.60126   39  147   73.25682   75.73090  3.38%  2367  783s
+  4437  2164   75.44260   43  160   73.25682   75.67177  3.30%  2363  813s
+  4494  2170   75.46091   42  130   73.25682   75.58473  3.18%  2364  831s
+  4551  2181   75.24093   28  191   73.25682   75.53247  3.11%  2366  855s
+  4605  2201   75.25315   30  177   73.25682   75.48107  3.04%  2379  874s
+H 4611  2110                      73.3587853   75.47392  2.88%  2381  874s
+  4659  2123     cutoff   36        73.35879   75.43673  2.83%  2394  885s
+  4758  2146   74.87807   43  131   73.35879   75.34568  2.71%  2407  896s
+  4875  2176   74.90497   31  177   73.35879   75.27012  2.61%  2405  908s
+  5022  2168   74.48257   43  147   73.35879   75.12527  2.41%  2416  920s
+  5173  2167   73.85418   43  146   73.35879   74.94908  2.17%  2423  936s
+  5322  2142   73.99668   35  165   73.35879   74.88347  2.08%  2435  951s
+  5483  2103   74.47011   43  128   73.35879   74.75963  1.91%  2443  965s
+  5675  2037   74.31190   41  140   73.35879   74.60185  1.69%  2440  984s
+  5739  2022     cutoff   47        73.35879   74.52960  1.60%  2441 1003s
+  5799  2002   74.16864   39  151   73.35879   74.47879  1.53%  2442 1021s
+  5859  1992   74.19077   47  138   73.35879   74.43532  1.47%  2445 1038s
+  6007  1931     cutoff   45        73.35879   74.39052  1.41%  2440 1054s
+  6223  1854     cutoff   48        73.35879   74.30187  1.29%  2425 1072s
+  6472  1761   74.09606   48  125   73.35879   74.17676  1.12%  2405 1088s
+  6740  1711   74.01429   49  110   73.35879   74.08593  0.99%  2371 1103s
+
+Cutting planes:
+  Gomory: 49
+  Projected implied bound: 678
+  MIR: 2670
+  Flow cover: 479
+  RLT: 115
+  Relax-and-lift: 2613
+
+Explored 7021 nodes (16319333 simplex iterations) in 1103.92 seconds (993.35 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 10: 73.3588 73.2568 73.2568 ... 73.2501
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 7.335878529548e+01, best bound 7.401426289004e+01, gap 0.8935%
+
+User-callback calls 292337, time in user-callback 0.68 sec
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 2 target: 3 model_arch: cnn1 perturbation type: translation perturbation size: [0, 3.0, 1.0] dataset: mnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<01:23,  5.96it/s]Attack:   6%|▌         | 30/500 [00:00<00:03, 134.53it/s]Attack:  12%|█▏        | 59/500 [00:00<00:02, 194.29it/s]Attack:  18%|█▊        | 88/500 [00:00<00:01, 227.11it/s]Attack:  23%|██▎       | 117/500 [00:00<00:01, 247.64it/s]Attack:  29%|██▉       | 147/500 [00:00<00:01, 262.42it/s]Attack:  35%|███▌      | 176/500 [00:00<00:01, 270.81it/s]Attack:  41%|████      | 204/500 [00:00<00:01, 273.38it/s]Attack:  46%|████▋     | 232/500 [00:00<00:00, 274.16it/s]Attack:  52%|█████▏    | 260/500 [00:01<00:00, 273.04it/s]Attack:  58%|█████▊    | 288/500 [00:01<00:00, 272.52it/s]Attack:  63%|██████▎   | 316/500 [00:01<00:00, 272.06it/s]Attack:  69%|██████▉   | 344/500 [00:01<00:00, 272.85it/s]Attack:  74%|███████▍  | 372/500 [00:01<00:00, 273.79it/s]Attack:  80%|████████  | 400/500 [00:01<00:00, 275.26it/s]Attack:  86%|████████▌ | 428/500 [00:01<00:00, 272.51it/s]Attack:  91%|█████████▏| 457/500 [00:01<00:00, 275.34it/s]Attack:  97%|█████████▋| 486/500 [00:01<00:00, 277.61it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 255.37it/s]
+best_val 59.7404899597168
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 73 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 35 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 577 of 577 N2 binaries (pgd-silent-filled=399, pgd-agreed-nop=155, pgd-disagreed-withdrew=23, flipped=11, no-N1-match=0, Tech2-eliminated-but-survived=0)
+73.35878529548206  74.0142628900365  1103.942097902298
+Clean sample classification: 3
+Perturbed sample classification: 3
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=4) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=4, 3104 vars, 767 neurons, 0 basis)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=4) ══
+set_n1_neuron_bounds: loaded 767 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=82 org-only=0 pert-only=35 none=271 (plus 162 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 59.7404899597168
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 59.7404899597168
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Warning for adding constraints: zero or small (< 1e-13) coefficients, ignored
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  59.7404899597168
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 4967 rows, 3439 columns and 66306 nonzeros (Max)
+Model fingerprint: 0xdefb3ebb
+Model has 1 linear objective coefficients
+Variable types: 2862 continuous, 577 integer (577 binary)
+Coefficient statistics:
+  Matrix range     [9e-13, 2e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [2e-02, 2e+02]
+  RHS range        [2e-06, 1e+03]
+Warning: Model contains large matrix coefficient range
+         Consider reformulating model or setting NumericFocus parameter
+         to avoid numerical issues.
+
+User MIP start produced solution with objective 73.2106 (0.49s)
+User MIP start produced solution with objective 73.2106 (0.50s)
+Loaded user MIP start with objective 73.2106
+
+Presolve removed 2752 rows and 1224 columns
+Presolve time: 0.23s
+Presolved: 2215 rows, 2215 columns, 47392 nonzeros
+Variable types: 1638 continuous, 577 integer (577 binary)
+Root relaxation presolve removed 577 rows and 577 columns
+Root relaxation presolved: 1638 rows, 1638 columns, 45704 nonzeros
+
+
+Root relaxation: objective 1.426370e+02, 1582 iterations, 0.26 seconds (0.14 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0  142.63702    0  176   73.21060  142.63702  94.8%     -    1s
+     0     0  125.84070    0  180   73.21060  125.84070  71.9%     -    2s
+     0     0  125.84070    0  180   73.21060  125.84070  71.9%     -    2s
+     0     0  125.84070    0  174   73.21060  125.84070  71.9%     -    2s
+     0     0  104.64664    0  176   73.21060  104.64664  42.9%     -    3s
+     0     0  104.64664    0  180   73.21060  104.64664  42.9%     -    3s
+     0     0  104.60869    0  180   73.21060  104.60869  42.9%     -    3s
+     0     0  104.60869    0  192   73.21060  104.60869  42.9%     -    4s
+     0     0  104.60869    0  192   73.21060  104.60869  42.9%     -    4s
+     0     0  104.60869    0  166   73.21060  104.60869  42.9%     -    5s
+     0     0   99.88727    0  180   73.21060   99.88727  36.4%     -    5s
+     0     0   99.70676    0  177   73.21060   99.70676  36.2%     -    6s
+     0     0   99.52320    0  179   73.21060   99.52320  35.9%     -    6s
+     0     0   99.42792    0  180   73.21060   99.42792  35.8%     -    6s
+     0     0   99.33151    0  179   73.21060   99.33151  35.7%     -    6s
+     0     0   98.56145    0  184   73.21060   98.56145  34.6%     -    7s
+     0     0   98.56145    0  184   73.21060   98.56145  34.6%     -    7s
+     0     0   98.56145    0  180   73.21060   98.56145  34.6%     -    8s
+     0     0   98.12148    0  180   73.21060   98.12148  34.0%     -    8s
+     0     0   98.12148    0  180   73.21060   98.12148  34.0%     -    9s
+     0     2   98.12148    0  180   73.21060   98.12148  34.0%     -   12s
+     5     4   98.12148    3  199   73.21060   98.12148  34.0%  2255   15s
+    19    16   90.93250    6  209   73.21060   91.29979  24.7%  3529   21s
+    43    64   88.40878    8  178   73.21060   88.44831  20.8%  2778   25s
+   107   128   86.59165   10  172   73.21060   87.62399  19.7%  2943   39s
+   139   160   85.39964   11  194   73.21060   86.58680  18.3%  3053   44s
+   171   192   85.37942   12  194   73.21060   85.41474  16.7%  3269   51s
+   203   221   84.49733   13  198   73.21060   85.35461  16.6%  3162   57s
+   239   251   84.17963   14  185   73.21060   84.47934  15.4%  3159   66s
+H  241   251                      73.2118510   84.36134  15.2%  3151   66s
+   271   344   80.71616   15  167   73.21185   84.28458  15.1%  2975   70s
+   396   417   78.67220   18  175   73.21185   83.17105  13.6%  2540   75s
+H  462   453                      73.2158026   82.06376  12.1%  2599   77s
+   473   486   81.51218   20  153   73.21580   81.95064  11.9%  2618   83s
+   506   533   79.21287   21  141   73.21580   81.50854  11.3%  2539   88s
+   553   640   80.53746   15  172   73.21580   81.22630  10.9%  2398   94s
+   660   727   80.09013   23  144   73.21580   80.96126  10.6%  2152   99s
+   749   782   76.68986   16  151   73.21580   80.69547  10.2%  2014  106s
+   804   847   79.71603   17  153   73.21580   80.56593  10.0%  1971  114s
+   869   887   79.76800   14  157   73.21580   80.44728  9.88%  1931  124s
+   909   956   75.25575   17  153   73.21580   80.33651  9.73%  1923  130s
+   978  1022   79.66431   24  147   73.21580   80.19938  9.54%  1873  136s
+  1044  1129   78.93869   23  138   73.21580   80.07501  9.37%  1830  141s
+H 1075  1129                      73.2158026   80.05740  9.34%  1798  141s
+  1154  1183   76.22589   18  152   73.21580   79.94625  9.19%  1728  147s
+H 1189  1183                      73.2366157   79.83152  9.00%  1708  147s
+  1210  1305   79.26033   12  167   73.23662   79.75030  8.89%  1700  156s
+  1354  1418   79.05797   25  136   73.23662   79.64744  8.75%  1601  164s
+  1477  1590   73.52302   18  157   73.23662   79.48913  8.54%  1524  171s
+  1657  1765   78.73101   25  149   73.23662   79.39966  8.42%  1438  178s
+  1836  1897   73.26040   18  163   73.23662   79.30327  8.28%  1365  184s
+  1986  1979   78.63037   26  140   73.23662   79.22684  8.18%  1327  193s
+  2080  2154   77.64509   25  146   73.23662   79.13593  8.06%  1312  211s
+  2269  2302     cutoff   12        73.23662   79.08318  7.98%  1263  221s
+H 2285  2299                      73.2742545   79.06984  7.91%  1259  221s
+H 2319  2299                      73.2752290   79.04490  7.87%  1254  221s
+  2455  2513   73.29619   16  170   73.27523   79.01552  7.83%  1227  229s
+  2679  2633   77.42624   25  134   73.27523   78.90246  7.68%  1181  234s
+  2813  2882   78.20599   19  150   73.27523   78.84252  7.60%  1162  238s
+H 3076  2880                      73.2804212   78.75154  7.47%  1117  338s
+H 3076  2880                      73.2811820   78.75154  7.46%  1117  366s
+H 3076  2880                      73.2812472   78.75154  7.46%  1117  393s
+  3077  2881   78.08853   31  180   73.28125   78.75154  7.46%  1117  403s
+  3079  2882   77.08179   29  175   73.28125   78.75154  7.46%  1116  405s
+  3082  2884   77.76668   20  185   73.28125   78.75154  7.46%  1115  410s
+  3084  2886   76.35196   30  170   73.28125   78.75154  7.46%  1114  416s
+  3087  2888   76.50114   18  209   73.28125   78.75154  7.46%  1113  421s
+  3088  2888   77.68984   27  196   73.28125   78.75154  7.46%  1113  425s
+H 3088  2743                      73.2826344   78.75154  7.46%  1113  425s
+  3090  2745   78.07929   30  181   73.28263   78.75154  7.46%  1112  432s
+  3091  2745   78.48520   26  181   73.28263   78.75154  7.46%  1112  436s
+  3092  2747   78.75154   14  221   73.28263   78.75154  7.46%  1122  451s
+  3096  2748   78.75154   16  214   73.28263   78.75154  7.46%  1126  455s
+  3099  2747   78.75154   17  226   73.28263   78.75154  7.46%  1126  461s
+  3107  2752   78.75154   19  204   73.28263   78.75154  7.46%  1130  470s
+H 3119  2616                      73.2833553   78.75154  7.46%  1135  473s
+  3127  2621   78.75154   21  217   73.28336   78.75154  7.46%  1141  478s
+  3145  2619   78.75154   22  204   73.28336   78.75154  7.46%  1145  483s
+  3171  2633   78.75154   23  223   73.28336   78.75154  7.46%  1157  487s
+H 3173  2502                      73.2833553   78.75154  7.46%  1158  487s
+  3203  2512   78.75154   24  186   73.28336   78.75154  7.46%  1172  492s
+  3241  2517   78.75154   25  212   73.28336   78.75154  7.46%  1184  496s
+H 3268  2384                      73.2885106   78.75154  7.45%  1201  496s
+  3279  2400   78.75154   26  167   73.28851   78.75154  7.45%  1205  501s
+  3322  2407   77.92673   28  173   73.28851   78.75154  7.45%  1215  505s
+  3400  2450   73.68386   30  164   73.28851   78.75154  7.45%  1244  511s
+  3486  2487   78.75154   33  168   73.28851   78.75154  7.45%  1271  516s
+H 3499  2364                      73.2885107   78.75154  7.45%  1273  516s
+H 3515  2247                      73.2885910   78.75154  7.45%  1274  516s
+  3604  2330   77.40475   35  165   73.28859   78.46915  7.07%  1279  520s
+  3693  2382   76.85332   38  147   73.28859   77.75900  6.10%  1314  528s
+  3725  2396   75.59081   37  166   73.28859   77.20343  5.34%  1336  533s
+  3758  2413   76.47097   38  161   73.28859   77.07522  5.17%  1360  537s
+  3792  2432   75.78620   34  151   73.28859   76.54458  4.44%  1379  543s
+  3830  2450   74.59927   36  160   73.28859   76.39022  4.23%  1387  548s
+  3866  2454   75.12984   38  162   73.28859   76.28135  4.08%  1406  553s
+H 3873  2345                      73.2885910   76.24548  4.03%  1412  553s
+  3898  2355   73.70373   42  153   73.28859   76.16369  3.92%  1434  559s
+H 3908  2251                      73.2885910   76.13625  3.89%  1437  559s
+  3931  2265   75.70230   37  146   73.28859   76.04907  3.77%  1444  567s
+  3963  2278   74.89945   40  156   73.28859   75.93052  3.60%  1471  572s
+  3998  2287   73.78616   37  164   73.28859   75.82481  3.46%  1494  585s
+  4031  2301   74.49639   41  129   73.28859   75.75645  3.37%  1514  600s
+  4066  2315     cutoff   40        73.28859   75.66784  3.25%  1523  619s
+  4104  2327   74.39072   30  172   73.28859   75.61564  3.18%  1544  630s
+  4140  2342   74.90310   41  155   73.28859   75.54089  3.07%  1562  639s
+H 4156  2240                      73.3133371   75.49593  2.98%  1570  639s
+H 4165  2145                      73.3398201   75.48394  2.92%  1575  639s
+  4180  2201   74.39071   41  137   73.33982   75.46447  2.90%  1583  645s
+  4330  2234   74.11171   43  133   73.33982   75.30048  2.67%  1613  655s
+  4431  2238   74.56469   27  183   73.33982   75.21548  2.56%  1639  663s
+  4521  2264   73.87197   33  160   73.33982   75.08655  2.38%  1665  672s
+  4626  2263   74.72564   39  155   73.33982   75.01784  2.29%  1668  682s
+  4731  2263     cutoff   45        73.33982   74.89077  2.11%  1670  691s
+  4833  2258   74.52597   45  138   73.33982   74.79336  1.98%  1698  704s
+  4943  2243   73.63356   41  147   73.33982   74.70089  1.86%  1701  715s
+  5059  2199   73.74132   39  186   73.33982   74.57697  1.69%  1731  724s
+  5178  2164   74.31792   42  132   73.33982   74.51583  1.60%  1756  739s
+  5233  2139     cutoff   45        73.33982   74.44166  1.50%  1768  759s
+  5291  2127     cutoff   41        73.33982   74.39183  1.43%  1769  774s
+  5346  2107     cutoff   40        73.33982   74.33636  1.36%  1776  788s
+  5416  2098   73.54902   44  165   73.33982   74.30371  1.31%  1789  804s
+  5517  2085     cutoff   40        73.33982   74.24615  1.24%  1789  816s
+H 5639  1957                      73.3398201   74.22335  1.20%  1790  816s
+  5687  1989   73.36680   30  153   73.33982   74.19956  1.17%  1787  831s
+H 5839  1856                      73.3403372   74.14757  1.10%  1787  831s
+  5882  1902   73.99653   51  130   73.34034   74.11873  1.06%  1795  845s
+
+Cutting planes:
+  Gomory: 55
+  Projected implied bound: 712
+  MIR: 2333
+  Mixing: 8
+  Flow cover: 423
+  RLT: 127
+  Relax-and-lift: 2537
+
+Explored 6163 nodes (11030013 simplex iterations) in 845.28 seconds (778.11 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 10: 73.3403 73.3398 73.3398 ... 73.2826
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 7.334033722543e+01, best bound 7.404963544916e+01, gap 0.9671%
+
+User-callback calls 214855, time in user-callback 0.49 sec
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 2 target: 4 model_arch: cnn1 perturbation type: translation perturbation size: [0, 3.0, 1.0] dataset: mnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<01:58,  4.20it/s]Attack:   4%|▎         | 18/500 [00:00<00:07, 66.23it/s]Attack:   7%|▋         | 36/500 [00:00<00:04, 105.07it/s]Attack:  11%|█         | 54/500 [00:00<00:03, 128.34it/s]Attack:  14%|█▍        | 71/500 [00:00<00:03, 141.57it/s]Attack:  18%|█▊        | 89/500 [00:00<00:02, 152.36it/s]Attack:  21%|██▏       | 107/500 [00:00<00:02, 158.07it/s]Attack:  25%|██▌       | 125/500 [00:00<00:02, 162.05it/s]Attack:  28%|██▊       | 142/500 [00:01<00:02, 164.23it/s]Attack:  32%|███▏      | 160/500 [00:01<00:02, 166.43it/s]Attack:  35%|███▌      | 177/500 [00:01<00:01, 166.01it/s]Attack:  39%|███▉      | 194/500 [00:01<00:01, 163.30it/s]Attack:  42%|████▏     | 211/500 [00:01<00:01, 163.45it/s]Attack:  46%|████▌     | 228/500 [00:01<00:01, 163.60it/s]Attack:  49%|████▉     | 245/500 [00:01<00:01, 163.42it/s]Attack:  52%|█████▏    | 262/500 [00:01<00:01, 164.00it/s]Attack:  56%|█████▌    | 279/500 [00:01<00:01, 163.94it/s]Attack:  59%|█████▉    | 296/500 [00:01<00:01, 164.33it/s]Attack:  63%|██████▎   | 313/500 [00:02<00:01, 164.50it/s]Attack:  66%|██████▌   | 330/500 [00:02<00:01, 163.83it/s]Attack:  69%|██████▉   | 347/500 [00:02<00:00, 164.05it/s]Attack:  73%|███████▎  | 364/500 [00:02<00:00, 163.97it/s]Attack:  76%|███████▌  | 381/500 [00:02<00:00, 164.01it/s]Attack:  80%|███████▉  | 398/500 [00:02<00:00, 165.24it/s]Attack:  83%|████████▎ | 415/500 [00:02<00:00, 165.70it/s]Attack:  86%|████████▋ | 432/500 [00:02<00:00, 166.28it/s]Attack:  90%|████████▉ | 449/500 [00:02<00:00, 165.92it/s]Attack:  93%|█████████▎| 466/500 [00:03<00:00, 166.58it/s]Attack:  97%|█████████▋| 484/500 [00:03<00:00, 167.77it/s]Attack: 100%|█████████▉| 499/500 [00:03<00:00, 154.89it/s]
+best_val 58.74407196044922
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 73 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 35 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 577 of 577 N2 binaries (pgd-silent-filled=388, pgd-agreed-nop=161, pgd-disagreed-withdrew=28, flipped=14, no-N1-match=0, Tech2-eliminated-but-survived=0)
+73.34033722543445  74.0496354491567  845.2929928302765
+Clean sample classification: 3
+Perturbed sample classification: 6
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=5) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=5, 3104 vars, 767 neurons, 0 basis)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=5) ══
+set_n1_neuron_bounds: loaded 767 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=82 org-only=0 pert-only=35 none=271 (plus 162 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.8744071960449219e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 5.8744071960449219e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Warning for adding constraints: zero or small (< 1e-13) coefficients, ignored
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  5.8744071960449219e+01
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 4967 rows, 3439 columns and 66306 nonzeros (Max)
+Model fingerprint: 0x4657c97b
+Model has 1 linear objective coefficients
+Variable types: 2862 continuous, 577 integer (577 binary)
+Coefficient statistics:
+  Matrix range     [9e-13, 2e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [2e-02, 2e+02]
+  RHS range        [2e-06, 1e+03]
+Warning: Model contains large matrix coefficient range
+         Consider reformulating model or setting NumericFocus parameter
+         to avoid numerical issues.
+
+User MIP start produced solution with objective 72.9245 (0.51s)
+Loaded user MIP start with objective 72.9245
+
+Presolve removed 2752 rows and 1224 columns
+Presolve time: 0.18s
+Presolved: 2215 rows, 2215 columns, 47392 nonzeros
+Variable types: 1638 continuous, 577 integer (577 binary)
+Root relaxation presolve removed 578 rows and 577 columns
+Root relaxation presolved: 1637 rows, 1638 columns, 45649 nonzeros
+
+
+Root relaxation: objective 1.426370e+02, 1423 iterations, 0.27 seconds (0.17 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0  142.63702    0  175   72.92449  142.63702  95.6%     -    1s
+     0     0  125.81349    0  209   72.92449  125.81349  72.5%     -    2s
+     0     0  125.81349    0  209   72.92449  125.81349  72.5%     -    2s
+     0     0  125.81349    0  176   72.92449  125.81349  72.5%     -    2s
+     0     0  122.27824    0  170   72.92449  122.27824  67.7%     -    2s
+     0     0  122.17808    0  176   72.92449  122.17808  67.5%     -    2s
+     0     0  122.17029    0  177   72.92449  122.17029  67.5%     -    2s
+     0     0  116.24109    0  205   72.92449  116.24109  59.4%     -    3s
+     0     0  116.24109    0  205   72.92449  116.24109  59.4%     -    3s
+     0     0  116.24109    0  171   72.92449  116.24109  59.4%     -    4s
+     0     0  104.31421    0  184   72.92449  104.31421  43.0%     -    4s
+     0     0  103.66811    0  189   72.92449  103.66811  42.2%     -    4s
+     0     0  103.66811    0  189   72.92449  103.66811  42.2%     -    5s
+     0     0  103.37292    0  190   72.92449  103.37292  41.8%     -    5s
+     0     0   99.42792    0  196   72.92449   99.42792  36.3%     -    6s
+     0     0   99.42792    0  196   72.92449   99.42792  36.3%     -    6s
+     0     0   99.42792    0  175   72.92449   99.42792  36.3%     -    7s
+     0     0   97.40145    0  188   72.92449   97.40145  33.6%     -   10s
+     0     0   95.56416    0  194   72.92449   95.56416  31.0%     -   10s
+     0     0   95.56416    0  205   72.92449   95.56416  31.0%     -   10s
+     0     0   95.56416    0  202   72.92449   95.56416  31.0%     -   10s
+     0     0   95.55683    0  193   72.92449   95.55683  31.0%     -   12s
+     0     0   95.55683    0  193   72.92449   95.55683  31.0%     -   12s
+     0     0   95.55683    0  171   72.92449   95.55683  31.0%     -   13s
+     0     0   92.11388    0  171   72.92449   92.11388  26.3%     -   13s
+     0     0   92.11388    0  171   72.92449   92.11388  26.3%     -   13s
+     0     2   92.11388    0  171   72.92449   92.11388  26.3%     -   15s
+    13    16   89.19078    6  197   72.92449   89.94330  23.3%  3390   20s
+H   27    30                      72.9244904   87.53681  20.0%  2547   21s
+   102    89   81.14300   10  207   72.92449   85.18370  16.8%  2673   25s
+   235   218   77.88542   14  195   72.92449   81.97907  12.4%  2961   32s
+   267   248   80.87824   15  178   72.92449   81.31633  11.5%  2990   35s
+   299   276   76.62818   16  184   72.92449   80.96977  11.0%  3135   40s
+   331   308   79.99821   17  166   72.92449   80.23239  10.0%  3198   45s
+   363   340   79.21340   18  161   72.92449   79.98627  9.68%  3092   50s
+   395   376   79.13527   19  174   72.92449   79.37922  8.85%  3149   56s
+   431   408   79.00756   20  169   72.92449   79.13161  8.51%  3013   61s
+   463   433   78.61352   21  166   72.92449   78.99996  8.33%  2922   69s
+   496   453   77.19537   22  166   72.92449   78.70287  7.92%  2879   77s
+   528   478   76.72939   23  184   72.92449   78.39337  7.50%  2882   83s
+   565   507   77.88302   23  166   72.92449   78.14371  7.16%  2873   90s
+   602   535   76.86346   25  178   72.92449   78.00802  6.97%  2865   99s
+   634   560   77.74031   25  154   72.92449   77.89792  6.82%  2870  110s
+   671   590   77.66490   25  146   72.92449   77.80327  6.69%  2811  116s
+H  685   590                      72.9244905   77.78956  6.67%  2795  116s
+   711   623   77.66142   28  158   72.92449   77.75045  6.62%  2770  123s
+   750   656   77.66160   27  148   72.92449   77.70616  6.56%  2722  129s
+   793   684   77.57557   28  150   72.92449   77.66530  6.50%  2664  135s
+H  794   684                      72.9246530   77.66530  6.50%  2660  135s
+   873   833   77.36083   27  182   72.92465   77.58475  6.39%  2603  145s
+  1000   929   77.32900   28  158   72.92465   77.55260  6.35%  2417  151s
+  1116  1028   76.95547   27  168   72.92465   77.50604  6.28%  2306  157s
+  1243  1108     cutoff   16        72.92465   77.43524  6.19%  2197  163s
+  1377  1196   76.80776   30  152   72.92465   77.37544  6.10%  2140  169s
+  1518  1227   76.75803   29  162   72.92465   77.32736  6.04%  2092  176s
+  1583  1260   76.97129   22  174   72.92465   77.24403  5.92%  2100  185s
+  1672  1285     cutoff   28        72.92465   77.14388  5.79%  2112  192s
+  1727  1369   76.76556   33  131   72.92465   77.03978  5.64%  2119  202s
+  1853  1428     cutoff   16        72.92465   76.99880  5.59%  2100  209s
+  1956  1505   75.17162   23  164   72.92465   76.91762  5.48%  2102  217s
+H 2050  1505                      72.9249187   76.83681  5.36%  2097  217s
+  2097  1550   73.41530   23  176   72.92492   76.80517  5.32%  2092  221s
+  2172  1682     cutoff   24        72.92492   76.74348  5.24%  2074  228s
+  2392  1764     cutoff   22        72.92492   76.69052  5.16%  2010  238s
+  2578  1828   76.21226   34  166   72.92492   76.61505  5.06%  1999  247s
+  2736  1917   76.19434   20  196   72.92492   76.57764  5.01%  2004  257s
+  2913  1972   76.14731   30  181   72.92492   76.49427  4.89%  2008  266s
+  3018  2011     cutoff   30        72.92492   76.44087  4.82%  2012  276s
+  3131  2053   75.38102   27  179   72.92492   76.40550  4.77%  2042  286s
+  3219  2126   75.71999   31  158   72.92492   76.33837  4.68%  2064  297s
+  3358  2207     cutoff   26        72.92492   76.28007  4.60%  2088  309s
+  3493  2321   75.85626   34  155   72.92492   76.22483  4.53%  2109  321s
+  3685  2379   75.57982   29  166   72.92492   76.08780  4.34%  2110  335s
+  3771  2483   74.00285   33  153   72.92492   76.03805  4.27%  2129  346s
+  3935  2602   75.71969   36  135   72.92492   75.96315  4.17%  2148  359s
+  4112  2733     cutoff   22        72.92492   75.90425  4.09%  2161  372s
+  4309  2849     cutoff   30        72.92492   75.84178  4.00%  2172  385s
+  4500  2921   75.31331   27  171   72.92492   75.79497  3.94%  2186  399s
+  4602  3034   75.07363   31  179   72.92492   75.76569  3.90%  2193  413s
+  4777  3184   73.69574   36  137   72.92492   75.71428  3.82%  2215  422s
+  4975  3325   73.64621   35  150   72.92492   75.63447  3.72%  2232  432s
+  5186  3524   75.12409   26  139   72.92492   75.55614  3.61%  2245  446s
+  5447  3744   73.24150   31  168   72.92492   75.46676  3.49%  2243  459s
+  5773  4005   74.49505   30  164   72.92492   75.38959  3.38%  2219  474s
+  6110  4217     cutoff   19        72.92492   75.30318  3.26%  2196  491s
+  6371  4672   74.73971   15  156   72.92492   75.24276  3.18%  2182  508s
+H 6888  4671                      72.9288215   75.17352  3.08%  2119  559s
+  6889  4672   73.19321   30  171   72.92882   75.17352  3.08%  2119  784s
+  6891  4673   73.96636   42  175   72.92882   75.17352  3.08%  2118  785s
+  6894  4675   74.51685   23  204   72.92882   75.17352  3.08%  2117  790s
+  6896  4677   74.78402   41  174   72.92882   75.17352  3.08%  2117  795s
+  6899  4679   74.68337   35  198   72.92882   75.17352  3.08%  2116  800s
+  6901  4680   75.00442   32  184   72.92882   75.17352  3.08%  2115  808s
+  6902  4681   74.81566   34  184   72.92882   75.17352  3.08%  2115  811s
+  6903  4682   75.17352   14  197   72.92882   75.17352  3.08%  2119  821s
+  6910  4682   75.17352   17  210   72.92882   75.17352  3.08%  2120  830s
+  6918  4690   75.17352   19  201   72.92882   75.17352  3.08%  2121  837s
+  6926  4689   75.17352   20  203   72.92882   75.17352  3.08%  2122  840s
+  6957  4694   75.17352   22  199   72.92882   75.17352  3.08%  2122  847s
+  6983  4712   75.17352   23  199   72.92882   75.17352  3.08%  2123  852s
+  7034  4712   75.17352   24  213   72.92882   75.17352  3.08%  2118  856s
+  7066  4752   75.17352   27  187   72.92882   75.17352  3.08%  2125  861s
+  7121  4764   75.17352   28  176   72.92882   75.17352  3.08%  2120  865s
+  7195  4799   75.17352   30  175   72.92882   75.17352  3.08%  2130  874s
+  7241  4803   73.93139   31  167   72.92882   75.17352  3.08%  2137  879s
+  7279  4814   75.17352   32  180   72.92882   75.17352  3.08%  2137  882s
+  7311  4828   75.17352   34  152   72.92882   75.17352  3.08%  2141  888s
+  7357  4845   75.17352   34  165   72.92882   75.17352  3.08%  2138  892s
+  7389  4895   75.17352   35  158   72.92882   75.17352  3.08%  2137  897s
+  7452  4900   75.17352   36  155   72.92882   75.17352  3.08%  2134  903s
+  7484  4911   75.17352   37  164   72.92882   75.17352  3.08%  2144  912s
+  7519  4917   75.17352   38  162   72.92882   75.17352  3.08%  2151  918s
+  7555  4916     cutoff   39        72.92882   75.17352  3.08%  2165  924s
+  7588  4934   75.17352   37  167   72.92882   75.17352  3.08%  2176  931s
+  7629  4947   75.17352   34  165   72.92882   75.17352  3.08%  2179  935s
+  7704  4973   75.17352   35  167   72.92882   75.17352  3.08%  2195  941s
+  7747  4978     cutoff   39        72.92882   75.17352  3.08%  2196  949s
+  7792  4976   75.17352   42  160   72.92882   75.17352  3.08%  2198  957s
+  7836  4992   75.17352   43  158   72.92882   75.17352  3.08%  2206  965s
+  7893  4999     cutoff   36        72.92882   75.17352  3.08%  2211  971s
+  7934  5008   74.76009   37  169   72.92882   75.17352  3.08%  2217  979s
+H 7938  4771                      72.9288808   75.17352  3.08%  2217  979s
+H 7950  4545                      72.9294323   75.17352  3.08%  2218  979s
+  7976  4547   73.59643   38  149   72.92943   75.17352  3.08%  2221  989s
+  8014  4556     cutoff   30        72.92943   75.17352  3.08%  2230  996s
+  8064  4565   74.92818   32  171   72.92943   75.17352  3.08%  2239 1006s
+  8146  4556   74.05676   39  170   72.92943   75.17352  3.08%  2238 1014s
+  8200  4583   74.55663   30  178   72.92943   75.14595  3.04%  2248 1023s
+  8285  4566     cutoff   31        72.92943   75.08721  2.96%  2245 1032s
+  8342  4583     cutoff   27        72.92943   74.98648  2.82%  2247 1040s
+  8438  4584   74.36607   31  191   72.92943   74.90120  2.70%  2255 1048s
+  8495  4606   73.98264   33  191   72.92943   74.79046  2.55%  2262 1058s
+  8604  4610     cutoff   38        72.92943   74.72918  2.47%  2269 1067s
+H 8643  4385                      72.9306759   74.66291  2.38%  2272 1067s
+H 8697  4165                      72.9329718   74.64254  2.34%  2272 1067s
+  8704  4229   73.02088   38  176   72.93297   74.59662  2.28%  2273 1078s
+  8857  4187   74.06780   41  161   72.93297   74.47630  2.12%  2270 1102s
+  8902  4188   73.74489   35  153   72.93297   74.42015  2.04%  2277 1130s
+  8955  4211     cutoff   48        72.93297   74.38312  1.99%  2281 1144s
+  9027  4202     cutoff   31        72.93297   74.34882  1.94%  2282 1166s
+  9074  4200   73.07248   29  179   72.93297   74.31450  1.89%  2285 1183s
+H 9090  4004                      72.9329718   74.27318  1.84%  2285 1183s
+H 9102  3818                      72.9329718   74.26608  1.83%  2285 1183s
+  9124  3832   73.86832   44  144   72.93297   74.24989  1.81%  2287 1202s
+  9203  3832     cutoff   43        72.93297   74.21349  1.76%  2288 1218s
+  9267  3829     cutoff   47        72.93297   74.18326  1.71%  2289 1236s
+  9346  3818   73.59289   43  160   72.93297   74.15869  1.68%  2288 1254s
+  9419  3828     cutoff   33        72.93297   74.12300  1.63%  2292 1273s
+H 9437  3650                      72.9329719   74.10988  1.61%  2292 1273s
+  9499  3673     cutoff   40        72.93297   74.08858  1.58%  2289 1295s
+H 9550  3493                      72.9329719   74.06750  1.56%  2285 1295s
+  9585  3538     cutoff   40        72.93297   74.05636  1.54%  2286 1311s
+  9715  3547   73.83044   47  128   72.93297   74.01317  1.48%  2274 1326s
+  9822  3594   73.71415   45  189   72.93297   73.97557  1.43%  2267 1346s
+  9981  3641   73.53839   50  150   72.93297   73.93646  1.38%  2249 1364s
+ 10173  3719   73.69050   41  135   72.93297   73.89650  1.32%  2227 1386s
+ 10389  3865   73.49819   43  158   72.93297   73.86263  1.27%  2202 1407s
+ 10717  3770   73.68317   60   68   72.93297   73.81738  1.21%  2166 1433s
+H10743  3605                      72.9329720   73.78911  1.17%  2166 1433s
+ 10765  3732     cutoff   42        72.93297   73.77897  1.16%  2166 1451s
+ 10953  4067     cutoff   48        72.93297   73.74988  1.12%  2147 1471s
+ 11482  4654   73.61366   53  132   72.93297   73.68852  1.04%  2082 1485s
+
+Cutting planes:
+  Gomory: 46
+  Projected implied bound: 749
+  MIR: 3022
+  Mixing: 3
+  Flow cover: 518
+  RLT: 108
+  Relax-and-lift: 2945
+
+Explored 12362 nodes (24384466 simplex iterations) in 1486.25 seconds (1515.43 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 10: 72.933 72.933 72.933 ... 72.9249
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 7.293297196943e+01, best bound 7.365341882625e+01, gap 0.9878%
+
+User-callback calls 344554, time in user-callback 0.84 sec
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 2 target: 5 model_arch: cnn1 perturbation type: translation perturbation size: [0, 3.0, 1.0] dataset: mnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<01:10,  7.08it/s]Attack:   7%|▋         | 35/500 [00:00<00:02, 172.36it/s]Attack:  14%|█▍        | 69/500 [00:00<00:01, 239.78it/s]Attack:  21%|██        | 103/500 [00:00<00:01, 274.22it/s]Attack:  27%|██▋       | 136/500 [00:00<00:01, 293.27it/s]Attack:  34%|███▍      | 170/500 [00:00<00:01, 307.21it/s]Attack:  41%|████      | 204/500 [00:00<00:00, 316.06it/s]Attack:  48%|████▊     | 238/500 [00:00<00:00, 321.36it/s]Attack:  54%|█████▍    | 271/500 [00:00<00:00, 323.86it/s]Attack:  61%|██████    | 304/500 [00:01<00:00, 325.58it/s]Attack:  67%|██████▋   | 337/500 [00:01<00:00, 326.59it/s]Attack:  74%|███████▍  | 370/500 [00:01<00:00, 327.44it/s]Attack:  81%|████████  | 403/500 [00:01<00:00, 327.13it/s]Attack:  87%|████████▋ | 436/500 [00:01<00:00, 325.25it/s]Attack:  94%|█████████▍| 469/500 [00:01<00:00, 326.16it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 301.84it/s]
+best_val 59.255252838134766
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 73 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 35 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 577 of 577 N2 binaries (pgd-silent-filled=399, pgd-agreed-nop=155, pgd-disagreed-withdrew=23, flipped=8, no-N1-match=0, Tech2-eliminated-but-survived=0)
+72.93297196943153  73.65341882625448  1486.2667260169983
+Clean sample classification: 3
+Perturbed sample classification: 9
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=6) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/translation/eps_3,1/n1_state_cnn1_model_seed42_itr20 (c_tag=3, c_target=6, 3104 vars, 767 neurons, 0 basis)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=6) ══
+set_n1_neuron_bounds: loaded 767 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=82 org-only=0 pert-only=35 none=271 (plus 162 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
