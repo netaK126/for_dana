@@ -12,6 +12,7 @@ function get_model(w_, h_, k_,
         "Determining upper and lower bounds for the input to each non-linear unit.",
     )
     m = Model(optimizer_with_attributes(optimizer, tightening_options...))
+    global geometric_diff_map = nothing   # cleared each build; set by the translation/rotation encoder when the flag is on
     if perturbation == "contrast"
         set_optimizer_attribute(m, "NonConvex", 2)
     end
@@ -359,6 +360,13 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
     I_pert_prev_up   = reshape(flat_up,   size(input))
     I_pert_prev_down = reshape(flat_down, size(input))
 
+    # --geometric_intervals: hand the move's exact (T-I) map to perturbed_interval_constraints (FC nets only).
+    global geometric_intervals, geometric_diff_map, geometric_input_shape
+    if geometric_intervals && !isempty(nn.layers) && occursin("Flatten", string(typeof(nn.layers[1])))
+        geometric_diff_map = geometric_diff_map_translation(t_down, t_right, w, h, k)
+        geometric_input_shape = size(input)
+    end
+
     global layer_counter, nueron_counter, network_version
     layer_counter = 0
     nueron_counter = 0
@@ -450,6 +458,7 @@ function get_model_transfer(w_, h_, k_,
         "Determining upper and lower bounds for the input to each non-linear unit.",
     )
     m = Model(optimizer_with_attributes(optimizer, tightening_options...))
+    global geometric_diff_map = nothing   # cleared each transfer build; set by the translation/rotation transfer encoder
     m.ext[:MIPVerify] = MIPVerifyExt(tightening_algorithm)
     d_common = Dict(
         :Model => m,
@@ -972,6 +981,14 @@ function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturb
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
+    # --geometric_intervals: the move's (T-I) map is net-independent; perturbed_interval_constraints on nn1/nn2
+    # each applies its own W1. Gate on nn1 being Flatten-first FC (transfer compares same-architecture nets).
+    global geometric_intervals, geometric_diff_map, geometric_input_shape
+    if geometric_intervals && !isempty(nn1.layers) && occursin("Flatten", string(typeof(nn1.layers[1])))
+        geometric_diff_map = geometric_diff_map_translation(t_down, t_right, w, h, k)
+        geometric_input_shape = size(input)
+    end
+
     v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
@@ -1175,6 +1192,13 @@ function get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
+    # --geometric_intervals: bilinear (T-I) map (net-independent), FC + k==1 only.
+    global geometric_intervals, geometric_diff_map, geometric_input_shape
+    if geometric_intervals && k_ == 1 && !isempty(nn1.layers) && occursin("Flatten", string(typeof(nn1.layers[1])))
+        geometric_diff_map = geometric_diff_map_rotation(angle, w_, h_, k_)
+        geometric_input_shape = size(input)
+    end
+
     v_out_n1, v_out_n2, v_out_n1_p, v_out_n2_p, v_n2_last_hidden =
         _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, I_pert_down, n1_p_mode)
     return Dict(:v_in => v_in, :v_in_p => v_x0, :Perturbation => "None",
@@ -1245,6 +1269,14 @@ function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn
     global I_pert_prev_up, I_pert_prev_down
     I_pert_prev_up   = reshape(flat_up,   size(input))
     I_pert_prev_down = reshape(flat_down, size(input))
+
+    # --geometric_intervals: hand the single angle's exact bilinear (T-I) map to perturbed_interval_constraints
+    # (FC nets, k==1 only — the encoder leaves k=3 channels 2/3 unpinned).
+    global geometric_intervals, geometric_diff_map, geometric_input_shape
+    if geometric_intervals && k_ == 1 && !isempty(nn.layers) && occursin("Flatten", string(typeof(nn.layers[1])))
+        geometric_diff_map = geometric_diff_map_rotation(angle, w_, h_, k_)
+        geometric_input_shape = size(input)
+    end
 
     global layer_counter, nueron_counter, network_version
     layer_counter = 0

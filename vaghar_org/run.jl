@@ -136,6 +136,13 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
+        "--geometric_intervals"
+        help = "Exploit pixel-relocation structure for translation/rotation in the perturbed-interval bounds " *
+               "(correct per-pixel envelope + first-layer composition of the move). Interval-only, no zonotope. " *
+               "Sound: delta unchanged. Default false = today's behavior."
+        arg_type = Bool
+        required = false
+        default = false
         "--activate_vaghgar_deps"
         help = "activate  vaghgar depandencies"
         arg_type = Bool
@@ -463,6 +470,16 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
     global relaxation_gap_area = args["relaxation_gap_area"]
+    global geometric_intervals = args["geometric_intervals"]
+    if geometric_intervals && !args["use_perturbed_intervals"]
+        println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
+                "perturbed-interval coupling). Ignoring it and falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    elseif geometric_intervals && !(perturbation in ("translation", "rotation"))
+        println("WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); " *
+                "perturbation '$(perturbation)' is unaffected. Falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    end
 
     # ── Standard-mode boosts (Boosting Standard Mode, single-network N1) ─────
     # See advstd_techniques.tex §3 (sec:std). These flags are independent of
@@ -612,6 +629,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save*"_PertruebedIntervals"
+                if geometric_intervals; name_to_save = name_to_save*"_geomInt"; end
                 println("Adding perturbed interval constraints...")
                 perturbed_interval_constraints(m, nn, "org", "perturbation")
             end
@@ -869,6 +887,16 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
     global relaxation_gap_area = args["relaxation_gap_area"]
+    global geometric_intervals = args["geometric_intervals"]
+    if geometric_intervals && !args["use_perturbed_intervals"]
+        println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
+                "perturbed-interval coupling). Ignoring it and falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    elseif geometric_intervals && !(perturbation in ("translation", "rotation"))
+        println("WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); " *
+                "perturbation '$(perturbation)' is unaffected. Falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    end
     name_to_save_init = name_to_save
 
     println("Advanced-standard mode: techniques enabled:")
@@ -916,6 +944,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
     if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps"; end
     if args["use_perturbed_intervals"];     n2_check = n2_check * "_PerturbedIntervals"; end
+    if geometric_intervals;                 n2_check = n2_check * "_geomInt"; end
 
     # Check if ALL results already exist — if so, skip entirely
     for c_tag in c_tag_list
@@ -1232,6 +1261,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             end
             if args["use_perturbed_intervals"]
                 n2_name = n2_name * "_PerturbedIntervals"
+                if geometric_intervals; n2_name = n2_name * "_geomInt"; end
                 perturbed_interval_constraints(m_n2, nn2, "org", "perturbation")
             end
             mip_set_delta_property(m_n2, perturbation, d_n2)
@@ -1290,6 +1320,16 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
     global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
     global relaxation_gap_area = args["relaxation_gap_area"]
+    global geometric_intervals = args["geometric_intervals"]
+    if geometric_intervals && !args["use_perturbed_intervals"]
+        println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
+                "perturbed-interval coupling). Ignoring it and falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    elseif geometric_intervals && !(perturbation in ("translation", "rotation"))
+        println("WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); " *
+                "perturbation '$(perturbation)' is unaffected. Falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    end
 
     for c_tag in c_tag_list
         c_targets = parse_numbers_to_Int64(args["ct"])
@@ -1415,6 +1455,16 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
     standard_warmstart_n1_only = args["standard_warmstart_n1_only"]
     c_tag_mode = args["c_tag_mode"]
     use_intervals = args["use_intervals"]
+    global geometric_intervals = args["geometric_intervals"]
+    if geometric_intervals && !args["use_perturbed_intervals"]
+        println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
+                "perturbed-interval coupling). Ignoring it and falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    elseif geometric_intervals && !(perturbation in ("translation", "rotation"))
+        println("WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); " *
+                "perturbation '$(perturbation)' is unaffected. Falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    end
     results_path = args["output_dir"]
     timout = args["timout"]
     c_tag_list = [args["ctag"]]
@@ -1711,6 +1761,7 @@ function main_transfer(args, dataset, model_name, model_path, perturbation, pert
             # Perturbation interval bounds (clean ↔ perturbed for each network)
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save * "_PerturbedIntervals"
+                if geometric_intervals; name_to_save = name_to_save * "_geomInt"; end
                 println("Adding perturbed interval constraints...")
                 if !no_n1_encoding_at_all
                     perturbed_interval_constraints(m, nn1, "n1_org", "n1_pert")
@@ -1861,6 +1912,16 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
     vaghar_results = args["vaghar_results"]
     c_tag_mode = args["c_tag_mode"]
     use_intervals = args["use_intervals"]
+    global geometric_intervals = args["geometric_intervals"]
+    if geometric_intervals && !args["use_perturbed_intervals"]
+        println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
+                "perturbed-interval coupling). Ignoring it and falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    elseif geometric_intervals && !(perturbation in ("translation", "rotation"))
+        println("WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); " *
+                "perturbation '$(perturbation)' is unaffected. Falling back to geometric_intervals=off.")
+        global geometric_intervals = false
+    end
     results_path = args["output_dir"]
     timout = args["timout"]
     c_tag_list = [args["ctag"]]
@@ -1956,6 +2017,7 @@ function main_transfer_distilation(args, dataset, model_name, model_path, pertur
             # Perturbation interval bounds (clean ↔ perturbed for each network)
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save * "_PerturbedIntervals"
+                if geometric_intervals; name_to_save = name_to_save * "_geomInt"; end
                 println("Adding perturbed interval constraints for N1 and N2...")
                 perturbed_interval_constraints(m, nn2, "n2_org", "n2_pert")
             end

@@ -103,17 +103,67 @@ atexit.register(_kill_descendants)
 
 # ── Rerun-on-timeout filter ──────────────────────────────────────────────
 # Module-level config set from --rerun_timeouts in main(). When enabled,
-# `_parse_c_source_target_pairs` excludes any result row whose solve_status
-# indicates a Gurobi time-limit termination (TIME_LIMIT / USER_LIMIT) — and
-# additionally any row whose optimization_time is within a small epsilon of
-# a previously-used timeout (for legacy result lines that lack solve_status).
+# `_parse_c_source_target_pairs` excludes (i.e. marks for re-solve) result
+# rows that look like a Gurobi termination-limit timeout — but ONLY when the
+# new per-cell budget (`_RERUN_TIMEOUT_BUDGET`, = the current --timeout) gives
+# meaningfully more time than the cell already consumed. A cell that already
+# ran for ≥ new_budget − eps got at least as much time as a fresh solve would
+# give it, so re-running it would just reproduce the same timeout — those rows
+# are kept as "done".
 _RERUN_TIMEOUTS = False
-# Timeout values (in seconds) that should be treated as "this row was a
-# timeout" when matched against optimization_time. Populated in main():
+# The new per-cell time budget (seconds) a re-solve would get, = --timeout.
+# A timeout row is only worth re-running when its prior runtime is below this
+# by more than _TIMEOUT_MATCH_EPS. Populated in main().
+_RERUN_TIMEOUT_BUDGET = 0.0
+# Timeout values (in seconds) used ONLY to identify legacy/status-less rows as
+# timeouts (a row whose optimization_time sits near one of these caps but
+# carries no solve_status is treated as a timeout). Populated in main():
 # always includes a configurable list of common historical caps (1800, 3600)
 # plus the current --timeout. The match tolerance is ±_TIMEOUT_MATCH_EPS s.
 _TIMEOUT_VALUES = ()  # type: tuple[float, ...]
 _TIMEOUT_MATCH_EPS = 30.0  # seconds
+
+
+def _timeout_row_is_stale_rerun(status, runtime):
+    """Under --rerun_timeouts, decide whether a result row should be EXCLUDED
+    from the 'covered' set (i.e. re-solved) because it is a timeout that a
+    fresh solve under the current --timeout could plausibly improve.
+
+    `status` is the upper-cased solve_status ("" if absent); `runtime` is the
+    row's optimization_time as a float, or None if unknown/unparseable.
+
+    A row is treated as a timeout when its status is in the Gurobi
+    termination-limit set, or — for legacy rows lacking a status — when its
+    runtime sits within ±_TIMEOUT_MATCH_EPS of a known cap in _TIMEOUT_VALUES.
+
+    A timeout is only worth re-running when the NEW budget
+    (`_RERUN_TIMEOUT_BUDGET`, = current --timeout) meaningfully exceeds the
+    time the cell already consumed: re-running a cell that already burned the
+    same (or a larger) budget would just reproduce the timeout. When the
+    runtime is unknown we cannot compare, so we err on the side of re-running
+    (the historical behavior).
+    """
+    timeout_statuses = {
+        "TIME_LIMIT", "USER_OBJ_LIMIT", "USER_LIMIT",
+        "ITERATION_LIMIT", "NODE_LIMIT",
+        "SOLUTION_LIMIT", "MEMORY_LIMIT", "WORK_LIMIT",
+    }
+    is_timeout = status in timeout_statuses
+    if not is_timeout and not status and runtime is not None:
+        # Only status-less (legacy/positional) rows fall back to a wall-clock
+        # cap match. A row with an explicit non-timeout terminal status
+        # (OPTIMAL, INFEASIBLE, ...) is definitively done and is never
+        # re-run, even if it happened to finish near a round-number cap.
+        is_timeout = any(abs(runtime - cap) <= _TIMEOUT_MATCH_EPS
+                         for cap in _TIMEOUT_VALUES)
+    if not is_timeout:
+        return False  # not a timeout → counts as covered (keep)
+    if runtime is None:
+        return True   # runtime unknown → re-run (conservative)
+    # Re-run only if the new budget gives meaningfully more time than the
+    # cell already had; otherwise it's already as solved as a re-run would
+    # leave it.
+    return runtime < _RERUN_TIMEOUT_BUDGET - _TIMEOUT_MATCH_EPS
 
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
@@ -188,6 +238,10 @@ def _parse_c_source_target_pairs(filepath):
       - optimization_time is within ±_TIMEOUT_MATCH_EPS seconds of any
         entry in `_TIMEOUT_VALUES` (catches legacy rows that lack
         solve_status — see the docstring note below about positional CSV).
+    A timeout row is only excluded when the new budget (current --timeout)
+    meaningfully exceeds the time it already ran, and rows with an explicit
+    non-timeout terminal status (OPTIMAL, INFEASIBLE, ...) are never excluded
+    — see `_timeout_row_is_stale_rerun`.
     """
     pairs = set()
     try:
@@ -206,22 +260,13 @@ def _parse_c_source_target_pairs(filepath):
                     if status == "INTERRUPTED":
                         continue
                     if _RERUN_TIMEOUTS:
-                        timeout_statuses = {
-                            "TIME_LIMIT", "USER_OBJ_LIMIT", "USER_LIMIT",
-                            "ITERATION_LIMIT", "NODE_LIMIT",
-                            "SOLUTION_LIMIT", "MEMORY_LIMIT", "WORK_LIMIT",
-                        }
-                        if status in timeout_statuses:
-                            continue
                         opt_t = fields.get("optimization_time", "")
-                        if opt_t:
-                            try:
-                                tval = float(opt_t)
-                                if any(abs(tval - cap) <= _TIMEOUT_MATCH_EPS
-                                       for cap in _TIMEOUT_VALUES):
-                                    continue
-                            except ValueError:
-                                pass
+                        try:
+                            runtime = float(opt_t) if opt_t else None
+                        except ValueError:
+                            runtime = None
+                        if _timeout_row_is_stale_rerun(status, runtime):
+                            continue
                     try:
                         pairs.add((int(fields["c_source"]), int(fields["c_target"])))
                     except ValueError:
@@ -239,12 +284,12 @@ def _parse_c_source_target_pairs(filepath):
                     if _RERUN_TIMEOUTS and len(parts) >= 5:
                         # Common legacy schema: source,target,incumbent,best_bound,solve_time
                         try:
-                            tval = float(parts[4])
-                            if any(abs(tval - cap) <= _TIMEOUT_MATCH_EPS
-                                   for cap in _TIMEOUT_VALUES):
-                                continue
+                            runtime = float(parts[4])
                         except ValueError:
-                            pass
+                            runtime = None
+                        if (runtime is not None
+                                and _timeout_row_is_stale_rerun("", runtime)):
+                            continue
                     pairs.add((cs, ct))
     except OSError:
         pass
@@ -276,7 +321,8 @@ def _eps_str_variants(eps_str):
 
 
 def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
-                              base_name_to_save, seed, c_tag, c_targets):
+                              base_name_to_save, seed, c_tag, c_targets,
+                              geometric_intervals=False):
     """Return subset of `c_targets` (Julia 1-indexed) for which no advstd
     result line `c_source=<c_tag-1>,c_target=<ct-1>` exists in any matching
     file for (combo=base_name_to_save, seed, c_tag).
@@ -310,13 +356,18 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
             f"{base_name_to_save}_seed{seed}_*.txt",
         )
         for fpath in glob.glob(pattern):
+            # geomInt and non-geomInt runs of the same combo share base_name_to_save,
+            # so only count files whose _geomInt presence matches this run.
+            if ("_geomInt" in os.path.basename(fpath)) != geometric_intervals:
+                continue
             for cs, ct in _parse_c_source_target_pairs(fpath):
                 if cs == src0:
                     covered.add(ct)
     return [ct for ct in c_targets if (ct - 1) not in covered]
 
 
-def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag):
+def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag,
+                             geometric_intervals=False):
     """Build a regex matching the exact name_to_save tail Julia's main_standard
     writes for a given (zb, sg, rt, pi) combo. The tail starts right after the
     user-provided --name_to_save base and runs through `_cTag{c_tag}`.
@@ -347,6 +398,8 @@ def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag):
     parts.append(re.escape("_HyperAttackHints_VagharDeps"))
     if pi == "true":
         parts.append(re.escape("_PertruebedIntervals"))
+        if geometric_intervals:
+            parts.append(re.escape("_geomInt"))   # main_standard adds this right after _PertruebedIntervals
     has_boost = (zb == "true") or (rt >= 0.0) or (sg == "true")
     if has_boost:
         parts.append(re.escape("_stdBoost"))
@@ -365,7 +418,7 @@ def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag):
 
 def _stdboost_missing_c_targets(out_dir, arch, pert_type, eps_str,
                                 base_name_to_save, seed, zb, sg, rt, pi,
-                                c_tag, c_targets):
+                                c_tag, c_targets, geometric_intervals=False):
     """Return subset of `c_targets` (Julia 1-indexed) for which no
     standard-mode boost (Boosting Standard Mode §3 of advstd_techniques.tex)
     result file in `out_dir` matches the exact (zb, sg, rt, pi, seed, c_tag)
@@ -386,7 +439,8 @@ def _stdboost_missing_c_targets(out_dir, arch, pert_type, eps_str,
     if not os.path.isdir(out_dir):
         return list(c_targets)
     src0 = c_tag - 1
-    tail_re = _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag)
+    tail_re = _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag,
+                                       geometric_intervals=geometric_intervals)
     covered = set()
     for variant in _eps_str_variants(eps_str):
         pattern = os.path.join(
@@ -1353,6 +1407,7 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
         "gap_standard", "gap_advstd",
         "solve_status_standard", "solve_status_advstd",
         "standard_file", "advstd_file",
+        "geom",
     ]
 
     rows_advstd_faster = []
@@ -1482,6 +1537,11 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                         "solve_status_advstd": a_info.get("solve_status", ""),
                         "standard_file": std_file,
                         "advstd_file": tf,
+                        # geometric_intervals twin: same flags/delta as its
+                        # baseline, differs only in solve time. Tagged via the
+                        # _geomInt filename marker so the table renderer can
+                        # pair base,geom and the combo-ranking can skip it.
+                        "geom": "yes" if "_geomInt" in tf_name else "no",
                     }
 
                     s_is_timeout = s_info.get("solve_status", "") == "TIME_LIMIT"
@@ -1594,6 +1654,12 @@ def write_advstd_combo_ranking_csv(rows_advstd_faster, rows_standard_faster, csv
     relaxed_pert_per_combo = defaultdict(list)
     delta_error_per_combo = defaultdict(list)
     for row in list(rows_advstd_faster) + list(rows_standard_faster):
+        # geometric_intervals twins share every flag with their baseline, so
+        # they would group into the same combo and double-count the win/lose
+        # and geomean-time tallies. They are a solve-time annotation for the
+        # table, not a separate combo -> exclude from the ranking.
+        if str(row.get("geom", "no")) == "yes":
+            continue
         try:
             t_std = float(row["time_standard"])
             t_adv = float(row["time_advstd"])
@@ -1889,6 +1955,7 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
         "gap_standard", "gap_advstd",
         "solve_status_standard", "solve_status_advstd",
         "standard_file", "advstd_file",
+        "geom",
     ]
 
     def _parse_speed(val):
@@ -2028,55 +2095,55 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
 
     # AAAI paper companion: same per-arch wide tables, sliced down to
     # the 4 safe-combo columns (standard zono+sg+pi at tau=0/0.5 plus
-    # advstd transfer zono+prev_pgd+sg at tau=0/0.5). The block lives
-    # between AUTO markers in neta-s-paper/sections/sec_appendix_percell.tex
-    # (the Per-Cell Evaluation Results appendix) so it stays in sync with
-    # the main advstd_techniques.tex tables.
-    try:
-        aaai_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                  "sec_appendix_percell.tex")
-        if not os.path.exists(aaai_tex):
-            # Silently skip if the AAAI paper isn't checked out next to
-            # the sweep; the main advstd_techniques.tex tables are still
-            # regenerated above.
-            pass
-        elif hasattr(updater, "regenerate_aaai_wide_perarch_section"):
-            updater.regenerate_aaai_wide_perarch_section(
-                aaai_tex, cwd, dataset_guess, arch_runs,
-                parse_result_file,
-                seeds_filter=combo_ranking_seeds,
-                force_timeout=force_timeout,
-                rerun_timeout_eps=rerun_timeout_eps)
-        else:
-            print("[tex-update] updater missing "
-                  "regenerate_aaai_wide_perarch_section -- upgrade "
-                  "update_advstd_tex_tables.py to populate the AAAI "
-                  "paper's safe-wide tables.")
-    except Exception as exc:
-        print(f"[tex-update] aaai_safe_wide block error: {exc}")
+    # advstd transfer zono+prev_pgd+sg at tau=0/0.5). The tables are split
+    # by network role: the target-network (N2) tables live in the
+    # Evaluation body (sec_evaluation.tex, the aaai_safe_wide_tables
+    # markers) and the source-network (N1) tables live in the appendix
+    # (sec_appendix_percell.tex, the aaai_safe_wide_n1_tables markers).
+    # Both are sliced from the same per-cell rows as the main
+    # advstd_techniques.tex tables.
+    if not hasattr(updater, "regenerate_aaai_wide_perarch_section"):
+        print("[tex-update] updater missing "
+              "regenerate_aaai_wide_perarch_section -- upgrade "
+              "update_advstd_tex_tables.py to populate the AAAI "
+              "paper's safe-wide tables.")
+    else:
+        # N2 (target network) -> Evaluation body.
+        try:
+            body_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                                    "sec_evaluation.tex")
+            if os.path.exists(body_tex):
+                updater.regenerate_aaai_wide_perarch_section(
+                    body_tex, cwd, dataset_guess, arch_runs,
+                    parse_result_file,
+                    seeds_filter=combo_ranking_seeds,
+                    force_timeout=force_timeout,
+                    rerun_timeout_eps=rerun_timeout_eps,
+                    roles={"N2"})
+        except Exception as exc:
+            print(f"[tex-update] aaai_safe_wide (N2 body) block error: {exc}")
 
-    # Body summary table (Table 2 in sec_evaluation.tex): per-architecture
-    # bound gap vs. the exact VHAGaR bound and transfer-mode speedup,
-    # aggregated from the same per-cell rows as the appendix tables.
-    try:
-        summary_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                   "sec_evaluation.tex")
-        if not os.path.exists(summary_tex):
-            pass
-        elif hasattr(updater, "regenerate_aaai_summary_section"):
-            updater.regenerate_aaai_summary_section(
-                summary_tex, cwd, dataset_guess, arch_runs,
-                parse_result_file,
-                seeds_filter=combo_ranking_seeds,
-                force_timeout=force_timeout,
-                rerun_timeout_eps=rerun_timeout_eps)
-        else:
-            print("[tex-update] updater missing "
-                  "regenerate_aaai_summary_section -- upgrade "
-                  "update_advstd_tex_tables.py to populate the AAAI "
-                  "paper's summary table.")
-    except Exception as exc:
-        print(f"[tex-update] aaai_summary block error: {exc}")
+        # N1 (source network) -> appendix.
+        try:
+            n1_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                                  "sec_appendix_percell.tex")
+            if os.path.exists(n1_tex):
+                updater.regenerate_aaai_wide_perarch_section(
+                    n1_tex, cwd, dataset_guess, arch_runs,
+                    parse_result_file,
+                    seeds_filter=combo_ranking_seeds,
+                    force_timeout=force_timeout,
+                    rerun_timeout_eps=rerun_timeout_eps,
+                    roles={"N1"}, label_suffix="-n1",
+                    begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK,
+                    end_mark=updater.AAAI_WIDE_N1_END_MARK)
+        except Exception as exc:
+            print(f"[tex-update] aaai_safe_wide (N1 appendix) block "
+                  f"error: {exc}")
+
+    # The old per-architecture summary table (former Table 2) was removed
+    # from sec_evaluation.tex in favor of the per-cell wide tables above,
+    # so there is no aaai_summary_table block left to regenerate.
 
     # Recompile the AAAI paper so main.pdf reflects the freshly
     # regenerated sec_evaluation.tex tables.
@@ -2084,15 +2151,23 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
 
 
 def _recompile_neta_s_paper(cwd):
-    """Rebuild neta-s-paper/main.pdf with pdflatex+bibtex (latexmk absent)."""
+    """Rebuild neta-s-paper/main.pdf with pdflatex+bibtex (latexmk absent).
+
+    Builds under a temp jobname and atomically swaps the result into
+    main.pdf only on full success. This keeps the VSCode PDF.js preview
+    from ever reading a half-written file (which shows up as "Invalid PDF
+    structure") and prevents a halted pass from clobbering the last-good
+    main.pdf with a truncated partial.
+    """
     paper_dir = os.path.join(cwd, "neta-s-paper")
     main_tex = os.path.join(paper_dir, "main.tex")
     if not os.path.exists(main_tex):
         print(f"[paper-build] skipped (missing {main_tex})")
         return
+    job = "main_build"
     pdflatex = ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
-                "main.tex"]
-    steps = [pdflatex, ["bibtex", "main"], pdflatex, pdflatex]
+                "-jobname", job, "main.tex"]
+    steps = [pdflatex, ["bibtex", job], pdflatex, pdflatex]
     for step in steps:
         try:
             proc = subprocess.run(step, cwd=paper_dir,
@@ -2104,10 +2179,16 @@ def _recompile_neta_s_paper(cwd):
         if proc.returncode != 0:
             tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
             print(f"[paper-build] {' '.join(step)} failed "
-                  f"(exit {proc.returncode}); last lines:")
+                  f"(exit {proc.returncode}); keeping previous main.pdf. "
+                  f"Last lines:")
             for line in tail:
                 print(f"  {line}")
             return
+    built_pdf = os.path.join(paper_dir, f"{job}.pdf")
+    if not os.path.exists(built_pdf):
+        print(f"[paper-build] no {job}.pdf produced; keeping previous main.pdf")
+        return
+    os.replace(built_pdf, os.path.join(paper_dir, "main.pdf"))
     print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
 
 
@@ -2376,7 +2457,12 @@ def main():
                              "WORK_LIMIT}) as NOT done, so they get re-solved under the "
                              "current --timeout. Also catches legacy/positional rows whose "
                              "optimization_time falls within ±--rerun_timeout_eps seconds of "
-                             "a known cap (--rerun_timeout_values). Affects all skip-check "
+                             "a known cap (--rerun_timeout_values). A timeout row is only "
+                             "re-run when the current --timeout exceeds the time it already "
+                             "ran by more than --rerun_timeout_eps; a cell that already "
+                             "consumed the full (or a larger) budget is left as done, since "
+                             "a same-budget re-solve would just reproduce the timeout. "
+                             "Affects all skip-check "
                              "phases that scan .txt result files (Phases 1.5, 2, 2.5, 0.5). "
                              "Phase 1 (N1 state) uses .bin files instead — delete those "
                              "manually if you also need to re-solve the N1 state.")
@@ -2390,6 +2476,13 @@ def main():
                         metavar="SECS",
                         help="Tolerance (in seconds) used when matching a row's "
                              "optimization_time against --rerun_timeout_values. Default: 30.")
+    parser.add_argument("--geometric_intervals", action="store_true",
+                        help="Pass --geometric_intervals true to run.jl for TRANSLATION/ROTATION jobs "
+                             "(advstd N2 and stdBoost standard with use_perturbed_intervals). Exploits the "
+                             "pixel-relocation structure in the perturbed-interval coupling (interval-only, no "
+                             "zonotope; delta unchanged). run.jl adds a _geomInt filename tag, and the skip-check "
+                             "keeps these separate from the non-geomInt baseline so resume is correct. No-op for "
+                             "other perturbations / pi=false combos (run.jl warns and falls back).")
     parser.add_argument("--prioritize_rows", action="store_true",
                         help="In --advanced_standard mode, dispatch jobs in row-priority "
                              "order (row = (arch, perturbation)) so earlier rows finish "
@@ -2430,8 +2523,10 @@ def main():
     # _parse_c_source_target_pairs can consult them without threading the
     # flag through every caller.
     global _RERUN_TIMEOUTS, _TIMEOUT_VALUES, _TIMEOUT_MATCH_EPS
+    global _RERUN_TIMEOUT_BUDGET
     _RERUN_TIMEOUTS = bool(args.rerun_timeouts)
     if _RERUN_TIMEOUTS:
+        _RERUN_TIMEOUT_BUDGET = float(args.timeout)
         default_caps = [1800.0, 3600.0, float(args.timeout)]
         if args.rerun_timeout_values:
             caps = list(args.rerun_timeout_values)
@@ -2444,7 +2539,10 @@ def main():
         _TIMEOUT_MATCH_EPS = float(args.rerun_timeout_eps)
         print(f"[rerun_timeouts] enabled — treating rows with "
               f"solve_status ∈ timeout-set OR optimization_time within "
-              f"±{_TIMEOUT_MATCH_EPS}s of {list(_TIMEOUT_VALUES)} as not done")
+              f"±{_TIMEOUT_MATCH_EPS}s of {list(_TIMEOUT_VALUES)} as not done, "
+              f"but only re-running those whose prior runtime is below the new "
+              f"{_RERUN_TIMEOUT_BUDGET:g}s budget by more than {_TIMEOUT_MATCH_EPS}s "
+              f"(cells that already ran the full budget are kept as done)")
 
     total_cores = args.max_cores
     thresholds = args.thresholds if args.thresholds else THRESHOLDS
@@ -3124,11 +3222,17 @@ def main():
 
                             requested_c_targets = _parse_c_targets(
                                 args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
+                            # --geometric_intervals applies to translation/rotation advstd N2 jobs (which always
+                            # have use_perturbed_intervals=true). run.jl adds _geomInt; the skip-check keeps these
+                            # separate from the non-geomInt baseline so resume is correct.
+                            geom_applies_adv = (args.geometric_intervals
+                                                and pert_type in ("translation", "rotation"))
                             for seed in seed_vals:
                                 missing_adv_cts = _advstd_missing_c_targets(
                                     cwd, dataset, arch, pert_type, eps_str,
                                     n1_tag, base_name_to_save, seed,
-                                    c_tag, requested_c_targets)
+                                    c_tag, requested_c_targets,
+                                    geometric_intervals=geom_applies_adv)
                                 if not missing_adv_cts:
                                     n2_skipped += 1
                                     continue
@@ -3171,6 +3275,8 @@ def main():
                                     "--adv_std_var_hint", vh,
                                     "--gurobi_seed", str(seed),
                                 ]
+                                if geom_applies_adv:
+                                    cmd += ["--geometric_intervals", "true"]
                                 n1_label_for_advstd = n1_label_by_pert_ctag.get((arch, pert_spec, c_tag))
                                 if n1_label_for_advstd is None:
                                     ready_advstd_jobs.append((label, cmd))
@@ -3289,6 +3395,11 @@ def main():
                                     pert_type, f"eps_{eps_str}",
                                     f"{role}stdBoost_{arch}_{target_tag}")
                                 base_name_to_save_nn = f"{target_tag}_{role}"
+                                # --geometric_intervals applies to translation/rotation stdBoost jobs WITH
+                                # perturbed intervals (pi=true); run.jl warns+falls back otherwise (no _geomInt tag).
+                                geom_applies_std = (args.geometric_intervals
+                                                    and pert_type in ("translation", "rotation")
+                                                    and pi == "true")
 
                                 for seed in seed_vals:
                                     missing_nn_cts = _stdboost_missing_c_targets(
@@ -3296,7 +3407,8 @@ def main():
                                         arch, pert_type, eps_str,
                                         base_name_to_save_nn, seed,
                                         zb, sg, rt, pi,
-                                        c_tag, requested_c_targets)
+                                        c_tag, requested_c_targets,
+                                        geometric_intervals=geom_applies_std)
                                     if not missing_nn_cts:
                                         n2_skipped += 1
                                         continue
@@ -3338,6 +3450,8 @@ def main():
                                         "--nn1_sibling_gate", sg,
                                         "--gurobi_seed", str(seed),
                                     ]
+                                    if geom_applies_std:
+                                        nn_cmd += ["--geometric_intervals", "true"]
                                     ready_advstd_jobs.append((nn_label, nn_cmd))
 
             # Move stdBoost jobs with --use_perturbed_intervals=false to the

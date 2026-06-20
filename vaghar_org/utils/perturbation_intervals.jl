@@ -631,7 +631,146 @@ function composed_interval_constraints(m, nn1, nn2, perturbation, perturbation_s
 end
 
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# --geometric_intervals : relocation-aware INTERVAL bounds for translation/rotation (no zonotope).
+# All gated behind the geometric_intervals flag; geometric_diff_map !== nothing only for translation/rotation
+# on FC (Flatten-first) nets (k==1 for rotation). δ is unchanged — this is a sound bound tightening.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Correct per-pixel input-difference envelope for a relocation move: mapped dst Δ∈[-1,1]; zero-padded dst Δ∈[-1,0].
+function input_perturbation_envelope(perturbation, perturbation_size, input_shape, w, h, k)
+    n = w*h*k; res = w*h
+    channel_offsets = (k == 3) ? (0, res, 2*res) : (0,)
+    up = ones(Float64, n); down = -ones(Float64, n)
+    if perturbation == "translation"
+        sd = Int(perturbation_size[1]); sr = Int(perturbation_size[2]); covered = falses(n)
+        for i2 = 1:w, i1 = 1:h
+            di1 = i1 + sd; di2 = i2 + sr
+            if 1 <= di1 <= h && 1 <= di2 <= w
+                for off in channel_offsets; covered[off + di1 + h*(di2-1)] = true; end
+            end
+        end
+        for dst in 1:n; if !covered[dst]; up[dst] = 0.0; end; end
+    elseif perturbation == "rotation"
+        center = [w/2, h/2]; angle = perturbation_size[1]; mapped = falses(res)
+        for i = 1:h, j = 1:w
+            j_c = j - center[1]; i_c = i - center[2]
+            j_r = j_c*cos(angle*pi/180) - i_c*sin(angle*pi/180) + center[1]
+            i_r = j_c*sin(angle*pi/180) + i_c*cos(angle*pi/180) + center[2]
+            if floor(Int,j_r)>=1 && ceil(Int,j_r)<=w && floor(Int,i_r)>=1 && ceil(Int,i_r)<=h
+                mapped[i + (j-1)*h] = true
+            end
+        end
+        for tt in 1:res; if !mapped[tt]; up[tt] = 0.0; end; end
+    end
+    return reshape(up, input_shape), reshape(down, input_shape)
+end
+
+# (T-I) for translation: covered dst +1 at src, -1 at dst; padded dst -1 at dst. Exact transcription of the encoder.
+function geometric_diff_map_translation(sd, sr, w, h, k)
+    n = w*h*k; res = w*h
+    channel_offsets = (k == 3) ? (0, res, 2*res) : (0,)
+    S = zeros(Float64, n, n); covered = falses(n)
+    for i2 = 1:w, i1 = 1:h
+        di1 = i1 + sd; di2 = i2 + sr
+        if 1 <= di1 <= h && 1 <= di2 <= w
+            for off in channel_offsets
+                src = off + i1 + h*(i2-1); dst = off + di1 + h*(di2-1)
+                S[dst, src] += 1.0; S[dst, dst] -= 1.0; covered[dst] = true
+            end
+        end
+    end
+    for dst in 1:n; if !covered[dst]; S[dst, dst] = -1.0; end; end
+    return S
+end
+
+# (T-I) for rotation: accumulate the 4 bilinear weights at the 4 neighbours, then subtract identity. k==1 only
+# (encoder leaves k=3 channels 2/3 unpinned) -> nothing -> caller falls back to the plain per-pixel propagation.
+function geometric_diff_map_rotation(angle, w, h, k)
+    k == 1 || return nothing
+    n = w*h; center = [w/2, h/2]; T = zeros(Float64, n, n)
+    for i = 1:h, j = 1:w
+        j_c = j - center[1]; i_c = i - center[2]
+        j_r = j_c*cos(angle*pi/180) - i_c*sin(angle*pi/180) + center[1]
+        i_r = j_c*sin(angle*pi/180) + i_c*cos(angle*pi/180) + center[2]
+        if floor(Int,j_r)>=1 && ceil(Int,j_r)<=w && floor(Int,i_r)>=1 && ceil(Int,i_r)<=h
+            di = i_r-floor(i_r); dj = j_r-floor(j_r); dst = i + (j-1)*h
+            fi=floor(Int,i_r); ci=ceil(Int,i_r); fj=floor(Int,j_r); cj=ceil(Int,j_r)
+            T[dst, fi+(fj-1)*h] += (1-di)*(1-dj);  T[dst, ci+(fj-1)*h] += (di)*(1-dj)
+            T[dst, fi+(cj-1)*h] += (1-di)*(dj);    T[dst, ci+(cj-1)*h] += (di)*(dj)
+        end
+    end
+    for dst in 1:n; T[dst, dst] -= 1.0; end
+    return T
+end
+
+# Per-ReLU PRE-activation diff bounds. First Linear: M = W1*(T-I) (each (T-I) column piped through the net's
+# Flatten so rows align with post-Flatten neurons); exact box min/max over v_in∈[0,1]; interval-propagate deeper;
+# ReLU clip. FC nets only.
+function geometric_interval_diff_bounds(nn, TmI, input_shape)
+    relu_up = Array{Float64}[]; relu_dn = Array{Float64}[]
+    diff_up = Float64[]; diff_dn = Float64[]; diff_active = false; flat = nothing
+    for l in nn.layers
+        t = string(typeof(l))
+        if occursin("Flatten", t)
+            flat = l
+        elseif occursin("Linear", t)
+            W = Float64.(transpose(l.matrix))
+            if !diff_active
+                cols = [W * (flat === nothing ? TmI[:, i] :
+                              vec(reshape(TmI[:, i], input_shape) |> flat)) for i in 1:size(TmI, 2)]
+                M = hcat(cols...)
+                diff_dn = vec(sum(min.(0.0, M), dims=2)); diff_up = vec(sum(max.(0.0, M), dims=2))
+                diff_active = true
+            else
+                diff_dn, diff_up = interval_matrix_vector_multiplication(W, W, diff_dn, diff_up)
+            end
+        elseif occursin("ReLU", t)
+            push!(relu_up, copy(diff_up)); push!(relu_dn, copy(diff_dn))
+            diff_up = max.(0.0, diff_up); diff_dn = .- max.(0.0, .- diff_dn)
+        else
+            error("geometric_interval_diff_bounds: unsupported layer $(t) (FC Flatten/Linear/ReLU nets only)")
+        end
+    end
+    return relu_up, relu_dn
+end
+
+# Couple clean vs perturbed post-ReLU x_rect from the per-ReLU PRE-activation diff bounds (post-ReLU relaxation
+# [min(0,dn), max(0,up)]). Mirrors the coupling perturbed_interval_constraints adds in the plain path.
+function add_geometric_coupling(m, nn, clean_prefix, pert_prefix, relu_up, relu_dn)
+    av = JuMP.all_variables(m); layer_cnt = 0; constraints_added = 0
+    for l in nn.layers
+        if occursin("ReLU", string(typeof(l)))
+            layer_cnt += 1
+            (layer_cnt <= length(relu_up)) || continue
+            post_up = max.(0.0, relu_up[layer_cnt]); post_dn = .- max.(0.0, .- relu_dn[layer_cnt])
+            vec_clean = Int[]; vec_pert = Int[]
+            for nidx in eachindex(av)
+                nm = JuMP.name(av[nidx])
+                if occursin(clean_prefix*"x_rect_layerCount"*string(layer_cnt)*"_", nm); push!(vec_clean, nidx)
+                elseif occursin(pert_prefix*"x_rect_layerCount"*string(layer_cnt)*"_", nm); push!(vec_pert, nidx) end
+            end
+            if !isempty(vec_clean) && !isempty(vec_pert)
+                constraints_added += add_matched_interval_constraints!(m, av, vec_clean, vec_pert,
+                                                                       ensure_1d(post_up), ensure_1d(post_dn))
+            end
+        end
+    end
+    println("  geometric-interval coupling: $constraints_added constraints ($(clean_prefix)/$(pert_prefix))")
+    return constraints_added
+end
+
+
 function perturbed_interval_constraints(m, nn, clean_prefix, pert_prefix)
+    global geometric_intervals, geometric_diff_map, geometric_input_shape
+    if geometric_intervals && geometric_diff_map !== nothing
+        gup, gdn = geometric_interval_diff_bounds(nn, geometric_diff_map, geometric_input_shape)
+        return add_geometric_coupling(m, nn, clean_prefix, pert_prefix, gup, gdn)
+    end
+    return perturbed_interval_constraints_plain(m, nn, clean_prefix, pert_prefix)
+end
+
+function perturbed_interval_constraints_plain(m, nn, clean_prefix, pert_prefix)
     global I_pert_prev_up
     global I_pert_prev_down
 

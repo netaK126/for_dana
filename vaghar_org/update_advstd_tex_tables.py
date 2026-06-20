@@ -3904,6 +3904,10 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                 "lb_total": val.get("lower_bound"),
                                 "ub_total": val.get("upper_bound"),
                                 "solve_status": val.get("solve_status", ""),
+                                # geometric_intervals twin (same cell, same
+                                # delta, faster/slower solve): paired as base,geom
+                                # in the time column by the renderer.
+                                "geom": ("_geomInt" in fname),
                             })
     return rows
 
@@ -4589,6 +4593,12 @@ def update_wide_perarch_tex(tex_path, body):
 AAAI_WIDE_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_tables"
 AAAI_WIDE_END_MARK   = "% END AUTO: aaai_safe_wide_tables"
 
+# Source-network (N1) per-cell tables. These live in the appendix
+# (sec_appendix_percell.tex); the target-network (N2) tables stay in the
+# evaluation body between the AAAI_WIDE marks above.
+AAAI_WIDE_N1_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_n1_tables"
+AAAI_WIDE_N1_END_MARK   = "% END AUTO: aaai_safe_wide_n1_tables"
+
 # Body-section summary table (Table 2 in the paper): one row per architecture
 # with the transfer-mode bound gap vs. the exact VHAGaR bound and the
 # transfer-mode speedup over VHAGaR. Lives between these markers in
@@ -4662,10 +4672,20 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                                     delta_max_by_key=None,
                                     delta_d_by_key=None,
                                     force_timeout=None,
-                                    rerun_timeout_eps=30.0):
+                                    rerun_timeout_eps=30.0,
+                                    roles=None,
+                                    label_suffix=""):
     """Slim version of _render_wide_perarch_body: only the four safe-combo
     columns and table* (two-column-spanning) floats, suitable for inclusion
     in the AAAI 2026 paper's evaluation section.
+
+    `roles`, when given, keeps only blocks for those network roles (e.g.
+    {"N2"} for the target-network tables in the body or {"N1"} for the
+    source-network tables in the appendix). `label_suffix` is appended to
+    each table's \\label so the body and appendix tables get distinct
+    labels (the body uses "", the N1 appendix uses "-n1"). The shared
+    header macro is emitted with \\providecommand so both the body and the
+    appendix block can define it without a redefinition clash.
 
     Data shape and column semantics are identical to the full table; only
     the column subset and the surrounding LaTeX shell differ. When
@@ -4689,26 +4709,39 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
 
     from collections import defaultdict
     buckets = defaultdict(lambda: defaultdict(
-        lambda: {"t": [], "lb": [], "ub": [], "status": [],
-                  "c_targets": set()}))
+        lambda: {"t_base": [], "t_geom": [], "lb_base": [], "lb_geom": [],
+                  "ub_base": [], "ub_geom": [], "status": [],
+                  "c_targets": set(), "c_targets_geom": set()}))
     for r in rows:
         key = (r["arch"], r["role"], r["perturbation"],
                r["perturbation_size"], r["c_source"])
         cell = buckets[key][r["combo"]]
-        cell["t"].append(r["t_total"])
+        # Split the solve time AND the delta bounds by the geometric_intervals
+        # twin flag, so every cell renders "base/geom" for delta_l, delta_u and
+        # t. status / c_targets (the partial-asterisk coverage) come from the
+        # BASELINE runs only, so the asterisk reflects baseline completeness.
+        is_geom = bool(r.get("geom"))
+        t_total = r.get("t_total")
+        if t_total is not None:
+            (cell["t_geom"] if is_geom else cell["t_base"]).append(t_total)
         lb = r.get("lb_total")
         if lb is not None and math.isfinite(lb):
-            cell["lb"].append(lb)
+            (cell["lb_geom"] if is_geom else cell["lb_base"]).append(lb)
         ub = r.get("ub_total")
         if ub is not None and math.isfinite(ub):
-            cell["ub"].append(ub)
-        cell["status"].append(str(r.get("solve_status", "") or ""))
+            (cell["ub_geom"] if is_geom else cell["ub_base"]).append(ub)
+        # c_target coverage tracked PER SIDE, so base and geom each get their
+        # own partial "*" when that side missed an expected class-pair.
         ct = r.get("c_target")
         if ct is not None:
             try:
-                cell["c_targets"].add(int(ct))
+                (cell["c_targets_geom"] if is_geom
+                 else cell["c_targets"]).add(int(ct))
             except (TypeError, ValueError):
                 pass
+        if is_geom:
+            continue
+        cell["status"].append(str(r.get("solve_status", "") or ""))
 
     columns = [col for col, _hdr in _AAAI_WIDE_COLUMNS]
 
@@ -4724,22 +4757,24 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
     sub_cells = ["", ""]
     for _ in _AAAI_WIDE_COLUMNS:
         sub_cells += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
-    lines.append(r"\newcommand{\aaaisafewideheader}{%")
+    lines.append(r"\providecommand{\aaaisafewideheader}{%")
     lines.append(" & ".join(header_cells) + r" \\")
     lines.append(" & ".join(sub_cells) + r" \\}")
     lines.append("")
 
     for arch in archs:
         arch_keys = sorted(
-            (k for k in buckets if k[0] == arch),
+            (k for k in buckets
+             if k[0] == arch and (roles is None or k[1] in roles)),
             key=lambda k: (k[1], k[4], k[2], k[3]),  # role, c_src, pert, p_size
         )
         if not arch_keys:
             continue
-        # Drop rows where every one of the 4 columns has no data
+        # Drop rows where every one of the 4 columns has no data (base or geom)
         arch_keys = [
             k for k in arch_keys
-            if any(buckets[k].get(c) and buckets[k][c].get("t")
+            if any(buckets[k].get(c)
+                   and (buckets[k][c].get("t_base") or buckets[k][c].get("t_geom"))
                    for c in columns)
         ]
         if not arch_keys:
@@ -4818,25 +4853,40 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 # Pre-compute stats for each rendered column
                 stats = {}
                 partial = {}
+                partial_geom = {}
                 for c in columns:
                     cell = cell_dict.get(c)
-                    if not cell or not cell.get("t"):
+                    if not cell or not (cell.get("t_base") or cell.get("t_geom")):
                         continue
                     s = {}
-                    s["t"] = sum(cell["t"]) / len(cell["t"]) / 60.0
-                    if cell["lb"] and dmax_ub is not None:
-                        s["lb_pct"] = (sum(cell["lb"]) / len(cell["lb"])
-                                       / dmax_ub) * 100.0
-                    if cell["ub"] and dmax_ub is not None:
-                        s["ub_pct"] = (sum(cell["ub"]) / len(cell["ub"])
-                                       / dmax_ub) * 100.0
+                    if cell.get("t_base"):
+                        s["t_base"] = (sum(cell["t_base"])
+                                       / len(cell["t_base"]) / 60.0)
+                    if cell.get("t_geom"):
+                        s["t_geom"] = (sum(cell["t_geom"])
+                                       / len(cell["t_geom"]) / 60.0)
+                    if dmax_ub is not None:
+                        if cell["lb_base"]:
+                            s["lb_pct_base"] = (sum(cell["lb_base"])
+                                / len(cell["lb_base"]) / dmax_ub) * 100.0
+                        if cell["lb_geom"]:
+                            s["lb_pct_geom"] = (sum(cell["lb_geom"])
+                                / len(cell["lb_geom"]) / dmax_ub) * 100.0
+                        if cell["ub_base"]:
+                            s["ub_pct_base"] = (sum(cell["ub_base"])
+                                / len(cell["ub_base"]) / dmax_ub) * 100.0
+                        if cell["ub_geom"]:
+                            s["ub_pct_geom"] = (sum(cell["ub_geom"])
+                                / len(cell["ub_geom"]) / dmax_ub) * 100.0
                     stats[c] = s
-                    seen_cts = cell.get("c_targets", set())
-                    # The cell is partial iff at least one expected
-                    # c_target wasn't run. Don't penalise extra
-                    # c_targets that fell outside expected_cts_block
-                    # (e.g. dataset-specific quirks).
-                    partial[c] = bool(expected_cts_block - seen_cts)
+                    # A side is partial iff at least one expected c_target
+                    # wasn't run on that side. Don't penalise extra c_targets
+                    # outside expected_cts_block (e.g. dataset-specific quirks).
+                    # Tracked per side so base and geom each get their own "*".
+                    partial[c] = bool(expected_cts_block
+                                      - cell.get("c_targets", set()))
+                    partial_geom[c] = bool(expected_cts_block
+                                           - cell.get("c_targets_geom", set()))
                 # Drop the row if no rendered column has data
                 if not stats:
                     continue
@@ -4849,24 +4899,55 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     if s is None:
                         data_cells += ["---", "---", "---"]
                         continue
-                    # Clamp for display: delta_l (% of delta_max) below 0
-                    # shows 0, delta_u above 100 shows 100.
-                    data_cells.append(_fmt_sig(max(0.0, s['lb_pct'])) if "lb_pct" in s else "---")
-                    data_cells.append(_fmt_sig(min(100.0, s['ub_pct'])) if "ub_pct" in s else "---")
-                    # Time is in minutes; when --force_timeout is set the
-                    # rows that survived the timeout-mismatch filter all
-                    # ran under that cap, so a mean above it is overhead
-                    # beyond the solver limit and is clamped to the forced
-                    # timeout (force_timeout is in seconds).
-                    if "t" in s:
-                        t_val = s["t"]
+                    # Every sub-column renders "base/geom" (baseline run vs its
+                    # --geometric_intervals twin). A side with no runs shows "?"
+                    # (geometric_intervals is inapplicable to linf/brightness/
+                    # occ/patch, or its run is absent); the whole sub-column is
+                    # "---" when neither side has data. delta is a sound
+                    # tightening, so base/geom match except where a run timed out
+                    # at a different gap or the baseline/geom c_target coverage
+                    # differs.
+                    def _pair(bk, gk, fmt):
+                        hb, hg = bk in s, gk in s
+                        if not hb and not hg:
+                            return "---"
+                        return ((fmt(s[bk]) if hb else "?") + "/"
+                                + (fmt(s[gk]) if hg else "?"))
+                    # Clamp for display: delta_l (% of delta_max) below 0 shows
+                    # 0, delta_u above 100 shows 100.
+                    data_cells.append(_pair("lb_pct_base", "lb_pct_geom",
+                                            lambda x: _fmt_sig(max(0.0, x))))
+                    data_cells.append(_pair("ub_pct_base", "ub_pct_geom",
+                                            lambda x: _fmt_sig(min(100.0, x))))
+                    # Time column reads "base/geom": the baseline solve time
+                    # and the --geometric_intervals twin's solve time (same
+                    # delta, so this is a pure speed comparison). A side with
+                    # no runs renders "?" (e.g. linf/brightness/occ/patch,
+                    # where geometric_intervals is structurally inapplicable,
+                    # or a translation/rotation cell whose geom run is absent);
+                    # the whole cell is "---" when neither side has data.
+                    # Time is in minutes; when --force_timeout is set the rows
+                    # that survived the timeout-mismatch filter all ran under
+                    # that cap, so a mean above it is overhead beyond the
+                    # solver limit and is clamped (force_timeout is in seconds).
+                    # Each side carries its OWN partial "*": base is starred
+                    # when the baseline sweep missed a class-pair, geom when the
+                    # geometric_intervals sweep did. A "?" side (no runs) is
+                    # never starred; the whole cell is "---" when both are "?".
+                    STAR = r"\textcolor{red}{$^*$}"
+                    def _t_side(key, is_partial):
+                        if key not in s:
+                            return "?"
+                        v = s[key]
                         if force_timeout is not None:
-                            t_val = min(t_val, force_timeout / 60.0)
-                        t_str = _fmt_trim(t_val)
-                    else:
+                            v = min(v, force_timeout / 60.0)
+                        return _fmt_trim(v) + (STAR if is_partial else "")
+                    base_side = _t_side("t_base", partial.get(c))
+                    geom_side = _t_side("t_geom", partial_geom.get(c))
+                    if base_side == "?" and geom_side == "?":
                         t_str = "---"
-                    if partial.get(c) and t_str != "---":
-                        t_str = t_str + r"\textcolor{red}{$^*$}"
+                    else:
+                        t_str = base_side + "/" + geom_side
                     data_cells.append(t_str)
                 block_rows.append(data_cells)
 
@@ -4897,6 +4978,20 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             lines[-1] = r"\bottomrule"
         lines.append(r"\end{tabular}%")
         lines.append(r"\end{adjustbox}")
+        if roles is not None and set(roles) == {"N2"}:
+            role_note = (r"This table reports the target network $N_2$; "
+                         r"per-cell results for the source network $N_1$ "
+                         r"are in Table~\ref{tab:safe-wide-"
+                         + safe_arch + r"-n1}.")
+        elif roles is not None and set(roles) == {"N1"}:
+            role_note = (r"This table reports the source network $N_1$, "
+                         r"for which transfer-mode does not apply (transfer "
+                         r"is $N_2$-only), so the transfer columns are "
+                         r"blank; the target network $N_2$ is in "
+                         r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
+        else:
+            role_note = (r"Transfer columns are blank on $N_1$ rows since "
+                         r"transfer-mode is $N_2$-only.")
         cap = (
             f"{arch} --- per-cell comparison of the original VHAGaR "
             r"baseline against our standard- and transfer-mode safe "
@@ -4905,8 +5000,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             r"\emph{zono + SibGate} combo with perturbed-interval "
             r"constraints. \emph{Transfer} adds the \emph{adv + "
             r"prev\_pgd} variable-hint pipeline that reuses $N_1$'s "
-            r"solver state; transfer columns are blank on $N_1$ rows "
-            r"since transfer-mode is $N_2$-only. Each cell is "
+            r"solver state. " + role_note + r" Each cell is "
             r"$(\delta_l, \delta_u, t)$ with $\delta_l$ and $\delta_u$ "
             r"in per-cent of $\delta_{\max}$ and $t$ in wall-clock "
             r"minutes (mean over $c_t$ and Gurobi seeds). Each block "
@@ -4919,26 +5013,28 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             r"over only some of the expected target classes."
         )
         lines.append(f"\\caption{{{cap}}}")
-        lines.append(f"\\label{{tab:safe-wide-{safe_arch}}}")
+        lines.append(f"\\label{{tab:safe-wide-{safe_arch}{label_suffix}}}")
         lines.append(r"\end{table*}")
         lines.append("")
 
     return "\n".join(lines)
 
 
-def update_aaai_wide_perarch_tex(tex_path, body):
-    """Rewrite the % BEGIN AUTO: aaai_safe_wide_tables block in tex_path."""
+def update_aaai_wide_perarch_tex(tex_path, body,
+                                 begin_mark=AAAI_WIDE_BEGIN_MARK,
+                                 end_mark=AAAI_WIDE_END_MARK):
+    """Rewrite the block between begin_mark and end_mark in tex_path."""
     with open(tex_path) as f:
         text = f.read()
-    if AAAI_WIDE_BEGIN_MARK not in text or AAAI_WIDE_END_MARK not in text:
+    if begin_mark not in text or end_mark not in text:
         raise SystemExit(
             f"aaai_safe_wide markers not found in {tex_path}; expected lines "
-            f"containing '{AAAI_WIDE_BEGIN_MARK}' and "
-            f"'{AAAI_WIDE_END_MARK}'")
-    pre, rest = text.split(AAAI_WIDE_BEGIN_MARK, 1)
-    _body, post = rest.split(AAAI_WIDE_END_MARK, 1)
-    updated = (f"{pre}{AAAI_WIDE_BEGIN_MARK}\n{body}\n"
-               f"{AAAI_WIDE_END_MARK}{post}")
+            f"containing '{begin_mark}' and "
+            f"'{end_mark}'")
+    pre, rest = text.split(begin_mark, 1)
+    _body, post = rest.split(end_mark, 1)
+    updated = (f"{pre}{begin_mark}\n{body}\n"
+               f"{end_mark}{post}")
     if updated == text:
         print("[update_advstd_tex_tables] no changes to aaai_safe_wide block")
         return
@@ -4952,11 +5048,20 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           parse_result_file,
                                           seeds_filter=None,
                                           force_timeout=None,
-                                          rerun_timeout_eps=30.0):
+                                          rerun_timeout_eps=30.0,
+                                          roles=None,
+                                          label_suffix="",
+                                          begin_mark=AAAI_WIDE_BEGIN_MARK,
+                                          end_mark=AAAI_WIDE_END_MARK):
     """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
     AAAI variant into the neta_s_paper evaluation section. When
     `force_timeout` is set (in seconds), cells whose Gurobi run hit a
-    termination limit under a different wall-clock cap are excluded."""
+    termination limit under a different wall-clock cap are excluded.
+
+    `roles`/`label_suffix`/`begin_mark`/`end_mark` select which network
+    role to emit and where: the target-network (N2) tables go to the body
+    with the default marks, and the source-network (N1) tables go to the
+    appendix with roles={"N1"}, label_suffix="-n1", and the N1 marks."""
     try:
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                             parse_result_file,
@@ -4971,8 +5076,12 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
             delta_max_by_key=delta_max_by_key,
             delta_d_by_key=delta_d_by_key,
             force_timeout=force_timeout,
-            rerun_timeout_eps=rerun_timeout_eps)
-        update_aaai_wide_perarch_tex(tex_path, body)
+            rerun_timeout_eps=rerun_timeout_eps,
+            roles=roles,
+            label_suffix=label_suffix)
+        update_aaai_wide_perarch_tex(tex_path, body,
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark)
     except SystemExit as exc:
         print(f"[update_advstd_tex_tables] aaai_safe_wide block skipped: "
               f"{exc}")
@@ -5273,6 +5382,9 @@ def _load_advstd_rows_for_wide(cwd, dataset, archs, seeds_filter=None,
                     "lb_total": _f("delta_advstd_lower_bound"),
                     "ub_total": _f("delta_advstd_upper_bound"),
                     "solve_status": r.get("solve_status_advstd", ""),
+                    # geometric_intervals twin flag from the advstd CSV's
+                    # geom column ("yes"/"no") -> paired as base,geom in time.
+                    "geom": (str(r.get("geom", "no")) == "yes"),
                 })
     return rows
 

@@ -58,6 +58,10 @@ global hybrid_solve::Bool = false  # two-phase solve: start with scalar bound, l
 global use_zonotope::Bool = false
 global refined_relu_zonotope::Bool = false
 global zonotope_conv::Bool = false   # activate zonotope propagation through conv layers
+# --geometric_intervals: relocation-aware interval bounds for translation/rotation (default OFF = no change).
+global geometric_intervals::Bool = false
+global geometric_diff_map = nothing          # the (T-I) matrix for the current build, or nothing
+global geometric_input_shape = nothing       # size(input) for the current build
 global zonotope_max_order::Int = 0   # max zonotope order (generators / neurons); 0 = unlimited
 global bound_n2_relu_using_zonotope::Bool = false  # tighten ReLU preact bounds of N2 by intersecting with N1 preact + zonotope diff
 global n1_stability_relax_threshold::Float64 = -1.0  # transfer-aware: replace N2 binary with triangle LP relaxation when N1 neuron is stable and gap <= threshold; <0 = disabled

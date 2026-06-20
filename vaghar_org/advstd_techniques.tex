@@ -1,4 +1,27 @@
 %% ═══════════════════════════════════════════════════════════════════════════════
+%% Standalone wrapper. This file was historically compiled on its own
+%% (see advstd_techniques.pdf); the preamble below restores that. The macro and
+%% package set mirrors neta-s-paper/main.tex so the body renders identically.
+%% ═══════════════════════════════════════════════════════════════════════════════
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\usepackage[outline]{contour}
+\contourlength{0.08em}
+\usepackage{hyperref}
+
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\ep}{\varepsilon}
+\newcommand{\dexact}{\delta^*}
+
+\begin{document}
+
+%% ═══════════════════════════════════════════════════════════════════════════════
 \section{Key Ideas}
 \label{sec:key_ideas}
 %% ═══════════════════════════════════════════════════════════════════════════════
@@ -119,6 +142,33 @@ $k$ at layer $m=1$ has incoming weight row $(w_{1,k}, w_{2,k}) = (1, -2)$. The i
 \caption{Worked example of perturbed-interval propagation for the neuron with weight row $(1,-2)$ under $\ep=0.1$. Each input neuron is labelled with its weight on the edge to neuron $k$, and each edge carries the up and down per-edge contributions $w\cdot\Delta^{a,\uparrow}_{0}$ and $w\cdot\Delta^{a,\downarrow}_{0}$; with $\Delta^{a}_0\in[-0.1,0.1]$ per coordinate, summing them gives the pre-activation drift $[-0.3,0.3]$, and the ReLU clip leaves $[\Delta^{a,\downarrow}_{1,k},\Delta^{a,\uparrow}_{1,k}]=[-0.3,0.3]$, which couples the two copies and is added to the MIP.}
 \label{fig:pi_example}
 \end{figure}
+
+\paragraph{Relocation-Aware Perturbed Intervals.}
+\label{sec:tech:geom}
+
+The recurrence above models the perturbed input as the clean input plus per-pixel noise, $x_p = x + v_e$ with $v_e \in [-\ep,\ep]^n$. This is the correct model for $\ell_\infty$ and brightness, but not for geometric perturbations such as translation and rotation. A geometric perturbation does not add noise to a pixel; it \emph{relocates} pixel values, so the intensity at one location is copied (translation) or blended (rotation) from other locations, and locations that fall outside the frame become black. Initializing the recurrence with the generic input box $[-\ep\mathbf{1}, +\ep\mathbf{1}]$ is then both meaningless and wasteful, because for a move $\ep$ is a shift count or a rotation angle rather than a bound on how much a pixel intensity can change. We instead feed the recurrence the exact algebraic structure of the move, which yields far tighter drift bounds while leaving $\hat{\delta}_{c_t}$ unchanged.
+
+A translation and a rotation are both linear maps of the clean image. Each is a fixed matrix $T \in \RR^{n \times n}$ acting on the input, so the perturbed input is $x_p = T x$ and the input drift is exactly
+\begin{equation}
+  \Delta_0 = x_p - x = (T - I)\, x,
+  \label{eq:geom_drift}
+\end{equation}
+a known linear function of the clean image rather than a free box. For a translation by $(s_d, s_r)$ pixels, $T = S$ is the shift operator: row $d$ of $S$ has a single $1$ at the source pixel that lands on $d$, or is all zeros when $d$ falls outside the frame, so $x_p$ either copies one clean pixel into $d$ or sets $d$ to $0$. For a rotation by an angle $\theta$, $T = R$ is the bilinear sampler: row $d$ of $R$ holds the four bilinear interpolation weights of the rotated source location of $d$, which are nonnegative and sum to $1$, or is all zeros when that location is outside the frame.
+
+We exploit \eqref{eq:geom_drift} by folding $(T-I)$ into the first affine layer instead of seeding the recurrence at the input. With first-layer weight $W_1$, the shared bias cancels in the difference and the first pre-activation drift is the single linear map $\Delta^{z}_{1} = W_1^\top (T-I)\, x = M x$, where $M = W_1^\top (T-I)$. Because each clean pixel ranges independently over $x_j \in [0,1]$, the exact range of each coordinate $(Mx)_k = \sum_j M_{k,j}\, x_j$ is attained at a box corner, which gives the closed form
+\begin{equation}
+  \Delta^{z,\downarrow}_{1,k} = \textstyle\sum_j \min(0,\, M_{k,j}), \qquad
+  \Delta^{z,\uparrow}_{1,k}   = \textstyle\sum_j \max(0,\, M_{k,j}).
+  \label{eq:geom_first}
+\end{equation}
+From the second layer onward nothing changes: we apply the same affine recurrence \eqref{eq:pi_affine} and ReLU clip \eqref{eq:pi_relu}, and we add the same coupling constraints \eqref{eq:pi_upper} and \eqref{eq:pi_lower}. As a concrete case, a right shift by $s$ pixels sets $x_p[d] = x[d-s]$, so the drift $\Delta_0[d] = x[d-s] - x[d]$ lies in $[-1,1]$, bounded by the pixel intensities alone and far tighter than the generic per-pixel seed $[-s,s]$ that grows with the shift. This composition applies whenever the first layer is fully connected; a convolutional first layer is also linear, but our implementation then falls back to the generic recurrence.
+
+\paragraph{Soundness.}
+The relocation-aware bounds are sound: the interval $[\Delta^{\downarrow}_{m,k}, \Delta^{\uparrow}_{m,k}]$ over-approximates the true post-ReLU drift of neuron $(m,k)$ for every clean image $x \in [0,1]^n$, so the constraints \eqref{eq:pi_upper} and \eqref{eq:pi_lower} cut no feasible point and the computed $\hat{\delta}_{c_t}$ is unchanged. We prove this separately for translation and rotation. In both cases the first-layer range \eqref{eq:geom_first} is in fact exact, and the deeper ReLU and affine steps are sound interval enclosures by the same argument as the generic recurrence, so it suffices to establish $x_p = T x$ and the exactness of \eqref{eq:geom_first}.
+
+\emph{Translation.} The encoder pins each perturbed pixel to a clean pixel: $x_p[d] = x[\mathrm{src}(d)]$ when the destination $d$ is in frame, and $x_p[d] = 0$ when $d$ is padded. Both cases are exactly row $d$ of $S$ applied to $x$, so $x_p = S x$ and $\Delta_0 = (S - I)x$ hold with equality rather than as a relaxation. Hence the first pre-activation drift is the exact linear map $M x$ with $M = W_1^\top (S - I)$, and since each $x_j$ varies independently over $[0,1]$, the minimum and the maximum of $\sum_j M_{k,j} x_j$ are attained by setting $x_j = 1$ exactly on the negative and the positive entries of row $k$, which is \eqref{eq:geom_first}. The first-layer interval is therefore the tight range of the drift, while the ReLU clip \eqref{eq:pi_relu} and the deeper affine steps \eqref{eq:pi_affine} are sound enclosures, so the final per-neuron interval contains the true drift for every $x \in [0,1]^n$. The coupling constraints thus hold at every feasible MIP point, and $\hat{\delta}_{c_t}$ is preserved.
+
+\emph{Rotation.} The encoder pins each perturbed pixel to the bilinear blend of its rotated source: $x_p[d] = \sum_{q} R_{d,q}\, x[q]$ with weights $R_{d,q} \ge 0$ that sum to $1$ when the source is in frame, and $x_p[d] = 0$ when it is out of frame. Both cases are exactly row $d$ of $R$ applied to $x$, so $x_p = R x$ and $\Delta_0 = (R - I)x$ hold with equality. The rest of the argument is identical to the translation case with $S$ replaced by $R$: the first-layer range \eqref{eq:geom_first} with $M = W_1^\top (R - I)$ is exact because each $x_j \in [0,1]$ independently, and the subsequent ReLU and affine steps are sound enclosures. Moreover, each bilinear weight lies in $[0,1]$ and every in-frame row of $R$ sums to $1$, so each perturbed pixel stays in $[0,1]$ and matches the encoder's variable bounds, which means no admissible rotation is excluded. Hence the constraints are sound and $\hat{\delta}_{c_t}$ is preserved.
 
 \paragraph{Zonotope Bound Tightening.}
 \label{sec:tech:zono}
@@ -362,4 +412,88 @@ three-way consensus filter against any existing entry:
 (i)~\emph{fill} when PGD left $\mathrm{Start}(a_i)$ unset, by setting $\mathrm{Start}(a_i) 
 \leftarrow \mathtt{hint\_val}(a_i)$; (ii)~\emph{leave} when PGD's value already matches 
 $\mathtt{hint\_val}(a_i)$; (iii)~\emph{withdraw} when PGD's value disagrees with 
-$\mathtt{hint\_val}(a_i)$, by clearing $\mathrm{Start}(a_i)$ back to unset. 
+$\mathtt{hint\_val}(a_i)$, by clearing $\mathrm{Start}(a_i)$ back to unset.
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+\section{The \texttt{-{}-geometric\_intervals} Flag in \texttt{run.jl}}
+\label{sec:geom_flag}
+%% ═══════════════════════════════════════════════════════════════════════════════
+
+This section explains, in the simplest possible terms, the command-line flag
+\texttt{-{}-geometric\_intervals} in \texttt{run.jl}. It is the on/off switch for the
+relocation-aware bounds described in the Relocation-Aware Perturbed Intervals discussion above.
+
+\paragraph{The one-sentence version.}
+Turning the flag on makes the verifier compute \emph{tighter} bounds for translation and rotation,
+so the solver (Gurobi) finishes the same job faster. It does \emph{not} change the answer
+$\hat{\delta}_{c_t}$ --- only the time it takes to get there. The flag is \texttt{false} by default,
+which is exactly today's behaviour.
+
+\paragraph{What problem it fixes.}
+By default the verifier treats \emph{every} perturbation as ``add a little noise to each pixel,''
+where the noise is at most the budget $\ep$ in size. That is the right picture for an $\ell_\infty$
+or brightness attack. For a translation or a rotation it is the \emph{wrong} picture: the move does
+not add noise to a pixel, it \emph{moves} pixel values around the image. Here $\ep$ means ``shift by
+this many pixels'' or ``rotate by this angle,'' which says nothing about how much a single pixel's
+brightness can change. So the default per-pixel box $[-\ep,\ep]$ is both meaningless and far too loose
+for these moves, and a loose bound makes the solver explore a needlessly large search space.
+
+\paragraph{What the flag does instead.}
+When the flag is on, the verifier uses the actual geometry of the move. A shift or rotation simply
+copies (or, for rotation, blends) a brightness value from one location to another, and every pixel
+value lives in $[0,1]$. From that single fact we get a much tighter per-pixel rule for how much a
+pixel can change:
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item a pixel that \emph{receives} a value from elsewhere can change by at most $\pm 1$, i.e.\
+        $\Delta \in [-1, 1]$;
+  \item a pixel that the move pushes \emph{off the image} (and is therefore set to black) can only go
+        down, i.e.\ $\Delta \in [-1, 0]$.
+\end{itemize}
+Internally the flag hands the solver the move's exact ``relocation map'' $(T-I)$ from
+Eq.~\eqref{eq:geom_drift}, folds it into the first network layer (Eq.~\eqref{eq:geom_first}), and from
+there propagates the tight per-pixel changes through the rest of the network with the same recurrence
+and ReLU clip as before (Eqs.~\eqref{eq:pi_affine} and~\eqref{eq:pi_relu}). The resulting bounds are
+typically much tighter than the generic $[-\ep,\ep]$, and that is what makes the solve faster.
+
+\paragraph{A tiny example.}
+Shift the image one step to the right by $s$ pixels. Pixel $d$ now shows whatever used to sit at pixel
+$d-s$, so its change is $x[d-s] - x[d]$, which lies in $[-1, 1]$. The default reasoning would report
+$[-s, s]$, a box that grows with the shift; the geometric bound stays inside $[-1, 1]$ no matter how
+large $s$ is.
+
+\paragraph{When it actually kicks in (and when it is ignored).}
+The flag does something only when \emph{all} of the following hold; otherwise \texttt{run.jl} prints a
+warning and silently falls back to the default (off) behaviour:
+\begin{itemize}[noitemsep,topsep=2pt]
+  \item the perturbation is \texttt{translation} or \texttt{rotation} --- the only pixel-relocation
+        moves; for anything else the flag is ignored;
+  \item \texttt{-{}-use\_perturbed\_intervals=true} --- the flag only sharpens the clean-vs-perturbed
+        coupling constraints, so with perturbed intervals turned off there is nothing for it to sharpen;
+  \item the network's first layer is fully connected (a \texttt{Flatten} feeding a dense layer), because
+        the trick is folded into that first affine layer; a convolutional first layer falls back to the
+        generic per-pixel bounds. For rotation the flag additionally applies to a single fixed angle.
+\end{itemize}
+It is interval-only: no zonotope is involved on this path.
+
+\paragraph{Is it safe?}
+Yes. The per-pixel rule above is a sound over-approximation of the true change, so no valid
+perturbation is ever excluded and the verified $\hat{\delta}_{c_t}$ is identical whether the flag is on
+or off (this is the Soundness argument above). The only thing that changes is the running time.
+
+\paragraph{Reading the results.}
+A run launched with the flag tags its output files with a \texttt{\_geomInt} suffix. That way a
+geometric-interval run sits right next to its plain twin, and the two can be lined up and compared
+--- same $\hat{\delta}_{c_t}$, hopefully a smaller solve time.
+
+%% ═══════════════════════════════════════════════════════════════════════════════
+%% Self-contained bibliography (single citation). Mirrors references.bib so no
+%% external .bib / bibtex pass is needed for standalone compilation.
+%% ═══════════════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{1}
+\bibitem{singh2018fast}
+G.~Singh, T.~Gehr, M.~Mirman, M.~P\"uschel, and M.~T. Vechev.
+\newblock Fast and Effective Robustness Certification.
+\newblock In \emph{Advances in Neural Information Processing Systems 31, NeurIPS 2018}, pages 10825--10836, 2018.
+\end{thebibliography}
+
+\end{document}
