@@ -4594,10 +4594,22 @@ AAAI_WIDE_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_tables"
 AAAI_WIDE_END_MARK   = "% END AUTO: aaai_safe_wide_tables"
 
 # Source-network (N1) per-cell tables. These live in the appendix
-# (sec_appendix_percell.tex); the target-network (N2) tables stay in the
-# evaluation body between the AAAI_WIDE marks above.
+# (sec_appendix_percell.tex).
 AAAI_WIDE_N1_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_n1_tables"
 AAAI_WIDE_N1_END_MARK   = "% END AUTO: aaai_safe_wide_n1_tables"
+
+# Target-network (N2) per-cell tables relocated to the appendix
+# (sec_appendix_percell.tex), alongside the N1 tables. The evaluation
+# body shows the N2 time charts (below) in their place; the full per-cell
+# N2 bounds live here.
+AAAI_WIDE_N2_APPENDIX_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_n2_appendix_tables"
+AAAI_WIDE_N2_APPENDIX_END_MARK   = "% END AUTO: aaai_safe_wide_n2_appendix_tables"
+
+# Target-network (N2) per-perturbation solve-time charts. These live in
+# the evaluation body (sec_evaluation.tex) and replace the N2 per-cell
+# tables there; one grouped-bar figure per (architecture, source class).
+AAAI_N2_CHARTS_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_time_charts"
+AAAI_N2_CHARTS_END_MARK   = "% END AUTO: aaai_n2_time_charts"
 
 # Body-section summary table (Table 2 in the paper): one row per architecture
 # with the transfer-mode bound gap vs. the exact VHAGaR bound and the
@@ -4612,8 +4624,8 @@ AAAI_SUMMARY_END_MARK   = "% END AUTO: aaai_summary_table"
 # Each entry: (column_key, multicolumn header label).
 _AAAI_WIDE_COLUMNS = (
     ("vaghar",                   r"vaghar"),
-    (("1", "1", "1", "0.5"),     r"standard ($\tau{=}0.5$)"),
-    ("adv_zono_prevpgd_0.5+sg",  r"transfer ($\tau{=}0.5$)"),
+    (("1", "1", "1", "0.5"),     r"ours ($\tau{=}0.5$)"),
+    ("adv_zono_prevpgd_0.5+sg",  r"ours with transfer ($\tau{=}0.5$)"),
 )
 
 
@@ -4985,20 +4997,21 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                          + safe_arch + r"-n1}.")
         elif roles is not None and set(roles) == {"N1"}:
             role_note = (r"This table reports the source network $N_1$, "
-                         r"for which transfer-mode does not apply (transfer "
-                         r"is $N_2$-only), so the transfer columns are "
-                         r"blank; the target network $N_2$ is in "
+                         r"for which transfer does not apply (transfer "
+                         r"is $N_2$-only), so the \emph{ours with transfer} "
+                         r"columns are blank; the target network $N_2$ is in "
                          r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
         else:
             role_note = (r"Transfer columns are blank on $N_1$ rows since "
                          r"transfer-mode is $N_2$-only.")
         cap = (
             f"{arch} --- per-cell comparison of the original VHAGaR "
-            r"baseline against our standard- and transfer-mode safe "
-            r"combinations at $\tau{=}0.5$. \emph{vaghar} is the "
-            r"VHAGaR baseline (no boosts). \emph{Standard} is the "
+            r"baseline against our two safe combinations, \emph{ours} "
+            r"and \emph{ours with transfer}, at $\tau{=}0.5$. "
+            r"\emph{vaghar} is the "
+            r"VHAGaR baseline (no boosts). \emph{Ours} is the "
             r"\emph{zono + SibGate} combo with perturbed-interval "
-            r"constraints. \emph{Transfer} adds the \emph{adv + "
+            r"constraints. \emph{Ours with transfer} adds the \emph{adv + "
             r"prev\_pgd} variable-hint pipeline that reuses $N_1$'s "
             r"solver state. " + role_note + r" Each cell is "
             r"$(\delta_l, \delta_u, t)$ with $\delta_l$ and $\delta_u$ "
@@ -5087,6 +5100,567 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
               f"{exc}")
     except Exception as exc:
         print(f"[update_advstd_tex_tables] aaai_safe_wide block error: "
+              f"{exc}")
+
+
+# ---------------------------------------------------------------------------
+# AAAI N2 per-perturbation charts (Evaluation body)
+# ---------------------------------------------------------------------------
+# Per (architecture, source class c_s) we emit up to two grouped-bar
+# figures, each with one bar per perturbation for the three methods (the
+# VHAGaR baseline, \tool's standard mode, \tool's transfer mode):
+#   * a SOLVE-TIME figure (y = minutes) for the perturbations on which at
+#     least one method finishes before the three-hour timeout; and
+#   * a BOUND-GAP figure (y = delta_u - delta_l, in percentage points of
+#     delta_max) for the perturbations on which ALL three methods hit the
+#     timeout -- there the time bars are all flat at the cap and carry no
+#     signal, so the remaining MIP optimality gap is the informative metric
+#     (smaller = tighter).
+# For translation/rotation the standard and transfer bars use the
+# geometric-range twin (the "with geom" variant); for every other
+# perturbation the geom twin does not exist so they fall back to the base
+# run. The full per-cell bounds behind these charts live in the appendix
+# N2 tables.
+#
+# (combo_key, legend label, pgfplots per-series style). The styles use a
+# light->dark spread so the three series stay distinguishable in grayscale
+# as well as in colour (cf. the AAAI grayscale-legibility guideline).
+_AAAI_CHART_SERIES = (
+    ("vaghar",                  r"vaghar",                  "fill=black!55, draw=black!70"),
+    (("1", "1", "1", "0.5"),    r"ours (geom)",             "fill=teal!55, draw=teal!65!black"),
+    ("adv_zono_prevpgd_0.5+sg", r"ours with transfer (geom)", "fill=orange!75, draw=orange!80!black"),
+)
+
+
+def _aaai_chart_time(cell, force_timeout, prefer_geom):
+    """Mean solve time in minutes for one method's cell, clamped to the
+    timeout, plus which side ('base'/'geom') the value came from.
+    `prefer_geom` picks the geometric-range twin's time when it exists and
+    falls back to the base run otherwise (standard/transfer); vaghar has no
+    geom twin so it always reads the base side. Returns (None, None) when
+    the cell has no timing on the chosen side."""
+    if cell is None:
+        return None, None
+    tb = cell.get("t_base")
+    tg = cell.get("t_geom")
+    if prefer_geom:
+        chosen, side = (tg, "geom") if tg else ((tb, "base") if tb else (None, None))
+    else:
+        chosen, side = (tb, "base") if tb else ((tg, "geom") if tg else (None, None))
+    if not chosen:
+        return None, None
+    v = sum(chosen) / len(chosen) / 60.0
+    if force_timeout is not None:
+        v = min(v, force_timeout / 60.0)
+    return v, side
+
+
+def _aaai_chart_gap(cell, dmax_ub, prefer_geom):
+    """delta_u - delta_l (percentage points of delta_max) for one method's
+    cell, plus which side ('base'/'geom') it came from, using the same
+    base/geom side preference as the time bars. The bounds are clamped to
+    [0, 100]% of delta_max exactly as the per-cell table renders them.
+    Returns (None, None) when the chosen side lacks a finite lower/upper
+    bound, or when delta_max is unknown."""
+    if cell is None or not dmax_ub:
+        return None, None
+
+    def _side(lb_key, ub_key):
+        lb = cell.get(lb_key)
+        ub = cell.get(ub_key)
+        if not lb or not ub:
+            return None
+        lb_pct = max(0.0, (sum(lb) / len(lb)) / dmax_ub * 100.0)
+        ub_pct = min(100.0, (sum(ub) / len(ub)) / dmax_ub * 100.0)
+        return max(0.0, ub_pct - lb_pct)
+
+    order = (("geom", "lb_geom", "ub_geom"), ("base", "lb_base", "ub_base"))
+    if not prefer_geom:
+        order = order[::-1]
+    for side, lbk, ubk in order:
+        g = _side(lbk, ubk)
+        if g is not None:
+            return g, side
+    return None, None
+
+
+def _aaai_partial(cell, side, expected_cts):
+    """True iff the bar's chosen side aggregates over only SOME of the
+    expected target classes (same partial-coverage notion the per-cell
+    tables flag with a red asterisk). `side` is 'base' or 'geom'."""
+    if cell is None or side is None:
+        return False
+    seen = cell.get("c_targets_geom" if side == "geom" else "c_targets", set())
+    return bool(expected_cts - seen)
+
+
+# Bar heights are drawn through a compressive transform f(v)=v**POWER so a
+# few very large bars (e.g. 180-min timeouts) do not flatten the small ones,
+# while the axis still starts at 0 and reads like a normal bar chart (unlike
+# a log axis, which floats off zero). POWER=0.5 is a square-root scale; a
+# smaller exponent compresses harder (small bars taller, gaps gentler) and
+# 1.0 recovers a plain linear axis. Tick LABELS show the true values placed
+# at f(value), so the y-axis is still read in real units.
+_AAAI_YAXIS_POWER = 0.5
+
+
+def _aaai_yaxis_ticks(vmax):
+    """Curated round tick values in [0, vmax] for the power-scaled y-axis,
+    with the last tick the first candidate >= vmax (the axis top). Denser
+    at the low end so the many small bars get resolution once the sqrt
+    spreads them out."""
+    if vmax <= 0:
+        return [0.0]
+    if vmax <= 1.5:
+        cand = [0, 0.1, 0.2, 0.5, 1, 1.5]
+    elif vmax <= 6:
+        cand = [0, 0.5, 1, 2, 3, 5, 6]
+    elif vmax <= 15:
+        cand = [0, 1, 2, 5, 10, 15]
+    elif vmax <= 60:
+        cand = [0, 1, 5, 10, 20, 40, 60]
+    else:
+        cand = [0, 1, 10, 30, 60, 90, 120, 180, 240]
+    ticks = []
+    for c in cand:
+        ticks.append(float(c))
+        if c >= vmax:
+            break
+    return ticks
+
+
+# Bar width in x data-units. Bars within a perturbation group are drawn
+# ADJACENT (touching, no gap); a group of k bars spans k*_AAAI_BAR_W < 1, so
+# neighbouring groups stay separated.
+_AAAI_BAR_W = 0.25
+
+
+def _aaai_draw_color(sty):
+    """Pull the `draw=` colour out of a series style string (e.g.
+    'fill=teal!55, draw=teal!65!black' -> 'teal!65!black')."""
+    if "draw=" in sty:
+        return sty.split("draw=", 1)[1].split(",", 1)[0].strip()
+    return "black"
+
+
+def _aaai_bar_content(groups, power, hatch=False):
+    """Build the in-axis drawing commands for one plot. `groups` is a list of
+    (label, {sk:(value, partial)}). The perturbation groups are ordered
+    ascending by the MEAN of their bar values; within each group the bars are
+    drawn in the FIXED order transfer, ours, vaghar (left to right) -- not
+    value-sorted -- and drawn ADJACENT as filled rectangles coloured by
+    method; a partial bar gets a red `*` above it. When `hatch` is set the
+    bars also get a diagonal-line overlay (used for the timed-out figure so it
+    reads differently from the solid-bar time figures). Bar heights pass
+    through f(v)=v**power. Returns (lines, n, xtick_str, xticklabels_str)."""
+    style_of = {k: sty for k, _l, sty in _AAAI_CHART_SERIES}
+    # Fixed within-group left-to-right order: transfer, ours, vaghar -- i.e.
+    # the reverse of the legend/series order (_AAAI_CHART_SERIES is
+    # vaghar, ours, transfer).
+    bar_rank = {k: i for i, (k, _l, _s)
+                in enumerate(reversed(_AAAI_CHART_SERIES))}
+
+    def _gmean(item):
+        vs = [v for _sk, (v, _p) in item[1].items()]
+        return sum(vs) / len(vs) if vs else 0.0
+
+    ordered = sorted(groups, key=_gmean)
+    lines = []
+    labels = []
+    for gi, (label, bars) in enumerate(ordered, start=1):
+        labels.append(label)
+        items = sorted(bars.items(),
+                       key=lambda kv: bar_rank.get(kv[0], 99))
+        k = len(items)
+        x0 = gi - (k * _AAAI_BAR_W) / 2.0
+        for bi, (sk, (v, p)) in enumerate(items):
+            xl = x0 + bi * _AAAI_BAR_W
+            xr = xl + _AAAI_BAR_W
+            h = v ** power
+            rect = (f"(axis cs:{xl:.4g},0) rectangle "
+                    f"(axis cs:{xr:.4g},{h:.4g})")
+            lines.append(
+                f"\\filldraw[{style_of[sk]}, line width=0.2pt] {rect};")
+            if hatch:
+                hc = _aaai_draw_color(style_of[sk])
+                lines.append(
+                    f"\\fill[pattern=north east lines, pattern color={hc}]"
+                    f" {rect};")
+            if p:
+                xc = (xl + xr) / 2.0
+                lines.append(
+                    r"\node[font=\footnotesize\bfseries, text=red,"
+                    r" anchor=south, inner sep=1pt] at "
+                    f"(axis cs:{xc:.4g},{h:.4g}) {{*}};")
+    n = len(ordered)
+    xtick = ",".join(str(i) for i in range(1, n + 1))
+    return lines, n, xtick, ",".join(labels)
+
+
+def _aaai_legend_lines(hatch=False):
+    """A legend entry per method (single coloured box), independent of the
+    manually drawn bars, via `\\addlegendimage`. When `hatch` is set each
+    style also carries its `pattern color` so the legend boxes match the
+    hatched bars (the legend image code adds the stripes)."""
+    out = []
+    for _k, _l, sty in _AAAI_CHART_SERIES:
+        if hatch:
+            out.append(f"\\addlegendimage{{{sty}, "
+                       f"pattern color={_aaai_draw_color(sty)}}}")
+        else:
+            out.append(f"\\addlegendimage{{{sty}}}")
+    out.append(r"\legend{"
+               + ", ".join(lbl for _k, lbl, _s in _AAAI_CHART_SERIES) + r"}")
+    return out
+
+
+def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False,
+                     hatch=False):
+    """Emit one bar figure (the three vaghar/ours/ours-with-transfer methods)
+    as a list of LaTeX lines. When `wide` is set the figure spans both columns
+    (figure*, full text width) -- used for the merged timed-out-cells chart.
+    When `hatch` is set the bars and legend boxes get a diagonal-line overlay,
+    so the timed-out figure is visually distinct from the solid-bar time
+    figures. `groups` is a list of (label, {sk:(value, partial)}); see
+    _aaai_bar_content for the sort/draw rules. The square-root y-axis is
+    labelled with the true values."""
+    power = _AAAI_YAXIS_POWER
+    allvals = [v for _l, bars in groups for (v, _p) in bars.values()]
+    vmax = max(allvals) if allvals else 1.0
+    yt = _aaai_yaxis_ticks(vmax)
+    ypos = ",".join(f"{(t ** power):.4g}" for t in yt)
+    ylab = ",".join("{" + f"{t:g}" + "}" for t in yt)
+    ymax = (yt[-1] ** power) * 1.10 if yt[-1] > 0 else 1.0
+    content, n, xtick, xticklabels = _aaai_bar_content(groups, power,
+                                                       hatch=hatch)
+    fig_env = "figure*" if wide else "figure"
+    plot_width = r"\textwidth" if wide else r"\columnwidth"
+    # Solid legend boxes (clearer as a colour key); the hatched bars carry
+    # the visual distinction of the timed-out figure.
+    legend_img = (
+        r"  legend image code/.code={\draw[#1] (0cm,-0.09cm) rectangle"
+        r" (0.32cm,0.09cm);}," "\n")
+    out = []
+    out.append("\\begin{" + fig_env + "}[!tbp]")
+    out.append(r"\centering")
+    out.append(r"\begin{tikzpicture}")
+    out.append(
+        r"\begin{axis}[" "\n"
+        r"  width=" + plot_width + r", height=6cm," "\n"
+        f"  ymin=0, ymax={ymax:.4g}, xmin=0.4, xmax={n + 0.6:g}," "\n"
+        f"  ytick={{{ypos}}}, yticklabels={{{ylab}}}," "\n"
+        f"  ylabel={{{ylabel}}}," "\n"
+        r"  ylabel style={font=\small}," "\n"
+        f"  title={{{title}}}, title style={{font=\\small, yshift=14pt}},"
+        "\n"
+        f"  xtick={{{xtick}}}, xticklabels={{{xticklabels}}}," "\n"
+        r"  x tick label style={rotate=90, anchor=east, font=\footnotesize},"
+        "\n"
+        r"  y tick label style={font=\small}," "\n"
+        r"  ymajorgrids, major grid style={gray!25}," "\n"
+        + legend_img +
+        r"  legend style={font=\footnotesize, at={(0.5,1.0)}, anchor=south,"
+        "\n"
+        r"    legend columns=-1, draw=none," "\n"
+        r"    /tikz/every even column/.append style={column sep=4pt}}]")
+    out += content
+    out += _aaai_legend_lines()
+    out.append(r"\end{axis}")
+    out.append(r"\end{tikzpicture}")
+    out.append(f"\\caption{{{caption}}}")
+    out.append(f"\\label{{{label}}}")
+    out.append("\\end{" + fig_env + "}")
+    out.append("")
+    return out
+
+
+def _aaai_standalone_legend():
+    """A centred, self-contained legend (one solid box + label per method),
+    drawn manually with tikz nodes (chained left-to-right via the
+    `positioning` library) so it sits once at the top of the combined
+    figure -- robust regardless of the surrounding floats."""
+    out = [r"\begin{tikzpicture}[font=\footnotesize]"]
+    prev = None
+    for i, (_k, lbl, sty) in enumerate(_AAAI_CHART_SERIES):
+        box, txt = f"lb{i}", f"lt{i}"
+        pos = "" if prev is None else f", right=14pt of {prev}"
+        out.append(f"\\node[{sty}, line width=0.2pt, minimum width=0.32cm,"
+                   f" minimum height=0.18cm, inner sep=0pt{pos}] ({box}) {{}};")
+        out.append(f"\\node[right=2pt of {box}, inner sep=1pt] "
+                   f"({txt}) {{{lbl}}};")
+        prev = txt
+    out.append(r"\end{tikzpicture}")
+    return out
+
+
+def _aaai_arch_groupplot(subplots, ylabel):
+    """One architecture's row: a 1xN groupplot tikzpicture (no figure wrapper,
+    no legend, no caption) with its OWN square-root y-axis (y-ticks on the
+    left subplot only). `subplots` is a list of (subtitle, groups)."""
+    power = _AAAI_YAXIS_POWER
+    allvals = [v for _st, groups in subplots
+               for _l, bars in groups for (v, _p) in bars.values()]
+    vmax = max(allvals) if allvals else 1.0
+    yt = _aaai_yaxis_ticks(vmax)
+    ypos = ",".join(f"{(t ** power):.4g}" for t in yt)
+    ylab = ",".join("{" + f"{t:g}" + "}" for t in yt)
+    ymax = (yt[-1] ** power) * 1.10 if yt[-1] > 0 else 1.0
+    n_sub = len(subplots)
+    out = [r"\begin{tikzpicture}"]
+    out.append(
+        r"\begin{groupplot}[" "\n"
+        f"  group style={{group size={n_sub} by 1, horizontal sep=18pt,"
+        r" ylabels at=edge left, yticklabels at=edge left}," "\n"
+        r"  width=6.0cm, height=4.4cm," "\n"
+        f"  ymin=0, ymax={ymax:.4g}, ytick={{{ypos}}}, yticklabels={{{ylab}}},"
+        "\n"
+        r"  ylabel style={font=\small}, y tick label style={font=\small},"
+        "\n"
+        r"  x tick label style={rotate=90, anchor=east, font=\footnotesize},"
+        "\n"
+        r"  ymajorgrids, major grid style={gray!25}]")
+    for si, (subtitle, groups) in enumerate(subplots):
+        content, n, xtick, xticklabels = _aaai_bar_content(groups, power)
+        opt = (f"title={{{subtitle}}}, title style={{font=\\small}}, "
+               f"xmin=0.4, xmax={n + 0.6:g}, "
+               f"xtick={{{xtick}}}, xticklabels={{{xticklabels}}}")
+        if si == 0:
+            opt += f", ylabel={{{ylabel}}}"
+        out.append(f"\\nextgroupplot[{opt}]")
+        out += content
+    out.append(r"\end{groupplot}")
+    out.append(r"\end{tikzpicture}")
+    return out
+
+
+def _aaai_group_grid_figure(arch_rows, ylabel, caption, label):
+    """Emit ONE two-column `figure*` stacking every architecture's row of
+    small-multiple bar charts: a single shared legend at the top, then for
+    each architecture a bold title naming it followed by its 1xN groupplot
+    row (each architecture keeps its own square-root y-axis), and one shared
+    caption. `arch_rows` is a list of (arch_disp, subplots)."""
+    out = [r"\begin{figure*}[!tbp]", r"\centering"]
+    out += _aaai_standalone_legend()
+    out.append(r"\par\smallskip")
+    for ri, (arch_disp, subplots) in enumerate(arch_rows):
+        if ri > 0:
+            out.append(r"\par\medskip")
+        out.append(r"\textbf{" + arch_disp + r"}\par\nopagebreak\smallskip")
+        out += _aaai_arch_groupplot(subplots, ylabel)
+    out.append(f"\\caption{{{caption}}}")
+    out.append(f"\\label{{{label}}}")
+    out.append(r"\end{figure*}")
+    out.append("")
+    return out
+
+
+def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
+                           force_timeout=None, rerun_timeout_eps=30.0):
+    """Emit per (arch, N2, c_s) a solve-time figure for the perturbations
+    where at least one method finishes, and a companion bound-gap figure
+    (delta_u - delta_l) for the perturbations where all three methods hit
+    the timeout. Bucketing mirrors the N2 per-cell table so the bar heights
+    equal the table's time / delta cells (geom side where present, else
+    base)."""
+    if not rows:
+        return r"\noindent\textit{No data available.}"
+    if force_timeout is not None:
+        rows = [r for r in rows
+                if not _aaai_is_timeout_mismatch(r, force_timeout,
+                                                 rerun_timeout_eps)]
+    from collections import defaultdict
+    buckets = defaultdict(lambda: defaultdict(lambda: {
+        "t_base": [], "t_geom": [],
+        "lb_base": [], "lb_geom": [], "ub_base": [], "ub_geom": [],
+        "c_targets": set(), "c_targets_geom": set()}))
+    for r in rows:
+        if r.get("role") != "N2":
+            continue
+        key = (r["arch"], r["perturbation"], r["perturbation_size"],
+               r["c_source"])
+        cell = buckets[key][r["combo"]]
+        is_geom = bool(r.get("geom"))
+        t = r.get("t_total")
+        if t is not None:
+            (cell["t_geom"] if is_geom else cell["t_base"]).append(t)
+        lb = r.get("lb_total")
+        if lb is not None and math.isfinite(lb):
+            (cell["lb_geom"] if is_geom else cell["lb_base"]).append(lb)
+        ub = r.get("ub_total")
+        if ub is not None and math.isfinite(ub):
+            (cell["ub_geom"] if is_geom else cell["ub_base"]).append(ub)
+        # Track which target classes contributed, per side, so a bar whose
+        # mean covers only some of the expected c_targets can be flagged
+        # with a red asterisk (same partial-coverage notion as the tables).
+        ct = r.get("c_target")
+        if ct is not None:
+            try:
+                (cell["c_targets_geom"] if is_geom
+                 else cell["c_targets"]).add(int(ct))
+            except (TypeError, ValueError):
+                pass
+
+    dataset_disp = {"mnist": "MNIST", "fashion_mnist": "Fashion-MNIST",
+                    "cifar10": "CIFAR-10"}.get(dataset, dataset)
+    series_keys = [k for k, _lbl, _sty in _AAAI_CHART_SERIES]
+    cap_min = (force_timeout / 60.0) if force_timeout is not None else None
+
+    lines = []
+    lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
+                 f"n2_time+gap_charts")
+    # All timed-out cells across every (arch, c_s) are merged into a single
+    # bound-gap figure at the end; each entry keeps its arch / c_s / pert so
+    # the merged chart can label every group.
+    merged_gap = []  # list of (arch_disp, c_src, pert_label_plain, {sk:(gap,partial)})
+    arch_rows = []   # (arch_disp, subplots) per architecture -> one grid figure
+    for arch in archs:
+        safe_arch = arch.replace("_", "")
+        arch_disp = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
+        c_sources = sorted({k[3] for k in buckets if k[0] == arch},
+                           key=lambda c: int(c))
+        arch_subplots = []  # (subtitle, xticklabels, time_coords) per c_s
+        for c_src in c_sources:
+            dmax_ub = None
+            if delta_max_by_key is not None:
+                dm = delta_max_by_key.get((arch, "N2", c_src))
+                if dm is not None:
+                    u = dm.get("upper")
+                    if u is not None and math.isfinite(u) and abs(u) > 1e-9:
+                        dmax_ub = u
+            # Expected target classes for every cell in this block: every
+            # class index except the source class. A bar whose mean covers
+            # a strict subset of these is "partial" and gets a red asterisk.
+            n_classes = {"mnist": 10, "cifar10": 10,
+                         "fashion_mnist": 10}.get(dataset, 10)
+            expected_cts = {ct for ct in range(n_classes)
+                            if ct != int(c_src)}
+            pert_keys = sorted(
+                (k for k in buckets if k[0] == arch and k[3] == c_src),
+                key=lambda k: (k[1], k[2]))  # (pert, p_size)
+            time_groups = []  # (label, {sk:(value,partial)}) per perturbation
+            for k in pert_keys:
+                _, pert, p_size, _ = k
+                cells = buckets[k]
+                times = {sk: _aaai_chart_time(cells.get(sk), force_timeout,
+                                              prefer_geom=(sk != "vaghar"))
+                         for sk in series_keys}  # sk -> (value, side)
+                present = [v for v, _s in times.values() if v is not None]
+                if not present:
+                    continue
+                pert_plain = (f"{pert} ({p_size})".replace("_", r"\_")
+                              .replace("linf", r"$\ell_\infty$"))
+                # A perturbation is "all-timeout" iff every method that ran
+                # it reached the wall-clock cap; its time bars would all be
+                # flat at the cap, so we route it to the merged bound-gap
+                # figure instead -- but only when we actually have delta data
+                # to plot there (else keep it in the time figure).
+                all_timeout = (cap_min is not None
+                               and all(v >= cap_min - 1e-6 for v in present))
+                gaps = None
+                if all_timeout:
+                    gaps = {sk: _aaai_chart_gap(cells.get(sk), dmax_ub,
+                                                prefer_geom=(sk != "vaghar"))
+                            for sk in series_keys}  # sk -> (value, side)
+                    if all(g is None for g, _s in gaps.values()):
+                        all_timeout = False
+                if all_timeout:
+                    cell_vals = {}
+                    for sk in series_keys:
+                        g, side = gaps[sk]
+                        if g is not None:
+                            partial = _aaai_partial(cells.get(sk), side,
+                                                    expected_cts)
+                            cell_vals[sk] = (g, partial)
+                    if cell_vals:
+                        merged_gap.append(
+                            (arch_disp, c_src, pert_plain, cell_vals))
+                else:
+                    bars = {}
+                    for sk in series_keys:
+                        v, side = times[sk]
+                        if v is not None:
+                            partial = _aaai_partial(cells.get(sk), side,
+                                                    expected_cts)
+                            bars[sk] = (v, partial)
+                    if bars:
+                        time_groups.append(("{" + pert_plain + "}", bars))
+
+            if time_groups:
+                arch_subplots.append(
+                    (r"$c_s{=}" + str(c_src) + r"$", time_groups))
+
+        # One compact figure per architecture: its per-class solve-time
+        # charts as a single groupplot row (shared square-root y-axis and a
+        # single legend) instead of one stacked figure per class.
+        if arch_subplots:
+            arch_rows.append((arch_disp, arch_subplots))
+
+    # All architectures in ONE figure: one row per architecture (with a bold
+    # title naming it), a single shared legend, and one caption.
+    if arch_rows:
+        cap = (
+            r"Evaluation of solve times using the " + dataset_disp
+            + r" dataset, with one row per architecture (" + ", ".join(
+                ad for ad, _s in arch_rows)
+            + r"). The $y$-axis is presented on a square-root scale, while "
+            r"tick marks indicate the true values.")
+        lines += _aaai_group_grid_figure(
+            arch_rows, r"time (min)", cap, "fig:n2-time")
+
+    # Single merged bound-gap figure over every timed-out cell. One x-group
+    # per (arch, c_s, pert), each x-tick label naming all three so the
+    # merged chart still identifies which architecture and source class a
+    # group belongs to. Spans both columns (wide) since there can be many.
+    if merged_gap:
+        gap_groups = []
+        for (a_disp, c_src, pert_plain, vals) in merged_gap:
+            label = ("{" + a_disp + r", $c_s{=}" + str(c_src) + r"$, "
+                     + pert_plain + "}")
+            gap_groups.append((label, vals))
+        cap = (
+            r"Evaluation of the remaining bound gap $\delta_u-\delta_l$ on "
+            r"the timed-out cells using the " + dataset_disp
+            + r" dataset, with each group labelled by architecture and "
+            r"$c_s$. The $y$-axis is presented on a square-root scale, while "
+            r"tick marks indicate the true values.")
+        lines += _aaai_bar_figure(
+            "Timed-out cells, " + dataset_disp, "fig:n2-gap-timeouts",
+            r"$\delta_u-\delta_l$ (pp of $\delta_{\max}$)",
+            cap, gap_groups, wide=True, hatch=True)
+    return "\n".join(lines)
+
+
+def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
+                                      parse_result_file,
+                                      seeds_filter=None,
+                                      force_timeout=None,
+                                      rerun_timeout_eps=30.0,
+                                      begin_mark=AAAI_N2_CHARTS_BEGIN_MARK,
+                                      end_mark=AAAI_N2_CHARTS_END_MARK):
+    """Collect the same per-cell rows as the N2 table and emit the
+    per-perturbation solve-time and bound-gap charts into the evaluation
+    body between the chart marks."""
+    try:
+        rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
+                                           parse_result_file,
+                                           seeds_filter=seeds_filter)
+        archs = [a for a, _ in arch_runs]
+        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                           seeds_filter=seeds_filter)
+        delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
+        body = _render_aaai_n2_charts(
+            rows, archs, dataset,
+            delta_max_by_key=delta_max_by_key,
+            force_timeout=force_timeout,
+            rerun_timeout_eps=rerun_timeout_eps)
+        update_aaai_wide_perarch_tex(tex_path, body,
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark)
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_charts block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_charts block error: "
               f"{exc}")
 
 

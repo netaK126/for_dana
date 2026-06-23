@@ -2108,20 +2108,40 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
               "update_advstd_tex_tables.py to populate the AAAI "
               "paper's safe-wide tables.")
     else:
-        # N2 (target network) -> Evaluation body.
+        # N2 (target network) -> Evaluation body, as per-perturbation
+        # solve-time charts (one ybar figure per arch x source class). The
+        # full N2 per-cell tables now live in the appendix (below).
         try:
             body_tex = os.path.join(cwd, "neta-s-paper", "sections",
                                     "sec_evaluation.tex")
-            if os.path.exists(body_tex):
-                updater.regenerate_aaai_wide_perarch_section(
+            if os.path.exists(body_tex) and hasattr(
+                    updater, "regenerate_aaai_n2_charts_section"):
+                updater.regenerate_aaai_n2_charts_section(
                     body_tex, cwd, dataset_guess, arch_runs,
                     parse_result_file,
                     seeds_filter=combo_ranking_seeds,
                     force_timeout=force_timeout,
-                    rerun_timeout_eps=rerun_timeout_eps,
-                    roles={"N2"})
+                    rerun_timeout_eps=rerun_timeout_eps)
         except Exception as exc:
-            print(f"[tex-update] aaai_safe_wide (N2 body) block error: {exc}")
+            print(f"[tex-update] aaai_n2_charts (body) block error: {exc}")
+
+        # N2 (target network) per-cell tables -> appendix.
+        try:
+            n2_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                                  "sec_appendix_percell.tex")
+            if os.path.exists(n2_tex):
+                updater.regenerate_aaai_wide_perarch_section(
+                    n2_tex, cwd, dataset_guess, arch_runs,
+                    parse_result_file,
+                    seeds_filter=combo_ranking_seeds,
+                    force_timeout=force_timeout,
+                    rerun_timeout_eps=rerun_timeout_eps,
+                    roles={"N2"},
+                    begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK,
+                    end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK)
+        except Exception as exc:
+            print(f"[tex-update] aaai_safe_wide (N2 appendix) block "
+                  f"error: {exc}")
 
         # N1 (source network) -> appendix.
         try:
@@ -2165,6 +2185,17 @@ def _recompile_neta_s_paper(cwd):
         print(f"[paper-build] skipped (missing {main_tex})")
         return
     job = "main_build"
+    # Clear stale intermediates first. A run interrupted mid-write can leave a
+    # half-written main_build.aux; pgfplots' `legend to name` stores the
+    # legend in the .aux and reads it back at \begin{document}, so a corrupt
+    # .aux makes the next build die with "File ended while scanning
+    # definition of \pgfplots@legend@to@name@...". The first pdflatex pass
+    # regenerates these, so deleting them up front is safe.
+    for ext in ("aux", "out", "toc"):
+        try:
+            os.remove(os.path.join(paper_dir, f"{job}.{ext}"))
+        except OSError:
+            pass
     pdflatex = ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
                 "-jobname", job, "main.tex"]
     steps = [pdflatex, ["bibtex", job], pdflatex, pdflatex]
