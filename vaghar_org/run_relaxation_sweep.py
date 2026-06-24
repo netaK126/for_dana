@@ -2481,6 +2481,17 @@ def main():
                              "vagharWithPerturbed N2 standard baseline). Use when you only want "
                              "the N1-solve, advstd, and stdBoost jobs and don't need the "
                              "wide-table 'pi' baseline.")
+    parser.add_argument("--n2_tables_only", action="store_true",
+                        help="In --advanced_standard mode, only run the jobs that fill the "
+                             "TARGET-network (N2) tables/rows. Skips jobs that solely populate "
+                             "the SOURCE-network (N1) tables: Phase 0.5 delta_max for role N1 and "
+                             "Phase 2.5 N1stdBoost combos (role=N1 in --stdboost_combos / "
+                             "--include_nn1_boost). N1 work that is ESSENTIAL for N2 is still run: "
+                             "the Phase 1 N1-solve (advanced_standard_n1) state that advstd N2 "
+                             "depends on is kept (and the existing skip-checks already run it only "
+                             "when an N2 job actually needs it). N2 jobs — delta_max N2, the "
+                             "standard-N2 baseline (Phase 1.5), advstd-N2 (Phase 2), and N2stdBoost "
+                             "(Phase 2.5) — are unaffected.")
     parser.add_argument("--rerun_timeouts", action="store_true",
                         help="Treat existing result rows that hit a Gurobi termination "
                              "limit (solve_status in {TIME_LIMIT, USER_OBJ_LIMIT, "
@@ -2931,6 +2942,10 @@ def main():
                           ("boundTight" if bt == "true" else "off")
                 print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}")
             print(f"  seeds: {seed_vals}")
+            if args.n2_tables_only:
+                print("  [n2_tables_only] N2 (target-network) tables only — "
+                      "skipping N1-only jobs (delta_max N1, N1stdBoost); the "
+                      "essential Phase 1 N1-solve state for advstd N2 is kept.")
 
             sys.path.insert(0, os.path.join(cwd, 'utils'))
             from run_experiment import ARCH_REGISTRY, DATASET_CONFIG
@@ -2972,6 +2987,10 @@ def main():
                 n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
                 for role, role_tag, role_model_p in (("N1", n1_tag, n1_model_p),
                                                      ("N2", n2_tag, n2_model_p)):
+                    # --n2_tables_only: N1's delta_max only feeds the source-network
+                    # (N1) tables; the N2 rows use N2's own delta_max. Skip it.
+                    if args.n2_tables_only and role == "N1":
+                        continue
                     dm_out_dir = os.path.join(
                         cwd, "paper_experiments", dataset, f"{arch}_exp",
                         "delta_max", f"delta_max_{arch}_{role}_{role_tag}")
@@ -3403,6 +3422,19 @@ def main():
                                             if sg == "true" and rt < 0.0:
                                                 continue
                                             explicit_stdboost_combos.append((role, zb, sg, rt, pi))
+
+                # --n2_tables_only: N1stdBoost combos only populate the
+                # source-network (N1) wide tables, so drop them here while
+                # keeping every N2stdBoost combo. (advstd-N2 still gets its N1
+                # state from the Phase 1 N1-solve, which is unaffected.)
+                if args.n2_tables_only and explicit_stdboost_combos:
+                    n1_combos = [c for c in explicit_stdboost_combos if c[0] == "N1"]
+                    explicit_stdboost_combos = [c for c in explicit_stdboost_combos
+                                                if c[0] != "N1"]
+                    if n1_combos and c_tag == sweep_ctag_vals[0]:
+                        print(f"  [n2_tables_only] skipping {len(n1_combos)} N1stdBoost "
+                              f"combo(s) (N1-only tables); keeping "
+                              f"{len(explicit_stdboost_combos)} N2stdBoost combo(s)")
 
                 if explicit_stdboost_combos:
                     for arch, model_path in arch_runs:

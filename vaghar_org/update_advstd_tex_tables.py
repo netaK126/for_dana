@@ -5194,14 +5194,30 @@ def _aaai_partial(cell, side, expected_cts):
     return bool(expected_cts - seen)
 
 
-# Bar heights are drawn through a compressive transform f(v)=v**POWER so a
-# few very large bars (e.g. 180-min timeouts) do not flatten the small ones,
-# while the axis still starts at 0 and reads like a normal bar chart (unlike
-# a log axis, which floats off zero). POWER=0.5 is a square-root scale; a
-# smaller exponent compresses harder (small bars taller, gaps gentler) and
-# 1.0 recovers a plain linear axis. Tick LABELS show the true values placed
-# at f(value), so the y-axis is still read in real units.
-_AAAI_YAXIS_POWER = 0.5
+# Bar heights are drawn through a transform f(v)=v**POWER. POWER=1.0 is a
+# plain LINEAR axis showing the real values (current choice, per user); a
+# square-root scale (POWER=0.5) compresses a few very large bars so the
+# small ones stay visible, at the cost of non-real spacing. With POWER<1 the
+# tick LABELS still show the true values placed at f(value).
+_AAAI_YAXIS_POWER = 1.0
+
+
+def _aaai_yaxis(vmax):
+    """Return (ymax, ytick_clause) for the y-axis. On a LINEAR axis
+    (_AAAI_YAXIS_POWER == 1) pgfplots auto-ticks at real values and we just
+    cap the axis a little above the tallest bar. On a power/sqrt axis we
+    place curated round ticks at f(value) but label them with the true
+    values, and `ytick_clause` carries the explicit ytick/yticklabels."""
+    power = _AAAI_YAXIS_POWER
+    if vmax <= 0:
+        return 1.0, ""
+    if power >= 1.0:
+        return vmax * 1.10, ""
+    yt = _aaai_yaxis_ticks(vmax)
+    ypos = ",".join(f"{(t ** power):.4g}" for t in yt)
+    ylab = ",".join("{" + f"{t:g}" + "}" for t in yt)
+    ymax = (yt[-1] ** power) * 1.10 if yt[-1] > 0 else 1.0
+    return ymax, f"ytick={{{ypos}}}, yticklabels={{{ylab}}}, "
 
 
 def _aaai_yaxis_ticks(vmax):
@@ -5243,36 +5259,42 @@ def _aaai_draw_color(sty):
     return "black"
 
 
-def _aaai_bar_content(groups, power, hatch=False):
+# Extra x-gap (data units) inserted between perturbation-type clusters.
+_AAAI_TYPE_GAP = 1.1
+
+
+def _aaai_bar_content(groups, power, hatch=False, cluster=False):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
-    (label, {sk:(value, partial)}). The perturbation groups are ordered
-    ascending by the MEAN of their bar values; within each group the bars are
-    drawn in the FIXED order transfer, ours, vaghar (left to right) -- not
-    value-sorted -- and drawn ADJACENT as filled rectangles coloured by
-    method; a partial bar gets a red `*` above it. When `hatch` is set the
-    bars also get a diagonal-line overlay (used for the timed-out figure so it
-    reads differently from the solid-bar time figures). Bar heights pass
-    through f(v)=v**power. Returns (lines, n, xtick_str, xticklabels_str)."""
+    (type_disp, item_label, {sk:(value, partial)}).
+
+    When `cluster` is set, the bar-groups are CLUSTERED by `type_disp`: the
+    types are ordered by mean, the perturbations within a type are ordered by
+    mean, an extra gap separates the clusters, and a small bold type label is
+    placed below each cluster (so the per-bar x labels show only the short
+    `item_label`, e.g. the size). When `cluster` is False, all bar-groups are
+    flattened into one mean-ordered list (type ignored) and `item_label` is
+    the full x label.
+
+    Within every bar-group the bars are drawn in the FIXED order transfer,
+    ours, vaghar (left to right), ADJACENT, coloured by method; a partial bar
+    gets a red `*`; with `hatch` they also get a diagonal overlay. Heights
+    pass through f(v)=v**power. Returns (lines, xmax, xtick_str,
+    xticklabels_str); each item_label is wrapped in braces here."""
     style_of = {k: sty for k, _l, sty in _AAAI_CHART_SERIES}
-    # Fixed within-group left-to-right order: transfer, ours, vaghar -- i.e.
-    # the reverse of the legend/series order (_AAAI_CHART_SERIES is
-    # vaghar, ours, transfer).
+    # Fixed within-group left-to-right order: transfer, ours, vaghar.
     bar_rank = {k: i for i, (k, _l, _s)
                 in enumerate(reversed(_AAAI_CHART_SERIES))}
+    lines = []
+    xticks = []  # (xpos, item_label)
 
-    def _gmean(item):
-        vs = [v for _sk, (v, _p) in item[1].items()]
+    def _bars_mean(bars):
+        vs = [v for _sk, (v, _p) in bars.items()]
         return sum(vs) / len(vs) if vs else 0.0
 
-    ordered = sorted(groups, key=_gmean)
-    lines = []
-    labels = []
-    for gi, (label, bars) in enumerate(ordered, start=1):
-        labels.append(label)
-        items = sorted(bars.items(),
-                       key=lambda kv: bar_rank.get(kv[0], 99))
+    def _draw_group(x, bars):
+        items = sorted(bars.items(), key=lambda kv: bar_rank.get(kv[0], 99))
         k = len(items)
-        x0 = gi - (k * _AAAI_BAR_W) / 2.0
+        x0 = x - (k * _AAAI_BAR_W) / 2.0
         for bi, (sk, (v, p)) in enumerate(items):
             xl = x0 + bi * _AAAI_BAR_W
             xr = xl + _AAAI_BAR_W
@@ -5282,19 +5304,58 @@ def _aaai_bar_content(groups, power, hatch=False):
             lines.append(
                 f"\\filldraw[{style_of[sk]}, line width=0.2pt] {rect};")
             if hatch:
-                hc = _aaai_draw_color(style_of[sk])
                 lines.append(
-                    f"\\fill[pattern=north east lines, pattern color={hc}]"
-                    f" {rect};")
+                    f"\\fill[pattern=north east lines,"
+                    f" pattern color={_aaai_draw_color(style_of[sk])}] {rect};")
             if p:
                 xc = (xl + xr) / 2.0
                 lines.append(
                     r"\node[font=\footnotesize\bfseries, text=red,"
                     r" anchor=south, inner sep=1pt] at "
                     f"(axis cs:{xc:.4g},{h:.4g}) {{*}};")
-    n = len(ordered)
-    xtick = ",".join(str(i) for i in range(1, n + 1))
-    return lines, n, xtick, ",".join(labels)
+
+    if cluster:
+        from collections import OrderedDict
+        by_type = OrderedDict()
+        for (type_disp, item_label, bars) in groups:
+            by_type.setdefault(type_disp, []).append((item_label, bars))
+        ordered_types = sorted(
+            by_type.items(),
+            key=lambda kv: sum(_bars_mean(b) for _l, b in kv[1]) / len(kv[1]))
+        # How far below the axis the type labels sit: clear the longest
+        # (rotated) item label. item labels are short sizes -> char count is a
+        # reliable proxy for their rotated drop.
+        maxlen = max((len(lbl) for _t, items in ordered_types
+                      for lbl, _b in items), default=1)
+        type_yshift = -(maxlen * 3.8 + 16.0)
+        x = 1.0
+        for ci, (type_disp, items) in enumerate(ordered_types):
+            if ci > 0:
+                x += _AAAI_TYPE_GAP
+            cstart = x
+            for item_label, bars in sorted(items,
+                                           key=lambda li: _bars_mean(li[1])):
+                xticks.append((x, item_label))
+                _draw_group(x, bars)
+                x += 1.0
+            cx = (cstart + (x - 1.0)) / 2.0
+            lines.append(
+                r"\node[anchor=north, font=\scriptsize\bfseries,"
+                f" yshift={type_yshift:.4g}pt] at "
+                f"(axis cs:{cx:.4g},0) {{{type_disp}}};")
+        xmax_pos = x - 1.0
+    else:
+        x = 1.0
+        for (_type_disp, item_label, bars) in sorted(
+                groups, key=lambda g: _bars_mean(g[2])):
+            xticks.append((x, item_label))
+            _draw_group(x, bars)
+            x += 1.0
+        xmax_pos = x - 1.0
+
+    xtick = ",".join(f"{xp:.4g}" for xp, _l in xticks)
+    xticklabels = ",".join("{" + lbl + "}" for _xp, lbl in xticks)
+    return lines, xmax_pos, xtick, xticklabels
 
 
 def _aaai_legend_lines(hatch=False):
@@ -5322,15 +5383,12 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False,
     When `hatch` is set the bars and legend boxes get a diagonal-line overlay,
     so the timed-out figure is visually distinct from the solid-bar time
     figures. `groups` is a list of (label, {sk:(value, partial)}); see
-    _aaai_bar_content for the sort/draw rules. The square-root y-axis is
-    labelled with the true values."""
+    _aaai_bar_content for the sort/draw rules. The y-axis shows the real
+    values (linear)."""
     power = _AAAI_YAXIS_POWER
-    allvals = [v for _l, bars in groups for (v, _p) in bars.values()]
+    allvals = [v for _t, _l, bars in groups for (v, _p) in bars.values()]
     vmax = max(allvals) if allvals else 1.0
-    yt = _aaai_yaxis_ticks(vmax)
-    ypos = ",".join(f"{(t ** power):.4g}" for t in yt)
-    ylab = ",".join("{" + f"{t:g}" + "}" for t in yt)
-    ymax = (yt[-1] ** power) * 1.10 if yt[-1] > 0 else 1.0
+    ymax, ytick_clause = _aaai_yaxis(vmax)
     content, n, xtick, xticklabels = _aaai_bar_content(groups, power,
                                                        hatch=hatch)
     fig_env = "figure*" if wide else "figure"
@@ -5347,8 +5405,8 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False,
     out.append(
         r"\begin{axis}[" "\n"
         r"  width=" + plot_width + r", height=6cm," "\n"
-        f"  ymin=0, ymax={ymax:.4g}, xmin=0.4, xmax={n + 0.6:g}," "\n"
-        f"  ytick={{{ypos}}}, yticklabels={{{ylab}}}," "\n"
+        f"  ymin=0, ymax={ymax:.4g}, xmin=0.4, xmax={n + 0.6:g}, "
+        f"{ytick_clause}" "\n"
         f"  ylabel={{{ylabel}}}," "\n"
         r"  ylabel style={font=\small}," "\n"
         f"  title={{{title}}}, title style={{font=\\small, yshift=14pt}},"
@@ -5395,32 +5453,31 @@ def _aaai_standalone_legend():
 
 def _aaai_arch_groupplot(subplots, ylabel):
     """One architecture's row: a 1xN groupplot tikzpicture (no figure wrapper,
-    no legend, no caption) with its OWN square-root y-axis (y-ticks on the
-    left subplot only). `subplots` is a list of (subtitle, groups)."""
+    no legend, no caption) with its OWN (linear, real-value) y-axis (y-ticks
+    on the left subplot only); perturbations are clustered by type. `subplots`
+    is a list of (subtitle, groups) where groups is a list of (type, size,
+    bars)."""
     power = _AAAI_YAXIS_POWER
     allvals = [v for _st, groups in subplots
-               for _l, bars in groups for (v, _p) in bars.values()]
+               for _t, _l, bars in groups for (v, _p) in bars.values()]
     vmax = max(allvals) if allvals else 1.0
-    yt = _aaai_yaxis_ticks(vmax)
-    ypos = ",".join(f"{(t ** power):.4g}" for t in yt)
-    ylab = ",".join("{" + f"{t:g}" + "}" for t in yt)
-    ymax = (yt[-1] ** power) * 1.10 if yt[-1] > 0 else 1.0
+    ymax, ytick_clause = _aaai_yaxis(vmax)
     n_sub = len(subplots)
     out = [r"\begin{tikzpicture}"]
     out.append(
         r"\begin{groupplot}[" "\n"
         f"  group style={{group size={n_sub} by 1, horizontal sep=18pt,"
         r" ylabels at=edge left, yticklabels at=edge left}," "\n"
-        r"  width=6.0cm, height=4.4cm," "\n"
-        f"  ymin=0, ymax={ymax:.4g}, ytick={{{ypos}}}, yticklabels={{{ylab}}},"
-        "\n"
+        r"  width=6.0cm, height=4.4cm, clip=false," "\n"
+        f"  ymin=0, ymax={ymax:.4g}, {ytick_clause}" "\n"
         r"  ylabel style={font=\small}, y tick label style={font=\small},"
         "\n"
         r"  x tick label style={rotate=90, anchor=east, font=\footnotesize},"
         "\n"
         r"  ymajorgrids, major grid style={gray!25}]")
     for si, (subtitle, groups) in enumerate(subplots):
-        content, n, xtick, xticklabels = _aaai_bar_content(groups, power)
+        content, n, xtick, xticklabels = _aaai_bar_content(
+            groups, power, cluster=True)
         opt = (f"title={{{subtitle}}}, title style={{font=\\small}}, "
                f"xmin=0.4, xmax={n + 0.6:g}, "
                f"xtick={{{xtick}}}, xticklabels={{{xticklabels}}}")
@@ -5547,8 +5604,10 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                 present = [v for v, _s in times.values() if v is not None]
                 if not present:
                     continue
-                pert_plain = (f"{pert} ({p_size})".replace("_", r"\_")
-                              .replace("linf", r"$\ell_\infty$"))
+                type_disp = (pert.replace("_", r"\_")
+                             .replace("linf", r"$\ell_\infty$"))
+                size_disp = ("(" + p_size + ")").replace("_", r"\_")
+                pert_plain = type_disp + " " + size_disp  # full, for gap
                 # A perturbation is "all-timeout" iff every method that ran
                 # it reached the wall-clock cap; its time bars would all be
                 # flat at the cap, so we route it to the merged bound-gap
@@ -5571,9 +5630,12 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                             partial = _aaai_partial(cells.get(sk), side,
                                                     expected_cts)
                             cell_vals[sk] = (g, partial)
-                    if cell_vals:
+                    # Only include a perturbation whose bars are all complete
+                    # (no partial-coverage `*`); drop it otherwise.
+                    if cell_vals and not any(p for _g, p in cell_vals.values()):
                         merged_gap.append(
-                            (arch_disp, c_src, pert_plain, cell_vals))
+                            (arch_disp, c_src, type_disp, pert_plain,
+                             cell_vals))
                 else:
                     bars = {}
                     for sk in series_keys:
@@ -5582,8 +5644,10 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                             partial = _aaai_partial(cells.get(sk), side,
                                                     expected_cts)
                             bars[sk] = (v, partial)
-                    if bars:
-                        time_groups.append(("{" + pert_plain + "}", bars))
+                    # Only include a perturbation whose bars are all complete
+                    # (no partial-coverage `*`); drop it otherwise.
+                    if bars and not any(p for _v, p in bars.values()):
+                        time_groups.append((type_disp, size_disp, bars))
 
             if time_groups:
                 arch_subplots.append(
@@ -5599,11 +5663,9 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
     # title naming it), a single shared legend, and one caption.
     if arch_rows:
         cap = (
-            r"Evaluation of solve times using the " + dataset_disp
+            r"Evaluation of solve times (minutes) using the " + dataset_disp
             + r" dataset, with one row per architecture (" + ", ".join(
-                ad for ad, _s in arch_rows)
-            + r"). The $y$-axis is presented on a square-root scale, while "
-            r"tick marks indicate the true values.")
+                ad for ad, _s in arch_rows) + r").")
         lines += _aaai_group_grid_figure(
             arch_rows, r"time (min)", cap, "fig:n2-time")
 
@@ -5613,16 +5675,14 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
     # group belongs to. Spans both columns (wide) since there can be many.
     if merged_gap:
         gap_groups = []
-        for (a_disp, c_src, pert_plain, vals) in merged_gap:
-            label = ("{" + a_disp + r", $c_s{=}" + str(c_src) + r"$, "
-                     + pert_plain + "}")
-            gap_groups.append((label, vals))
+        for (a_disp, c_src, type_disp, pert_plain, vals) in merged_gap:
+            label = (a_disp + r", $c_s{=}" + str(c_src) + r"$, " + pert_plain)
+            gap_groups.append((type_disp, label, vals))
         cap = (
             r"Evaluation of the remaining bound gap $\delta_u-\delta_l$ on "
             r"the timed-out cells using the " + dataset_disp
             + r" dataset, with each group labelled by architecture and "
-            r"$c_s$. The $y$-axis is presented on a square-root scale, while "
-            r"tick marks indicate the true values.")
+            r"$c_s$.")
         lines += _aaai_bar_figure(
             "Timed-out cells, " + dataset_disp, "fig:n2-gap-timeouts",
             r"$\delta_u-\delta_l$ (pp of $\delta_{\max}$)",
