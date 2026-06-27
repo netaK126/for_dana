@@ -1,0 +1,64 @@
+[rerun_timeouts] enabled — treating rows with solve_status ∈ timeout-set OR optimization_time within ±30.0s of [1800.0, 3600.0, 10800.0] as not done, but only re-running those whose prior runtime is below the new 10800s budget by more than 30.0s (cells that already ran the full budget are kept as done)
+
+Multi-dataset run: 2 datasets — mnist(2 arch), fashion-mnist(3 arch)  [merged pool, interleaved row priority]
+  slot reservation (spillover on): mnist=2, fashion-mnist=5  of 7 slots
+
+Advanced-standard: 1 technique combinations × 1 seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):
+  mipStart=false  branchPri=off  lpBasis=false  boundTight/BTPR=BoundTightPertRelax0.5  zonoBounds=true  n1Probe=off  varHint=prev_pgd  sibGate=true
+  seeds: [4]
+  [n2_tables_only] N2 (target-network) tables only — skipping N1-only jobs (delta_max N1, N1stdBoost); the essential Phase 1 N1-solve state for advstd N2 is kept.
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [mnist/3x50]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/model_seed42_itr20/19_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/model_seed42_itr20/19
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/model_seed42_itr20/19_sgd_itr1
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [mnist/cnn1]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/model_seed42_itr20_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/model_seed42_itr20
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/model_seed42_itr20_sgd_itr1
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [fashion-mnist/3x50]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/3x50_exp/model_seed42_itr19_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/3x50_exp/model_seed42_itr19
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/3x50_exp/model_seed42_itr19_sgd_itr1
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [fashion-mnist/cnn1]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn1_exp/model_seed42_itr19_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn1_exp/model_seed42_itr19
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn1_exp/model_seed42_itr19_sgd_itr1
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [fashion-mnist/cnn2]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn2_exp/model_seed42_itr19_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn2_exp/model_seed42_itr19
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn2_exp/model_seed42_itr19_sgd_itr1
+  [mnist/3x50] N2 delta_max already complete for c_srcs=[1, 3] at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/delta_max/delta_max_3x50_N2_19_sgd_itr1 — skipping
+  [mnist/cnn1] N2 delta_max already complete for c_srcs=[1, 3] at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/cnn1_exp/delta_max/delta_max_cnn1_N2_model_seed42_itr20_sgd_itr1 — skipping
+  [fashion-mnist/3x50] N2 delta_max already complete for c_srcs=[1, 3] at /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/3x50_exp/delta_max/delta_max_3x50_N2_model_seed42_itr19_sgd_itr1 — skipping
+  [fashion-mnist/cnn1] N2 delta_max already complete for c_srcs=[1, 3] at /root/Downloads/for_dana/vaghar_org/paper_experiments/fashion-mnist/cnn1_exp/delta_max/delta_max_cnn1_N2_model_seed42_itr19_sgd_itr1 — skipping
+  [fashion-mnist/cnn2] N2 delta_max missing — computing for c_srcs=[1, 3]
+
+============================================================
+Phase 0.5 (delta_max): 2 jobs total  (2 ready now, 0 waiting on deps)  7 concurrent slots  (32 cores/job, cores 8-231)
+  reserved slot split (with spillover): mnist:2, fashion-mnist:5
+============================================================
+
+  [[fashion-mnist/cnn2] N2 delta_max c_src=1         ] cores 8-39  (0/2 done, 1 queued, 0 locked)
+  [[fashion-mnist/cnn2] N2 delta_max c_src=3         ] cores 40-71  (0/2 done, 0 queued, 0 locked)
+
+[supervisor] Received SIGTERM; terminating 2 live child job(s) and their descendants...

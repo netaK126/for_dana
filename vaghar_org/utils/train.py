@@ -10,8 +10,13 @@ import argparse
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 transform = transforms.Compose([transforms.ToTensor()])
-mnist_train = dsets.MNIST(root='./data/', train=True, transform=transform, download=True)
-mnist_test = dsets.MNIST(root='./data/', train=False, transform=transform, download=True)
+
+# dataset name -> (torchvision class, channels k, width w, height h)
+DATASETS = {
+    "mnist":   (dsets.MNIST,        1, 28, 28),
+    "cifar10": (dsets.CIFAR10,      3, 32, 32),
+    "fmnist":  (dsets.FashionMNIST, 1, 28, 28),
+}
 
 def save_model(model, itr,output):
     a = []
@@ -27,12 +32,24 @@ def save_model(model, itr,output):
     pickle.dump(a, open(model_path + model_name + ".p", "wb"))
     torch.save(model.state_dict(), model_path + model_name + '.pth')
 
+
+def save_final(model, save_dir):
+    """Save the final-epoch model directly into save_dir (model.p + model.pth)."""
+    os.makedirs(save_dir, exist_ok=True)
+    a = [np.transpose(p.cpu().detach().numpy()) for p in model.parameters()]
+    pickle.dump(a, open(os.path.join(save_dir, "model.p"), "wb"))
+    torch.save(model.state_dict(), os.path.join(save_dir, "model.pth"))
+    print("Saved final model to", save_dir)
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--batch_size', type=int, default=128, help='batch size')
     parser.add_argument('--model', type=str, default="cnn0", help='3x10, 3x50, cnn1, or cnn2')
     parser.add_argument('--output_dir', type=str, default="./model/", help='output directory')
+    parser.add_argument('--dataset', type=str, default="mnist", help='mnist, cifar10, or fmnist')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='if set, save only the FINAL-epoch model to this dir (model.p + model.pth)')
     parser.add_argument('--epochs', type=int, default=20, help='number of epochs')
     parser.add_argument('--loss', type=str, default="Cross", help='Cross, MSE, or L1')
     parser.add_argument('--optimizer', type=str, default="Adam", help='Adam, or SGD')
@@ -73,24 +90,16 @@ if __name__ == '__main__':
     loss_type = args.loss
     optimizer_type = args.optimizer
 
-    if model_type == "3x10":
-        model = FNN_3_10()
-    elif model_type == "3x50":
-        model = FNN_3_50()
-    elif model_type == "3x100":
-        model = FNN_3_100()
-    elif model_type == "6x100":
-        model = FNN_6_100()
-    elif model_type == "9x200":
-        model = FNN_9_200()
-    elif model_type == "cnn0":
-        model = CNN0()
-    elif model_type == "cnn1":
-        model = CNN1()
-    elif model_type == "cnn2":
-        model = CNN2()
-    else:
+    ds_class, k, w, h = DATASETS[args.dataset]
+
+    MODEL_CLASSES = {
+        "3x10": FNN_3_10, "3x50": FNN_3_50, "3x100": FNN_3_100,
+        "6x100": FNN_6_100, "9x200": FNN_9_200,
+        "cnn0": CNN0, "cnn1": CNN1, "cnn2": CNN2,
+    }
+    if model_type not in MODEL_CLASSES:
         assert ("New model arch has been detected, please expand models.py and this if condition.")
+    model = MODEL_CLASSES[model_type](k=k, w=w, h=h)
 
     if loss_type == "Cross":
         loss = nn.CrossEntropyLoss().to(device)
@@ -114,14 +123,16 @@ if __name__ == '__main__':
     # atk = PGD(model, eps=0.2, alpha=0.05, steps=4)
     # attacker = PGM(0.05, 0.25, 5, 0)
 
-    train_loader = torch.utils.data.DataLoader(dataset=mnist_train, batch_size=batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(dataset=mnist_test, batch_size=batch_size, shuffle=False)
+    train_ds = ds_class(root='./data/', train=True, transform=transform, download=True)
+    test_ds = ds_class(root='./data/', train=False, transform=transform, download=True)
+    train_loader = torch.utils.data.DataLoader(dataset=train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(dataset=test_ds, batch_size=batch_size, shuffle=False)
 
     for epoch in range(num_epochs):
-        total_batch = len(mnist_train) // batch_size
+        total_batch = len(train_ds) // batch_size
         for i, (batch_images, batch_labels) in enumerate(train_loader):
 
-            X = batch_images.view(-1, 1, 28, 28).to(device)
+            X = batch_images.view(-1, k, w, h).to(device)
             Y = batch_labels.to(device)
             if args.pgd_training:
                 model.eval()
@@ -150,4 +161,8 @@ if __name__ == '__main__':
                 correct += (predicted == labels.to(device)).sum()
             print('Test accuracy: %.2f %%' % (100 * float(correct) / total))
 
-        save_model(model, epoch, output_dir)
+        if args.save_dir is None:
+            save_model(model, epoch, output_dir)
+
+    if args.save_dir is not None:
+        save_final(model, args.save_dir)

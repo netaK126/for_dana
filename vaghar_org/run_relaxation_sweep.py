@@ -176,12 +176,17 @@ PERTURBATIONS = [
     ("trans(3,3)",        "translation:3,3"),
     ("occ(5,5,5)",        "occ:5,5,5"),
     ("occ(3,3,5)",        "occ:3,3,5"),
-    # ("contrast(1.5)",      "contrast:1.5"),
-    # ("rotation(10)",      "rotation:10"),
+    ("occ(14,14,9)",        "occ:14,14,9"),
+    ("occ(1,1,9)",        "occ:1,1,9"),
+    ("contrast(1.5)",      "contrast:1.5"),
+    ("contrast(1.2)",      "contrast:1.2"),
+    ("rotation(10)",      "rotation:10"),
+    ("rotation(5)",      "rotation:5"),
     # ("occ(1,1,5)",        "occ:1,1,5"),
-    # ("linf(0.05)",        "linf:0.05"),    
+    ("linf(0.05)",        "linf:0.05"),    
     ("linf(0.1)",         "linf:0.1"),     
-    # ("brightness(0.25)",  "brightness:0.25"), 
+    ("brightness(0.25)",  "brightness:0.25"), 
+    ("brightness(0.1)",  "brightness:0.1")
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
@@ -190,7 +195,9 @@ OPT_INTERVALS = ["true"]#["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
 CORES_PER_JOB = 32
-CORE_START = 8  # first core to use (reserve 0-7)
+# First core to use (reserve 0-7). Override via SWEEP_CORE_START so two
+# concurrent sweeps can claim disjoint core windows and not fight each other.
+CORE_START = int(os.environ.get("SWEEP_CORE_START", "8"))
 TOTAL_CORES = 255
 
 
@@ -700,7 +707,8 @@ def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_in
 
 
 def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
-             locked_jobs=None, on_job_done=None, priority=None):
+             locked_jobs=None, on_job_done=None, priority=None,
+             group_slots=None, job_group=None):
     """Run jobs with CPU-pinned slot pooling.
 
     ready_jobs:  list of (label, cmd) that can start immediately.
@@ -716,7 +724,16 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
                  queue is sorted by this key before every slot-fill so the
                  lowest-key job is dispatched first (including jobs that have
                  just been unlocked). Pass None (default) for FIFO dispatch.
+    group_slots: optional list of length max_slots assigning each slot a
+                 "preferred group" key (e.g. a dataset name). When given,
+                 a slot is filled with the highest-priority queued job whose
+                 job_group(job) matches its preferred group; if that group has
+                 nothing queued the slot SPILLS OVER to the highest-priority
+                 job of any group (work-conserving — a slot never idles while
+                 any job waits). Pass None (default) for ungrouped pooling.
+    job_group:   callable(job)->group-key, required when group_slots is given.
     """
+    grouped = group_slots is not None and job_group is not None
     if locked_jobs is None:
         locked_jobs = {}
 
@@ -732,6 +749,10 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
           f"({len(ready_jobs)} ready now, {total_jobs - len(ready_jobs)} waiting on deps)  "
           f"{max_slots} concurrent slots  "
           f"({cores_per_job} cores/job, cores {CORE_START}-{CORE_START + max_slots * cores_per_job - 1})")
+    if grouped:
+        from collections import Counter as _Counter
+        split = ", ".join(f"{g}:{n}" for g, n in _Counter(group_slots).items())
+        print(f"  reserved slot split (with spillover): {split}")
     print(f"{'=' * 60}\n")
 
     slots = [None] * max_slots
@@ -759,13 +780,28 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
         _ACTIVE_CHILDREN.add(proc)
         slots[slot_idx] = (label, proc, log_file)
 
+    def pick_for_slot(slot_idx):
+        """Pop the best queued job for this slot. With group_slots, prefer the
+        slot's owner group (highest-priority match, since job_queue is pre-sorted)
+        and spill over to the global highest-priority job if the owner has none
+        queued. Returns (label, cmd), or None when the queue is empty."""
+        if not job_queue:
+            return None
+        if grouped:
+            want = group_slots[slot_idx]
+            for j, job in enumerate(job_queue):
+                if job_group(job) == want:
+                    return job_queue.pop(j)
+            # owner group has nothing queued -> spill over to any group
+        return job_queue.pop(0)
+
     # Fill initial slots from the ready queue.
     if priority:
         job_queue.sort(key=priority)
     for i in range(max_slots):
-        if job_queue:
-            label, cmd = job_queue.pop(0)
-            launch_in_slot(i, label, cmd)
+        job = pick_for_slot(i)
+        if job:
+            launch_in_slot(i, job[0], job[1])
 
     # Poll for finished jobs, unlock dependents, refill slots.
     #
@@ -819,13 +855,34 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
         if priority:
             job_queue.sort(key=priority)
         for i in range(max_slots):
-            if slots[i] is None and job_queue:
-                next_label, next_cmd = job_queue.pop(0)
-                launch_in_slot(i, next_label, next_cmd)
+            if slots[i] is None:
+                job = pick_for_slot(i)
+                if job:
+                    launch_in_slot(i, job[0], job[1])
 
         time.sleep(1)
 
     print(f"\n{phase_name}: all {total_jobs} jobs done.")
+
+
+# ── dataset-name normalization ───────────────────────────────────────────
+# Three layers disagree on the Fashion-MNIST name: the exp folder is
+# 'fashion-mnist', the Python DATASET_CONFIG is keyed by 'fashion_mnist', and
+# the Julia stack (run.jl, datasets.jl, hyper_attack.py) only knows 'fmnist'.
+# These helpers translate any Fashion-MNIST spelling to the identifier each
+# side expects, so --dataset can match the folder name without adding a
+# DATASET_CONFIG entry.
+_FASHION_ALIASES = frozenset({"fashion-mnist", "fashion_mnist", "fashion", "fmnist"})
+
+
+def _dataset_config_key(name):
+    """Key into run_experiment.DATASET_CONFIG for a (possibly aliased) dataset name."""
+    return "fashion_mnist" if name in _FASHION_ALIASES else name
+
+
+def _julia_dataset_name(name):
+    """Dataset identifier that run.jl / hyper_attack.py understand."""
+    return "fmnist" if name in _FASHION_ALIASES else name
 
 
 def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_size=128):
@@ -846,7 +903,7 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
     from run_experiment import ARCH_REGISTRY, DATASET_CONFIG, save_model, evaluate
 
     model_cls, _ = ARCH_REGISTRY[arch]
-    ds_cls, channels, w, h, julia_ds = DATASET_CONFIG[dataset]
+    ds_cls, channels, w, h, julia_ds = DATASET_CONFIG[_dataset_config_key(dataset)]
 
     # Accept both directory and file path (e.g. .../model_seed42_itr20 or .../model_seed42_itr20/model.p)
     model_path = os.path.normpath(model_path)
@@ -871,7 +928,7 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
         sys.exit(1)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = model_cls().to(device)
+    model = model_cls(k=channels, w=w, h=h).to(device)
     model.load_state_dict(torch.load(model_pth, map_location=device))
     print(f"  Loaded model from {model_pth}")
 
@@ -2039,22 +2096,43 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
         return
     suffix = "_vs_withPerturbed" if compare_to_with_perturbed else ""
     rows = updater.load_rows(combined_base, suffix)
-    if not rows:
-        print(f"[tex-update] skipped (no rows in {combined_base})")
-        return
     archs = [arch for arch, _ in arch_runs]
+    # Dataset-scoped AUTO blocks: MNIST (the default) keeps the bare markers
+    # and labels so its output is byte-identical; every other dataset
+    # (e.g. fashion-mnist) writes into its OWN marker pair (name + ":<ds>")
+    # with a "-<ds>" label suffix, so its tables/charts sit ALONGSIDE the
+    # MNIST ones instead of overwriting them. The paper tex must contain a
+    # matching marker pair for the dataset; if not, the splice is skipped.
+    _ds = os.path.basename(combined_base) or "mnist"
+    _default_ds = (_ds == "mnist")
+    _mslug = "" if _default_ds else f":{_ds}"   # marker-name suffix
+    _lslug = "" if _default_ds else f"-{_ds}"   # \label suffix
+    # The combo-ranking CSV (`rows`) feeds ONLY the advstd_techniques.tex
+    # safe_tables block. The nn1/wide and the AAAI per-cell tables+charts
+    # below each scan the per-cell result dirs directly, so they must still
+    # run even when the combo ranking is empty (e.g. a dataset that has the
+    # per-cell N1/N2 runs but no standard-vs-advstd baseline pairing). Only
+    # the safe_tables block is gated on `rows`.
+    if not rows:
+        print(f"[tex-update] safe_tables skipped (no combo rows in "
+              f"{combined_base}); continuing with per-cell tables/charts")
     # Pass seed=None / tau=None so the regenerated tables include every
     # row produced by the sweep (all thresholds, all seeds); tau and seed
     # are already row columns in the tables.
-    try:
-        combination_filter = updater.parse_combination_spec(combination_table)
-        body = updater.render_all(archs, rows, None, None,
-                                  combination_filter=combination_filter)
-        updater.update_tex(tex_path, body)
-    except SystemExit as exc:
-        print(f"[tex-update] {exc}")
-    except Exception as exc:
-        print(f"[tex-update] error: {exc}")
+    if rows:
+        try:
+            combination_filter = updater.parse_combination_spec(
+                combination_table)
+            body = updater.render_all(archs, rows, None, None,
+                                      combination_filter=combination_filter)
+            updater.update_tex(tex_path, body,
+                               begin_mark=updater.BEGIN_MARK + _mslug,
+                               end_mark=updater.END_MARK + _mslug,
+                               label_suffix=_lslug)
+        except SystemExit as exc:
+            print(f"[tex-update] {exc}")
+        except Exception as exc:
+            print(f"[tex-update] error: {exc}")
 
     # ── Standard-mode nn1-boost section (sec:safe_nn1) ──
     # Scan _stdBoost_* result files, pair each cell with its
@@ -2068,7 +2146,10 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
             updater.regenerate_nn1_section(
                 tex_path, cwd, dataset_guess, arch_runs,
                 parse_result_file,
-                seeds_filter=combo_ranking_seeds)
+                seeds_filter=combo_ranking_seeds,
+                begin_mark=updater.NN1_BEGIN_MARK + _mslug,
+                end_mark=updater.NN1_END_MARK + _mslug,
+                ds_label_suffix=_lslug)
         else:
             print("[tex-update] updater missing regenerate_nn1_section "
                   "-- upgrade update_advstd_tex_tables.py to populate "
@@ -2084,7 +2165,10 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
             updater.regenerate_wide_perarch_section(
                 tex_path, cwd, dataset_guess, arch_runs,
                 parse_result_file,
-                seeds_filter=combo_ranking_seeds)
+                seeds_filter=combo_ranking_seeds,
+                begin_mark=updater.WIDE_BEGIN_MARK + _mslug,
+                end_mark=updater.WIDE_END_MARK + _mslug,
+                ds_label_suffix=_lslug)
         else:
             print("[tex-update] updater missing "
                   "regenerate_wide_perarch_section -- upgrade "
@@ -2121,7 +2205,10 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                     parse_result_file,
                     seeds_filter=combo_ranking_seeds,
                     force_timeout=force_timeout,
-                    rerun_timeout_eps=rerun_timeout_eps)
+                    rerun_timeout_eps=rerun_timeout_eps,
+                    begin_mark=updater.AAAI_N2_CHARTS_BEGIN_MARK + _mslug,
+                    end_mark=updater.AAAI_N2_CHARTS_END_MARK + _mslug,
+                    ds_label_suffix=_lslug)
         except Exception as exc:
             print(f"[tex-update] aaai_n2_charts (body) block error: {exc}")
 
@@ -2137,8 +2224,9 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                     force_timeout=force_timeout,
                     rerun_timeout_eps=rerun_timeout_eps,
                     roles={"N2"},
-                    begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK,
-                    end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK)
+                    begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
+                    end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug,
+                    ds_label_suffix=_lslug)
         except Exception as exc:
             print(f"[tex-update] aaai_safe_wide (N2 appendix) block "
                   f"error: {exc}")
@@ -2155,8 +2243,9 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                     force_timeout=force_timeout,
                     rerun_timeout_eps=rerun_timeout_eps,
                     roles={"N1"}, label_suffix="-n1",
-                    begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK,
-                    end_mark=updater.AAAI_WIDE_N1_END_MARK)
+                    begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK + _mslug,
+                    end_mark=updater.AAAI_WIDE_N1_END_MARK + _mslug,
+                    ds_label_suffix=_lslug)
         except Exception as exc:
             print(f"[tex-update] aaai_safe_wide (N1 appendix) block "
                   f"error: {exc}")
@@ -2259,6 +2348,21 @@ def main():
                         help="Run multiple architectures, each with its own model path. "
                              "Format: arch=model_path (e.g. cnn1=/path/to/cnn1_model cnn2=/path/to/cnn2_model). "
                              "Overrides --arch and --model_path when specified.")
+    parser.add_argument("--dataset_group", action="append", default=None,
+                        help="(advanced_standard only) Run MULTIPLE datasets in a single "
+                             "merged job pool, interleaving their row priority. Repeatable, "
+                             "once per dataset. Format: 'dataset|arch=path,arch=path'. "
+                             "e.g. --dataset_group 'mnist|cnn1=/p/cnn1,3x50=/p/3x50' "
+                             "--dataset_group 'fashion-mnist|3x10=/p/3x10,cnn1=/p/cnn1'. "
+                             "All other flags (--sweep_ctag, --ct, techniques, etc.) are "
+                             "shared across groups. Overrides --dataset/--arch_models.")
+    parser.add_argument("--dataset_slots", type=str, default=None,
+                        help="(with --dataset_group) Reserve a slot split per dataset, "
+                             "comma-separated in --dataset_group order, e.g. '2,5' = 2 slots "
+                             "for the 1st dataset, 5 for the 2nd. Reserved slots give each "
+                             "dataset guaranteed concurrency; idle slots SPILL OVER to the "
+                             "other dataset's remaining jobs (work-conserving, no idle cores). "
+                             "Default: split the available slots as evenly as possible.")
     parser.add_argument("--find_transfer_faster_than_standard", action="store_true",
                         help="Scan existing results and report transfer experiments that are "
                              "faster than standard N2 (vagharNoPerturbed with sgd) for each "
@@ -2477,7 +2581,7 @@ def main():
                              "'N1:false:false:0:false,N2:false:false:0:false,"
                              "N1:true:true:0:true,N1:true:true:0.5:true'.")
     parser.add_argument("--skip_std_n2_baseline", action="store_true",
-                        help="In --advanced_standard mode, skip Phase 1.5 (the auto-launched "
+                        help="In --advanc ed_standard mode, skip Phase 1.5 (the auto-launched "
                              "vagharWithPerturbed N2 standard baseline). Use when you only want "
                              "the N1-solve, advstd, and stdBoost jobs and don't need the "
                              "wide-table 'pi' baseline.")
@@ -2749,6 +2853,118 @@ def main():
             cores_per_job = Threads_num
             max_slots = (total_cores - CORE_START) // cores_per_job
 
+            # ── Multi-dataset grouping ──────────────────────────────────
+            # By default the sweep runs a single dataset (args.dataset) over
+            # arch_runs. With --dataset_group (repeatable) it runs SEVERAL
+            # datasets in one merged job pool, interleaving their row priority
+            # round-robin. Each group carries its own dataset + arch_models;
+            # everything else (sweep_ctag, ct, techniques, …) is shared.
+            # arch_runs is reshaped here into (dataset, arch, model_path)
+            # triples; every per-arch loop below iterates these triples so the
+            # single c_tag loop wraps both datasets and one run_pool schedules
+            # them together. (Safe: this branch returns before any later code
+            # that expects the original 2-tuple arch_runs.)
+            if args.dataset_group:
+                dataset_groups = []
+                for spec in args.dataset_group:
+                    if "|" not in spec:
+                        print(f"ERROR: --dataset_group '{spec}' must be "
+                              f"'dataset|arch=path,arch=path'")
+                        sys.exit(1)
+                    ds_part, am_part = spec.split("|", 1)
+                    ds_name = ds_part.strip()
+                    if not ds_name:
+                        print(f"ERROR: --dataset_group '{spec}' has an empty dataset name")
+                        sys.exit(1)
+                    aruns = []
+                    for pair in am_part.split(","):
+                        pair = pair.strip()
+                        if not pair:
+                            continue
+                        if "=" not in pair:
+                            print(f"ERROR: --dataset_group arch entry '{pair}' "
+                                  f"must be arch=model_path (in '{spec}')")
+                            sys.exit(1)
+                        a, p = pair.split("=", 1)
+                        aruns.append((a.strip(), p.strip()))
+                    if not aruns:
+                        print(f"ERROR: --dataset_group '{spec}' lists no arch=model_path pairs")
+                        sys.exit(1)
+                    dataset_groups.append((ds_name, aruns))
+            else:
+                dataset_groups = [(dataset, arch_runs)]
+            _multi_ds = len(dataset_groups) > 1
+            # NOTE: arch_runs is reshaped to (dataset, arch, model_path) triples
+            # later, just before the Phase-0 arch_meta loop — AFTER the
+            # combo-ranking analysis block below, which still consumes the
+            # original 2-tuple arch_runs.
+            if _multi_ds:
+                print(f"\nMulti-dataset run: {len(dataset_groups)} datasets — "
+                      + ", ".join(f"{ds}({len(aruns)} arch)" for ds, aruns in dataset_groups)
+                      + "  [merged pool, interleaved row priority]")
+
+            def _aprefix(dataset, arch):
+                """Label prefix. Includes the dataset only in multi-dataset runs
+                so single-dataset labels (and sweep_logs filenames) are unchanged."""
+                return f"[{dataset}/{arch}] " if _multi_ds else f"[{arch}] "
+
+            # ── Per-dataset slot reservation (work-conserving) ───────────
+            # In a multi-dataset run, reserve a share of the concurrent slots
+            # for each dataset so both make progress at once; idle slots spill
+            # over to the other dataset's remaining jobs so no core sits unused.
+            # job_group maps a job to its dataset via the output_dir path.
+            _grp_re = re.compile(r"paper_experiments/([^/]+)/")
+            def _job_group(job):
+                cmd = job[1]
+                try:
+                    out = cmd[cmd.index("--output_dir") + 1]
+                except (ValueError, IndexError):
+                    out = ""
+                m = _grp_re.search(out or "")
+                return m.group(1) if m else None
+            group_slots = None
+            if _multi_ds:
+                n_groups = len(dataset_groups)
+                if args.dataset_slots:
+                    try:
+                        slot_counts = [int(x) for x in args.dataset_slots.split(",")]
+                    except ValueError:
+                        print(f"ERROR: --dataset_slots must be comma-separated ints, got '{args.dataset_slots}'")
+                        sys.exit(1)
+                    if len(slot_counts) != n_groups:
+                        print(f"ERROR: --dataset_slots has {len(slot_counts)} entries but "
+                              f"there are {n_groups} --dataset_group(s)")
+                        sys.exit(1)
+                    if any(c < 0 for c in slot_counts) or sum(slot_counts) == 0:
+                        print("ERROR: --dataset_slots must be non-negative and not all zero")
+                        sys.exit(1)
+                    if sum(slot_counts) > max_slots:
+                        print(f"ERROR: --dataset_slots sums to {sum(slot_counts)} but only "
+                              f"{max_slots} slots are available (cores {CORE_START}-"
+                              f"{CORE_START + max_slots * cores_per_job - 1}, {cores_per_job}/job)")
+                        sys.exit(1)
+                else:
+                    base = max_slots // n_groups
+                    slot_counts = [base] * n_groups
+                    for i in range(max_slots - base * n_groups):  # remainder to first groups
+                        slot_counts[i] += 1
+                # Expand to a per-slot owner list. Any leftover slots (when the
+                # split sums to < max_slots) are handed out round-robin; they
+                # still spill over, so no slot ever idles.
+                group_slots = []
+                for (ds, _), c in zip(dataset_groups, slot_counts):
+                    group_slots.extend([ds] * c)
+                _gi = 0
+                while len(group_slots) < max_slots:
+                    group_slots.append(dataset_groups[_gi % n_groups][0])
+                    _gi += 1
+                group_slots = group_slots[:max_slots]
+                _spill = max_slots - sum(slot_counts)
+                print("  slot reservation (spillover on): "
+                      + ", ".join(f"{ds}={c}" for (ds, _), c in zip(dataset_groups, slot_counts))
+                      + (f" +{_spill} shared" if _spill > 0 else "")
+                      + f"  of {max_slots} slots")
+
             # Resolve technique sweep values
             mip_start_vals = [v.lower() for v in args.sweep_adv_std_mip_start] if args.sweep_adv_std_mip_start else ["true"]
             # Branch priorities: rank (uniform-spacing) / decay (magnitude-aware).
@@ -2950,27 +3166,35 @@ def main():
             sys.path.insert(0, os.path.join(cwd, 'utils'))
             from run_experiment import ARCH_REGISTRY, DATASET_CONFIG
 
+            # Flatten arch_runs to (dataset, arch, model_path) triples spanning
+            # all groups. From here on every per-arch loop iterates triples, so
+            # the single c_tag loop covers all datasets and one run_pool
+            # schedules them together. (Done here, after the combo-ranking
+            # analysis block, which uses the original 2-tuple arch_runs.)
+            arch_runs = [(ds, a, p) for ds, aruns in dataset_groups for a, p in aruns]
+
             # ── Phase 0: Train N2 = N1 + sgd_epochs for each arch (once) ─
             # Hoisted out of the c_tag loop — training only depends on
             # (arch, sgd_epochs, lr) and is idempotent if N2 already exists.
-            arch_meta = {}  # arch -> (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
-            for arch, model_path in arch_runs:
+            arch_meta = {}  # (dataset, arch) -> (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
+            for dataset, arch, model_path in arch_runs:
                 if model_path is None:
                     print(f"ERROR: --advanced_standard requires --model_path (or --arch_models)")
                     sys.exit(1)
                 print(f"\n{'=' * 60}")
-                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
+                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) {_aprefix(dataset, arch).strip()}")
                 print(f"{'=' * 60}\n")
                 n1_dir, n2_dir = train_extra_epochs(
                     model_path, arch, dataset,
                     sgd_epochs=args.sgd_epochs, lr=args.lr)
                 _, model_name = ARCH_REGISTRY[arch]
-                _, _, _, _, julia_dataset = DATASET_CONFIG[dataset]
+                _, _, _, _, julia_dataset = DATASET_CONFIG[_dataset_config_key(dataset)]
+                julia_dataset = _julia_dataset_name(julia_dataset)
                 n1_tag = os.path.basename(os.path.normpath(n1_dir))
                 n2_tag = os.path.basename(os.path.normpath(n2_dir))
                 n1_model_p = os.path.join(n1_dir, "model.p")
                 n2_model_p = os.path.join(n2_dir, "model.p")
-                arch_meta[arch] = (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
+                arch_meta[(dataset, arch)] = (n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset)
 
             # ── Phase 0.5: delta_max for N1 and N2 (single-network, no perturbation) ─
             # Runs run.jl with --perturbation max once per (arch, network, c_src).
@@ -2983,8 +3207,9 @@ def main():
             # delta_max_{arch}_{network}_{tag}/ dir; cells whose c_src already
             # has a result line are skipped.
             ready_delta_max_jobs = []
-            for arch, model_path in arch_runs:
-                n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+            for dataset, arch, model_path in arch_runs:
+                n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
+                arch_prefix = _aprefix(dataset, arch)
                 for role, role_tag, role_model_p in (("N1", n1_tag, n1_model_p),
                                                      ("N2", n2_tag, n2_model_p)):
                     # --n2_tables_only: N1's delta_max only feeds the source-network
@@ -2996,16 +3221,16 @@ def main():
                         "delta_max", f"delta_max_{arch}_{role}_{role_tag}")
                     missing_c_srcs = _delta_max_missing_c_srcs(dm_out_dir, sweep_ctag_vals)
                     if not missing_c_srcs:
-                        print(f"  [{arch}] {role} delta_max already complete for c_srcs={list(sweep_ctag_vals)} at {dm_out_dir} — skipping")
+                        print(f"  {arch_prefix}{role} delta_max already complete for c_srcs={list(sweep_ctag_vals)} at {dm_out_dir} — skipping")
                         continue
                     have = [c for c in sweep_ctag_vals if c not in missing_c_srcs]
                     if have:
-                        print(f"  [{arch}] {role} delta_max partial — have c_srcs={have}, computing missing={missing_c_srcs}")
+                        print(f"  {arch_prefix}{role} delta_max partial — have c_srcs={have}, computing missing={missing_c_srcs}")
                     else:
-                        print(f"  [{arch}] {role} delta_max missing — computing for c_srcs={missing_c_srcs}")
+                        print(f"  {arch_prefix}{role} delta_max missing — computing for c_srcs={missing_c_srcs}")
                     for c_src in missing_c_srcs:
                         dummy_ct = c_src + 1 if c_src < 10 else 1
-                        dm_label = f"[{arch}] {role} delta_max c_src={c_src}"
+                        dm_label = f"{arch_prefix}{role} delta_max c_src={c_src}"
                         dm_cmd = [
                             "julia", "run.jl",
                             "--mode", "standard",
@@ -3031,6 +3256,7 @@ def main():
                 run_pool(
                     ready_delta_max_jobs, max_slots, cwd, cores_per_job,
                     "Phase 0.5 (delta_max)",
+                    group_slots=group_slots, job_group=_job_group,
                 )
 
             # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
@@ -3049,15 +3275,17 @@ def main():
             stale_lock_sec = max(2 * args.timeout, 600)
             wait_timeout_sec = stale_lock_sec
 
-            # Cross-c_tag / cross-pert tracking. The (arch, pert_spec) lock is
-            # acquired once (at the first c_tag that needs N1 for that pert),
-            # held while ALL chained N1 jobs for it run sequentially, and
-            # released the moment the last N1 in the chain finishes.
-            n1_lock_by_pert = {}              # (arch, pert_spec) -> lock_path
-            n1_pending_count_per_pert = {}    # (arch, pert_spec) -> int (countdown)
-            n1_last_label_per_pert = {}       # (arch, pert_spec) -> label of most-recent N1 job queued (next c_tag chains behind it)
-            n1_pert_by_label = {}             # n1_label -> (arch, pert_spec) reverse lookup for on_job_done
-            n1_label_by_pert_ctag = {}        # (arch, pert_spec, c_tag) -> n1_label (None if no N1 queued for that triple)
+            # Cross-c_tag / cross-pert tracking. The (dataset, arch, pert_spec)
+            # lock is acquired once (at the first c_tag that needs N1 for that
+            # pert), held while ALL chained N1 jobs for it run sequentially, and
+            # released the moment the last N1 in the chain finishes. The dataset
+            # field keeps the two datasets' identical archs (e.g. cnn1) from
+            # colliding in a merged --dataset_group run.
+            n1_lock_by_pert = {}              # (dataset, arch, pert_spec) -> lock_path
+            n1_pending_count_per_pert = {}    # (dataset, arch, pert_spec) -> int (countdown)
+            n1_last_label_per_pert = {}       # (dataset, arch, pert_spec) -> label of most-recent N1 job queued (next c_tag chains behind it)
+            n1_pert_by_label = {}             # n1_label -> (dataset, arch, pert_spec) reverse lookup for on_job_done
+            n1_label_by_pert_ctag = {}        # (dataset, arch, pert_spec, c_tag) -> n1_label (None if no N1 queued for that triple)
 
             ready_n1_jobs = []
             ready_std_n2_jobs = []
@@ -3074,11 +3302,12 @@ def main():
                 print(f"\n{'━' * 60}\nc_tag = {c_tag}  (Julia 1-indexed; Julia writes ctag{c_tag - 1} into filenames)\n{'━' * 60}")
 
                 # Phase 1 (this c_tag): N1 jobs.
-                for arch, model_path in arch_runs:
-                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                for dataset, arch, model_path in arch_runs:
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                     for pert_name, pert_spec in perts:
                         pert_type, eps_str = pert_spec.split(":", 1)
-                        arch_prefix = f"[{arch}] "
+                        arch_prefix = _aprefix(dataset, arch)
+                        pkey = (dataset, arch, pert_spec)  # per-dataset N1 lock/chain key
 
                         n1_state_dir = os.path.join(
                             cwd, "paper_experiments", dataset, f"{arch}_exp",
@@ -3101,11 +3330,11 @@ def main():
                         else:
                             print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state missing — solving for c_targets={missing_c_targets}")
 
-                        # Acquire the (arch, pert_spec) lock if we don't
-                        # already hold it from an earlier c_tag in this build
-                        # phase. The lock is held until the LAST chained N1
-                        # for this pert finishes (released via on_job_done).
-                        if (arch, pert_spec) not in n1_lock_by_pert:
+                        # Acquire the (dataset, arch, pert_spec) lock if we
+                        # don't already hold it from an earlier c_tag in this
+                        # build phase. The lock is held until the LAST chained
+                        # N1 for this pert finishes (released via on_job_done).
+                        if pkey not in n1_lock_by_pert:
                             got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
                             if not got_lock:
                                 print(f"  {arch_prefix}{pert_name} c_tag={c_tag} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
@@ -3123,7 +3352,7 @@ def main():
                                 if not got_lock:
                                     print(f"  {arch_prefix}{pert_name} ERROR: still unable to acquire N1 solve lock at {lock_path}. Aborting.")
                                     sys.exit(1)
-                            n1_lock_by_pert[(arch, pert_spec)] = lock_path
+                            n1_lock_by_pert[pkey] = lock_path
                         # else: lock already held from an earlier c_tag — reuse.
 
                         ct_arg = ",".join(str(ct) for ct in missing_c_targets)
@@ -3148,20 +3377,20 @@ def main():
                             "--Threads_num", str(Threads_num),
                         ]
 
-                        # First N1 for this (arch, pert_spec) goes into ready;
-                        # subsequent c_tags chain behind the previous N1 so
-                        # they serialize on the shared state-dir (n1_preact_bounds.bin
-                        # and the lock file).
-                        prev_label = n1_last_label_per_pert.get((arch, pert_spec))
+                        # First N1 for this (dataset, arch, pert_spec) goes into
+                        # ready; subsequent c_tags chain behind the previous N1
+                        # so they serialize on the shared state-dir
+                        # (n1_preact_bounds.bin and the lock file).
+                        prev_label = n1_last_label_per_pert.get(pkey)
                         if prev_label is None:
                             ready_n1_jobs.append((n1_label, n1_cmd))
                         else:
                             locked_jobs_by_label.setdefault(prev_label, []).append((n1_label, n1_cmd))
 
-                        n1_last_label_per_pert[(arch, pert_spec)] = n1_label
-                        n1_pending_count_per_pert[(arch, pert_spec)] = n1_pending_count_per_pert.get((arch, pert_spec), 0) + 1
-                        n1_pert_by_label[n1_label] = (arch, pert_spec)
-                        n1_label_by_pert_ctag[(arch, pert_spec, c_tag)] = n1_label
+                        n1_last_label_per_pert[pkey] = n1_label
+                        n1_pending_count_per_pert[pkey] = n1_pending_count_per_pert.get(pkey, 0) + 1
+                        n1_pert_by_label[n1_label] = pkey
+                        n1_label_by_pert_ctag[(dataset, arch, pert_spec, c_tag)] = n1_label
 
                 # Phase 1.5 (this c_tag): standard-N2 (vagharWithPerturbed)
                 # baselines — independent of N1 state, always ready.
@@ -3170,11 +3399,11 @@ def main():
                     arch_iter_phase1_5 = []
                 else:
                     arch_iter_phase1_5 = arch_runs
-                for arch, model_path in arch_iter_phase1_5:
-                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                for dataset, arch, model_path in arch_iter_phase1_5:
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                     for pert_name, pert_spec in perts:
                         pert_type, eps_str = pert_spec.split(":", 1)
-                        arch_prefix = f"[{arch}] "
+                        arch_prefix = _aprefix(dataset, arch)
 
                         requested_c_targets = _parse_c_targets(
                             args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
@@ -3221,11 +3450,11 @@ def main():
                         ready_std_n2_jobs.append((std_label, std_cmd))
 
                 # Phase 2 (this c_tag): advstd jobs.
-                for arch, model_path in arch_runs:
-                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                for dataset, arch, model_path in arch_runs:
+                    n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                     for pert_name, pert_spec in perts:
                         pert_type, eps_str = pert_spec.split(":", 1)
-                        arch_prefix = f"[{arch}] "
+                        arch_prefix = _aprefix(dataset, arch)
 
                         n1_state_dir = os.path.join(
                             cwd, "paper_experiments", dataset, f"{arch}_exp",
@@ -3327,7 +3556,7 @@ def main():
                                 ]
                                 if geom_applies_adv:
                                     cmd += ["--geometric_intervals", "true"]
-                                n1_label_for_advstd = n1_label_by_pert_ctag.get((arch, pert_spec, c_tag))
+                                n1_label_for_advstd = n1_label_by_pert_ctag.get((dataset, arch, pert_spec, c_tag))
                                 if n1_label_for_advstd is None:
                                     ready_advstd_jobs.append((label, cmd))
                                 else:
@@ -3437,11 +3666,11 @@ def main():
                               f"{len(explicit_stdboost_combos)} N2stdBoost combo(s)")
 
                 if explicit_stdboost_combos:
-                    for arch, model_path in arch_runs:
-                        n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[arch]
+                    for dataset, arch, model_path in arch_runs:
+                        n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                         for pert_name, pert_spec in perts:
                             pert_type, eps_str = pert_spec.split(":", 1)
-                            arch_prefix = f"[{arch}] "
+                            arch_prefix = _aprefix(dataset, arch)
 
                             requested_c_targets = _parse_c_targets(
                                 args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
@@ -3534,19 +3763,31 @@ def main():
             # default (FIFO) path we keep the global pi=false tail-sort. In the
             # row-priority path the pi=false ordering is folded into the
             # priority key, so the global sort is skipped and run_pool sorts the
-            # queue by (row_index, phase_rank, pi_false) before every slot-fill.
+            # queue by (within_row, ds_rank, phase_rank, pi_false) before every
+            # slot-fill.
             row_priority = None
             if args.prioritize_rows:
-                # Row = (arch, pert_spec), ordered as built (arch outer, pert
-                # inner). Lower row index dispatches first, so earlier rows
-                # finish before later rows get going (spare slots still run
-                # later-row work). Within a row: N1 (which unlocks advstd)
-                # before std/stdBoost before advstd-N2, and pi=false last.
-                row_order = [(arch, pert_spec)
-                             for arch, _ in arch_runs
-                             for _, pert_spec in perts]
-                row_index = {rk: i for i, rk in enumerate(row_order)}
-                _arch_exp_re = re.compile(r"/([^/]+)_exp/")
+                # Row = (arch, pert_spec) WITHIN a dataset, ordered as built
+                # (arch outer, pert inner). The primary key is the within-dataset
+                # row index and the secondary key is the dataset's CLI order, so
+                # dispatch interleaves datasets round-robin: dataset-A row 0,
+                # dataset-B row 0, dataset-A row 1, dataset-B row 1, …  (when one
+                # dataset runs out of rows the other keeps filling). Within a
+                # single (dataset, row) cell: N1 (which unlocks advstd) before
+                # std/stdBoost before advstd-N2, and pi=false last. For a
+                # single-dataset run ds_rank is constant, so this degenerates to
+                # the original (row_index, phase_rank, pi_false) ordering.
+                _ds_rank = {ds: i for i, (ds, _) in enumerate(dataset_groups)}
+                _within_row = {}
+                for ds, aruns in dataset_groups:
+                    ri = 0
+                    for a, _ in aruns:
+                        for _, pert_spec in perts:
+                            _within_row[(ds, a, pert_spec)] = ri
+                            ri += 1
+                _n_rows = len(_within_row)
+                # output_dir looks like .../paper_experiments/<dataset>/<arch>_exp/...
+                _ds_arch_exp_re = re.compile(r"paper_experiments/([^/]+)/([^/]+)_exp/")
 
                 def _cmd_opt(cmd, name):
                     try:
@@ -3560,9 +3801,11 @@ def main():
                     psize = _cmd_opt(cmd, "--perturbation_size")
                     pert_spec = f"{pert}:{psize}" if pert and psize else None
                     out_dir = _cmd_opt(cmd, "--output_dir") or ""
-                    m = _arch_exp_re.search(out_dir)
-                    arch = m.group(1) if m else None
-                    ridx = row_index.get((arch, pert_spec), len(row_order))
+                    m = _ds_arch_exp_re.search(out_dir)
+                    ds = m.group(1) if m else None
+                    arch = m.group(2) if m else None
+                    within = _within_row.get((ds, arch, pert_spec), _n_rows)
+                    drank = _ds_rank.get(ds, len(_ds_rank))
                     mode = _cmd_opt(cmd, "--mode")
                     if mode == "advanced_standard_n1":
                         phase_rank = 0
@@ -3570,7 +3813,7 @@ def main():
                         phase_rank = 2
                     else:
                         phase_rank = 1
-                    return (ridx, phase_rank, _is_pi_false(job))
+                    return (within, drank, phase_rank, _is_pi_false(job))
 
                 row_priority = _job_priority
             else:
@@ -3626,6 +3869,7 @@ def main():
                         locked_jobs=locked_jobs_by_label,
                         on_job_done=_on_pool_job_done,
                         priority=row_priority,
+                        group_slots=group_slots, job_group=_job_group,
                     )
                 finally:
                     # Defensive: release any (arch, pert_spec) locks still
