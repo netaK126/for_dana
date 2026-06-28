@@ -623,7 +623,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 name_to_save = name_to_save*"_HyperAttackHints"
             end
             if activate_vaghgar_deps
-                name_to_save = name_to_save*"_VagharDeps"
+                name_to_save = name_to_save*"_VagharDeps_depGuardFix"
                 perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d[:Perturbation])
             end
@@ -942,7 +942,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
     if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
-    if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps"; end
+    if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps_depGuardFix"; end
     if args["use_perturbed_intervals"];     n2_check = n2_check * "_PerturbedIntervals"; end
     if geometric_intervals;                 n2_check = n2_check * "_geomInt"; end
 
@@ -1255,7 +1255,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name * "_HyperAttackCutoff"
             end
             if activate_vaghgar_deps
-                n2_name = n2_name * "_VagharDeps"
+                n2_name = n2_name * "_VagharDeps_depGuardFix"
                 perturbation_dependencies(m_n2, nn2, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d_n2[:Perturbation])
             end

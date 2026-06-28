@@ -3836,10 +3836,16 @@ def _wide_column_short_label(col):
 
 
 def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
-                                 seeds_filter=None):
+                                 seeds_filter=None, stale_fn=None):
     """Walk each arch's results dir and yield per-cell timing rows for the
     per-arch wide comparison section. One row per (.txt file, cs, ct) cell.
     The combo field is 'vaghar', 'PI', or one of the 8 boost masks.
+
+    `stale_fn` (run_relaxation_sweep._is_pre_fix_dropped) drops files made
+    unsound by the perturbation-dependency fix -- a pre-fix file that relaxed
+    >=1 binary. None disables the gate (keeps the prior behavior). Applies to
+    the relaxed combos (e.g. "ours" at tau=0.5); all-off/vaghar files dropped
+    no binary so they pass through unchanged.
     """
     import glob
     rows = []
@@ -3872,6 +3878,11 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                     role = _role_of_stdboost_dir(cd)
                     for tf in glob.glob(os.path.join(cd, "*.txt")):
                         fname = os.path.basename(tf)
+                        # Drop pre-fix files that relaxed >=1 binary (unsound
+                        # under the perturbation-dependency fix). all-off/vaghar
+                        # files dropped nothing, so they pass.
+                        if stale_fn is not None and stale_fn(fname):
+                            continue
                         if src_kind == "boost":
                             combo = _classify_stdboost_filename(fname)
                             if combo is None:
@@ -5262,7 +5273,11 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           label_suffix="",
                                           begin_mark=AAAI_WIDE_BEGIN_MARK,
                                           end_mark=AAAI_WIDE_END_MARK,
-                                          ds_label_suffix=""):
+                                          ds_label_suffix="",
+                                          advstd_meta_fn=None,
+                                          perts=None,
+                                          combination_filter=None,
+                                          stale_fn=None):
     """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
     AAAI variant into the neta_s_paper evaluation section. When
     `force_timeout` is set (in seconds), cells whose Gurobi run hit a
@@ -5271,14 +5286,32 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
     `roles`/`label_suffix`/`begin_mark`/`end_mark` select which network
     role to emit and where: the target-network (N2) tables go to the body
     with the default marks, and the source-network (N1) tables go to the
-    appendix with roles={"N1"}, label_suffix="-n1", and the N1 marks."""
+    appendix with roles={"N1"}, label_suffix="-n1", and the N1 marks.
+
+    The transfer (advstd N2) rows come from the CSVs by default; when
+    `advstd_meta_fn` and `perts` are supplied they instead come DIRECTLY from
+    the advStd .txt files (no CSV, no baseline pairing) via
+    _load_advstd_rows_for_wide_from_txt, optionally filtered by
+    `combination_filter` (--combination_table). `stale_fn`
+    (_is_pre_fix_dropped) drops pre-fix files that relaxed >=1 binary, applied
+    uniformly to the vaghar/ours AND transfer rows."""
     try:
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                             parse_result_file,
-                                            seeds_filter=seeds_filter)
+                                            seeds_filter=seeds_filter,
+                                            stale_fn=stale_fn)
         archs = [a for a, _ in arch_runs]
-        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
-                                            seeds_filter=seeds_filter)
+        if advstd_meta_fn is not None and perts is not None:
+            rows += _load_advstd_rows_for_wide_from_txt(
+                cwd, dataset, archs, perts, parse_result_file, advstd_meta_fn,
+                seeds_filter=seeds_filter,
+                combination_filter=combination_filter,
+                force_timeout=force_timeout,
+                rerun_timeout_eps=rerun_timeout_eps,
+                stale_fn=stale_fn)
+        else:
+            rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                                seeds_filter=seeds_filter)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
         delta_d_by_key = _load_delta_d_values(cwd, dataset, archs)
         body = _render_aaai_wide_perarch_body(
@@ -5990,17 +6023,37 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
                                       rerun_timeout_eps=30.0,
                                       begin_mark=AAAI_N2_CHARTS_BEGIN_MARK,
                                       end_mark=AAAI_N2_CHARTS_END_MARK,
-                                      ds_label_suffix=""):
+                                      ds_label_suffix="",
+                                      advstd_meta_fn=None,
+                                      perts=None,
+                                      combination_filter=None,
+                                      stale_fn=None):
     """Collect the same per-cell rows as the N2 table and emit the
     per-perturbation solve-time and bound-gap charts into the evaluation
-    body between the chart marks."""
+    body between the chart marks.
+
+    Like regenerate_aaai_wide_perarch_section, the transfer (advstd N2) rows
+    come from the advStd .txt files directly when `advstd_meta_fn`/`perts` are
+    supplied, else from the CSVs. `stale_fn` (_is_pre_fix_dropped) drops
+    pre-fix files that relaxed >=1 binary, on both the vaghar/ours and
+    transfer rows."""
     try:
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                            parse_result_file,
-                                           seeds_filter=seeds_filter)
+                                           seeds_filter=seeds_filter,
+                                           stale_fn=stale_fn)
         archs = [a for a, _ in arch_runs]
-        rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
-                                           seeds_filter=seeds_filter)
+        if advstd_meta_fn is not None and perts is not None:
+            rows += _load_advstd_rows_for_wide_from_txt(
+                cwd, dataset, archs, perts, parse_result_file, advstd_meta_fn,
+                seeds_filter=seeds_filter,
+                combination_filter=combination_filter,
+                force_timeout=force_timeout,
+                rerun_timeout_eps=rerun_timeout_eps,
+                stale_fn=stale_fn)
+        else:
+            rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
+                                               seeds_filter=seeds_filter)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
         body = _render_aaai_n2_charts(
             rows, archs, dataset,
@@ -6315,6 +6368,156 @@ def _load_advstd_rows_for_wide(cwd, dataset, archs, seeds_filter=None,
                     # geom column ("yes"/"no") -> paired as base,geom in time.
                     "geom": (str(r.get("geom", "no")) == "yes"),
                 })
+    return rows
+
+
+def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
+                                        parse_result_file, advstd_meta_fn,
+                                        seeds_filter=None,
+                                        combination_filter=None,
+                                        force_timeout=None,
+                                        rerun_timeout_eps=30.0,
+                                        stale_fn=None):
+    """Read advStd per-cell rows DIRECTLY from the advStd .txt result files.
+
+    Discovery is IDENTICAL to find_advstd_faster_than_standard (the old
+    --find_advstd command): iterate `perts` (run_relaxation_sweep.PERTURBATIONS),
+    build exp_base/{pert_dir}/eps_{eps}/advStd_*/*.txt via the same
+    pert_dir_map, and read every "_N2_advStd_" file. The ONLY difference from
+    the old path is that there is no standard-baseline pairing: an advStd cell
+    is emitted as soon as its .txt line exists, so advStd results are never
+    dropped for want of a vaghar baseline (and no CSV is involved). Validated
+    to reproduce the old command's MNIST table exactly (50/54 cells identical,
+    0 regressions) while filling the cells the baseline pairing used to drop.
+
+    role is always 'N2' (advstd is transfer mode N1 -> N2). Only the two
+    advstd N2 combos in _ADVSTD_WIDE_COMBOS are emitted. Row shape matches
+    _collect_wide_perarch_cells / the CSV-based _load_advstd_rows_for_wide so
+    transfer rows bucket against vaghar/ours rows on identical keys
+    (perturbation=pert_type, perturbation_size=eps_str -- exactly as the old
+    CSV rows were keyed).
+
+    Filters:
+      - seeds_filter: keep only the requested Gurobi seed(s).
+      - combination_filter: when set (--combination_table), keep only combos
+        whose (bt, vh, tau[+sg]) _combo_label is listed.
+      - solve status: keep only OPTIMAL or a genuine timeout
+        (_AAAI_TIMEOUT_STATUSES); partial/killed runs are dropped.
+      - force_timeout: honored here exactly as the renderer does it
+        (_aaai_is_timeout_mismatch) so cross-cap timeout re-runs (e.g. an old
+        1800s run vs a new 10800s run) are deduplicated -- the same dedup the
+        old --find_advstd ... --force_timeout 10800 command performed.
+
+    `advstd_meta_fn` is run_relaxation_sweep._extract_advstd_file_metadata,
+    passed in so this module needs no new filename-parsing logic.
+    """
+    import glob
+    # Identical to find_advstd_faster_than_standard's pert_dir_map.
+    pert_dir_map = {
+        "patch": "patch", "occ": "occ", "trans": "translation",
+        "rotation": "rotation", "brightness": "brightness",
+    }
+    seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
+    rows = []
+    for arch in (archs or []):
+        exp_base = os.path.join(cwd, "paper_experiments", dataset,
+                                f"{arch}_exp")
+        if not os.path.isdir(exp_base):
+            continue
+        for _pert_name, pert_spec in perts:
+            pert_type, eps_str = pert_spec.split(":", 1)
+            pert_dir = pert_dir_map.get(pert_type, pert_type)
+            eps_dir = os.path.join(exp_base, pert_dir, f"eps_{eps_str}")
+            if not os.path.isdir(eps_dir):
+                continue
+            for ad in sorted(glob.glob(os.path.join(eps_dir, "advStd_*"))):
+                for tf in sorted(glob.glob(os.path.join(ad, "*.txt"))):
+                    fname = os.path.basename(tf)
+                    if "_N2_advStd" not in fname:
+                        continue
+                    # Drop only files made stale by the perturbation-dependency
+                    # soundness fix: a pre-fix file is unsound ONLY if it relaxed
+                    # (dropped) >=1 ReLU binary, because the missing
+                    # has_a_o && has_a_p guard mis-coupled relaxed neurons. A
+                    # pre-fix file that dropped nothing is byte-identical under
+                    # the fix and is kept. `stale_fn` is
+                    # run_relaxation_sweep._is_pre_fix_dropped (the same predicate
+                    # the sweep skip-check uses); None disables the gate.
+                    if stale_fn is not None and stale_fn(fname):
+                        continue
+                    meta = advstd_meta_fn(fname)
+                    # Parity with the CSV loader's pre-filters.
+                    if (meta.get("bound_tightening") != "yes"
+                            or meta.get("branch_priorities") != "off"
+                            or meta.get("n1_probe", "off") != "off"):
+                        continue
+                    if seeds_filter and meta.get("seed") not in seeds_filter:
+                        continue
+                    # Restrict to the two wide-table advstd combos.
+                    combo_label = None
+                    for label, zb, vh, rt, sg in _ADVSTD_WIDE_COMBOS:
+                        if (meta.get("zono_bounds") == zb
+                                and meta.get("var_hint") == vh
+                                and meta.get("relax_threshold") == rt
+                                and meta.get("sibling_gate", "no") == sg):
+                            combo_label = label
+                            break
+                    if combo_label is None:
+                        continue
+                    # --combination_table filter: reuse _combo_label so the
+                    # spec form ('zono:prev_pgd:0.5+sg') matches verbatim.
+                    if combination_filter is not None:
+                        grp_key = (meta["mip_start"], meta["branch_priorities"],
+                                   meta["lp_basis"], meta["bound_tightening"],
+                                   meta["var_hint"], meta["zono_bounds"],
+                                   meta["n1_probe"], meta["relax_threshold"],
+                                   meta["sibling_gate"])
+                        if _combo_label(grp_key) not in combination_filter:
+                            continue
+                    seed_val = meta.get("seed", "0")
+                    is_geom = "_geomInt" in fname
+                    for (cs, ct), val in parse_result_file(tf).items():
+                        t = val.get("total_time", 0.0) or 0.0
+                        if t <= 0:
+                            continue
+                        # Only completed cells belong in the table: a proven
+                        # optimum or a genuine timeout. Anything else (e.g.
+                        # INTERRUPTED / killed mid-solve) is a partial result
+                        # and is dropped.
+                        status_norm = (val.get("solve_status", "") or "") \
+                            .upper().replace(" ", "_")
+                        is_opt = status_norm == "OPTIMAL"
+                        is_to = any(tag.replace(" ", "_") in status_norm
+                                    for tag in _AAAI_TIMEOUT_STATUSES)
+                        if not (is_opt or is_to):
+                            continue
+                        lb = val.get("lower_bound")
+                        ub = val.get("upper_bound")
+                        lb = lb if (isinstance(lb, (int, float))
+                                    and math.isfinite(lb)) else None
+                        ub = ub if (isinstance(ub, (int, float))
+                                    and math.isfinite(ub)) else None
+                        row = {
+                            "arch": arch,
+                            "role": "N2",
+                            "perturbation": pert_type,
+                            "perturbation_size": eps_str,
+                            "c_source": cs, "c_target": ct,
+                            "seed": seed_val,
+                            "combo": combo_label,
+                            "t_total": t,
+                            "lb_total": lb,
+                            "ub_total": ub,
+                            "solve_status": val.get("solve_status", ""),
+                            "geom": is_geom,
+                        }
+                        # Honor --force_timeout: drop a timeout cell whose
+                        # wall-clock does not match the requested cap (the
+                        # cross-cap re-run dedup the old path did at render).
+                        if _aaai_is_timeout_mismatch(row, force_timeout,
+                                                     rerun_timeout_eps):
+                            continue
+                        rows.append(row)
     return rows
 
 

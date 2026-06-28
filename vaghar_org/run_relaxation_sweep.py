@@ -327,6 +327,41 @@ def _eps_str_variants(eps_str):
     return {eps_str, julia_form}
 
 
+_DROP_COUNT_RE = re.compile(r"_both(\d+)_orgDrop(\d+)_pertDrop(\d+)")
+
+
+def _filename_dropped_binaries(fname):
+    """True if this result file's name shows the run relaxed (dropped) >=1 ReLU
+    binary, which is the only condition under which the pre-fix
+    perturbation_dependencies bug (missing has_a_o && has_a_p guard) could have
+    corrupted the encoding.
+
+    Signal, in priority order:
+      * `_both{X}_orgDrop{Y}_pertDrop{Z}` (emitted when sibling_gate is on):
+        any non-zero count => binaries were dropped.
+      * else a positive relaxation threshold tag `_BTPR{t}` (stdBoost) or
+        `_BoundTightPertRelax{t}` (advStd) with t>0: relaxation was enabled but
+        per-tier counts weren't recorded, so conservatively treat as dropped.
+      * otherwise (no boost / threshold 0): no binary dropped.
+
+    Files that did NOT drop a binary are byte-identical under the fix, so they
+    are never forced to re-run regardless of the _depGuardFix tag.
+    """
+    m = _DROP_COUNT_RE.search(fname)
+    if m:
+        return any(int(g) > 0 for g in m.groups())
+    bm = re.search(r"_(?:BTPR|BoundTightPertRelax)(\d+(?:\.\d+)?)", fname)
+    if bm:
+        return float(bm.group(1)) > 0.0
+    return False
+
+
+def _is_pre_fix_dropped(fname):
+    """A result is stale (must be re-run) iff it dropped binaries AND was not
+    produced by the fixed encoder (no _depGuardFix tag)."""
+    return _filename_dropped_binaries(fname) and "_depGuardFix" not in fname
+
+
 def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
                               base_name_to_save, seed, c_tag, c_targets,
                               geometric_intervals=False):
@@ -363,9 +398,14 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
             f"{base_name_to_save}_seed{seed}_*.txt",
         )
         for fpath in glob.glob(pattern):
+            fname = os.path.basename(fpath)
             # geomInt and non-geomInt runs of the same combo share base_name_to_save,
             # so only count files whose _geomInt presence matches this run.
-            if ("_geomInt" in os.path.basename(fpath)) != geometric_intervals:
+            if ("_geomInt" in fname) != geometric_intervals:
+                continue
+            # A pre-fix run that relaxed binaries may have a corrupted encoding;
+            # don't let it count as covering its c_targets, so it gets re-run.
+            if _is_pre_fix_dropped(fname):
                 continue
             for cs, ct in _parse_c_source_target_pairs(fpath):
                 if cs == src0:
@@ -402,7 +442,11 @@ def _stdboost_filename_regex(base_name_to_save, seed, zb, sg, rt, pi, c_tag,
     parts = [re.escape(base_name_to_save)]
     if seed != 0:
         parts.append(re.escape(f"_seed{seed}"))
-    parts.append(re.escape("_HyperAttackHints_VagharDeps"))
+    # run.jl stamps _depGuardFix right after _VagharDeps on every fixed-code dep
+    # run. Accept names with OR without it here (old files lack it); whether a
+    # missing tag forces a re-run is decided separately by _is_pre_fix_dropped,
+    # and only for files whose name shows dropped binaries.
+    parts.append(re.escape("_HyperAttackHints_VagharDeps") + r"(?:_depGuardFix)?")
     if pi == "true":
         parts.append(re.escape("_PertruebedIntervals"))
         if geometric_intervals:
@@ -458,6 +502,9 @@ def _stdboost_missing_c_targets(out_dir, arch, pert_type, eps_str,
             fname = os.path.basename(fpath)
             if tail_re.search(fname) is None:
                 continue  # different combo's file
+            # Pre-fix run that relaxed binaries -> potentially corrupted; re-run.
+            if _is_pre_fix_dropped(fname):
+                continue
             for cs, ct in _parse_c_source_target_pairs(fpath):
                 if cs == src0:
                     covered.add(ct)
@@ -636,26 +683,79 @@ def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False,
     return True
 
 
+def _pid_alive(pid):
+    """True if a process with this PID is running on THIS host, False if it is
+    gone, None if it can't be determined (unknown/zero PID)."""
+    if not pid:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True            # signal deliverable -> alive
+    except ProcessLookupError:
+        return False           # no such process -> dead
+    except PermissionError:
+        return True            # exists but owned by another user -> alive
+    except OSError:
+        return None
+
+
+def _read_lock_owner(lock_path):
+    """Parse (pid, host) recorded in a .solving.lock file. Either may be None —
+    older locks have no host line, and a crash mid-write can leave it empty."""
+    pid = host = None
+    try:
+        with open(lock_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("pid="):
+                    try:
+                        pid = int(line[4:])
+                    except ValueError:
+                        pass
+                elif line.startswith("host="):
+                    host = line[5:]
+    except (FileNotFoundError, OSError):
+        pass
+    return pid, host
+
+
 def _acquire_n1_solve_lock(n1_state_dir, stale_after_sec):
     """Try to atomically claim the right to solve N1 for this state directory.
 
     Uses O_CREAT|O_EXCL via `open(path, 'x')` which is atomic across
     concurrent Python processes on the same POSIX filesystem. If another
-    process already holds the lock, check whether the lock is stale (older
-    than `stale_after_sec`) and steal it if so.
+    process already holds the lock, reclaim it when the owning process is no
+    longer alive (a tombstone from a hard-killed run), or — as a cross-host
+    fallback — when it is older than `stale_after_sec`.
 
     Returns (True, lock_path) on success — the caller is responsible for
     calling `_release_n1_solve_lock(lock_path)` after the solve finishes.
-    Returns (False, lock_path) if another live process holds the lock.
+    Returns (False, lock_path) if another LIVE process holds the lock.
     """
     os.makedirs(n1_state_dir, exist_ok=True)
     lock_path = os.path.join(n1_state_dir, N1_LOCK_FILENAME)
+    this_host = os.uname().nodename
     while True:
         try:
             with open(lock_path, "x") as f:
-                f.write(f"pid={os.getpid()}\nstarted={time.time()}\n")
+                f.write(f"pid={os.getpid()}\nhost={this_host}\nstarted={time.time()}\n")
             return True, lock_path
         except FileExistsError:
+            # Liveness first: a lock whose owner process is gone is a leftover
+            # from a hard-killed run — reclaim it immediately instead of waiting
+            # out `stale_after_sec`. A PID is only meaningful on the host that
+            # wrote it, so only trust it when the host matches (or is unknown,
+            # for backward compatibility with pre-host lock files).
+            owner_pid, owner_host = _read_lock_owner(lock_path)
+            same_host = owner_host is None or owner_host == this_host
+            if same_host and _pid_alive(owner_pid) is False:
+                print(f"  reclaiming dead-owner N1 solve lock at {lock_path} "
+                      f"(owner pid {owner_pid} is not running)")
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
             try:
                 mtime = os.stat(lock_path).st_mtime
             except FileNotFoundError:
@@ -2312,6 +2412,98 @@ def _recompile_neta_s_paper(cwd):
     print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
 
 
+def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
+                                 combination_table=None, force_timeout=None,
+                                 rerun_timeout_eps=30.0):
+    """Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, sourcing
+    the transfer (advstd N2) column DIRECTLY from the advStd .txt files (no
+    CSVs, no standard-baseline pairing). Honors --combination_table (combo
+    filter) and --force_timeout (cross-cap timeout dedup) exactly like the old
+    --find_advstd path, but writes no CSV and does not touch
+    advstd_techniques.tex.
+    """
+    try:
+        sys.path.insert(0, cwd)
+        import update_advstd_tex_tables as updater
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        print(f"[paper-tables] skipped (import failed: {exc})")
+        return
+    if not hasattr(updater, "_load_advstd_rows_for_wide_from_txt"):
+        print("[paper-tables] skipped: update_advstd_tex_tables.py is missing "
+              "_load_advstd_rows_for_wide_from_txt (upgrade it).")
+        return
+    try:
+        combination_filter = updater.parse_combination_spec(combination_table)
+    except SystemExit as exc:
+        print(f"[paper-tables] {exc}")
+        return
+
+    # Dataset-scoped AUTO markers: MNIST (the default) keeps the bare markers
+    # and labels; every other dataset writes into its OWN ":<ds>" marker pair
+    # with a "-<ds>" label suffix (same convention as _update_advstd_tex_tables).
+    _default_ds = (dataset == "mnist")
+    _mslug = "" if _default_ds else f":{dataset}"
+    _lslug = "" if _default_ds else f"-{dataset}"
+
+    # Shared kwargs: the txt-direct transfer source + the seed/combo/timeout
+    # filters. parse_result_file and _extract_advstd_file_metadata are this
+    # module's functions; PERTURBATIONS gives the exact same discovery paths
+    # the old --find_advstd command walked.
+    common = dict(
+        parse_result_file=parse_result_file,
+        seeds_filter=combo_ranking_seeds,
+        force_timeout=force_timeout,
+        rerun_timeout_eps=rerun_timeout_eps,
+        advstd_meta_fn=_extract_advstd_file_metadata,
+        perts=PERTURBATIONS,
+        combination_filter=combination_filter,
+        # Drop pre-fix files that relaxed >=1 binary (unsound under the
+        # perturbation-dependency fix) on BOTH vaghar/ours and transfer rows --
+        # the same predicate the sweep skip-check uses.
+        stale_fn=_is_pre_fix_dropped,
+    )
+
+    # N2 (target network) -> Evaluation body, as per-perturbation charts.
+    body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    if os.path.exists(body_tex) and hasattr(
+            updater, "regenerate_aaai_n2_charts_section"):
+        try:
+            updater.regenerate_aaai_n2_charts_section(
+                body_tex, cwd, dataset, arch_runs,
+                begin_mark=updater.AAAI_N2_CHARTS_BEGIN_MARK + _mslug,
+                end_mark=updater.AAAI_N2_CHARTS_END_MARK + _mslug,
+                ds_label_suffix=_lslug, **common)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_n2_charts (body) block error: {exc}")
+
+    # N2 + N1 (source) per-cell tables -> appendix.
+    percell_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                               "sec_appendix_percell.tex")
+    if os.path.exists(percell_tex):
+        try:
+            updater.regenerate_aaai_wide_perarch_section(
+                percell_tex, cwd, dataset, arch_runs, roles={"N2"},
+                begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
+                end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug,
+                ds_label_suffix=_lslug, **common)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_safe_wide (N2 appendix) block "
+                  f"error: {exc}")
+        try:
+            # advstd is N2-only, so the N1 table's transfer column stays '---'.
+            updater.regenerate_aaai_wide_perarch_section(
+                percell_tex, cwd, dataset, arch_runs, roles={"N1"},
+                label_suffix="-n1",
+                begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK + _mslug,
+                end_mark=updater.AAAI_WIDE_N1_END_MARK + _mslug,
+                ds_label_suffix=_lslug, **common)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_safe_wide (N1 appendix) block "
+                  f"error: {exc}")
+
+    _recompile_neta_s_paper(cwd)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2374,6 +2566,14 @@ def main():
                         help="Scan existing results and report advanced-standard N2 experiments "
                              "that are faster than regular standard N2 for each perturbation "
                              "and (c_source, c_target) pair.")
+    parser.add_argument("--paper_tables_from_txt", action="store_true",
+                        help="Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, "
+                             "sourcing the transfer (advstd N2) column DIRECTLY from the advStd "
+                             ".txt files -- no CSVs and no standard-baseline pairing, so advStd "
+                             "results are never dropped for want of a vaghar baseline. Honors "
+                             "--combo_ranking_seeds (seed filter), --combination_table (combo "
+                             "filter), --force_timeout (cross-cap timeout dedup), --arch_models "
+                             "and --dataset. Does not write CSVs or touch advstd_techniques.tex.")
     parser.add_argument("--skip_vaghar_no_perturbed", action="store_true",
                         help="When running standard, skip vagharNoPerturbed (without perturbed intervals) "
                              "and only run vagharWithPerturbed.")
@@ -2834,6 +3034,23 @@ def main():
         print(f"  {len(all_sf)} rows -> {csv_standard_faster}")
         print(f"  {len(all_tt)} rows -> {csv_transfer_tighter}")
         print(f"  {len(all_st)} rows -> {csv_standard_tighter}")
+        return
+
+    # ── Paper-tables mode: regenerate neta-s-paper tables from advStd txt ──
+    if args.paper_tables_from_txt:
+        # --dataset may be comma-separated; regenerate each dataset's
+        # neta-s-paper per-cell tables + N2 charts straight from the advStd
+        # .txt files (no CSVs), reusing the same --arch_models.
+        pt_datasets = [d.strip() for d in dataset.split(",") if d.strip()]
+        for pt_dataset in pt_datasets:
+            if len(pt_datasets) > 1:
+                print(f"\n===== Regenerating neta-s-paper tables (from advStd "
+                      f"txt) for dataset: {pt_dataset} =====")
+            _regen_paper_tables_from_txt(
+                arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
+                combination_table=args.combination_table,
+                force_timeout=args.force_timeout,
+                rerun_timeout_eps=args.rerun_timeout_eps)
         return
 
     # ── Analysis mode: find advanced-standard faster than standard ───

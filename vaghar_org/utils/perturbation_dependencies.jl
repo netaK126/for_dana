@@ -98,7 +98,19 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
                     # Contrast: x' = e*x, so z_pert = e*z_org (zero-bias layer).
                     # Post-ReLU: relu(z_pert) = e*relu(z_org) since e>0.
                     @constraint(m, av[ind_p+1] == v_e * av[ind_o+1])
-                    @constraint(m, av[ind_o+2] == av[ind_p+2])
+                    # Only couple the binaries when both copies actually have one.
+                    # Relaxed (conditional-triangle) neurons have no binary at
+                    # av[ind+2]; coupling there would constrain an unrelated
+                    # variable or run off the end of av (see encode_dependencies).
+                    expected_a_o_suffix = "_$(activation_cnt)_$(n)"
+                    expected_a_p_suffix = "_$(activation_cnt+layers_n)_$(n)"
+                    name_o = (ind_o+2 <= length(av)) ? JuMP.name(av[ind_o+2]) : ""
+                    name_p = (ind_p+2 <= length(av)) ? JuMP.name(av[ind_p+2]) : ""
+                    has_a_o = endswith(name_o, expected_a_o_suffix) && occursin("a_layerCount", name_o)
+                    has_a_p = endswith(name_p, expected_a_p_suffix) && occursin("a_layerCount", name_p)
+                    if has_a_o && has_a_p
+                        @constraint(m, av[ind_o+2] == av[ind_p+2])
+                    end
                 end
             end
         end
@@ -151,11 +163,15 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
                 if reuse_bounds_conf.is_reuse_bounds_and_deps == false
                     if l_o >=u_p
                         @constraint(m,av[ind_o+1]>=av[ind_p+1])
-                        @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                        if has_a_o && has_a_p
+                            @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                        end
                         phi_dep_c[n] = -1
                     elseif l_p>=u_o
                         @constraint(m,av[ind_o+1]<=av[ind_p+1])
-                        @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                        if has_a_o && has_a_p
+                            @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                        end
                         phi_dep_c[n] = 1
                     else
                         l_diff = Inf
@@ -182,12 +198,16 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
                         end
                         if (l_diff != Inf) & (l_diff>-non_equality_tolerance)
                             @constraint(m,av[ind_o+1]>=av[ind_p+1])
-                            @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                            if has_a_o && has_a_p
+                                @constraint(m,av[ind_o+2]>=av[ind_p+2])
+                            end
                             phi_dep_c[n] = -1
                         end
                         if u_diff<non_equality_tolerance
                             @constraint(m,av[ind_o+1]<=av[ind_p+1])
-                            @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                            if has_a_o && has_a_p
+                                @constraint(m,av[ind_o+2]<=av[ind_p+2])
+                            end
                             phi_dep_c[n] = 1
                         end
                     end
