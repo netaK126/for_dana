@@ -2343,7 +2343,10 @@ def main():
     parser.add_argument("--arch", type=str, default="cnn1",
                         help="Network architecture (e.g. cnn1, cnn2, 3x10, 3x50, 4x10, 5x10, 5x50, 10x10, 3x100)")
     parser.add_argument("--dataset", type=str, default="mnist",
-                        help="Dataset name (default: mnist)")
+                        help="Dataset name (default: mnist). With "
+                             "--find_advstd_faster_than_standard, a comma-separated "
+                             "list (e.g. 'mnist,fashion-mnist') regenerates the tables "
+                             "for every dataset in turn, reusing the same --arch_models.")
     parser.add_argument("--arch_models", nargs="*", default=None,
                         help="Run multiple architectures, each with its own model path. "
                              "Format: arch=model_path (e.g. cnn1=/path/to/cnn1_model cnn2=/path/to/cnn2_model). "
@@ -2835,12 +2838,20 @@ def main():
 
     # ── Analysis mode: find advanced-standard faster than standard ───
     if args.find_advstd_faster_than_standard:
-        _generate_combo_ranking_csv(
-            arch_runs, cwd, dataset,
-            args.compare_to_with_perturbed, args.combo_ranking_seeds,
-            combination_table=args.combination_table,
-            force_timeout=args.force_timeout,
-            rerun_timeout_eps=args.rerun_timeout_eps)
+        # --dataset may be a comma-separated list here; regenerate the
+        # combo CSVs + appendix tables for each dataset in turn, reusing the
+        # same --arch_models. (Single dataset works unchanged.)
+        fa_datasets = [d.strip() for d in dataset.split(",") if d.strip()]
+        for fa_dataset in fa_datasets:
+            if len(fa_datasets) > 1:
+                print(f"\n===== Regenerating combo ranking + tables for "
+                      f"dataset: {fa_dataset} =====")
+            _generate_combo_ranking_csv(
+                arch_runs, cwd, fa_dataset,
+                args.compare_to_with_perturbed, args.combo_ranking_seeds,
+                combination_table=args.combination_table,
+                force_timeout=args.force_timeout,
+                rerun_timeout_eps=args.rerun_timeout_eps)
         return
 
     cores_per_job = CORES_PER_JOB
