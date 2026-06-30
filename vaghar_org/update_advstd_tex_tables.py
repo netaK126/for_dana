@@ -5365,7 +5365,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
 # (white on the red and dark-green bars, dark on the light-green bar).
 _AAAI_CHART_SERIES = (
     ("vaghar",                  r"vaghar",                  "fill=vagharred, draw=vagharred!60!black",
-        "pattern=horizontal lines, pattern color=white"),
+        ""),
     (("1", "1", "1", "0.5"),    r"ours",                    "fill=oursgreen!42, draw=oursgreen!60!black",
         "pattern=north east lines, pattern color=oursgreen!70!black"),
     ("adv_zono_prevpgd_0.5+sg", r"ours with transfer",      "fill=oursgreen!48!black, draw=oursgreen!25!black",
@@ -5732,18 +5732,29 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     classes `c_cols` (left-to-right) and ROWS are the perturbation types
     `types_order` (top-to-bottom), so every (type, c_s) gets its own little
     graph. `cell_map[(type_disp, c_src)]` is a list of (type, size, bars) for
-    that panel (missing -> blank panel). One shared (linear, real-value) y-axis
-    for the whole block (y-ticks on the left column); each row is labelled on
-    the left by its type, each column titled by its c_s (top row only); within
-    a panel the bars are the per-size groups (mean-sorted)."""
+    that panel (missing -> blank panel). Each ROW (perturbation type) has its
+    OWN linear (real-value) y-axis, fitted to that row's tallest bar (y-ticks on
+    the left column reflect that row's scale); each row is labelled on the left
+    by its type, each column titled by its c_s (top row only); within a panel
+    the bars are the per-size groups (mean-sorted)."""
     power = _AAAI_YAXIS_POWER
-    allvals = [v for cell in cell_map.values()
-               for _t, _l, bars in cell for (v, _p) in bars.values()]
-    vmax = max(allvals) if allvals else 1.0
-    ymax, ytick_clause = _aaai_yaxis(vmax)
-    # Extra headroom so the ROTATED value label above the tallest bar (its length
-    # now extends upward) stays inside the panel.
-    ymax *= 1.32
+    # Per-row (per-perturbation-type) y-axis: each row is scaled to its OWN
+    # tallest bar rather than to a single block-wide maximum, so a row of small
+    # solve times isn't squashed flat beneath a row of large ones. Within a row
+    # every column shares one scale (the row's left column carries the y-tick
+    # labels via `yticklabels at=edge left`), so panels in the same row stay
+    # directly comparable.
+    row_axis = {}
+    for type_disp in types_order:
+        rowvals = [v for c in c_cols
+                   for _t, _l, bars in cell_map.get((type_disp, c), [])
+                   for (v, _p) in bars.values()]
+        rvmax = max(rowvals) if rowvals else 1.0
+        rymax, rytick = _aaai_yaxis(rvmax)
+        # Extra headroom so the ROTATED value label above the tallest bar (its
+        # length now extends upward) stays inside the panel.
+        rymax *= 1.32
+        row_axis[type_disp] = (rymax, rytick)
     ncol, nrow = len(c_cols), len(types_order)
     # Every panel shares ONE x-range so all bars render at the same physical
     # width: the range spans the figure-wide maximum cluster count `nmax`
@@ -5771,7 +5782,7 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
         r" vertical sep=24pt, yticklabels at=edge left}," "\n"
         r"  scale only axis, width=" + panel_w + r", height=2.5cm, clip=false,"
         "\n"
-        f"  ymin=0, ymax={ymax:.4g}, {ytick_clause}" "\n"
+        r"  ymin=0," "\n"
         r"  ylabel style={font=\footnotesize},"
         r" y tick label style={font=\scriptsize}," "\n"
         r"  x tick label style={font=\scriptsize}," "\n"
@@ -5799,7 +5810,10 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                     value_labels=True, label_font=_AAAI_VALUE_LABEL_PT)
             else:
                 content, xtick, xticklabels = [], "", ""
-            opt = f"xmin=0.5, xmax={slots + 0.5:g}"
+            rymax, rytick = row_axis[type_disp]
+            opt = f"xmin=0.5, xmax={slots + 0.5:g}, ymax={rymax:.4g}"
+            if rytick:
+                opt += ", " + rytick.rstrip(", ")
             if xtick:
                 opt += f", xtick={{{xtick}}}, xticklabels={{{xticklabels}}}"
             else:
@@ -5819,7 +5833,8 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
     """Emit one two-column `figure*` PER architecture (user: separate each
     architecture into its own figure). Each figure has its own shared legend,
     that architecture's 2-D groupplot grid (columns = c_s, rows = perturbation
-    type, with its own linear y-axis), and a caption naming the architecture;
+    type, each row with its own linear y-axis fitted to that perturbation), and
+    a caption naming the architecture;
     its label is `<label_base>-<arch>` (the first figure also carries the bare
     `<label_base>` so any older `\\ref` still resolves). `arch_rows` is a list
     of (arch, arch_disp, c_cols, types_order, cell_map). Every bar across every
