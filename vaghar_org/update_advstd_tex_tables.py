@@ -5486,17 +5486,23 @@ def _aaai_yaxis_ticks(vmax):
     return ticks
 
 
-# Bar width in x data-units. Bars within a perturbation-size cluster are drawn
-# ADJACENT (touching, no gap). A cluster of k bars fills up to _AAAI_GROUP_SPAN
-# units, so the actual per-bar width is min(_AAAI_BAR_W, _AAAI_GROUP_SPAN/k):
-# a full 3-bar cluster uses 0.88/3=0.29, a 2-bar cluster the 0.40 cap, a lone
-# bar 0.40. Clusters sit 1.0 unit apart, so _AAAI_GROUP_SPAN=0.88 leaves a
-# ~0.12-unit GAP between neighbouring perturbation-size clusters (and keeps them
-# from merging). The per-bar value labels are horizontal; their font is sized
-# per panel to the bar width (see _aaai_arch_typegrid) so they stay as large as
-# possible without overlapping. _AAAI_BAR_W is the MAX single-bar width.
-_AAAI_BAR_W = 0.40
+# Bar width in x data-units. EVERY bar is exactly _AAAI_BAR_W wide regardless of
+# how many methods (k) a group holds, so all bars in the figure render at the
+# same physical width (combined with `scale only axis` + a figure-wide shared
+# x-range in _aaai_arch_typegrid, which makes every panel's plot box -- and
+# hence its data->cm scale -- identical). Bars within a perturbation-size
+# cluster are drawn ADJACENT (touching); clusters sit 1.0 unit apart, so a full
+# 3-bar cluster spans 3*0.30=0.90 and still leaves a ~0.10-unit gap before the
+# next cluster. The per-bar value labels are ROTATED 90 degrees and printed at a
+# single fixed point size (_AAAI_VALUE_LABEL_PT) so every label is the same size
+# and large relative to the body text; rotation makes the binding fit the bar
+# WIDTH vs the label's x-height (not its length), which a wide bar clears easily.
+_AAAI_BAR_W = 0.30
 _AAAI_GROUP_SPAN = 0.88
+# Fixed point size for the rotated per-bar value labels (uniform across every
+# panel and architecture). The AAAI body text is 10pt, so 8pt keeps the numbers
+# clearly legible rather than shrunk.
+_AAAI_VALUE_LABEL_PT = 8.0
 
 
 def _aaai_draw_color(sty):
@@ -5564,11 +5570,11 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
     def _draw_group(x, bars):
         items = sorted(bars.items(), key=lambda kv: bar_rank.get(kv[0], 99))
         k = len(items)
-        # Bars of a group touch (stride == width). The width is capped at
-        # _AAAI_BAR_W but shrinks to fit _AAAI_GROUP_SPAN when a group has many
-        # bars, so fewer-bar groups get wider bars (and their value labels more
-        # room) while a full 3-bar group still fits within the cluster slot.
-        bar_w = min(_AAAI_BAR_W, _AAAI_GROUP_SPAN / k)
+        # Every bar is the SAME width (_AAAI_BAR_W) regardless of how many
+        # methods the group holds, so all bars in the figure render identically.
+        # Bars within a group touch (stride == width); a full 3-bar group spans
+        # 3*_AAAI_BAR_W < 1.0 and so still fits inside its cluster slot.
+        bar_w = _AAAI_BAR_W
         stride = bar_w
         center0 = x - (k - 1) * stride / 2.0
         for bi, (sk, (v, p)) in enumerate(items):
@@ -5583,17 +5589,18 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
             if pattern_of[sk]:
                 lines.append(f"\\fill[{pattern_of[sk]}] {rect};")
             if value_labels:
-                # HORIZONTAL value label centred above the bar. The font is
-                # small (5pt) because the binding panel is the LEFT column,
-                # whose plot area is only ~4.9cm wide (it also carries the
-                # perturbation-name y-label) yet must hold up to 4 clusters of
-                # 3 bars -- a 6.5pt number is ~0.40cm wide and cannot fit over
-                # the resulting ~0.36cm bars, while a 5pt one (~0.31cm) does,
-                # leaving room for the inter-cluster gap.
+                # Value label ROTATED 90 degrees, reading bottom-to-top, centred
+                # above the bar. Rotation makes the fit depend on the bar WIDTH
+                # vs the label's x-height (~0.7em) rather than its length, so a
+                # single fixed point size (label_font, uniform across every panel
+                # and architecture) clears every bar -- giving identical,
+                # readable numbers everywhere. anchor=west + rotate=90 puts the
+                # text's (rotated) base at the bar top, centred on the bar.
                 lines.append(
-                    f"\\node[anchor=south, font=\\fontsize{{{label_font:.2g}}}"
+                    f"\\node[anchor=west, rotate=90,"
+                    f" font=\\fontsize{{{label_font:.2g}}}"
                     f"{{{label_font * 1.15:.2g}}}\\selectfont,"
-                    r" inner sep=0.4pt, text=black] at "
+                    r" inner sep=1pt, text=black] at "
                     f"(axis cs:{xc:.4g},{h:.4g}) {{{_aaai_fmt_bar_value(v)}}};")
             if p:
                 lines.append(
@@ -5719,7 +5726,8 @@ def _aaai_standalone_legend():
     return out
 
 
-def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax):
+def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
+                        ncol_max):
     """One architecture's block: a 2-D groupplot whose COLUMNS are the source
     classes `c_cols` (left-to-right) and ROWS are the perturbation types
     `types_order` (top-to-bottom), so every (type, c_s) gets its own little
@@ -5733,16 +5741,36 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax):
                for _t, _l, bars in cell for (v, _p) in bars.values()]
     vmax = max(allvals) if allvals else 1.0
     ymax, ytick_clause = _aaai_yaxis(vmax)
-    # Extra headroom so the horizontal value label above the tallest bar
-    # stays inside the panel.
-    ymax *= 1.18
+    # Extra headroom so the ROTATED value label above the tallest bar (its length
+    # now extends upward) stays inside the panel.
+    ymax *= 1.32
     ncol, nrow = len(c_cols), len(types_order)
+    # Every panel shares ONE x-range so all bars render at the same physical
+    # width: the range spans the figure-wide maximum cluster count `nmax`
+    # (sparser panels simply leave empty space on the right rather than widening
+    # their bars). `scale only axis` makes `width` the plot-box width itself, so
+    # the y-labelled left column gets the SAME box (and the same data->cm scale)
+    # as the others -- otherwise its bars would be ~15% narrower. Panel width is
+    # derived from \textwidth so the whole figure* fills the page without ever
+    # overflowing it (AAAI-safe): an allowance covers the left column's y-label /
+    # ticks plus the 4pt inter-panel separations.
+    slots_global = max(nmax, 1)
+    # Panel width is derived from the figure-wide MAXIMUM column count
+    # (`ncol_max`), not this figure's own `ncol`, so every architecture's bars
+    # are the same physical width: the densest figure exactly fills \textwidth,
+    # and an architecture with fewer columns yields a narrower (centred) figure
+    # rather than wider bars. Sizing for ncol_max guarantees no figure* overruns
+    # the text width (AAAI-safe).
+    overhead_cm = 1.5 + 0.2 * max(ncol_max - 1, 0)
+    panel_w = (r"\dimexpr(\textwidth-" + f"{overhead_cm:.2g}" +
+               f"cm)/{ncol_max}" + r"\relax")
     out = [r"\begin{tikzpicture}"]
     out.append(
         r"\begin{groupplot}[" "\n"
         f"  group style={{group size={ncol} by {nrow}, horizontal sep=4pt,"
         r" vertical sep=24pt, yticklabels at=edge left}," "\n"
-        r"  width=5.85cm, height=2.5cm, clip=false," "\n"
+        r"  scale only axis, width=" + panel_w + r", height=2.5cm, clip=false,"
+        "\n"
         f"  ymin=0, ymax={ymax:.4g}, {ytick_clause}" "\n"
         r"  ylabel style={font=\footnotesize},"
         r" y tick label style={font=\scriptsize}," "\n"
@@ -5752,38 +5780,23 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax):
     for ri, type_disp in enumerate(types_order):
         for ci, c in enumerate(c_cols):
             groups = cell_map.get((type_disp, c), [])
-            n_local = len(groups)
-            # Per-panel x-range: each graph is scaled to ITS OWN cluster count
-            # (not the figure-wide `nmax`), so panels with few perturbation
-            # sizes fill their width with WIDE bars instead of wasting it on
-            # empty edge margins. Clusters sit at x=1..n_local and the side pad
-            # is a tight 0.5, so the reclaimed edge space goes into the bars.
-            slots = max(n_local, 1)
+            # Shared figure-wide x-range (`slots_global`) so every panel uses the
+            # same data->cm scale and therefore the same physical bar width; a
+            # panel with fewer perturbation sizes leaves empty space on the right
+            # rather than widening its bars. Clusters sit at x=1..n_local.
+            slots = slots_global
             if groups:
-                # Size the value-label font to THIS panel's bar width so the
-                # text is as large as possible WITHOUT overlapping: wide bars
-                # (sparse panels) get a big font, the few dense panels a smaller
-                # one. Within a cluster the bars touch, so adjacent label
-                # centres are one bar-width apart -> the widest label that
-                # actually appears in the panel must fit in one bar width. We
-                # size to that exact label (not a worst-case guess) with an 8%
-                # safety margin, and clamp to [4.5,8]pt. The left column (ci==0)
-                # carries the y-axis label/ticks, so it has less plot width.
-                maxk = max((len(b) for (_t, _l, b) in groups), default=2)
-                bar_w_units = min(_AAAI_BAR_W, _AAAI_GROUP_SPAN / maxk)
-                plot_cm = 5.85 - (1.25 if ci == 0 else 0.45)
-                bar_cm = bar_w_units * plot_cm / slots
-                max_em = max(
-                    (_aaai_label_em(_aaai_fmt_bar_value(v))
-                     for (_t, _l, b) in groups for (v, _p) in b.values()),
-                    default=1.5)
-                # label width (cm) = max_em * font_pt * 0.0353; solve for the
-                # largest font whose label width <= 0.92 * bar_cm.
-                fit_font = 0.92 * bar_cm / (max_em * 0.0353)
-                label_font = max(4.5, min(8.0, fit_font))
+                # Centre this panel's clusters within the shared x-range: a panel
+                # with fewer perturbation sizes than the figure-wide maximum is
+                # shifted right by half the empty slots so its bars sit in the
+                # middle of the graph rather than flush left.
+                x_offset = (slots_global - len(groups)) / 2.0
+                # One fixed point size for every value label, in every panel and
+                # architecture (rotated, so it clears the bar width regardless of
+                # label length -- see _AAAI_BAR_W / _draw_group).
                 content, _n, xtick, xticklabels = _aaai_bar_content(
-                    groups, power, cluster=False, x_offset=0.0,
-                    value_labels=True, label_font=label_font)
+                    groups, power, cluster=False, x_offset=x_offset,
+                    value_labels=True, label_font=_AAAI_VALUE_LABEL_PT)
             else:
                 content, xtick, xticklabels = [], "", ""
             opt = f"xmin=0.5, xmax={slots + 0.5:g}"
@@ -5809,13 +5822,16 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
     type, with its own linear y-axis), and a caption naming the architecture;
     its label is `<label_base>-<arch>` (the first figure also carries the bare
     `<label_base>` so any older `\\ref` still resolves). `arch_rows` is a list
-    of (arch, arch_disp, c_cols, types_order, cell_map). Each panel is scaled
-    to its OWN cluster count (see _aaai_arch_typegrid), so a panel with few
-    perturbation sizes fills its width with wide bars rather than wasting it on
-    empty edge margins."""
+    of (arch, arch_disp, c_cols, types_order, cell_map). Every bar across every
+    figure renders at the SAME physical width: panels share one figure-wide
+    x-range (`nmax`) and are sized from the figure-wide maximum column count
+    (`ncol_max`) under `scale only axis` (see _aaai_arch_typegrid), so a figure
+    with fewer columns is simply narrower (centred) rather than carrying wider
+    bars."""
     nmax = max((len(groups)
                 for (_ar, _ad, _c, _t, cm) in arch_rows
                 for groups in cm.values()), default=1)
+    ncol_max = max((len(c) for (_ar, _ad, c, _t, _cm) in arch_rows), default=1)
     out = []
     for ri, (arch, arch_disp, c_cols, types_order, cell_map) in enumerate(
             arch_rows):
@@ -5823,7 +5839,8 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
         out.append(r"\centering")
         out += _aaai_standalone_legend()
         out.append(r"\par\smallskip")
-        out += _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax)
+        out += _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
+                                   ncol_max)
         cap = (r"Evaluation of solve times (minutes) for the " + arch_disp
                + r" architecture using the " + dataset_disp
                + r" dataset; columns are the source class $c_s$ and rows are "
@@ -5956,9 +5973,11 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                             partial = _aaai_partial(cells.get(sk), side,
                                                     expected_cts)
                             cell_vals[sk] = (g, partial)
-                    # Only include a perturbation whose bars are all complete
-                    # (no partial-coverage `*`); drop it otherwise.
-                    if cell_vals and not any(p for _g, p in cell_vals.values()):
+                    # Only include a perturbation that has ALL THREE methods
+                    # (ours with transfer, ours, vaghar) and whose bars are all
+                    # complete (no partial-coverage `*`); drop it otherwise.
+                    if (len(cell_vals) == len(series_keys)
+                            and not any(p for _g, p in cell_vals.values())):
                         merged_gap.append(
                             (arch_disp, c_src, type_disp, pert_plain,
                              cell_vals))
@@ -5970,9 +5989,11 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                             partial = _aaai_partial(cells.get(sk), side,
                                                     expected_cts)
                             bars[sk] = (v, partial)
-                    # Only include a perturbation whose bars are all complete
-                    # (no partial-coverage `*`); drop it otherwise.
-                    if bars and not any(p for _v, p in bars.values()):
+                    # Only include a perturbation that has ALL THREE methods
+                    # (ours with transfer, ours, vaghar) and whose bars are all
+                    # complete (no partial-coverage `*`); drop it otherwise.
+                    if (len(bars) == len(series_keys)
+                            and not any(p for _v, p in bars.values())):
                         cell_map.setdefault((type_disp, c_src), []).append(
                             (type_disp, size_disp, bars))
                         type_means.setdefault(type_disp, []).extend(

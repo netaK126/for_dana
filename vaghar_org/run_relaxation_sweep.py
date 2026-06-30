@@ -2331,24 +2331,8 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
             print(f"[tex-update] aaai_safe_wide (N2 appendix) block "
                   f"error: {exc}")
 
-        # N1 (source network) -> appendix.
-        try:
-            n1_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                  "sec_appendix_percell.tex")
-            if os.path.exists(n1_tex):
-                updater.regenerate_aaai_wide_perarch_section(
-                    n1_tex, cwd, dataset_guess, arch_runs,
-                    parse_result_file,
-                    seeds_filter=combo_ranking_seeds,
-                    force_timeout=force_timeout,
-                    rerun_timeout_eps=rerun_timeout_eps,
-                    roles={"N1"}, label_suffix="-n1",
-                    begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK + _mslug,
-                    end_mark=updater.AAAI_WIDE_N1_END_MARK + _mslug,
-                    ds_label_suffix=_lslug)
-        except Exception as exc:
-            print(f"[tex-update] aaai_safe_wide (N1 appendix) block "
-                  f"error: {exc}")
+        # N1 (source network) appendix tables are intentionally not generated:
+        # neta-s-paper no longer carries any per-cell N1 tables.
 
     # The old per-architecture summary table (former Table 2) was removed
     # from sec_evaluation.tex in favor of the per-cell wide tables above,
@@ -2476,7 +2460,8 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         except Exception as exc:
             print(f"[paper-tables] aaai_n2_charts (body) block error: {exc}")
 
-    # N2 + N1 (source) per-cell tables -> appendix.
+    # N2 (target network) per-cell tables -> appendix. (N1 source tables are
+    # intentionally not regenerated in the --paper_tables_from_txt path.)
     percell_tex = os.path.join(cwd, "neta-s-paper", "sections",
                                "sec_appendix_percell.tex")
     if os.path.exists(percell_tex):
@@ -2488,17 +2473,6 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                 ds_label_suffix=_lslug, **common)
         except Exception as exc:
             print(f"[paper-tables] aaai_safe_wide (N2 appendix) block "
-                  f"error: {exc}")
-        try:
-            # advstd is N2-only, so the N1 table's transfer column stays '---'.
-            updater.regenerate_aaai_wide_perarch_section(
-                percell_tex, cwd, dataset, arch_runs, roles={"N1"},
-                label_suffix="-n1",
-                begin_mark=updater.AAAI_WIDE_N1_BEGIN_MARK + _mslug,
-                end_mark=updater.AAAI_WIDE_N1_END_MARK + _mslug,
-                ds_label_suffix=_lslug, **common)
-        except Exception as exc:
-            print(f"[paper-tables] aaai_safe_wide (N1 appendix) block "
                   f"error: {exc}")
 
     _recompile_neta_s_paper(cwd)
