@@ -4619,7 +4619,7 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                f"\\texttt{{zono:prev\\_pgd:0.5+sg}} combinations (loaded "
                f"directly from the per-cell advstd CSVs that back "
                f"Section~\\ref{{sec:safe}}); these rows only populate on "
-               f"the $N_2$ block since advstd is a transfer technique. "
+               f"the $N$ block since advstd is a transfer technique. "
                f"In each row, every winning combo's three sub-cells "
                f"are shaded \\cellcolor{{green!25}}~light~green: a "
                f"combo wins if its mean $t$ ties the row-minimum (at "
@@ -4911,10 +4911,13 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             if (dd_val is not None and math.isfinite(dd_val)
                     and dmax_ub is not None):
                 dd_str = _fmt_sig((dd_val / dmax_ub) * 100.0) + "\\%"
-            # role is stored as "N1"/"N2"; render with a subscript so
-            # the model cell reads "cnn1 / N_1" / "cnn1 / N_2" rather
-            # than the italic-bare "N1"/"N2".
-            role_tex = "N_" + role[1:] if role.startswith("N") else role
+            # role is stored as "N1"/"N2"; render per the paper's notation:
+            # the target network N2 is written N, and the source network N1
+            # is written N_{\mathrm{pre}} (so the model cell reads
+            # "cnn1 / N" or "cnn1 / N_{pre}", matching \Npre in the body).
+            _ROLE_TEX = {"N2": "N", "N1": r"N_{\mathrm{pre}}"}
+            role_tex = _ROLE_TEX.get(
+                role, "N_" + role[1:] if role.startswith("N") else role)
             # The model value is distributed down the first column, one
             # part per row, across the block's rows (rather than a wide
             # full-width heading that overflows into the data columns).
@@ -5216,19 +5219,19 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         if is_n1:
             cap = (
                 f"Per-cell results on {ds_disp} for architecture "
-                f"\\textbf{{{arch}}}, source network $N_1$. "
+                f"\\textbf{{{arch}}}, source network $N_{{\\mathrm{{pre}}}}$. "
                 r"Each cell gives $(\delta_l, \delta_u, t)$ for the VHAGaR "
                 r"baseline and \emph{ours} at $\tau{=}0.5$ (the \emph{ours "
                 r"with transfer} columns are blank, as transfer applies to "
-                r"$N_2$ only). The target network $N_2$ is in "
+                r"$N$ only). The target network $N$ is in "
                 r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
         else:
             cap = (
                 f"Per-cell results on {ds_disp} for architecture "
-                f"\\textbf{{{arch}}}, target network $N_2$. "
+                f"\\textbf{{{arch}}}, target network $N$. "
                 r"Each cell gives $(\delta_l, \delta_u, t)$ for the VHAGaR "
                 r"baseline, \emph{ours}, and \emph{ours with transfer} at "
-                r"$\tau{=}0.5$. The source network $N_1$ is in "
+                r"$\tau{=}0.5$. The source network $N_{\mathrm{pre}}$ is in "
                 r"Table~\ref{tab:safe-wide-" + safe_arch + r"-n1}.")
         lines.append(f"\\caption{{{cap}}}")
         lines.append(f"\\label{{tab:safe-wide-{safe_arch}{label_suffix}}}")
@@ -5504,6 +5507,22 @@ _AAAI_GROUP_SPAN = 0.88
 # clearly legible rather than shrunk.
 _AAAI_VALUE_LABEL_PT = 8.0
 
+# I-beam (error-bar-style) gap marker drawn ON each time bar. Its height encodes
+# the remaining bound gap delta_u - delta_l (in percentage points of delta_max,
+# the same number the appendix N2 tables and the timed-out gap figure report),
+# on a FIXED visual scale: a full 100-pp gap draws an I-beam whose total height
+# is _AAAI_IBEAM_PANEL_FRAC of the panel's data range (no numeric secondary
+# axis). The marker is CENTRED on the bar top -- its lower cap sits inside the
+# bar fill, its upper cap floats above the bar -- exactly like the error bars in
+# arXiv:2511.10576 fig 5. The rotated value label is lifted to start above the
+# upper cap so the two never overlap. Gaps below _AAAI_IBEAM_MIN_PP (a finished,
+# provably-optimal run) draw no marker. The short caps span _AAAI_IBEAM_CAP_FRAC
+# of the bar width to each side, so the marker reads as a narrow capital "I"
+# (clearly thinner than the bar) whose length is the gap.
+_AAAI_IBEAM_PANEL_FRAC = 0.30
+_AAAI_IBEAM_CAP_FRAC = 0.20
+_AAAI_IBEAM_MIN_PP = 0.05
+
 
 def _aaai_draw_color(sty):
     """Pull the `draw=` colour out of a series style string (e.g.
@@ -5538,9 +5557,13 @@ def _aaai_fmt_bar_value(v):
 
 
 def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
-                      value_labels=False, label_font=6.5):
+                      value_labels=False, label_font=6.5,
+                      draw_ibeam=False, panel_ymax=None):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
-    (type_disp, item_label, {sk:(value, partial)}).
+    (type_disp, item_label, {sk:(value, partial[, gap_pp])}). The optional third
+    element `gap_pp` is delta_u - delta_l in percentage points of delta_max; when
+    `draw_ibeam` is set (and `panel_ymax` gives the panel's data range) it is
+    rendered as an I-beam centred on the bar top (see _AAAI_IBEAM_PANEL_FRAC).
 
     When `cluster` is set, the bar-groups are CLUSTERED by `type_disp`: the
     types are ordered by mean, the perturbations within a type are ordered by
@@ -5564,7 +5587,7 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
     xticks = []  # (xpos, item_label)
 
     def _bars_mean(bars):
-        vs = [v for _sk, (v, _p) in bars.items()]
+        vs = [pair[0] for pair in bars.values()]
         return sum(vs) / len(vs) if vs else 0.0
 
     def _draw_group(x, bars):
@@ -5577,7 +5600,9 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
         bar_w = _AAAI_BAR_W
         stride = bar_w
         center0 = x - (k - 1) * stride / 2.0
-        for bi, (sk, (v, p)) in enumerate(items):
+        for bi, (sk, pair) in enumerate(items):
+            v, p = pair[0], pair[1]
+            gap_pp = pair[2] if len(pair) > 2 else None
             xc = center0 + bi * stride
             xl = xc - bar_w / 2.0
             xr = xc + bar_w / 2.0
@@ -5588,6 +5613,31 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                 f"\\filldraw[{style_of[sk]}, line width=0.2pt] {rect};")
             if pattern_of[sk]:
                 lines.append(f"\\fill[{pattern_of[sk]}] {rect};")
+            # I-beam gap marker, centred on the bar top: half its height sits
+            # inside the bar fill, half floats above (arXiv:2511.10576 fig 5).
+            # Height = gap fraction of the panel's data range; short caps make
+            # it read as a narrow capital "I". The value label (below) is lifted
+            # by `label_lift` to clear the upper cap.
+            label_lift = 0.0
+            if (draw_ibeam and panel_ymax and gap_pp is not None
+                    and gap_pp > _AAAI_IBEAM_MIN_PP):
+                half = (gap_pp / 100.0) * _AAAI_IBEAM_PANEL_FRAC * panel_ymax / 2.0
+                yb, yt = h - half, h + half
+                cap = bar_w * _AAAI_IBEAM_CAP_FRAC
+                cl, cr = xc - cap, xc + cap
+                lines.append(
+                    f"\\draw[black, line width=0.5pt, line cap=round]"
+                    f" (axis cs:{xc:.4g},{yb:.4g}) --"
+                    f" (axis cs:{xc:.4g},{yt:.4g});")
+                lines.append(
+                    f"\\draw[black, line width=0.5pt, line cap=round]"
+                    f" (axis cs:{cl:.4g},{yt:.4g}) --"
+                    f" (axis cs:{cr:.4g},{yt:.4g});")
+                lines.append(
+                    f"\\draw[black, line width=0.5pt, line cap=round]"
+                    f" (axis cs:{cl:.4g},{yb:.4g}) --"
+                    f" (axis cs:{cr:.4g},{yb:.4g});")
+                label_lift = half
             if value_labels:
                 # Value label ROTATED 90 degrees, reading bottom-to-top, centred
                 # above the bar. Rotation makes the fit depend on the bar WIDTH
@@ -5595,13 +5645,17 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                 # single fixed point size (label_font, uniform across every panel
                 # and architecture) clears every bar -- giving identical,
                 # readable numbers everywhere. anchor=west + rotate=90 puts the
-                # text's (rotated) base at the bar top, centred on the bar.
+                # text's (rotated) base at the bar top, centred on the bar; when
+                # an I-beam is present the base is lifted to the upper cap so the
+                # number never sits over the marker.
+                ly = h + label_lift
+                yshift = ", yshift=2pt" if label_lift else ""
                 lines.append(
                     f"\\node[anchor=west, rotate=90,"
                     f" font=\\fontsize{{{label_font:.2g}}}"
                     f"{{{label_font * 1.15:.2g}}}\\selectfont,"
-                    r" inner sep=1pt, text=black] at "
-                    f"(axis cs:{xc:.4g},{h:.4g}) {{{_aaai_fmt_bar_value(v)}}};")
+                    f" inner sep=1pt, text=black{yshift}] at "
+                    f"(axis cs:{xc:.4g},{ly:.4g}) {{{_aaai_fmt_bar_value(v)}}};")
             if p:
                 lines.append(
                     r"\node[font=\footnotesize\bfseries, text=red,"
@@ -5665,7 +5719,7 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False):
     background keeps this (timed-out) figure visually distinct from the time
     figures."""
     power = _AAAI_YAXIS_POWER
-    allvals = [v for _t, _l, bars in groups for (v, _p) in bars.values()]
+    allvals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
     vmax = max(allvals) if allvals else 1.0
     ymax, ytick_clause = _aaai_yaxis(vmax)
     content, n, xtick, xticklabels = _aaai_bar_content(groups, power)
@@ -5746,14 +5800,17 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     # directly comparable.
     row_axis = {}
     for type_disp in types_order:
-        rowvals = [v for c in c_cols
+        rowvals = [pair[0] for c in c_cols
                    for _t, _l, bars in cell_map.get((type_disp, c), [])
-                   for (v, _p) in bars.values()]
+                   for pair in bars.values()]
         rvmax = max(rowvals) if rowvals else 1.0
         rymax, rytick = _aaai_yaxis(rvmax)
         # Extra headroom so the ROTATED value label above the tallest bar (its
-        # length now extends upward) stays inside the panel.
-        rymax *= 1.32
+        # length now extends upward) stays inside the panel. The added factor
+        # over the old 1.32 also clears the upper half of a full-height I-beam
+        # (_AAAI_IBEAM_PANEL_FRAC/2 of the panel) sitting on the tallest bar, so
+        # a timed-out bar's marker + lifted label never overflow the panel top.
+        rymax *= 1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0
         row_axis[type_disp] = (rymax, rytick)
     ncol, nrow = len(c_cols), len(types_order)
     # Every panel shares ONE x-range so all bars render at the same physical
@@ -5796,6 +5853,7 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
             # panel with fewer perturbation sizes leaves empty space on the right
             # rather than widening its bars. Clusters sit at x=1..n_local.
             slots = slots_global
+            rymax, rytick = row_axis[type_disp]
             if groups:
                 # Centre this panel's clusters within the shared x-range: a panel
                 # with fewer perturbation sizes than the figure-wide maximum is
@@ -5804,13 +5862,15 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                 x_offset = (slots_global - len(groups)) / 2.0
                 # One fixed point size for every value label, in every panel and
                 # architecture (rotated, so it clears the bar width regardless of
-                # label length -- see _AAAI_BAR_W / _draw_group).
+                # label length -- see _AAAI_BAR_W / _draw_group). Each bar also
+                # carries an I-beam whose height encodes its delta_u-delta_l gap,
+                # scaled against this panel's data range (`rymax`).
                 content, _n, xtick, xticklabels = _aaai_bar_content(
                     groups, power, cluster=False, x_offset=x_offset,
-                    value_labels=True, label_font=_AAAI_VALUE_LABEL_PT)
+                    value_labels=True, label_font=_AAAI_VALUE_LABEL_PT,
+                    draw_ibeam=True, panel_ymax=rymax)
             else:
                 content, xtick, xticklabels = [], "", ""
-            rymax, rytick = row_axis[type_disp]
             opt = f"xmin=0.5, xmax={slots + 0.5:g}, ymax={rymax:.4g}"
             if rytick:
                 opt += ", " + rytick.rstrip(", ")
@@ -5859,7 +5919,12 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
         cap = (r"Evaluation of solve times (minutes) for the " + arch_disp
                + r" architecture using the " + dataset_disp
                + r" dataset; columns are the source class $c_s$ and rows are "
-                 r"the perturbation type.")
+                 r"the perturbation type. The I-beam centred on each bar top "
+                 r"encodes that run's remaining bound gap $\delta_u-\delta_l$ "
+                 r"(in percentage points of $\delta_{\max}$; a full I-beam of "
+                 + f"{int(round(_AAAI_IBEAM_PANEL_FRAC * 100))}"
+               + r"\% of the panel height marks a $100$-pp gap), so a shorter "
+                 r"I-beam is a tighter certificate.")
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
             out.append(f"\\label{{{label_base}}}")
@@ -5871,11 +5936,13 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
 
 def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                            force_timeout=None, rerun_timeout_eps=30.0):
-    """Emit per (arch, N2, c_s) a solve-time figure for the perturbations
-    where at least one method finishes, and a companion bound-gap figure
-    (delta_u - delta_l) for the perturbations where all three methods hit
-    the timeout. Bucketing mirrors the N2 per-cell table so the bar heights
-    equal the table's time / delta cells (geom side where present, else
+    """Emit one solve-time figure per architecture (a c_s x perturbation-type
+    grid of bars for the three methods). Every perturbation is charted here,
+    including cells where all three methods hit the timeout: those simply sit
+    flat at the wall-clock cap and are told apart by their I-beam, which
+    encodes the remaining delta_u - delta_l gap (there is no longer a separate
+    bound-gap figure). Bucketing mirrors the N2 per-cell table so the bar
+    heights equal the table's time cells (geom side where present, else
     base)."""
     if not rows:
         return r"\noindent\textit{No data available.}"
@@ -5917,15 +5984,9 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
 
     dataset_disp = _dataset_display_name(dataset)
     series_keys = [k for k, _lbl, _sty, _pat in _AAAI_CHART_SERIES]
-    cap_min = (force_timeout / 60.0) if force_timeout is not None else None
-
     lines = []
     lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
-                 f"n2_time+gap_charts")
-    # All timed-out cells across every (arch, c_s) are merged into a single
-    # bound-gap figure at the end; each entry keeps its arch / c_s / pert so
-    # the merged chart can label every group.
-    merged_gap = []  # list of (arch_disp, c_src, pert_label_plain, {sk:(gap,partial)})
+                 f"n2_time_charts")
     arch_rows = []   # (arch_disp, c_cols, types_order, cell_map) per arch
     for arch in archs:
         arch_disp = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
@@ -5965,54 +6026,34 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                 type_disp = (pert.replace("_", r"\_")
                              .replace("linf", r"$\ell_\infty$"))
                 size_disp = ("(" + p_size + ")").replace("_", r"\_")
-                pert_plain = type_disp + " " + size_disp  # full, for gap
-                # A perturbation is "all-timeout" iff every method that ran
-                # it reached the wall-clock cap; its time bars would all be
-                # flat at the cap, so we route it to the merged bound-gap
-                # figure instead -- but only when we actually have delta data
-                # to plot there (else keep it in the time figure).
-                all_timeout = (cap_min is not None
-                               and all(v >= cap_min - 1e-6 for v in present))
-                gaps = None
-                if all_timeout:
-                    gaps = {sk: _aaai_chart_gap(cells.get(sk), dmax_ub,
-                                                prefer_geom=(sk != "vaghar"))
-                            for sk in series_keys}  # sk -> (value, side)
-                    if all(g is None for g, _s in gaps.values()):
-                        all_timeout = False
-                if all_timeout:
-                    cell_vals = {}
-                    for sk in series_keys:
-                        g, side = gaps[sk]
-                        if g is not None:
-                            partial = _aaai_partial(cells.get(sk), side,
-                                                    expected_cts)
-                            cell_vals[sk] = (g, partial)
-                    # Only include a perturbation that has ALL THREE methods
-                    # (ours with transfer, ours, vaghar) and whose bars are all
-                    # complete (no partial-coverage `*`); drop it otherwise.
-                    if (len(cell_vals) == len(series_keys)
-                            and not any(p for _g, p in cell_vals.values())):
-                        merged_gap.append(
-                            (arch_disp, c_src, type_disp, pert_plain,
-                             cell_vals))
-                else:
-                    bars = {}
-                    for sk in series_keys:
-                        v, side = times[sk]
-                        if v is not None:
-                            partial = _aaai_partial(cells.get(sk), side,
-                                                    expected_cts)
-                            bars[sk] = (v, partial)
-                    # Only include a perturbation that has ALL THREE methods
-                    # (ours with transfer, ours, vaghar) and whose bars are all
-                    # complete (no partial-coverage `*`); drop it otherwise.
-                    if (len(bars) == len(series_keys)
-                            and not any(p for _v, p in bars.values())):
-                        cell_map.setdefault((type_disp, c_src), []).append(
-                            (type_disp, size_disp, bars))
-                        type_means.setdefault(type_disp, []).extend(
-                            v for v, _p in bars.values())
+                # Every perturbation is a regular time bar (clamped to the
+                # wall-clock cap): even a cell where all three methods time
+                # out is now kept here -- its bars sit flat at the cap and are
+                # told apart by their I-beam (the remaining delta_u-delta_l
+                # gap), so no separate bound-gap figure is needed.
+                bars = {}
+                for sk in series_keys:
+                    v, side = times[sk]
+                    if v is not None:
+                        partial = _aaai_partial(cells.get(sk), side,
+                                                expected_cts)
+                        # Remaining bound gap for this bar's I-beam (same
+                        # delta_u-delta_l, in pp of delta_max, the appendix
+                        # N2 table reports); None when it cannot be computed
+                        # -> the bar simply carries no marker.
+                        gap, _gside = _aaai_chart_gap(
+                            cells.get(sk), dmax_ub,
+                            prefer_geom=(sk != "vaghar"))
+                        bars[sk] = (v, partial, gap)
+                # Only include a perturbation that has ALL THREE methods
+                # (ours with transfer, ours, vaghar) and whose bars are all
+                # complete (no partial-coverage `*`); drop it otherwise.
+                if (len(bars) == len(series_keys)
+                        and not any(pair[1] for pair in bars.values())):
+                    cell_map.setdefault((type_disp, c_src), []).append(
+                        (type_disp, size_disp, bars))
+                    type_means.setdefault(type_disp, []).extend(
+                        pair[0] for pair in bars.values())
 
         # One block per architecture: a (c_s columns) x (type rows) grid; the
         # type rows are ordered by ascending mean solve time.
@@ -6026,29 +6067,12 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                 (arch, arch_disp, c_cols, types_order, cell_map))
 
     # All architectures in ONE figure: one row per architecture (with a bold
-    # title naming it), a single shared legend, and one caption.
+    # title naming it), a single shared legend, and one caption. Timed-out
+    # cells are included here as regular capped bars (their I-beams still carry
+    # the remaining delta_u-delta_l gap), so there is no separate gap figure.
     if arch_rows:
         lines += _aaai_group_grid_figure(
             arch_rows, r"time (min)", dataset_disp, "fig:n2-time")
-
-    # Single merged bound-gap figure over every timed-out cell. One x-group
-    # per (arch, c_s, pert), each x-tick label naming all three so the
-    # merged chart still identifies which architecture and source class a
-    # group belongs to. Spans both columns (wide) since there can be many.
-    if merged_gap:
-        gap_groups = []
-        for (a_disp, c_src, type_disp, pert_plain, vals) in merged_gap:
-            label = (a_disp + r", $c_s{=}" + str(c_src) + r"$, " + pert_plain)
-            gap_groups.append((type_disp, label, vals))
-        cap = (
-            r"Evaluation of the remaining bound gap $\delta_u-\delta_l$ on "
-            r"the timed-out cells using the " + dataset_disp
-            + r" dataset, with each group labelled by architecture and "
-            r"$c_s$.")
-        lines += _aaai_bar_figure(
-            "Timed-out cells, " + dataset_disp, "fig:n2-gap-timeouts",
-            r"$\delta_u-\delta_l$ (pp of $\delta_{\max}$)",
-            cap, gap_groups, wide=True)
     return "\n".join(lines)
 
 
