@@ -4696,7 +4696,7 @@ AAAI_SUMMARY_END_MARK   = "% END AUTO: aaai_summary_table"
 # transfer-mode safe combo adv+zono+prev_pgd+SibGate at tau=0.5.
 # Each entry: (column_key, multicolumn header label).
 _AAAI_WIDE_COLUMNS = (
-    ("vaghar",                   r"vaghar"),
+    ("vaghar",                   r"\baseline"),
     (("1", "1", "1", "0.5"),     r"ours ($\tau{=}0.5$)"),
     ("adv_zono_prevpgd_0.5+sg",  r"ours with transfer ($\tau{=}0.5$)"),
 )
@@ -4840,13 +4840,13 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         # Every method group is now followed by the trailing diff column,
         # so each multicolumn group keeps a right rule.
         header_cells.append("\\multicolumn{3}{c|}{" + hdr + "}")
-    # Two trailing columns comparing the vaghar baseline against \emph{ours}
-    # (diff-single-net) and \emph{ours with transfer} (diff-transfer). Each is
-    # the per-cent solve-time saving (diff-time) when a method finishes, or
-    # the per-cent MIP optimality-gap reduction (diff-bounds, daggered) when
-    # all methods time out. Rows are sorted by diff-transfer on N2.
-    header_cells.append(r"\multirow{2}{*}{\shortstack{diff-\\single-net}}")
-    header_cells.append(r"\multirow{2}{*}{\shortstack{diff-\\transfer}}")
+    # Two trailing SPEEDUP columns: the vaghar baseline's solve time divided by
+    # \emph{ours} (speedup-single-net) and by \emph{ours with transfer}
+    # (speedup-transfer), reported as a "x" ratio (higher = faster), the same
+    # speedup metric the body uses (t_vaghar / t_ours). Rows are sorted by the
+    # transfer speedup on N2.
+    header_cells.append(r"\multirow{2}{*}{\shortstack{speedup\\single-net}}")
+    header_cells.append(r"\multirow{2}{*}{\shortstack{speedup\\transfer}}")
     sub_cells = ["", ""]
     for _ in _AAAI_WIDE_COLUMNS:
         sub_cells += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
@@ -5073,24 +5073,6 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         v = min(v, force_timeout / 60.0)
                     return v
 
-                def _repr_gap(c):
-                    # delta_u - delta_l, both as a per-cent of delta_max (the
-                    # delta_max scaling cancels in the ratio), geom-preferred to
-                    # match the rendered bounds. Each bound is rounded EXACTLY
-                    # as the cell prints it (_fmt_sig of the clamped value:
-                    # delta_l >= 0, delta_u <= 100) so the gap -- and the diff
-                    # built from it -- is reproducible from the printed
-                    # delta_l / delta_u. None when either bound is absent.
-                    s2 = stats.get(c)
-                    if not s2:
-                        return None
-                    lo = s2.get("lb_pct_geom", s2.get("lb_pct_base"))
-                    hi = s2.get("ub_pct_geom", s2.get("ub_pct_base"))
-                    if lo is None or hi is None:
-                        return None
-                    return (float(_fmt_sig(min(100.0, hi)))
-                            - float(_fmt_sig(max(0.0, lo))))
-
                 def _disp_time(c):
                     # The solve time EXACTLY as the cell prints it: geom-
                     # preferred and clamped (via _repr_time), then rounded to
@@ -5109,58 +5091,43 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         return bool(partial_geom.get(c))
                     return bool(partial.get(c))
 
-                cap_min = (force_timeout / 60.0
-                           if force_timeout is not None else None)
                 # A cell carries the partial "*" on its chosen side when that
                 # sweep missed an expected c_target. If ANY column in the row
-                # is starred, the row has a missing run, so BOTH diffs are left
-                # blank -- the means are not over a comparable class set.
+                # is starred, the row has a missing run, so BOTH speedups are
+                # left blank -- the means are not over a comparable class set.
                 row_partial = any(_repr_partial(c) for c in columns)
 
-                def _diff_for(cmp_c):
-                    """(frac, cell) comparing the vaghar baseline against column
-                    cmp_c. diff-time normally; diff-bounds (daggered) when every
-                    method that ran on the cell is pinned at the timeout cap;
-                    blank when the row is partial or an input is missing. Built
-                    from the DISPLAYED (rounded) values so it is reproducible
-                    from the printed cells."""
+                def _speedup_for(cmp_c):
+                    """(speedup, cell) = t_vaghar / t_cmp, the baseline's solve
+                    time over column cmp_c's, rendered as an "x" ratio (higher =
+                    faster; <1 means slower). Even when every method is pinned at
+                    the timeout cap the raw ratio (~1x) is shown -- no special
+                    case. Built from the DISPLAYED (rounded) times so it is
+                    reproducible from the printed minutes; blank ("---") when the
+                    row is partial, an input time is missing, or cmp_c's printed
+                    time is 0."""
                     if row_partial:
                         return None, "---"
                     tv = _disp_time(columns[0])
                     tc = _disp_time(cmp_c)
-                    if tv is None or tc is None:
+                    if tv is None or tc is None or tc <= 0:
                         return None, "---"
-                    method_times = [t for t in
-                                    (_repr_time(c) for c in columns)
-                                    if t is not None]
-                    all_timeout = (cap_min is not None and method_times
-                                   and all(t >= cap_min - 1e-6
-                                           for t in method_times))
-                    if all_timeout:
-                        gv = _repr_gap(columns[0])
-                        gc = _repr_gap(cmp_c)
-                        if (gv is not None and gc is not None
-                                and abs(gv) > 1e-9):
-                            d = (gv - gc) / gv
-                            return d, _fmt_trim(d * 100.0) + r"$^\dagger$"
-                        return None, "---"
-                    if tv > 0:
-                        d = (tv - tc) / tv
-                        return d, _fmt_trim(d * 100.0)
-                    return None, "---"
+                    s = tv / tc
+                    return s, _fmt_trim(s) + r"$\times$"
 
-                # Two diff columns, left to right: diff-single-net (vaghar vs
-                # \emph{ours}) then diff-transfer (vaghar vs \emph{ours with
-                # transfer}). On N1 the transfer column has no data, so
-                # diff-transfer renders "---" for every row.
-                std_frac, std_cell = _diff_for(columns[1])
-                trans_frac, trans_cell = _diff_for(columns[2])
+                # Two speedup columns, left to right: speedup-single-net (vaghar
+                # over \emph{ours}) then speedup-transfer (vaghar over \emph{ours
+                # with transfer}). On N1 the transfer column has no data, so
+                # speedup-transfer renders "---" for every row.
+                std_frac, std_cell = _speedup_for(columns[1])
+                trans_frac, trans_cell = _speedup_for(columns[2])
                 data_cells.append(std_cell)
                 data_cells.append(trans_cell)
-                # Order rows by the transfer diff on N2 (the headline method,
-                # as before); N1 has no transfer, so fall back to the standard
-                # diff there. A blank ranking diff sinks the row to the end of
-                # its cluster ((0, -d) sorts descending; (1, 0.0) parks blanks).
+                # Order rows by the transfer speedup on N2 (the headline method,
+                # as before); N1 has no transfer, so fall back to the single-net
+                # speedup there. A blank ranking value sinks the row to the end
+                # of its cluster ((0, -s) sorts descending; (1, 0.0) parks
+                # blanks).
                 sort_frac = std_frac if role == "N1" else trans_frac
                 row_sort = ((0, -sort_frac) if sort_frac is not None
                             else (1, 0.0))
@@ -5171,16 +5138,15 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
 
             # Two-level ordering that keeps each perturbation TYPE contiguous:
             #  (1) cluster the rows by perturbation name and order the clusters
-            #      by their best (largest) diff-time/diff-bounds value -- a
-            #      cluster whose rows all lack a diff sinks below every cluster
-            #      that has one;
-            #  (2) within a cluster, order rows by that value (largest first)
-            #      with the gap-less ("---") rows kept at the END of THAT
+            #      by their best (largest) speedup -- a cluster whose rows all
+            #      lack a speedup sinks below every cluster that has one;
+            #  (2) within a cluster, order rows by that speedup (largest first)
+            #      with the speedup-less ("---") rows kept at the END of THAT
             #      cluster (not the block);
             #  (3) ties broken by perturbation size for a stable order.
-            # row_sort is (0, -diff) when a diff exists and (1, 0.0) otherwise,
-            # so min(row_sort) over a cluster is its best rank and smaller
-            # sorts earlier.
+            # row_sort is (0, -speedup) when a speedup exists and (1, 0.0)
+            # otherwise, so min(row_sort) over a cluster is its best rank and
+            # smaller sorts earlier.
             best_by_pert = {}
             for row_sort, pert_name, _ps, _dc in block_rows:
                 cur = best_by_pert.get(pert_name)
@@ -5218,21 +5184,18 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         is_n1 = roles is not None and set(roles) == {"N1"}
         if is_n1:
             cap = (
-                f"Per-cell results on {ds_disp} for architecture "
+                f"Experiments for {ds_disp} and architecture "
                 f"\\textbf{{{arch}}}, source network $N_{{\\mathrm{{pre}}}}$. "
-                r"Each cell gives $(\delta_l, \delta_u, t)$ for the VHAGaR "
-                r"baseline and \emph{ours} at $\tau{=}0.5$ (the \emph{ours "
+                r"Each cell gives $(\delta_l, \delta_u, t)$ for the \baseline "
+                r"baseline and \emph{ours} (the \emph{ours "
                 r"with transfer} columns are blank, as transfer applies to "
                 r"$N$ only). The target network $N$ is in "
                 r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
         else:
             cap = (
-                f"Per-cell results on {ds_disp} for architecture "
-                f"\\textbf{{{arch}}}, target network $N$. "
-                r"Each cell gives $(\delta_l, \delta_u, t)$ for the VHAGaR "
-                r"baseline, \emph{ours}, and \emph{ours with transfer} at "
-                r"$\tau{=}0.5$. The source network $N_{\mathrm{pre}}$ is in "
-                r"Table~\ref{tab:safe-wide-" + safe_arch + r"-n1}.")
+                r"Experiments evaluating \tool in comparison to \baseline on "
+                + ds_disp + r" and architecture \textbf{" + arch
+                + r"}, target network $N$.")
         lines.append(f"\\caption{{{cap}}}")
         lines.append(f"\\label{{tab:safe-wide-{safe_arch}{label_suffix}}}")
         lines.append(r"\end{table*}")
@@ -5367,7 +5330,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
 # / diagonal lines / vertical lines). Pattern colours contrast with each fill
 # (white on the red and dark-green bars, dark on the light-green bar).
 _AAAI_CHART_SERIES = (
-    ("vaghar",                  r"vaghar",                  "fill=vagharred, draw=vagharred!60!black",
+    ("vaghar",                  r"\baseline",               "fill=vagharred, draw=vagharred!60!black",
         ""),
     (("1", "1", "1", "0.5"),    r"ours",                    "fill=oursgreen!42, draw=oursgreen!60!black",
         "pattern=north east lines, pattern color=oursgreen!70!black"),
@@ -5496,16 +5459,11 @@ def _aaai_yaxis_ticks(vmax):
 # hence its data->cm scale -- identical). Bars within a perturbation-size
 # cluster are drawn ADJACENT (touching); clusters sit 1.0 unit apart, so a full
 # 3-bar cluster spans 3*0.30=0.90 and still leaves a ~0.10-unit gap before the
-# next cluster. The per-bar value labels are ROTATED 90 degrees and printed at a
-# single fixed point size (_AAAI_VALUE_LABEL_PT) so every label is the same size
-# and large relative to the body text; rotation makes the binding fit the bar
-# WIDTH vs the label's x-height (not its length), which a wide bar clears easily.
+# next cluster. The per-bar value labels are printed HORIZONTALLY at one
+# figure-wide point size (from _aaai_hlabel_pt) chosen so the widest label fits
+# the bar WIDTH with a small gap each side -- see _aaai_hlabel_pt / _draw_group.
 _AAAI_BAR_W = 0.30
 _AAAI_GROUP_SPAN = 0.88
-# Fixed point size for the rotated per-bar value labels (uniform across every
-# panel and architecture). The AAAI body text is 10pt, so 8pt keeps the numbers
-# clearly legible rather than shrunk.
-_AAAI_VALUE_LABEL_PT = 8.0
 
 # I-beam (error-bar-style) gap marker drawn ON each time bar. Its height encodes
 # the remaining bound gap delta_u - delta_l (in percentage points of delta_max,
@@ -5554,6 +5512,42 @@ def _aaai_fmt_bar_value(v):
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s
+
+
+# The per-bar value labels are printed HORIZONTALLY (not rotated), so their
+# WIDTH -- not their height -- must fit inside a bar. We pick one figure-wide
+# point size such that the widest label a cell can print ("XX.XX", ~2.36 em)
+# spans at most _AAAI_LABEL_FIT_FRAC of a bar's physical width, leaving a small
+# gap on each side so adjacent labels stay visually separated; the size is then
+# clamped to a legible range. The AAAI 2026 (letterpaper) template has
+# \textwidth = 505.89pt, which the N2 figures span (figure*); a bar's physical
+# width follows the panel geometry in _aaai_arch_typegrid: panel width =
+# (\textwidth - overhead)/ncol_max, the panel's x-range is `nmax` slots, and a
+# bar is _AAAI_BAR_W data-units wide.
+_AAAI_TEXTWIDTH_PT = 505.89
+_AAAI_PT_PER_CM = 28.4527
+_AAAI_LABEL_FIT_FRAC = 0.86
+_AAAI_LABEL_PT_MIN = 4.0
+_AAAI_LABEL_PT_MAX = 8.5
+
+
+def _aaai_hlabel_pt(nmax, ncol_max):
+    """Figure-wide point size for the HORIZONTAL per-bar value labels, chosen so
+    the widest possible label ('XX.XX') fits within one bar's physical width
+    with a small gap on each side, then clamped to [_AAAI_LABEL_PT_MIN,
+    _AAAI_LABEL_PT_MAX]. Mirrors the panel-width geometry in
+    _aaai_arch_typegrid (panel_w = (\\textwidth - overhead)/ncol_max, x-range =
+    `nmax` slots, bar = _AAAI_BAR_W data-units)."""
+    ncol_max = max(int(ncol_max), 1)
+    slots = max(int(nmax), 1)
+    overhead_cm = 1.5 + 0.2 * max(ncol_max - 1, 0)
+    panel_w_pt = (max(_AAAI_TEXTWIDTH_PT - overhead_cm * _AAAI_PT_PER_CM, 1.0)
+                  / ncol_max)
+    bar_w_pt = _AAAI_BAR_W * panel_w_pt / slots
+    avail_pt = bar_w_pt * _AAAI_LABEL_FIT_FRAC
+    widest_em = _aaai_label_em("88.88")  # 'XX.XX' upper bound (~2.36 em)
+    pt = avail_pt / widest_em if widest_em > 0 else _AAAI_LABEL_PT_MAX
+    return max(_AAAI_LABEL_PT_MIN, min(_AAAI_LABEL_PT_MAX, pt))
 
 
 def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
@@ -5639,22 +5633,19 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                     f" (axis cs:{cr:.4g},{yb:.4g});")
                 label_lift = half
             if value_labels:
-                # Value label ROTATED 90 degrees, reading bottom-to-top, centred
-                # above the bar. Rotation makes the fit depend on the bar WIDTH
-                # vs the label's x-height (~0.7em) rather than its length, so a
-                # single fixed point size (label_font, uniform across every panel
-                # and architecture) clears every bar -- giving identical,
-                # readable numbers everywhere. anchor=west + rotate=90 puts the
-                # text's (rotated) base at the bar top, centred on the bar; when
-                # an I-beam is present the base is lifted to the upper cap so the
-                # number never sits over the marker.
+                # Value label printed HORIZONTALLY, centred just above the bar
+                # top (anchor=south). The figure-wide point size (label_font,
+                # from _aaai_hlabel_pt) is sized so even the widest label fits
+                # the bar WIDTH with a small gap each side, so horizontal numbers
+                # stay separated and readable. When an I-beam is present the
+                # baseline is lifted to just above its upper cap so the number
+                # never sits over the marker.
                 ly = h + label_lift
-                yshift = ", yshift=2pt" if label_lift else ""
                 lines.append(
-                    f"\\node[anchor=west, rotate=90,"
-                    f" font=\\fontsize{{{label_font:.2g}}}"
-                    f"{{{label_font * 1.15:.2g}}}\\selectfont,"
-                    f" inner sep=1pt, text=black{yshift}] at "
+                    f"\\node[anchor=south,"
+                    f" font=\\fontsize{{{label_font:.3g}}}"
+                    f"{{{label_font * 1.15:.3g}}}\\selectfont,"
+                    f" inner sep=1pt, text=black, yshift=1.5pt] at "
                     f"(axis cs:{xc:.4g},{ly:.4g}) {{{_aaai_fmt_bar_value(v)}}};")
             if p:
                 lines.append(
@@ -5823,6 +5814,10 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     # overflowing it (AAAI-safe): an allowance covers the left column's y-label /
     # ticks plus the 4pt inter-panel separations.
     slots_global = max(nmax, 1)
+    # Figure-wide font size for the horizontal value labels, fitted to the bar
+    # width implied by (nmax, ncol_max); uniform across every panel so the
+    # numbers read consistently.
+    hlabel_pt = _aaai_hlabel_pt(nmax, ncol_max)
     # Panel width is derived from the figure-wide MAXIMUM column count
     # (`ncol_max`), not this figure's own `ncol`, so every architecture's bars
     # are the same physical width: the densest figure exactly fills \textwidth,
@@ -5860,14 +5855,14 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                 # shifted right by half the empty slots so its bars sit in the
                 # middle of the graph rather than flush left.
                 x_offset = (slots_global - len(groups)) / 2.0
-                # One fixed point size for every value label, in every panel and
-                # architecture (rotated, so it clears the bar width regardless of
-                # label length -- see _AAAI_BAR_W / _draw_group). Each bar also
+                # One figure-wide point size for every horizontal value label,
+                # sized so the widest label fits the bar WIDTH with a small gap
+                # each side (see _aaai_hlabel_pt / _draw_group). Each bar also
                 # carries an I-beam whose height encodes its delta_u-delta_l gap,
                 # scaled against this panel's data range (`rymax`).
                 content, _n, xtick, xticklabels = _aaai_bar_content(
                     groups, power, cluster=False, x_offset=x_offset,
-                    value_labels=True, label_font=_AAAI_VALUE_LABEL_PT,
+                    value_labels=True, label_font=hlabel_pt,
                     draw_ibeam=True, panel_ymax=rymax)
             else:
                 content, xtick, xticklabels = [], "", ""
@@ -5916,15 +5911,9 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
         out.append(r"\par\smallskip")
         out += _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                                    ncol_max)
-        cap = (r"Evaluation of solve times (minutes) for the " + arch_disp
-               + r" architecture using the " + dataset_disp
-               + r" dataset; columns are the source class $c_s$ and rows are "
-                 r"the perturbation type. The I-beam centred on each bar top "
-                 r"encodes that run's remaining bound gap $\delta_u-\delta_l$ "
-                 r"(in percentage points of $\delta_{\max}$; a full I-beam of "
-                 + f"{int(round(_AAAI_IBEAM_PANEL_FRAC * 100))}"
-               + r"\% of the panel height marks a $100$-pp gap), so a shorter "
-                 r"I-beam is a tighter certificate.")
+        cap = (r"\tool compared to \baseline (baseline) on "
+               + dataset_disp + r" (" + arch_disp + r") across different perturbation "
+               r"types and sizes.")
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
             out.append(f"\\label{{{label_base}}}")
