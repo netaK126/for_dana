@@ -3437,6 +3437,19 @@ def _is_baseline_stdname(name):
     return "_PertruebedIntervals" in name and "_stdBoost_" not in name
 
 
+# The real perturbation directory names under paper_experiments/{ds}/{arch}_exp.
+# Every paper-table/chart loader discovers perturbations by scanning the
+# filesystem for these dirs (then globbing their eps_* subdirs), so the tables
+# reflect whatever results exist on disk. This is intentionally DECOUPLED from
+# run_relaxation_sweep.PERTURBATIONS, which only schedules which jobs to launch:
+# commenting a perturbation out of that list (e.g. to run fewer jobs at once)
+# must never drop already-computed results from the tables/charts. Anything not
+# in this list (deprecated/, patch_old/, delta_max/, model_seed*/, ...) is
+# ignored.
+_WIDE_PERT_SUBDIRS = ["patch", "occ", "translation", "rotation",
+                      "brightness", "linf", "contrast"]
+
+
 def _collect_stdboost_cells(arch_runs, cwd, dataset, parse_result_file,
                             seeds_filter=None):
     """Walk each arch's results dir, pair each _stdBoost_* cell with the
@@ -3450,8 +3463,7 @@ def _collect_stdboost_cells(arch_runs, cwd, dataset, parse_result_file,
     rows = []
     seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
 
-    pert_subdirs = ["patch", "occ", "translation", "rotation",
-                    "brightness", "linf", "contrast"]
+    pert_subdirs = _WIDE_PERT_SUBDIRS
     for arch, _ in arch_runs:
         exp_base = os.path.join(cwd, "paper_experiments", dataset,
                                 f"{arch}_exp")
@@ -3851,8 +3863,7 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
     rows = []
     seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
 
-    pert_subdirs = ["patch", "occ", "translation", "rotation",
-                    "brightness", "linf", "contrast"]
+    pert_subdirs = _WIDE_PERT_SUBDIRS
     for arch, _ in arch_runs:
         exp_base = os.path.join(cwd, "paper_experiments", dataset,
                                 f"{arch}_exp")
@@ -6608,15 +6619,18 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                                         stale_fn=None):
     """Read advStd per-cell rows DIRECTLY from the advStd .txt result files.
 
-    Discovery is IDENTICAL to find_advstd_faster_than_standard (the old
-    --find_advstd command): iterate `perts` (run_relaxation_sweep.PERTURBATIONS),
-    build exp_base/{pert_dir}/eps_{eps}/advStd_*/*.txt via the same
-    pert_dir_map, and read every "_N2_advStd_" file. The ONLY difference from
-    the old path is that there is no standard-baseline pairing: an advStd cell
-    is emitted as soon as its .txt line exists, so advStd results are never
-    dropped for want of a vaghar baseline (and no CSV is involved). Validated
-    to reproduce the old command's MNIST table exactly (50/54 cells identical,
-    0 regressions) while filling the cells the baseline pairing used to drop.
+    Discovery is FILESYSTEM-driven: for each arch, scan every real perturbation
+    dir (`_WIDE_PERT_SUBDIRS`) and its eps_* subdirs, and read every
+    "_N2_advStd_" file under advStd_*/. This mirrors _collect_wide_perarch_cells
+    (which finds the vaghar/ours columns the same way), so the transfer column
+    covers exactly the same on-disk cells. It does NOT consult
+    run_relaxation_sweep.PERTURBATIONS: that list only schedules which jobs to
+    launch, so commenting a perturbation out of it (to run fewer jobs at once)
+    must never drop already-computed results from the tables/charts. The `perts`
+    parameter is kept only as the truthy sentinel the callers use to select this
+    txt-direct path. There is no standard-baseline pairing: an advStd cell is
+    emitted as soon as its .txt line exists, so advStd results are never dropped
+    for want of a vaghar baseline (and no CSV is involved).
 
     role is always 'N2' (advstd is transfer mode N1 -> N2). Only the two
     advstd N2 combos in _ADVSTD_WIDE_COMBOS are emitted. Row shape matches
@@ -6640,11 +6654,6 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
     passed in so this module needs no new filename-parsing logic.
     """
     import glob
-    # Identical to find_advstd_faster_than_standard's pert_dir_map.
-    pert_dir_map = {
-        "patch": "patch", "occ": "occ", "trans": "translation",
-        "rotation": "rotation", "brightness": "brightness",
-    }
     seeds_filter = set(str(s) for s in seeds_filter) if seeds_filter else None
     rows = []
     for arch in (archs or []):
@@ -6652,103 +6661,111 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                                 f"{arch}_exp")
         if not os.path.isdir(exp_base):
             continue
-        for _pert_name, pert_spec in perts:
-            pert_type, eps_str = pert_spec.split(":", 1)
-            pert_dir = pert_dir_map.get(pert_type, pert_type)
-            eps_dir = os.path.join(exp_base, pert_dir, f"eps_{eps_str}")
-            if not os.path.isdir(eps_dir):
+        # Discover perturbation/eps dirs straight from the filesystem -- the
+        # SAME way _collect_wide_perarch_cells finds the vaghar/ours columns --
+        # so the transfer column covers exactly the same cells. The `perts`
+        # argument (run_relaxation_sweep.PERTURBATIONS) is deliberately NOT used
+        # for discovery: that list only schedules which jobs to launch, and
+        # commenting a perturbation out of it must not drop already-computed
+        # results from the tables/charts. It survives only as the truthy
+        # sentinel the callers use to pick this txt-direct path.
+        for pert_type in _WIDE_PERT_SUBDIRS:
+            pert_base = os.path.join(exp_base, pert_type)
+            if not os.path.isdir(pert_base):
                 continue
-            for ad in sorted(glob.glob(os.path.join(eps_dir, "advStd_*"))):
-                for tf in sorted(glob.glob(os.path.join(ad, "*.txt"))):
-                    fname = os.path.basename(tf)
-                    if "_N2_advStd" not in fname:
-                        continue
-                    # Drop only files made stale by the perturbation-dependency
-                    # soundness fix: a pre-fix file is unsound ONLY if it relaxed
-                    # (dropped) >=1 ReLU binary, because the missing
-                    # has_a_o && has_a_p guard mis-coupled relaxed neurons. A
-                    # pre-fix file that dropped nothing is byte-identical under
-                    # the fix and is kept. `stale_fn` is
-                    # run_relaxation_sweep._is_pre_fix_dropped (the same predicate
-                    # the sweep skip-check uses); None disables the gate.
-                    if stale_fn is not None and stale_fn(fname):
-                        continue
-                    meta = advstd_meta_fn(fname)
-                    # Parity with the CSV loader's pre-filters.
-                    if (meta.get("bound_tightening") != "yes"
-                            or meta.get("branch_priorities") != "off"
-                            or meta.get("n1_probe", "off") != "off"):
-                        continue
-                    if seeds_filter and meta.get("seed") not in seeds_filter:
-                        continue
-                    # Restrict to the two wide-table advstd combos.
-                    combo_label = None
-                    for label, zb, vh, rt, sg in _ADVSTD_WIDE_COMBOS:
-                        if (meta.get("zono_bounds") == zb
-                                and meta.get("var_hint") == vh
-                                and meta.get("relax_threshold") == rt
-                                and meta.get("sibling_gate", "no") == sg):
-                            combo_label = label
-                            break
-                    if combo_label is None:
-                        continue
-                    # --combination_table filter: reuse _combo_label so the
-                    # spec form ('zono:prev_pgd:0.5+sg') matches verbatim.
-                    if combination_filter is not None:
-                        grp_key = (meta["mip_start"], meta["branch_priorities"],
-                                   meta["lp_basis"], meta["bound_tightening"],
-                                   meta["var_hint"], meta["zono_bounds"],
-                                   meta["n1_probe"], meta["relax_threshold"],
-                                   meta["sibling_gate"])
-                        if _combo_label(grp_key) not in combination_filter:
+            for eps_dir in sorted(glob.glob(os.path.join(pert_base, "eps_*"))):
+                eps_str = os.path.basename(eps_dir).replace("eps_", "")
+                for ad in sorted(glob.glob(os.path.join(eps_dir, "advStd_*"))):
+                    for tf in sorted(glob.glob(os.path.join(ad, "*.txt"))):
+                        fname = os.path.basename(tf)
+                        if "_N2_advStd" not in fname:
                             continue
-                    seed_val = meta.get("seed", "0")
-                    is_geom = "_geomInt" in fname
-                    for (cs, ct), val in parse_result_file(tf).items():
-                        t = val.get("total_time", 0.0) or 0.0
-                        if t <= 0:
+                        # Drop only files made stale by the perturbation-dependency
+                        # soundness fix: a pre-fix file is unsound ONLY if it relaxed
+                        # (dropped) >=1 ReLU binary, because the missing
+                        # has_a_o && has_a_p guard mis-coupled relaxed neurons. A
+                        # pre-fix file that dropped nothing is byte-identical under
+                        # the fix and is kept. `stale_fn` is
+                        # run_relaxation_sweep._is_pre_fix_dropped (the same predicate
+                        # the sweep skip-check uses); None disables the gate.
+                        if stale_fn is not None and stale_fn(fname):
                             continue
-                        # Only completed cells belong in the table: a proven
-                        # optimum or a genuine timeout. Anything else (e.g.
-                        # INTERRUPTED / killed mid-solve) is a partial result
-                        # and is dropped.
-                        status_norm = (val.get("solve_status", "") or "") \
-                            .upper().replace(" ", "_")
-                        is_opt = status_norm == "OPTIMAL"
-                        is_to = any(tag.replace(" ", "_") in status_norm
-                                    for tag in _AAAI_TIMEOUT_STATUSES)
-                        if not (is_opt or is_to):
+                        meta = advstd_meta_fn(fname)
+                        # Parity with the CSV loader's pre-filters.
+                        if (meta.get("bound_tightening") != "yes"
+                                or meta.get("branch_priorities") != "off"
+                                or meta.get("n1_probe", "off") != "off"):
                             continue
-                        lb = val.get("lower_bound")
-                        ub = val.get("upper_bound")
-                        lb = lb if (isinstance(lb, (int, float))
-                                    and math.isfinite(lb)) else None
-                        ub = ub if (isinstance(ub, (int, float))
-                                    and math.isfinite(ub)) else None
-                        row = {
-                            "arch": arch,
-                            "role": "N2",
-                            "perturbation": pert_type,
-                            "perturbation_size": eps_str,
-                            "c_source": cs, "c_target": ct,
-                            "seed": seed_val,
-                            "combo": combo_label,
-                            "t_total": t,
-                            # Gurobi solver wall-clock only (no hyper-attack
-                            # overhead); used for the timeout-cap dedup.
-                            "t_opt": val.get("optimization_time"),
-                            "lb_total": lb,
-                            "ub_total": ub,
-                            "solve_status": val.get("solve_status", ""),
-                            "geom": is_geom,
-                        }
-                        # Honor --force_timeout: drop a timeout cell whose
-                        # wall-clock does not match the requested cap (the
-                        # cross-cap re-run dedup the old path did at render).
-                        if _aaai_is_timeout_mismatch(row, force_timeout,
-                                                     rerun_timeout_eps):
+                        if seeds_filter and meta.get("seed") not in seeds_filter:
                             continue
-                        rows.append(row)
+                        # Restrict to the two wide-table advstd combos.
+                        combo_label = None
+                        for label, zb, vh, rt, sg in _ADVSTD_WIDE_COMBOS:
+                            if (meta.get("zono_bounds") == zb
+                                    and meta.get("var_hint") == vh
+                                    and meta.get("relax_threshold") == rt
+                                    and meta.get("sibling_gate", "no") == sg):
+                                combo_label = label
+                                break
+                        if combo_label is None:
+                            continue
+                        # --combination_table filter: reuse _combo_label so the
+                        # spec form ('zono:prev_pgd:0.5+sg') matches verbatim.
+                        if combination_filter is not None:
+                            grp_key = (meta["mip_start"], meta["branch_priorities"],
+                                       meta["lp_basis"], meta["bound_tightening"],
+                                       meta["var_hint"], meta["zono_bounds"],
+                                       meta["n1_probe"], meta["relax_threshold"],
+                                       meta["sibling_gate"])
+                            if _combo_label(grp_key) not in combination_filter:
+                                continue
+                        seed_val = meta.get("seed", "0")
+                        is_geom = "_geomInt" in fname
+                        for (cs, ct), val in parse_result_file(tf).items():
+                            t = val.get("total_time", 0.0) or 0.0
+                            if t <= 0:
+                                continue
+                            # Only completed cells belong in the table: a proven
+                            # optimum or a genuine timeout. Anything else (e.g.
+                            # INTERRUPTED / killed mid-solve) is a partial result
+                            # and is dropped.
+                            status_norm = (val.get("solve_status", "") or "") \
+                                .upper().replace(" ", "_")
+                            is_opt = status_norm == "OPTIMAL"
+                            is_to = any(tag.replace(" ", "_") in status_norm
+                                        for tag in _AAAI_TIMEOUT_STATUSES)
+                            if not (is_opt or is_to):
+                                continue
+                            lb = val.get("lower_bound")
+                            ub = val.get("upper_bound")
+                            lb = lb if (isinstance(lb, (int, float))
+                                        and math.isfinite(lb)) else None
+                            ub = ub if (isinstance(ub, (int, float))
+                                        and math.isfinite(ub)) else None
+                            row = {
+                                "arch": arch,
+                                "role": "N2",
+                                "perturbation": pert_type,
+                                "perturbation_size": eps_str,
+                                "c_source": cs, "c_target": ct,
+                                "seed": seed_val,
+                                "combo": combo_label,
+                                "t_total": t,
+                                # Gurobi solver wall-clock only (no hyper-attack
+                                # overhead); used for the timeout-cap dedup.
+                                "t_opt": val.get("optimization_time"),
+                                "lb_total": lb,
+                                "ub_total": ub,
+                                "solve_status": val.get("solve_status", ""),
+                                "geom": is_geom,
+                            }
+                            # Honor --force_timeout: drop a timeout cell whose
+                            # wall-clock does not match the requested cap (the
+                            # cross-cap re-run dedup the old path did at render).
+                            if _aaai_is_timeout_mismatch(row, force_timeout,
+                                                         rerun_timeout_eps):
+                                continue
+                            rows.append(row)
     return rows
 
 
