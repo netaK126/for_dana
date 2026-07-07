@@ -5908,15 +5908,46 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     # standalone axis. (This trades the old within-row comparability -- where a
     # row shared one scale -- for each graph being sized to its own data, as
     # requested.)
-    def _panel_axis(groups):
-        vals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
+    def _panel_axis(groups, label_pt):
+        # Cap the y-axis just above the DECORATION STACK of the tallest bar --
+        # its top, plus (for a timed-out bar) the upper half of its I-beam, plus
+        # the horizontal value label -- rather than by a blanket multiple of the
+        # tallest bar. The old flat multiplier (~1.6x) wasted a wide band of
+        # white space above tall bars: the value label is a FIXED pt height (not
+        # proportional to the bar), so a tall bar needs proportionally little
+        # headroom for it. We size each bar's requirement individually and take
+        # the max, so a panel whose tallest bar is 2.66 tops out near ~3 instead
+        # of ~4.7.
+        bars_all = [pair for _t, _l, bars in groups for pair in bars.values()]
+        vals = [pair[0] for pair in bars_all]
         vmax = max(vals) if vals else 1.0
-        pymax, pytick = _aaai_yaxis(vmax)
-        # Extra headroom so the ROTATED value label above the tallest bar stays
-        # inside the panel, and clears the upper half of a full-height I-beam
-        # (_AAAI_IBEAM_PANEL_FRAC/2) on a timed-out bar.
-        pymax *= 1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0
-        return pymax, pytick
+        base_ymax, pytick = _aaai_yaxis(vmax)
+        if power < 1.0 or vmax <= 0:
+            # A power/sqrt axis keeps its curated ticks (base_ymax already sits
+            # at the top tick); retain the generous headroom there.
+            return base_ymax * (1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0), pytick
+        # Value-label vertical extent (pt) as a fraction of the 2.5cm panel box:
+        # font ascent + leading (label_pt*1.15) + the node's yshift/inner sep.
+        panel_h_pt = 2.5 * _AAAI_PT_PER_CM
+        label_frac = (label_pt * 1.15 + 2.5) / panel_h_pt
+        # For each bar: top h, plus I-beam upper half (fraction of pymax), plus
+        # the label band (fraction of pymax) must fit under pymax. Solve for the
+        # smallest pymax per bar and take the max.
+        need = vmax
+        for pair in bars_all:
+            h = pair[0] ** power
+            gap_pp = pair[2] if len(pair) > 2 else None
+            ibeam_frac = 0.0
+            if gap_pp is not None and gap_pp > _AAAI_IBEAM_MIN_PP:
+                ibeam_frac = (gap_pp / 100.0) * _AAAI_IBEAM_PANEL_FRAC / 2.0
+            denom = max(1.0 - ibeam_frac - label_frac, 0.35)
+            need = max(need, h / denom)
+        # Cap at the previous blanket headroom so this only ever SHRINKS the
+        # gap, never grows it (a rare panel whose tallest bar is a timed-out bar
+        # with a very tall I-beam would otherwise want slightly more room; the
+        # old rendering clipped that too, so matching it is safe).
+        old_blanket = base_ymax * (1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0)
+        return min(need * 1.03, old_blanket), pytick
     ncol, nrow = len(c_cols), len(types_order)
     # Every panel shares ONE x-range so all bars render at the same physical
     # width: the range spans the figure-wide maximum cluster count `nmax`
@@ -5967,7 +5998,7 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
             # rather than widening its bars. Clusters sit at x=1..n_local.
             slots = slots_global
             # This graph's OWN y-axis, fitted to its own tallest bar.
-            pymax, pytick = _panel_axis(groups) if groups else (1.0, "")
+            pymax, pytick = _panel_axis(groups, hlabel_pt) if groups else (1.0, "")
             if groups:
                 # Centre this panel's clusters within the shared x-range: a panel
                 # with fewer perturbation sizes than the figure-wide maximum is
