@@ -62,8 +62,19 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = map(_ -> @variable(m, lower_bound = -p_size, upper_bound = p_size), input_range,)
-    v_in = map( i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    if internet_nets_benchmarks
+        # ACAS/HAR: use the per-coordinate input box. A missing box under the
+        # flag is a misconfiguration (e.g. absent <model>_box.txt sidecar), so
+        # fail loudly rather than silently reverting to [0,1].
+        (input_box_lo === nothing || input_box_hi === nothing) &&
+            error("--internet_nets_benchmarks is on but no input box was loaded; " *
+                  "check the <model>_box.txt sidecar next to model_path.")
+        v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
+    else
+        v_in = map( i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    end
     @constraint(m, v_x0 .== v_in + v_e)
 
     # Initialize perturbation interval globals: Δ_{0,k} = e_k ∈ [-ε, ε]

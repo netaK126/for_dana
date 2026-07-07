@@ -370,3 +370,54 @@ class FNN_4_10(nn.Module):
         x = F.relu(self.fc3(x))
         x = self.fc4(x)
         return x
+
+
+# ── Pretrained tabular benchmark nets (ACAS Xu, HAR) ──────────────────────
+# Used only under --internet_nets_benchmarks. Weights are the .pth emitted by
+# utils/nnet_to_pickle.py (state_dict keys fc1.weight/bias, ...). Defaults bake
+# in the true input/output sizes because load_model() in the hyper-attack
+# instantiates these with no arguments.
+class FNN_ACAS(nn.Module):
+    # ACAS Xu: 5 inputs -> 6 hidden ReLU layers of 50 -> 5 outputs.
+    def __init__(self, k=1, w=5, h=1, output_size=5):
+        super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
+        self.flatten1 = nn.Flatten()
+        self.fc1 = nn.Linear(self.k*self.w*self.h, 50)
+        self.fc2 = nn.Linear(50, 50)
+        self.fc3 = nn.Linear(50, 50)
+        self.fc4 = nn.Linear(50, 50)
+        self.fc5 = nn.Linear(50, 50)
+        self.fc6 = nn.Linear(50, 50)
+        self.fc7 = nn.Linear(50, output_size)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.k*self.w*self.h)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = F.relu(self.fc6(x))
+        x = self.fc7(x)
+        return x
+
+
+class FNN_HAR(nn.Module):
+    # HAR: 561 inputs -> one hidden ReLU layer of 500 -> 6 classes.
+    def __init__(self, k=1, w=561, h=1, output_size=6):
+        super().__init__()
+        self.k = k
+        self.w = w
+        self.h = h
+        self.flatten1 = nn.Flatten()
+        self.fc1 = nn.Linear(self.k*self.w*self.h, 500)
+        self.fc2 = nn.Linear(500, output_size)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.k*self.w*self.h)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x

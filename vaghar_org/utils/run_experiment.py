@@ -37,6 +37,7 @@ from models import (
     FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_6_100,
     FNN_9_200, FNN_10_10,
     CNN0, CNN1, CNN2, CNN3,
+    FNN_ACAS, FNN_HAR,
 )
 
 # ── architecture registry ────────────────────────────────────────────────
@@ -57,6 +58,9 @@ ARCH_REGISTRY = {
     'cnn1':  (CNN1,      'cnn1'),
     'cnn2':  (CNN2,      'cnn2'),
     'cnn3':  (CNN3,      'cnn3'),
+    # Pretrained tabular benchmark nets (only under --internet_nets_benchmarks).
+    'acas':  (FNN_ACAS,  'acas'),
+    'har':   (FNN_HAR,   'har'),
 }
 
 # ── dataset config ───────────────────────────────────────────────────────
@@ -65,6 +69,12 @@ DATASET_CONFIG = {
     'mnist':         (dsets.MNIST,        1, 28, 28, 'mnist'),
     'fashion_mnist': (dsets.FashionMNIST, 1, 28, 28, 'fashion_mnist'),
     'cifar10':       (dsets.CIFAR10,      3, 32, 32, 'cifar10'),
+    # Pretrained tabular benchmark nets: no torchvision dataset (sentinel None),
+    # channels/width/height encode the flat input dim (channels*w*h). Only the
+    # julia-name and input-dim fields are used on the internet-nets path; the
+    # torchvision slot must never be dereferenced for these.
+    'acas':          (None,               1, 5,   1,  'acas'),
+    'har':           (None,               1, 561, 1,  'har'),
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

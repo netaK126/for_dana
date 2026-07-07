@@ -4709,10 +4709,38 @@ _AAAI_TIMEOUT_STATUSES = frozenset({
 })
 
 
+def _ft_for(force_timeout, arch):
+    """Resolve the effective wall-clock cap for one architecture.
+
+    `force_timeout` is either a plain scalar in seconds (the same cap for every
+    arch, from --force_timeout) or a dict {arch: seconds} carrying a different
+    cap per architecture (from --arch_timeouts). None -- or an arch missing from
+    the dict -- disables the cap for that arch."""
+    if isinstance(force_timeout, dict):
+        return force_timeout.get(arch)
+    return force_timeout
+
+
+def _ct_for(requested_c_targets, arch):
+    """Resolve the requested target-class set (0-indexed) for one architecture.
+
+    `requested_c_targets` is either a set (the same --ct for every arch), a dict
+    {arch: set|None} (a different --ct per architecture, from the per-group ct
+    lists of --arch_timeouts), or None (no restriction). A dict entry of None --
+    or an arch absent from the dict -- means no restriction for that arch."""
+    if isinstance(requested_c_targets, dict):
+        return requested_c_targets.get(arch)
+    return requested_c_targets
+
+
 def _aaai_is_timeout_mismatch(row, force_timeout, eps):
     """True iff this row's Gurobi run hit a termination limit at a wall-clock
     cap different from `force_timeout` (within ±eps seconds). Non-timeout
-    rows always return False (they're included regardless)."""
+    rows always return False (they're included regardless).
+
+    `force_timeout` may be a per-arch dict, in which case this row's own arch
+    selects the cap; a scalar is applied to every arch."""
+    force_timeout = _ft_for(force_timeout, row.get("arch"))
     if force_timeout is None:
         return False
     status = str(row.get("solve_status", "") or "").upper().replace(" ", "_")
@@ -4759,7 +4787,8 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                                     force_timeout=None,
                                     rerun_timeout_eps=30.0,
                                     roles=None,
-                                    label_suffix=""):
+                                    label_suffix="",
+                                    requested_c_targets=None):
     """Slim version of _render_wide_perarch_body: only the four safe-combo
     columns and table* (two-column-spanning) floats, suitable for inclusion
     in the AAAI 2026 paper's evaluation section.
@@ -4933,12 +4962,21 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # index except c_src. A combo whose actually-recorded set of
             # c_targets is a strict subset of this gets a red asterisk
             # next to its time cell so the reader knows the mean was
-            # taken over a partial sweep.
+            # taken over a partial sweep. When the caller restricts the
+            # sweep to specific target classes (--ct / requested_c_targets,
+            # 0-indexed), the "expected" set is exactly that request (minus
+            # the self-pair c_src), so the "*" flags a requested c_target
+            # with no data rather than every unrun class.
             _DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10,
                                      "fashion_mnist": 10}
             n_classes = _DATASET_NUM_CLASSES.get(dataset, 10)
-            expected_cts_block = {ct for ct in range(n_classes)
-                                  if ct != int(c_src)}
+            _req_cts = _ct_for(requested_c_targets, arch)
+            if _req_cts is not None:
+                expected_cts_block = {ct for ct in _req_cts
+                                      if ct != int(c_src)}
+            else:
+                expected_cts_block = {ct for ct in range(n_classes)
+                                      if ct != int(c_src)}
 
             # First pass: build the data cells (everything except the
             # model column) for every row that actually has data, so the
@@ -5029,8 +5067,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     if t_v is None:
                         data_cells.append("---")
                     else:
-                        if force_timeout is not None:
-                            t_v = min(t_v, force_timeout / 60.0)
+                        _ft = _ft_for(force_timeout, arch)
+                        if _ft is not None:
+                            t_v = min(t_v, _ft / 60.0)
                         t_partial = (partial_geom.get(c) if t_is_geom
                                      else partial.get(c))
                         data_cells.append(_fmt_trim(t_v)
@@ -5069,8 +5108,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         v = s2.get("t_base")
                     if v is None:
                         return None
-                    if force_timeout is not None:
-                        v = min(v, force_timeout / 60.0)
+                    _ft = _ft_for(force_timeout, arch)
+                    if _ft is not None:
+                        v = min(v, _ft / 60.0)
                     return v
 
                 def _disp_time(c):
@@ -5230,6 +5270,36 @@ def update_aaai_wide_perarch_tex(tex_path, body,
           f"in {tex_path}")
 
 
+def _filter_rows_by_c_targets(rows, requested_c_targets):
+    """Keep only rows whose (0-indexed) c_target is in `requested_c_targets`.
+
+    Used by the --paper_tables_from_txt path to restrict every generated
+    table/chart to a caller-chosen subset of target classes (--ct). Rows with
+    no c_target (e.g. the 'max' perturbation's dummy) are kept as-is. A None
+    request is a no-op, preserving the default full-sweep behavior. Note
+    `requested_c_targets` is 0-indexed here to match the c_target field the
+    result files store (Julia's 1-indexed --ct is converted by the caller).
+
+    `requested_c_targets` may be a per-arch dict (from the per-group ct lists of
+    --arch_timeouts); each row is then filtered against its own arch's set, and
+    an arch with no restriction keeps all its rows."""
+    if requested_c_targets is None:
+        return rows
+    out = []
+    for r in rows:
+        req = _ct_for(requested_c_targets, r.get("arch"))
+        ct = r.get("c_target")
+        if req is None or ct is None:
+            out.append(r)
+            continue
+        try:
+            if int(ct) in req:
+                out.append(r)
+        except (TypeError, ValueError):
+            out.append(r)
+    return out
+
+
 def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           parse_result_file,
                                           seeds_filter=None,
@@ -5243,6 +5313,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           advstd_meta_fn=None,
                                           perts=None,
                                           combination_filter=None,
+                                          requested_c_targets=None,
                                           stale_fn=None):
     """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
     AAAI variant into the neta_s_paper evaluation section. When
@@ -5278,6 +5349,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
         else:
             rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
                                                 seeds_filter=seeds_filter)
+        rows = _filter_rows_by_c_targets(rows, requested_c_targets)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
         delta_d_by_key = _load_delta_d_values(cwd, dataset, archs)
         body = _render_aaai_wide_perarch_body(
@@ -5287,7 +5359,8 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
             force_timeout=force_timeout,
             rerun_timeout_eps=rerun_timeout_eps,
             roles=roles,
-            label_suffix=label_suffix)
+            label_suffix=label_suffix,
+            requested_c_targets=requested_c_targets)
         update_aaai_wide_perarch_tex(tex_path, body,
                                      begin_mark=begin_mark,
                                      end_mark=end_mark,
@@ -5477,7 +5550,10 @@ _AAAI_GROUP_SPAN = 0.88
 # provably-optimal run) draw no marker. The short caps span _AAAI_IBEAM_CAP_FRAC
 # of the bar width to each side, so the marker reads as a narrow capital "I"
 # (clearly thinner than the bar) whose length is the gap.
-_AAAI_IBEAM_PANEL_FRAC = 0.30
+# NOTE: this is the visual density of the implicit gap axis -- a larger value
+# maps the same gap to a LONGER I-beam. Raised from 0.30 so the (typically
+# few-pp) gaps read as visibly long markers rather than short stubs.
+_AAAI_IBEAM_PANEL_FRAC = 0.60
 _AAAI_IBEAM_CAP_FRAC = 0.20
 _AAAI_IBEAM_MIN_PP = 0.05
 
@@ -5777,32 +5853,31 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     classes `c_cols` (left-to-right) and ROWS are the perturbation types
     `types_order` (top-to-bottom), so every (type, c_s) gets its own little
     graph. `cell_map[(type_disp, c_src)]` is a list of (type, size, bars) for
-    that panel (missing -> blank panel). Each ROW (perturbation type) has its
-    OWN linear (real-value) y-axis, fitted to that row's tallest bar (y-ticks on
-    the left column reflect that row's scale); each row is labelled on the left
-    by its type, each column titled by its c_s (top row only); within a panel
-    the bars are the per-size groups (mean-sorted)."""
+    that panel (missing -> blank panel). Each GRAPH (panel) carries its OWN
+    standalone linear (real-value) y-axis, fitted to that panel's tallest bar
+    and printing its OWN y-tick numbers (user request: the y-axis stands on its
+    own per graph rather than being shared/labelled once per row). Each row is
+    still labelled on the left by its perturbation type, each column titled by
+    its c_s (top row only), and the left-column axis label carries -- once per
+    row -- the perturbation name plus, on an inner vertical line to its right,
+    the y-axis unit "time (minutes)"; within a panel the bars are the per-size
+    groups (mean-sorted)."""
     power = _AAAI_YAXIS_POWER
-    # Per-row (per-perturbation-type) y-axis: each row is scaled to its OWN
-    # tallest bar rather than to a single block-wide maximum, so a row of small
-    # solve times isn't squashed flat beneath a row of large ones. Within a row
-    # every column shares one scale (the row's left column carries the y-tick
-    # labels via `yticklabels at=edge left`), so panels in the same row stay
-    # directly comparable.
-    row_axis = {}
-    for type_disp in types_order:
-        rowvals = [pair[0] for c in c_cols
-                   for _t, _l, bars in cell_map.get((type_disp, c), [])
-                   for pair in bars.values()]
-        rvmax = max(rowvals) if rowvals else 1.0
-        rymax, rytick = _aaai_yaxis(rvmax)
-        # Extra headroom so the ROTATED value label above the tallest bar (its
-        # length now extends upward) stays inside the panel. The added factor
-        # over the old 1.32 also clears the upper half of a full-height I-beam
-        # (_AAAI_IBEAM_PANEL_FRAC/2 of the panel) sitting on the tallest bar, so
-        # a timed-out bar's marker + lifted label never overflow the panel top.
-        rymax *= 1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0
-        row_axis[type_disp] = (rymax, rytick)
+
+    # Per-PANEL (per graph) y-axis: each (type, c_s) graph is scaled to its OWN
+    # tallest bar and shows its OWN y-tick numbers, so every graph reads on a
+    # standalone axis. (This trades the old within-row comparability -- where a
+    # row shared one scale -- for each graph being sized to its own data, as
+    # requested.)
+    def _panel_axis(groups):
+        vals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
+        vmax = max(vals) if vals else 1.0
+        pymax, pytick = _aaai_yaxis(vmax)
+        # Extra headroom so the ROTATED value label above the tallest bar stays
+        # inside the panel, and clears the upper half of a full-height I-beam
+        # (_AAAI_IBEAM_PANEL_FRAC/2) on a timed-out bar.
+        pymax *= 1.32 + _AAAI_IBEAM_PANEL_FRAC / 2.0
+        return pymax, pytick
     ncol, nrow = len(c_cols), len(types_order)
     # Every panel shares ONE x-range so all bars render at the same physical
     # width: the range spans the figure-wide maximum cluster count `nmax`
@@ -5823,19 +5898,23 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     # are the same physical width: the densest figure exactly fills \textwidth,
     # and an architecture with fewer columns yields a narrower (centred) figure
     # rather than wider bars. Sizing for ncol_max guarantees no figure* overruns
-    # the text width (AAAI-safe).
-    overhead_cm = 1.5 + 0.2 * max(ncol_max - 1, 0)
+    # the text width (AAAI-safe). Because every panel now prints its OWN y-tick
+    # numbers (no `yticklabels at=edge left`), the inter-panel gap is widened so
+    # an inner panel's y-numbers clear the neighbour to its left, and that extra
+    # `horizontal sep` is folded into the width overhead so the figure still fits
+    # \textwidth.
+    overhead_cm = 1.5 + 0.75 * max(ncol_max - 1, 0)
     panel_w = (r"\dimexpr(\textwidth-" + f"{overhead_cm:.2g}" +
                f"cm)/{ncol_max}" + r"\relax")
     out = [r"\begin{tikzpicture}"]
     out.append(
         r"\begin{groupplot}[" "\n"
-        f"  group style={{group size={ncol} by {nrow}, horizontal sep=4pt,"
-        r" vertical sep=24pt, yticklabels at=edge left}," "\n"
+        f"  group style={{group size={ncol} by {nrow}, horizontal sep=20pt,"
+        r" vertical sep=24pt}," "\n"
         r"  scale only axis, width=" + panel_w + r", height=2.5cm, clip=false,"
         "\n"
         r"  ymin=0," "\n"
-        r"  ylabel style={font=\footnotesize},"
+        r"  ylabel style={font=\footnotesize, align=center},"
         r" y tick label style={font=\scriptsize}," "\n"
         r"  x tick label style={font=\scriptsize}," "\n"
         r"  title style={font=\small}," "\n"
@@ -5848,7 +5927,8 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
             # panel with fewer perturbation sizes leaves empty space on the right
             # rather than widening its bars. Clusters sit at x=1..n_local.
             slots = slots_global
-            rymax, rytick = row_axis[type_disp]
+            # This graph's OWN y-axis, fitted to its own tallest bar.
+            pymax, pytick = _panel_axis(groups) if groups else (1.0, "")
             if groups:
                 # Centre this panel's clusters within the shared x-range: a panel
                 # with fewer perturbation sizes than the figure-wide maximum is
@@ -5859,16 +5939,16 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                 # sized so the widest label fits the bar WIDTH with a small gap
                 # each side (see _aaai_hlabel_pt / _draw_group). Each bar also
                 # carries an I-beam whose height encodes its delta_u-delta_l gap,
-                # scaled against this panel's data range (`rymax`).
+                # scaled against this panel's data range (`pymax`).
                 content, _n, xtick, xticklabels = _aaai_bar_content(
                     groups, power, cluster=False, x_offset=x_offset,
                     value_labels=True, label_font=hlabel_pt,
-                    draw_ibeam=True, panel_ymax=rymax)
+                    draw_ibeam=True, panel_ymax=pymax)
             else:
                 content, xtick, xticklabels = [], "", ""
-            opt = f"xmin=0.5, xmax={slots + 0.5:g}, ymax={rymax:.4g}"
-            if rytick:
-                opt += ", " + rytick.rstrip(", ")
+            opt = f"xmin=0.5, xmax={slots + 0.5:g}, ymax={pymax:.4g}"
+            if pytick:
+                opt += ", " + pytick.rstrip(", ")
             if xtick:
                 opt += f", xtick={{{xtick}}}, xticklabels={{{xticklabels}}}"
             else:
@@ -5876,7 +5956,15 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
             if ri == 0:
                 opt += r", title={$c_s{=}" + str(c) + r"$}"
             if ci == 0:
-                opt += f", ylabel={{{type_disp}}}"
+                # Left-column axis label, written ONCE per row: the perturbation
+                # name plus, on a second (inner) vertical line to its right, the
+                # y-axis unit "time (minutes)". The rotated 2-line label stacks
+                # the first line on the OUTER (left) side and the second on the
+                # INNER (right, axis-facing) side, so "time (minutes)" sits just
+                # right of the perturbation name (see `align=center` in the
+                # ylabel style). Smaller/gray so the name stays dominant.
+                opt += (", ylabel={" + type_disp
+                        + r"\\{\scriptsize\color{gray!55!black} time (minutes)}}")
             out.append(f"\\nextgroupplot[{opt}]")
             out += content
     out.append(r"\end{groupplot}")
@@ -5924,7 +6012,8 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
 
 
 def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
-                           force_timeout=None, rerun_timeout_eps=30.0):
+                           force_timeout=None, rerun_timeout_eps=30.0,
+                           requested_c_targets=None):
     """Emit one solve-time figure per architecture (a c_s x perturbation-type
     grid of bars for the three methods). Every perturbation is charted here,
     including cells where all three methods hit the timeout: those simply sit
@@ -5996,17 +6085,26 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
             # Expected target classes for every cell in this block: every
             # class index except the source class. A bar whose mean covers
             # a strict subset of these is "partial" and gets a red asterisk.
+            # When restricted via --ct (requested_c_targets, 0-indexed), the
+            # expected set is exactly that request minus the self-pair, so the
+            # "*" flags a requested c_target with no data.
             n_classes = {"mnist": 10, "cifar10": 10,
                          "fashion_mnist": 10}.get(dataset, 10)
-            expected_cts = {ct for ct in range(n_classes)
-                            if ct != int(c_src)}
+            _req_cts = _ct_for(requested_c_targets, arch)
+            if _req_cts is not None:
+                expected_cts = {ct for ct in _req_cts
+                                if ct != int(c_src)}
+            else:
+                expected_cts = {ct for ct in range(n_classes)
+                                if ct != int(c_src)}
             pert_keys = sorted(
                 (k for k in buckets if k[0] == arch and k[3] == c_src),
                 key=lambda k: (k[1], k[2]))  # (pert, p_size)
             for k in pert_keys:
                 _, pert, p_size, _ = k
                 cells = buckets[k]
-                times = {sk: _aaai_chart_time(cells.get(sk), force_timeout,
+                _ft = _ft_for(force_timeout, arch)
+                times = {sk: _aaai_chart_time(cells.get(sk), _ft,
                                               prefer_geom=(sk != "vaghar"))
                          for sk in series_keys}  # sk -> (value, side)
                 present = [v for v, _s in times.values() if v is not None]
@@ -6036,7 +6134,12 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                         bars[sk] = (v, partial, gap)
                 # Only include a perturbation that has ALL THREE methods
                 # (ours with transfer, ours, vaghar) and whose bars are all
-                # complete (no partial-coverage `*`); drop it otherwise.
+                # complete -- i.e. each covers every EXPECTED target class. With
+                # --ct set, `expected_cts` is exactly the requested class set, so
+                # a cell missing any requested c_target is dropped: the bar graphs
+                # show only cells with all three bars AND full --ct coverage. (The
+                # partial-coverage `*` for results missing vs --ct is shown in the
+                # per-cell TABLES only, not in these charts.)
                 if (len(bars) == len(series_keys)
                         and not any(pair[1] for pair in bars.values())):
                     cell_map.setdefault((type_disp, c_src), []).append(
@@ -6076,6 +6179,7 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
                                       advstd_meta_fn=None,
                                       perts=None,
                                       combination_filter=None,
+                                      requested_c_targets=None,
                                       stale_fn=None):
     """Collect the same per-cell rows as the N2 table and emit the
     per-perturbation solve-time and bound-gap charts into the evaluation
@@ -6103,12 +6207,14 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
         else:
             rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
                                                seeds_filter=seeds_filter)
+        rows = _filter_rows_by_c_targets(rows, requested_c_targets)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
         body = _render_aaai_n2_charts(
             rows, archs, dataset,
             delta_max_by_key=delta_max_by_key,
             force_timeout=force_timeout,
-            rerun_timeout_eps=rerun_timeout_eps)
+            rerun_timeout_eps=rerun_timeout_eps,
+            requested_c_targets=requested_c_targets)
         update_aaai_wide_perarch_tex(tex_path, body,
                                      begin_mark=begin_mark,
                                      end_mark=end_mark,

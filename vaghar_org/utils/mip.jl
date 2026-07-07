@@ -22,6 +22,78 @@ function mip_set_delta_property(m, perturbation, d)
     @objective(m, Max, delta)
 end
 
+# ── TwoSafe confidence-based robustness: decision mode ────────────────────
+# Chosen when the global `twosafe_property != "none"` (set from run.jl under
+# --internet_nets_benchmarks). Instead of MAXIMIZING the confidence margin
+# (mip_set_delta_property), we DECIDE the confidence-based robustness property
+# of Athavale et al. (Def 2.10 asymmetric / Def 3.1 symmetric) at a fixed
+# (ε, τ): a feasible point of the MIP is a counterexample (⇒ NOT robust); a
+# proven-infeasible MIP means the property holds for this (source,target) pair
+# (⇒ robust); a timeout with no feasible point is inconclusive.
+
+function add_softmax_confidence_constraint(m, logits, class_index, tau_val; gmin = -1e4, tol = 1e-6)
+    # conf_c = softmax_c(logits) > τ. Because `class_index` is fixed as the
+    # argmax (set_max_indexes), every g_j = f_j - f_c ≤ 0, so e^{g_j} ∈ (0,1]
+    # and the equivalent condition is overflow-free:
+    #   softmax_c > τ  ⟺  e^{f_c}/Σ_j e^{f_j} > τ  ⟺  Σ_{j≠c} e^{f_j-f_c} < (1-τ)/τ.
+    @assert 0.0 < tau_val < 1.0 "tau must be in (0,1); got $tau_val"
+    n = length(logits)
+    egs = Vector{JuMP.VariableRef}()
+    for j in 1:n
+        j == class_index && continue
+        g = @variable(m, lower_bound = gmin, upper_bound = 0.0)
+        @constraint(m, g == logits[j] - logits[class_index])
+        eg = @variable(m, lower_bound = 0.0, upper_bound = 1.0)
+        @constraint(m, eg == exp(g))   # Gurobi general function constraint (exact under FuncNonlinear=1)
+        push!(egs, eg)
+    end
+    @constraint(m, sum(egs) <= (1.0 - tau_val) / tau_val - tol)
+    return nothing
+end
+
+function mip_set_twosafe_property(m, d, tau_val, property)
+    # Fix both classifications: original x ⇒ source class, perturbed x' ⇒ target.
+    set_max_indexes(m, d[:v_out], d[:SourceIndex])
+    set_max_indexes(m, d[:v_out_p], d[:TargetIndex])
+    # conf(f(x)) > τ on the original copy (Def 2.10, asymmetric).
+    add_softmax_confidence_constraint(m, d[:v_out], d[:SourceIndex][1], tau_val)
+    if property == "symmetric"
+        # Also require the perturbed point to be high-confidence (Def 3.1).
+        add_softmax_confidence_constraint(m, d[:v_out_p], d[:TargetIndex][1], tau_val)
+    elseif property != "asymmetric"
+        error("twosafe_property must be \"asymmetric\" or \"symmetric\"; got \"$property\"")
+    end
+    # Feasibility problem: any feasible point is a counterexample.
+    @objective(m, Max, 0)
+    return nothing
+end
+
+function mip_set_attr_twosafe(m, timout)
+    # Decision mode: stop at the first counterexample (feasible ⇒ NOT robust);
+    # otherwise prove infeasibility (⇒ robust) or hit the time limit. No Cutoff
+    # (that belongs to the optimization objective); exact softmax exponentials.
+    global Threads_num
+    global gurobi_seed
+    set_optimizer_attribute(m, "MIPFocus", 1)        # prioritise finding feasible points
+    set_optimizer_attribute(m, "SolutionLimit", 1)   # the first counterexample is enough
+    set_optimizer_attribute(m, "FuncNonlinear", 1)   # exact exp (not piecewise)
+    set_optimizer_attribute(m, "Threads", Threads_num)
+    set_optimizer_attribute(m, "TimeLimit", timout)
+    set_optimizer_attribute(m, "Seed", gurobi_seed)
+    return nothing
+end
+
+function twosafe_verdict(m)
+    st = JuMP.termination_status(m)
+    if JuMP.primal_status(m) == MOI.FEASIBLE_POINT
+        return "NOT_ROBUST"      # a counterexample satisfying every constraint exists
+    elseif st == MOI.INFEASIBLE || st == MOI.INFEASIBLE_OR_UNBOUNDED
+        return "ROBUST"          # property holds for this class pair
+    else
+        return "INCONCLUSIVE"    # e.g. TIME_LIMIT before any counterexample
+    end
+end
+
 function mip_set_attr(m, perturbation, d, timout)
     if (perturbation == "contrast")
         set_optimizer_attribute(m, "NonConvex", 2)

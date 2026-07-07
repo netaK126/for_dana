@@ -44,7 +44,7 @@ function parse_commandline()
     s = ArgParseSettings()
     @add_arg_table! s begin
         "--dataset", "-d"
-        help = "mnist, fmnist, or cifar10"
+        help = "mnist, fmnist, cifar10, or (with --internet_nets_benchmarks) acas, har"
         arg_type = String
         required = false
         default = "mnist"
@@ -428,6 +428,29 @@ function parse_commandline()
         required = false
         default = false
 
+        # ── ACAS/HAR benchmark support (pretrained tabular nets) ──
+        "--internet_nets_benchmarks"
+        help = "Master switch for the ACAS Xu / HAR benchmark nets (pretrained tabular FC nets " *
+               "from the TwoSafe paper). Off ⇒ behavior identical to today. On ⇒ enables the acas/har " *
+               "datasets, their per-coordinate input box, and the new archs; required to run acas/har."
+        arg_type = Bool
+        required = false
+        default = false
+        "--twosafe_property"
+        help = "Verification mode for the TwoSafe comparison (requires --internet_nets_benchmarks): " *
+               "\"none\" (default) ⇒ optimization mode (Max delta, minimal-δ bound); " *
+               "\"asymmetric\"/\"symmetric\" ⇒ decision mode — is the confidence-based robustness " *
+               "property (Def 2.10 / 3.1) satisfied at fixed (ε, τ)? Reports robust/counterexample/inconclusive."
+        arg_type = String
+        required = false
+        default = "none"
+        "--tau"
+        help = "Softmax-confidence threshold τ for the TwoSafe decision mode (used when " *
+               "--twosafe_property is asymmetric/symmetric). ε reuses --perturbation_size."
+        arg_type = Float64
+        required = false
+        default = 0.0
+
     end
     return parse_args(s)
 end
@@ -447,6 +470,23 @@ function main()
     end
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
+
+    # ── ACAS/HAR benchmark support (behind --internet_nets_benchmarks) ──
+    global internet_nets_benchmarks = args["internet_nets_benchmarks"]
+    global twosafe_property = args["twosafe_property"]
+    global tau = args["tau"]
+    if dataset in ("acas", "har") && !internet_nets_benchmarks
+        error("dataset \"$dataset\" requires --internet_nets_benchmarks true")
+    end
+    if internet_nets_benchmarks
+        (input_width, input_height, input_channels, _num_classes) = get_dataset_params(dataset)
+        input_box = get_input_box(dataset, model_path, input_width, input_height, input_channels)
+        input_box === nothing &&
+            error("--internet_nets_benchmarks is on but no input box was found for " *
+                  "model_path=\"$model_path\" (expected a <model>_box.txt sidecar).")
+        global input_box_lo = input_box[1]
+        global input_box_hi = input_box[2]
+    end
 
     if mode == "transfer"
         main_transfer(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
@@ -623,7 +663,10 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 name_to_save = name_to_save*"_HyperAttackHints"
             end
             if activate_vaghgar_deps
-                name_to_save = name_to_save*"_VagharDeps"
+                # _depGuardFix marks the fixed dep encoder (has_a_o && has_a_p
+                # guard); the paper-tables pipeline keeps binary-dropping runs
+                # only when this tag is present, so it MUST follow _VagharDeps.
+                name_to_save = name_to_save*"_VagharDeps_depGuardFix"
                 perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d[:Perturbation])
             end
@@ -656,28 +699,42 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 end
             end
 
-            mip_set_delta_property(m, perturbation, d)
-            set_optimizer(m, optimizer)
-            mip_set_attr(m, perturbation, d, timout)
-            MOI.set(m, Gurobi.CallbackFunction(), my_callback)
-            optimize!(m)
-            mip_log(m, d)
-            mip_reuse_bounds()
-            results.str = update_results_str(results.str, c_tag, c_target, d)
-            println(results_path)
-            if args["use_relaxations"]
-                name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+            if twosafe_property != "none"
+                # Mode 2: TwoSafe confidence-based robustness decision at fixed (ε, τ).
+                mip_set_twosafe_property(m, d, tau, twosafe_property)
+                set_optimizer(m, optimizer)
+                mip_set_attr_twosafe(m, timout)
+                MOI.set(m, Gurobi.CallbackFunction(), my_callback)
+                optimize!(m)
+                mip_log(m, d)
+                save_twosafe_result(results_path, model_name, perturbation, perturbation_size, d,
+                                    c_tag-1, c_target-1, name_to_save*"_cTag"*string(c_tag),
+                                    token_signature, twosafe_verdict(m), twosafe_property, tau)
+            else
+                # Mode 1: optimization (minimal-δ global-robustness bound).
+                mip_set_delta_property(m, perturbation, d)
+                set_optimizer(m, optimizer)
+                mip_set_attr(m, perturbation, d, timout)
+                MOI.set(m, Gurobi.CallbackFunction(), my_callback)
+                optimize!(m)
+                mip_log(m, d)
+                mip_reuse_bounds()
+                results.str = update_results_str(results.str, c_tag, c_target, d)
+                println(results_path)
+                if args["use_relaxations"]
+                    name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
+                end
+                # Append per-tier neuron counts at the very end, mirroring the
+                # advstd _both/_orgDrop/_pertDrop convention so result-file
+                # name matching can strip them with a single regex.
+                if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
+                    name_to_save = name_to_save *
+                                   "_both"    * string(n_sibgate_both_thin) *
+                                   "_orgDrop" * string(n_sibgate_one_thin_org_dropped) *
+                                   "_pertDrop" * string(n_sibgate_one_thin_pert_dropped)
+                end
+                save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save*"_cTag"*string(c_tag),token_signature)
             end
-            # Append per-tier neuron counts at the very end, mirroring the
-            # advstd _both/_orgDrop/_pertDrop convention so result-file
-            # name matching can strip them with a single regex.
-            if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
-                name_to_save = name_to_save *
-                               "_both"    * string(n_sibgate_both_thin) *
-                               "_orgDrop" * string(n_sibgate_one_thin_org_dropped) *
-                               "_pertDrop" * string(n_sibgate_one_thin_pert_dropped)
-            end
-            save_results(results_path, model_name, perturbation, perturbation_size, results.str, d, nn, c_tag-1, c_target-1, w, h, k,name_to_save*"_cTag"*string(c_tag),token_signature)
         end
     end
 end
@@ -942,7 +999,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
     if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
-    if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps"; end
+    if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps_depGuardFix"; end  # must mirror the saved name's tag (see line ~666)
     if args["use_perturbed_intervals"];     n2_check = n2_check * "_PerturbedIntervals"; end
     if geometric_intervals;                 n2_check = n2_check * "_geomInt"; end
 
@@ -1255,7 +1312,9 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name * "_HyperAttackCutoff"
             end
             if activate_vaghgar_deps
-                n2_name = n2_name * "_VagharDeps"
+                # _depGuardFix marks the fixed dep encoder; must follow
+                # _VagharDeps so paper-tables keeps this binary-dropping run.
+                n2_name = n2_name * "_VagharDeps_depGuardFix"
                 perturbation_dependencies(m_n2, nn2, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d_n2[:Perturbation])
             end

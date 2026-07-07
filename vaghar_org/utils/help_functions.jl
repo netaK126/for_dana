@@ -7,6 +7,20 @@ global all_bounds_of_perturbation = []
 global I_pert_prev_up = []
 global I_pert_prev_down = []
 
+# ── ACAS/HAR benchmark support (behind --internet_nets_benchmarks) ────────
+# Master switch; when false every branch below is bypassed and behavior is
+# identical to the image pipeline. Set from run.jl.
+global internet_nets_benchmarks = false
+# Per-coordinate input box for the perturbation encoders, each an array shaped
+# (1,w,h,k) or `nothing` (⇒ historical [0,1] box). Set from get_input_box.
+global input_box_lo = nothing
+global input_box_hi = nothing
+# Verification-mode selector for the TwoSafe comparison (Def 2.10 / 3.1):
+# "none" ⇒ optimization (Max delta); "asymmetric"/"symmetric" ⇒ decision at
+# fixed (ε, τ). τ is the softmax-confidence threshold.
+global twosafe_property = "none"
+global tau = 0.0
+
 # ── Conditional-triangle relaxation globals ──────────────────────────────
 # Populated by compute_diff_and_comp_bounds() before encoding n2_org/n2_pert.
 # Each entry is a Float64 vector (one value per neuron), indexed by ReLU layer.
@@ -894,6 +908,30 @@ function save_results(results_path, model_name, perturbation, perturbation_size,
    catch e
         println("no results")
    end
+end
+
+# TwoSafe decision-mode result: robust / counterexample / inconclusive + time
+# (instead of the (δ_l, δ_u, t) triple that save_results writes for the
+# optimization mode). Written when --twosafe_property is asymmetric/symmetric.
+function save_twosafe_result(results_path, model_name, perturbation, perturbation_size, d, ss, tt, name_to_save, token_signature, verdict, property, tau_val)
+    mkpath(results_path)
+    basename = token_signature*"_"*model_name*"_"*perturbation*"_"*create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_twosafe_"*name_to_save
+    eps_val = perturbation_size[1]
+    solve_time = get(d, :solve_time, 0.0)
+    open(safe_filepath(results_path, basename), "w") do file
+        write(file, "source,target,property,tau,epsilon,verdict,solve_time\n")
+        write(file, string(ss, ",", tt, ",", property, ",", tau_val, ",", eps_val, ",", verdict, ",", solve_time, "\n"))
+        if verdict == "NOT_ROBUST"
+            try
+                write(file, "# counterexample x (original input): " * join(vec(d[:v_in]), ",") * "\n")
+                write(file, "# counterexample x' (perturbed input): " * join(vec(d[:v_in_p]), ",") * "\n")
+            catch e
+                write(file, "# counterexample inputs unavailable\n")
+            end
+        end
+    end
+    println("TwoSafe[", property, " tau=", tau_val, " eps=", eps_val, "] src=", ss, " tgt=", tt,
+            " => ", verdict, " (", round(solve_time, digits=2), "s)")
 end
 
 function create_perturbation_string(perturbation_size)

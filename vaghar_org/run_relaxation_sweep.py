@@ -173,8 +173,8 @@ PERTURBATIONS = [
     ("trans(1,1)",        "translation:1,1"),
     # ("trans(1,3)",        "translation:1,3"),
     ("trans(3,1)",        "translation:3,1"),
-    ("trans(3,3)",        "translation:3,3"),
-    ("occ(5,5,5)",        "occ:5,5,5"),
+    # ("trans(3,3)",        "translation:3,3"),
+    # ("occ(5,5,5)",        "occ:5,5,5"),
     ("occ(3,3,5)",        "occ:3,3,5"),
     ("occ(14,14,9)",        "occ:14,14,9"),
     ("occ(1,1,9)",        "occ:1,1,9"),
@@ -2396,15 +2396,101 @@ def _recompile_neta_s_paper(cwd):
     print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
 
 
+def _parse_arch_timeouts(spec):
+    """Parse --arch_timeouts into (arch_runs, force_timeout_by_arch,
+    c_targets_by_arch).
+
+    Grammar: '|'-separated groups, each 'SECS:arch=path,arch=path[@CT]':
+      * SECS     -- wall-clock cap in seconds, shared by the group's models.
+      * arch=path,... -- same syntax as --arch_models.
+      * @CT      -- OPTIONAL per-group target-class list, Julia 1-indexed and
+                    comma-separated (same syntax as --ct), e.g. '@2,4,5'. The
+                    '@...' is split off first so it never collides with the
+                    arch=path ':'/'=' separators.
+
+    Returns:
+      * arch_runs           -- list of (arch, model_path) pairs in spec order.
+      * force_timeout_by_arch -- {arch: seconds}.
+      * c_targets_by_arch   -- {arch: set_of_0indexed_targets | None}, or None
+                               overall when NO group carried a '@CT' (so the
+                               caller keeps using the global --ct unchanged). A
+                               group without '@CT' maps its archs to None.
+
+    Combines --arch_models, a per-model --force_timeout, and a per-model --ct so
+    different models can carry different caps and target-class sets."""
+    arch_runs = []
+    ft_by_arch = {}
+    ct_by_arch = {}
+    any_group_ct = False
+    for group in spec.split("|"):
+        group = group.strip()
+        if not group:
+            continue
+        # Optional per-group target-class list, introduced by '@'.
+        group_ct = None
+        if "@" in group:
+            group, ct_part = group.rsplit("@", 1)
+            group = group.strip()
+            ct_part = ct_part.strip()
+            try:
+                group_ct = {c - 1 for c in _parse_c_targets(ct_part)}  # 0-indexed
+            except ValueError:
+                print(f"ERROR: --arch_timeouts ct list after '@' must be "
+                      f"comma-separated integers, got: {ct_part!r}")
+                sys.exit(1)
+            if not group_ct:
+                print(f"ERROR: --arch_timeouts group '{group}@{ct_part}' has an "
+                      f"empty ct list after '@'")
+                sys.exit(1)
+            any_group_ct = True
+        if ":" not in group:
+            print(f"ERROR: --arch_timeouts group must be 'SECS:arch=path,...', "
+                  f"got: {group}")
+            sys.exit(1)
+        secs_str, models_part = group.split(":", 1)
+        try:
+            secs = int(secs_str.strip())
+        except ValueError:
+            print(f"ERROR: --arch_timeouts timeout must be an integer number of "
+                  f"seconds, got: {secs_str.strip()!r} (in '{group}')")
+            sys.exit(1)
+        for pair in models_part.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                print(f"ERROR: --arch_timeouts entry must be arch=model_path, "
+                      f"got: {pair} (in '{group}')")
+                sys.exit(1)
+            a, mp = pair.split("=", 1)
+            a = a.strip()
+            if a in ft_by_arch:
+                print(f"ERROR: --arch_timeouts lists arch '{a}' more than once")
+                sys.exit(1)
+            arch_runs.append((a, mp.strip()))
+            ft_by_arch[a] = secs
+            ct_by_arch[a] = group_ct
+    if not arch_runs:
+        print("ERROR: --arch_timeouts listed no arch=model_path pairs")
+        sys.exit(1)
+    return arch_runs, ft_by_arch, (ct_by_arch if any_group_ct else None)
+
+
 def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                                  combination_table=None, force_timeout=None,
-                                 rerun_timeout_eps=30.0):
+                                 rerun_timeout_eps=30.0,
+                                 requested_c_targets=None):
     """Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, sourcing
     the transfer (advstd N2) column DIRECTLY from the advStd .txt files (no
     CSVs, no standard-baseline pairing). Honors --combination_table (combo
     filter) and --force_timeout (cross-cap timeout dedup) exactly like the old
     --find_advstd path, but writes no CSV and does not touch
     advstd_techniques.tex.
+
+    `requested_c_targets` (a set of 0-indexed target classes, or None) comes
+    from --ct: when set, every generated table/chart is restricted to exactly
+    those target classes, and a requested c_target with no data is flagged with
+    the same red "*" the tables already use for partial sweeps.
     """
     try:
         sys.path.insert(0, cwd)
@@ -2441,6 +2527,9 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         advstd_meta_fn=_extract_advstd_file_metadata,
         perts=PERTURBATIONS,
         combination_filter=combination_filter,
+        # Restrict every table/chart to the requested target classes (--ct);
+        # None keeps the full-sweep behavior.
+        requested_c_targets=requested_c_targets,
         # Drop pre-fix files that relaxed >=1 binary (unsound under the
         # perturbation-dependency fix) on BOTH vaghar/ours and transfer rows --
         # the same predicate the sweep skip-check uses.
@@ -2633,6 +2722,22 @@ def main():
                              "30s). Useful when re-running the sweep after lowering "
                              "--timeout so older 1-hour timed-out cells don't pollute "
                              "the means.")
+    parser.add_argument("--arch_timeouts", type=str, default=None,
+                        metavar="SECS:arch=path,...[@CT]|SECS2:arch=path,...[@CT]",
+                        help="Combine --arch_models, a PER-MODEL --force_timeout, and "
+                             "an optional PER-MODEL --ct in one flag: '|'-separated "
+                             "groups, each 'SECS:arch=path,arch=path[@CT]' sharing one "
+                             "wall-clock cap (seconds); the arch=path list uses the "
+                             "same syntax as --arch_models, and the optional trailing "
+                             "'@CT' gives that group its own comma-separated, Julia "
+                             "1-indexed target-class list (same syntax as --ct). "
+                             "Example: '10800:3x50=.,cnn1=.@2,4,5|1800:3x100=.@2,4'. "
+                             "A group without '@CT' falls back to the global --ct. "
+                             "Overrides --arch_models and --force_timeout (and, for "
+                             "@CT groups, --ct). Honored by --paper_tables_from_txt "
+                             "(per-model ct) and --find_advstd_faster_than_standard "
+                             "(per-model cap): every model renders in one pass, each "
+                             "filtered/clamped to its own cap and target-class set.")
     parser.add_argument("--combination_table", type=str, default=None,
                         metavar="BT:VH:TAU[,BT:VH:TAU,...]",
                         help="Restrict the advstd tables in advstd_techniques.tex (overall "
@@ -2834,7 +2939,10 @@ def main():
                              "Requires --advstd_safe_combos_only. Ignored if --advstd_safe_labels is given.")
     parser.add_argument("--ct", type=str, default=None,
                         help="Comma-separated Julia-indexed c_target values (1-indexed). "
-                             "Default: 2,3,4,5,6,7,8,9,10. Use to restrict to specific scenarios.")
+                             "Default: 2,3,4,5,6,7,8,9,10. Use to restrict to specific scenarios. "
+                             "With --paper_tables_from_txt this restricts the generated "
+                             "tables/charts to exactly these target classes; any requested "
+                             "c_target with no data is flagged with a red '*'.")
     parser.add_argument("--sweep_ctag", nargs="*", type=int, default=None,
                         help="Julia-indexed c_tag (source class) values to sweep (e.g. '1 2 3'). "
                              "Each value is passed to run.jl as --ctag in a separate invocation; "
@@ -2877,8 +2985,22 @@ def main():
     if args.standard_warmstart:
         args.skip_standard = True  # standard is done inside each transfer Julia process
 
-    # Build list of (arch, model_path|None) to run
-    if args.arch_models:
+    # Build list of (arch, model_path|None) to run. --arch_timeouts folds
+    # --arch_models together with a per-model --force_timeout; when given it
+    # yields both arch_runs and a {arch: seconds} cap dict that the table
+    # regeneration paths use in place of the scalar --force_timeout.
+    arch_force_timeout = None
+    arch_c_targets = None
+    if args.arch_timeouts:
+        arch_runs, arch_force_timeout, arch_c_targets = _parse_arch_timeouts(
+            args.arch_timeouts)
+        if args.arch_models:
+            print("WARNING: --arch_timeouts overrides --arch_models "
+                  "(models are taken from --arch_timeouts)")
+        if args.force_timeout is not None:
+            print("WARNING: --arch_timeouts overrides the scalar --force_timeout "
+                  "(per-model caps are taken from --arch_timeouts)")
+    elif args.arch_models:
         arch_runs = []
         for pair in args.arch_models:
             if "=" not in pair:
@@ -2888,6 +3010,11 @@ def main():
             arch_runs.append((a, mp))
     else:
         arch_runs = [(args.arch, args.model_path)]
+
+    # The effective cap passed to the table/chart regenerators: the per-arch
+    # dict from --arch_timeouts if present, else the scalar --force_timeout.
+    effective_force_timeout = (arch_force_timeout if arch_force_timeout is not None
+                               else args.force_timeout)
 
     # Filter perturbations if requested
     perts = PERTURBATIONS
@@ -3016,6 +3143,32 @@ def main():
         # neta-s-paper per-cell tables + N2 charts straight from the advStd
         # .txt files (no CSVs), reusing the same --arch_models.
         pt_datasets = [d.strip() for d in dataset.split(",") if d.strip()]
+        # --ct restricts the tables to specific target classes. The flag is
+        # Julia 1-indexed (2..10); result files store 0-indexed c_targets, so
+        # convert here. None => full sweep (all classes), the prior behavior.
+        pt_global_c_targets = None
+        if args.ct:
+            pt_global_c_targets = {ct - 1 for ct in _parse_c_targets(args.ct)}
+        # Per-model ct lists from --arch_timeouts (@CT groups) take precedence:
+        # build a {arch: set} map where a model whose group carried no @CT falls
+        # back to the global --ct (or full sweep). Otherwise use the single
+        # global set for every model, exactly as before.
+        if arch_c_targets is not None:
+            pt_requested_c_targets = {
+                a: (cts if cts is not None else pt_global_c_targets)
+                for a, cts in arch_c_targets.items()}
+            print("[paper-tables] restricting tables/charts to PER-MODEL "
+                  "c_targets (Julia-indexed): "
+                  + ", ".join(
+                      f"{a}={sorted(c + 1 for c in cts)}" if cts else f"{a}=all"
+                      for a, cts in pt_requested_c_targets.items())
+                  + "; requested targets with no data are flagged with a red '*'")
+        else:
+            pt_requested_c_targets = pt_global_c_targets
+            if pt_global_c_targets is not None:
+                print(f"[paper-tables] restricting tables/charts to c_targets "
+                      f"(Julia-indexed) {_parse_c_targets(args.ct)}; requested "
+                      f"targets with no data are flagged with a red '*'")
         for pt_dataset in pt_datasets:
             if len(pt_datasets) > 1:
                 print(f"\n===== Regenerating neta-s-paper tables (from advStd "
@@ -3023,8 +3176,9 @@ def main():
             _regen_paper_tables_from_txt(
                 arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
                 combination_table=args.combination_table,
-                force_timeout=args.force_timeout,
-                rerun_timeout_eps=args.rerun_timeout_eps)
+                force_timeout=effective_force_timeout,
+                rerun_timeout_eps=args.rerun_timeout_eps,
+                requested_c_targets=pt_requested_c_targets)
         return
 
     # ── Analysis mode: find advanced-standard faster than standard ───
@@ -3041,7 +3195,7 @@ def main():
                 arch_runs, cwd, fa_dataset,
                 args.compare_to_with_perturbed, args.combo_ranking_seeds,
                 combination_table=args.combination_table,
-                force_timeout=args.force_timeout,
+                force_timeout=effective_force_timeout,
                 rerun_timeout_eps=args.rerun_timeout_eps)
         return
 
