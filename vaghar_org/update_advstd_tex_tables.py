@@ -3943,6 +3943,9 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                 "seed": seed_val,
                                 "combo": combo_label,
                                 "t_total": t,
+                                # Gurobi solver wall-clock only (no hyper-attack
+                                # overhead); used for the timeout-cap dedup.
+                                "t_opt": val.get("optimization_time"),
                                 "lb_total": val.get("lower_bound"),
                                 "ub_total": val.get("upper_bound"),
                                 "solve_status": val.get("solve_status", ""),
@@ -4537,14 +4540,17 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
                         continue
                     combo_gap = bool(per_combo_missing.get(c))
                     star = "$^*$" if combo_gap else ""
-                    # delta_l is a percentage of delta_max, so a negative
-                    # value (margin below 0) is clamped to 0; delta_u above
-                    # 100% is clamped to 100 for display.
+                    # Both delta_l and delta_u are percentages of delta_max, so
+                    # neither should render above 100% (delta_max is the max) or
+                    # below 0. Cap BOTH to [0, 100]; capping only delta_u (as
+                    # before) let a cell whose bounds both sit just above
+                    # delta_max show delta_l > delta_u. Display-only; the gap
+                    # winner logic above uses the pre-clamp lb_pct/ub_pct.
                     row.append(_paint(
-                        f"{max(0.0, s['lb_pct']):.1f}" if "lb_pct" in s else "---",
+                        f"{min(100.0, max(0.0, s['lb_pct'])):.1f}" if "lb_pct" in s else "---",
                         is_win))
                     row.append(_paint(
-                        f"{min(100.0, s['ub_pct']):.1f}" if "ub_pct" in s else "---",
+                        f"{min(100.0, max(0.0, s['ub_pct'])):.1f}" if "ub_pct" in s else "---",
                         is_win))
                     t_str = f"{s['t']:.1f}" if "t" in s else "---"
                     row.append(_paint(t_str + star, is_win))
@@ -4721,6 +4727,20 @@ def _ft_for(force_timeout, arch):
     return force_timeout
 
 
+def _timeout_caption_clause(force_timeout, arch):
+    """A caption sentence stating this architecture's solver timeout, always in
+    hours. Empty string when no cap is set for the arch (so the caption is
+    unchanged). Example: ' Each run is given a solver timeout of $3$ hours.'"""
+    ft = _ft_for(force_timeout, arch)
+    if ft is None:
+        return ""
+    hrs = ft / 3600.0
+    hrs_str = (f"{hrs:.0f}" if abs(hrs - round(hrs)) < 1e-9
+               else _fmt_trim(hrs))
+    unit = "hour" if hrs_str == "1" else "hours"
+    return f" Each run is given a solver timeout of ${hrs_str}$ {unit}."
+
+
 def _ct_for(requested_c_targets, arch):
     """Resolve the requested target-class set (0-indexed) for one architecture.
 
@@ -4746,7 +4766,17 @@ def _aaai_is_timeout_mismatch(row, force_timeout, eps):
     status = str(row.get("solve_status", "") or "").upper().replace(" ", "_")
     if not any(tag in status for tag in _AAAI_TIMEOUT_STATUSES):
         return False
-    t = row.get("t_total")
+    # Compare the Gurobi SOLVER wall-clock (optimization_time) against the cap,
+    # NOT total_time. total_time = optimization_time + hyper_attack_time, and
+    # the PGD hyper-attack warm-up adds ~50-70s (unbounded, grows with the net).
+    # A run that genuinely hit the cap has optimization_time ~= force_timeout
+    # but total_time = force_timeout + hyper_attack_time, so testing total_time
+    # would push a legitimate at-cap timeout past `eps` and wrongly drop it as a
+    # cross-cap re-run (emptying the cell to "---"). Fall back to t_total only
+    # when the solver time wasn't recorded.
+    t = row.get("t_opt")
+    if t is None:
+        t = row.get("t_total")
     if t is None:
         return True  # timeout with unknown wall-clock; conservatively drop
     try:
@@ -5050,14 +5080,22 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         if bk in s:
                             return s[bk], False
                         return None, False
-                    # Clamp for display: delta_l (% of delta_max) below 0 shows
-                    # 0, delta_u above 100 shows 100.
+                    # Clamp for display: both bounds are percentages of
+                    # delta_max, so nothing should ever render above 100%
+                    # (delta_max is by definition the max) or below 0. Cap
+                    # BOTH to [0, 100]. delta_u already had the 100 cap; delta_l
+                    # needs it too, otherwise a transfer cell whose bounds both
+                    # sit just above delta_max shows delta_l rounding up to 101
+                    # while delta_u is pinned to 100 -- a spurious delta_l >
+                    # delta_u. The raw incumbent <= best_bound invariant holds;
+                    # this is purely a display cap. The diff/gap column is
+                    # computed from the pre-clamp values, so it is unaffected.
                     lb_v, _ = _pick("lb_pct_base", "lb_pct_geom")
                     ub_v, _ = _pick("ub_pct_base", "ub_pct_geom")
                     data_cells.append("---" if lb_v is None
-                                      else _fmt_sig(max(0.0, lb_v)))
+                                      else _fmt_sig(min(100.0, max(0.0, lb_v))))
                     data_cells.append("---" if ub_v is None
-                                      else _fmt_sig(min(100.0, ub_v)))
+                                      else _fmt_sig(min(100.0, max(0.0, ub_v))))
                     # Solve time (minutes), same geom-preferred side. When
                     # --force_timeout is set, a mean above the cap is overhead
                     # beyond the solver limit and is clamped. The partial "*"
@@ -5236,6 +5274,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 r"Experiments evaluating \tool in comparison to \baseline on "
                 + ds_disp + r" and architecture \textbf{" + arch
                 + r"}, target network $N$.")
+        cap += _timeout_caption_clause(force_timeout, arch)
         lines.append(f"\\caption{{{cap}}}")
         lines.append(f"\\label{{tab:safe-wide-{safe_arch}{label_suffix}}}")
         lines.append(r"\end{table*}")
@@ -5972,7 +6011,8 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     return out
 
 
-def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
+def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
+                            force_timeout=None):
     """Emit one two-column `figure*` PER architecture (user: separate each
     architecture into its own figure). Each figure has its own shared legend,
     that architecture's 2-D groupplot grid (columns = c_s, rows = perturbation
@@ -6002,6 +6042,7 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base):
         cap = (r"\tool compared to \baseline (baseline) on "
                + dataset_disp + r" (" + arch_disp + r") across different perturbation "
                r"types and sizes.")
+        cap += _timeout_caption_clause(force_timeout, arch)
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
             out.append(f"\\label{{{label_base}}}")
@@ -6164,7 +6205,8 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
     # the remaining delta_u-delta_l gap), so there is no separate gap figure.
     if arch_rows:
         lines += _aaai_group_grid_figure(
-            arch_rows, r"time (min)", dataset_disp, "fig:n2-time")
+            arch_rows, r"time (min)", dataset_disp, "fig:n2-time",
+            force_timeout=force_timeout)
     return "\n".join(lines)
 
 
@@ -6661,6 +6703,9 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                             "seed": seed_val,
                             "combo": combo_label,
                             "t_total": t,
+                            # Gurobi solver wall-clock only (no hyper-attack
+                            # overhead); used for the timeout-cap dedup.
+                            "t_opt": val.get("optimization_time"),
                             "lb_total": lb,
                             "ub_total": ub,
                             "solve_status": val.get("solve_status", ""),
