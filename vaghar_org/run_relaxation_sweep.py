@@ -3751,32 +3751,22 @@ def main():
 
             # delta_max jobs feed ONLY the table generators (which run in a
             # separate later invocation) — nothing in the main verification
-            # phase depends on them.
+            # phase depends on them, so they are dependency-free.
             #
-            # MULTI-dataset runs only: a blocking Phase 0.5 put a GLOBAL barrier
-            # before the main phase, so one dataset's fresh delta_max (e.g. a
-            # newly trained cifar arch) stalled EVERY dataset's main jobs — even
-            # datasets whose delta_max was already cached. There we fold the
-            # delta_max jobs into the SAME pool as the main jobs (see
-            # ready_jobs_all below); with per-dataset slot reservation they run
-            # concurrently with other datasets' main jobs and still complete
-            # before this invocation returns (hence before any table regen).
-            #
-            # SINGLE-dataset runs (e.g. mnist-only, fmnist-only): there is no
-            # cross-dataset stall to avoid, so we keep the ORIGINAL blocking
-            # Phase 0.5 pass byte-for-byte — mnist/fmnist behavior is unchanged
-            # from before this feature. (group_slots is None for single-dataset
-            # runs, so this call is identical to the historical one.)
-            if ready_delta_max_jobs and not _multi_ds:
-                run_pool(
-                    ready_delta_max_jobs, max_slots, cwd, cores_per_job,
-                    "Phase 0.5 (delta_max)",
-                    group_slots=group_slots, job_group=_job_group,
-                )
-                ready_delta_max_jobs = []   # consumed here; not merged below
-            elif ready_delta_max_jobs:
+            # We therefore ALWAYS fold them into the main pool (ready_jobs_all
+            # below) rather than running a separate blocking Phase 0.5 pass, so
+            # they run concurrently with every other job — and we rank them FIRST
+            # (priority sentinel in _job_priority / FIFO prepend) so they are
+            # dispatched ahead of the row jobs. This holds for both single- and
+            # multi-dataset runs. It removes two problems the old blocking pass
+            # had: (1) MULTI-dataset — a global barrier stalled EVERY dataset's
+            # main jobs behind one dataset's fresh delta_max; (2) SINGLE-dataset
+            # — the pool idled behind a possibly-hours-long `max` solve. They
+            # still complete before this invocation returns (hence before any
+            # table regen), since the pool drains fully.
+            if ready_delta_max_jobs:
                 print(f"\n  delta_max: {len(ready_delta_max_jobs)} job(s) folded into the "
-                      f"main pool (multi-dataset overlap; no global barrier).")
+                      f"main pool, dispatched first (no blocking Phase 0.5 barrier).")
 
             # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
             # now uses a continuous transfer-probability signal built from
@@ -4316,6 +4306,11 @@ def main():
 
                 def _job_priority(job):
                     cmd = job[1]
+                    # delta_max jobs (--perturbation max) are dependency-free and
+                    # must be dispatched FIRST: give them a sentinel key that
+                    # sorts ahead of every real (within>=0, ...) row job.
+                    if _cmd_opt(cmd, "--perturbation") == "max":
+                        return (-1, -1, -1, False)
                     pert = _cmd_opt(cmd, "--perturbation")
                     psize = _cmd_opt(cmd, "--perturbation_size")
                     pert_spec = f"{pert}:{psize}" if pert and psize else None
@@ -4357,9 +4352,9 @@ def main():
             skip_note = (" " + skip_note.strip()) if skip_note else ""
 
             order_note = " [row-priority]" if row_priority else ""
-            # delta_max jobs are only present here in the multi-dataset overlap
-            # case; single-dataset runs ran them in the blocking Phase 0.5 above,
-            # so this line stays byte-identical to the historical output for them.
+            # delta_max jobs are folded into this pool for both single- and
+            # multi-dataset runs now (no blocking Phase 0.5); when present they
+            # are dispatched first (priority sentinel / FIFO prepend).
             _phase_label = "0.5+1+1.5+2" if ready_delta_max_jobs else "1+1.5+2"
             _dm_seg = f"{len(ready_delta_max_jobs)} delta_max + " if ready_delta_max_jobs else ""
             print(f"\n── Phase {_phase_label} merged across c_tags={list(sweep_ctag_vals)}{order_note}: "
@@ -4387,8 +4382,10 @@ def main():
 
             # delta_max jobs are dependency-free (nothing in this pool waits on
             # them); folding them in here — instead of a blocking Phase 0.5 —
-            # lets a dataset's fresh delta_max overlap other datasets' main jobs
-            # rather than barriering the whole run behind it.
+            # lets them overlap the row jobs rather than barriering the whole
+            # run behind a possibly-hours-long `max` solve. They are placed at
+            # the FRONT so the FIFO path dispatches them first; the row-priority
+            # path pins them first via the _job_priority sentinel above.
             ready_jobs_all = ready_delta_max_jobs + ready_n1_jobs + ready_std_n2_jobs + ready_advstd_jobs
             if ready_jobs_all or locked_jobs_by_label:
                 try:
