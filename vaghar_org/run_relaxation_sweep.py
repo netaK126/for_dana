@@ -171,22 +171,22 @@ PERTURBATIONS = [
     
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("trans(1,1)",        "translation:1,1"),
+    ("occ(14,14,9)",        "occ:14,14,9"),
+    ("contrast(1.5)",      "contrast:1.5"),
+    ("rotation(10)",      "rotation:10"),
+    ("linf(0.1)",         "linf:0.1"), 
+    ("brightness(0.25)",  "brightness:0.25"), 
     # ("trans(1,3)",        "translation:1,3"),
-    ("trans(3,1)",        "translation:3,1"),
+    # ("trans(3,1)",        "translation:3,1"),
     # ("trans(3,3)",        "translation:3,3"),
     # ("occ(5,5,5)",        "occ:5,5,5"),
-    ("occ(3,3,5)",        "occ:3,3,5"),
-    ("occ(14,14,9)",        "occ:14,14,9"),
-    ("occ(1,1,9)",        "occ:1,1,9"),
-    ("contrast(1.5)",      "contrast:1.5"),
-    ("contrast(1.2)",      "contrast:1.2"),
-    ("rotation(10)",      "rotation:10"),
-    ("rotation(5)",      "rotation:5"),
+    # ("occ(3,3,5)",        "occ:3,3,5"),
+    # ("occ(1,1,9)",        "occ:1,1,9"),
+    # ("contrast(1.2)",      "contrast:1.2"),
+    # ("rotation(5)",      "rotation:5"),
     # ("occ(1,1,5)",        "occ:1,1,5"),
-    ("linf(0.05)",        "linf:0.05"),    
-    ("linf(0.1)",         "linf:0.1"),     
-    ("brightness(0.25)",  "brightness:0.25"), 
-    ("brightness(0.1)",  "brightness:0.1")
+    # ("linf(0.05)",        "linf:0.05"),    
+    # ("brightness(0.1)",  "brightness:0.1")
 ]
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
@@ -974,15 +974,28 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
 # DATASET_CONFIG entry.
 _FASHION_ALIASES = frozenset({"fashion-mnist", "fashion_mnist", "fashion", "fmnist"})
 
+# CIFAR-10 has the same kind of name disagreement: the exp folder is 'cifar'
+# while both the Python DATASET_CONFIG and the Julia stack use 'cifar10'. These
+# aliases let --dataset cifar match the folder without a new DATASET_CONFIG key.
+_CIFAR_ALIASES = frozenset({"cifar", "cifar10", "cifar-10"})
+
 
 def _dataset_config_key(name):
     """Key into run_experiment.DATASET_CONFIG for a (possibly aliased) dataset name."""
-    return "fashion_mnist" if name in _FASHION_ALIASES else name
+    if name in _FASHION_ALIASES:
+        return "fashion_mnist"
+    if name in _CIFAR_ALIASES:
+        return "cifar10"
+    return name
 
 
 def _julia_dataset_name(name):
     """Dataset identifier that run.jl / hyper_attack.py understand."""
-    return "fmnist" if name in _FASHION_ALIASES else name
+    if name in _FASHION_ALIASES:
+        return "fmnist"
+    if name in _CIFAR_ALIASES:
+        return "cifar10"
+    return name
 
 
 def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_size=128):
@@ -2398,15 +2411,20 @@ def _recompile_neta_s_paper(cwd):
 
 def _parse_arch_timeouts(spec):
     """Parse --arch_timeouts into (arch_runs, force_timeout_by_arch,
-    c_targets_by_arch).
+    c_targets_by_arch, c_sources_by_arch).
 
-    Grammar: '|'-separated groups, each 'SECS:arch=path,arch=path[@CT]':
+    Grammar: '|'-separated groups, each 'SECS:arch=path,arch=path[@CT][#CS]':
       * SECS     -- wall-clock cap in seconds, shared by the group's models.
       * arch=path,... -- same syntax as --arch_models.
       * @CT      -- OPTIONAL per-group target-class list, Julia 1-indexed and
-                    comma-separated (same syntax as --ct), e.g. '@2,4,5'. The
-                    '@...' is split off first so it never collides with the
-                    arch=path ':'/'=' separators.
+                    comma-separated (same syntax as --ct), e.g. '@2,4,5'.
+      * #CS      -- OPTIONAL per-group SOURCE-class (Cs) list, 0-indexed (the
+                    exact 'c_s=k' chart labels, NOT shifted -- same syntax as
+                    --cs), e.g. '#0,2'. Restricts which source classes the
+                    generated tables/charts include, mirroring '@CT' for
+                    targets.
+      The '@...'/'#...' suffixes are stripped off the END of the group first
+      (in any order) so they never collide with the arch=path ':'/'=' seps.
 
     Returns:
       * arch_runs           -- list of (arch, model_path) pairs in spec order.
@@ -2415,34 +2433,57 @@ def _parse_arch_timeouts(spec):
                                overall when NO group carried a '@CT' (so the
                                caller keeps using the global --ct unchanged). A
                                group without '@CT' maps its archs to None.
+      * c_sources_by_arch   -- {arch: set_of_0indexed_sources | None}, or None
+                               overall when NO group carried a '#CS' (caller
+                               keeps using the global --cs). A group without
+                               '#CS' maps its archs to None.
 
-    Combines --arch_models, a per-model --force_timeout, and a per-model --ct so
-    different models can carry different caps and target-class sets."""
+    Combines --arch_models, a per-model --force_timeout, a per-model --ct, and a
+    per-model --cs so different models can carry different caps, target-class
+    sets, and source-class sets."""
     arch_runs = []
     ft_by_arch = {}
     ct_by_arch = {}
+    cs_by_arch = {}
     any_group_ct = False
+    any_group_cs = False
     for group in spec.split("|"):
         group = group.strip()
         if not group:
             continue
-        # Optional per-group target-class list, introduced by '@'.
+        # Optional per-group target-class ('@CT') and source-class ('#CS')
+        # lists. Both are stripped off the END of the group, in whatever order
+        # they appear, so the arch=path body is left clean for the ':'/'='
+        # parsing below.
         group_ct = None
-        if "@" in group:
-            group, ct_part = group.rsplit("@", 1)
-            group = group.strip()
-            ct_part = ct_part.strip()
+        group_cs = None
+        while True:
+            m = re.search(r"([@#])([0-9,\s]+)$", group)
+            if not m:
+                break
+            sym, lst = m.group(1), m.group(2).strip()
+            kind = "ct" if sym == "@" else "cs"
             try:
-                group_ct = {c - 1 for c in _parse_c_targets(ct_part)}  # 0-indexed
+                raw = _parse_c_targets(lst)
             except ValueError:
-                print(f"ERROR: --arch_timeouts ct list after '@' must be "
-                      f"comma-separated integers, got: {ct_part!r}")
+                print(f"ERROR: --arch_timeouts {kind} list after '{sym}' must "
+                      f"be comma-separated integers, got: {lst!r}")
                 sys.exit(1)
-            if not group_ct:
-                print(f"ERROR: --arch_timeouts group '{group}@{ct_part}' has an "
-                      f"empty ct list after '@'")
+            # '@CT' is Julia 1-indexed (shifted to the 0-indexed c_target the
+            # result files store); '#CS' is already the 0-indexed source class
+            # shown as "c_s=k" on the chart axis, so it is NOT shifted.
+            parsed = {c - 1 for c in raw} if sym == "@" else set(raw)
+            if not parsed:
+                print(f"ERROR: --arch_timeouts group '{group}{sym}{lst}' has an "
+                      f"empty {kind} list after '{sym}'")
                 sys.exit(1)
-            any_group_ct = True
+            if sym == "@":
+                group_ct = parsed
+                any_group_ct = True
+            else:
+                group_cs = parsed
+                any_group_cs = True
+            group = group[:m.start()].strip()
         if ":" not in group:
             print(f"ERROR: --arch_timeouts group must be 'SECS:arch=path,...', "
                   f"got: {group}")
@@ -2470,16 +2511,21 @@ def _parse_arch_timeouts(spec):
             arch_runs.append((a, mp.strip()))
             ft_by_arch[a] = secs
             ct_by_arch[a] = group_ct
+            cs_by_arch[a] = group_cs
     if not arch_runs:
         print("ERROR: --arch_timeouts listed no arch=model_path pairs")
         sys.exit(1)
-    return arch_runs, ft_by_arch, (ct_by_arch if any_group_ct else None)
+    return (arch_runs, ft_by_arch,
+            (ct_by_arch if any_group_ct else None),
+            (cs_by_arch if any_group_cs else None))
 
 
 def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                                  combination_table=None, force_timeout=None,
                                  rerun_timeout_eps=30.0,
-                                 requested_c_targets=None):
+                                 requested_c_targets=None,
+                                 requested_c_sources=None,
+                                 recompile=True):
     """Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, sourcing
     the transfer (advstd N2) column DIRECTLY from the advStd .txt files (no
     CSVs, no standard-baseline pairing). Honors --combination_table (combo
@@ -2491,6 +2537,11 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     from --ct: when set, every generated table/chart is restricted to exactly
     those target classes, and a requested c_target with no data is flagged with
     the same red "*" the tables already use for partial sweeps.
+
+    `requested_c_sources` (a set/dict of 0-indexed source classes, or None) is
+    the Cs / c_tag analogue from --cs / '#CS': when set, every table/chart is
+    restricted to exactly those source classes, and a requested Cs with no data
+    shows up as a "missing Cs=k" note in the bar charts.
     """
     try:
         sys.path.insert(0, cwd)
@@ -2530,18 +2581,23 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         # Restrict every table/chart to the requested target classes (--ct);
         # None keeps the full-sweep behavior.
         requested_c_targets=requested_c_targets,
+        # Same for the source classes (Cs / c_tag) via --cs / '#CS'.
+        requested_c_sources=requested_c_sources,
         # Drop pre-fix files that relaxed >=1 binary (unsound under the
         # perturbation-dependency fix) on BOTH vaghar/ours and transfer rows --
         # the same predicate the sweep skip-check uses.
         stale_fn=_is_pre_fix_dropped,
     )
 
-    # N2 (target network) -> Evaluation body, as per-perturbation charts.
+    # N2 (target network) -> Evaluation body, as per-perturbation charts. The
+    # solve-time cells AND the bounds-difference clusters are returned so the
+    # caller can pool BOTH across datasets into one combined figure each.
+    time_cells, bd_groups = [], []
     body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
     if os.path.exists(body_tex) and hasattr(
             updater, "regenerate_aaai_n2_charts_section"):
         try:
-            updater.regenerate_aaai_n2_charts_section(
+            time_cells, bd_groups = updater.regenerate_aaai_n2_charts_section(
                 body_tex, cwd, dataset, arch_runs,
                 begin_mark=updater.AAAI_N2_CHARTS_BEGIN_MARK + _mslug,
                 end_mark=updater.AAAI_N2_CHARTS_END_MARK + _mslug,
@@ -2564,6 +2620,41 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
             print(f"[paper-tables] aaai_safe_wide (N2 appendix) block "
                   f"error: {exc}")
 
+    # Both combined figures (solve-time + bounds-difference) are written once,
+    # after ALL datasets are collected, so the caller defers the compile
+    # (recompile=False) and returns the pooled data.
+    if recompile:
+        _recompile_neta_s_paper(cwd)
+    return time_cells, bd_groups
+
+
+def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
+                                   force_timeout=None):
+    """Emit the SINGLE combined solve-time grid (columns = networks) AND the
+    SINGLE combined bounds-difference figure, pooling `time_cells`/`bd_groups`
+    across every dataset, then recompile. Run once after the per-dataset
+    _regen_paper_tables_from_txt calls."""
+    try:
+        sys.path.insert(0, cwd)
+        import update_advstd_tex_tables as updater
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        print(f"[paper-tables] combined figures skipped (import failed: {exc})")
+        return
+    body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    if os.path.exists(body_tex) and hasattr(
+            updater, "regenerate_aaai_time_combined_section"):
+        try:
+            updater.regenerate_aaai_time_combined_section(
+                body_tex, time_cells, force_timeout=force_timeout)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_n2_time_combined block error: {exc}")
+    if os.path.exists(body_tex) and hasattr(
+            updater, "regenerate_aaai_bounddiff_section"):
+        try:
+            updater.regenerate_aaai_bounddiff_section(
+                body_tex, bd_groups, force_timeout=force_timeout)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_n2_bounddiff block error: {exc}")
     _recompile_neta_s_paper(cwd)
 
 
@@ -2943,6 +3034,16 @@ def main():
                              "With --paper_tables_from_txt this restricts the generated "
                              "tables/charts to exactly these target classes; any requested "
                              "c_target with no data is flagged with a red '*'.")
+    parser.add_argument("--cs", type=str, default=None,
+                        help="Comma-separated 0-indexed c_source (Cs) values, the "
+                             "SOURCE-class analogue of --ct. These are the exact 'c_s=k' "
+                             "labels shown on the chart axis, so -- unlike Julia 1-indexed "
+                             "--ct -- they are NOT shifted (e.g. --cs 0,2 keeps c_s=0 and "
+                             "c_s=2). With --paper_tables_from_txt this restricts the "
+                             "generated tables/charts to exactly these source classes; a "
+                             "requested Cs with no data is flagged \"missing Cs=k\" in the "
+                             "bar charts. Per-model overrides come from the '#CS' groups of "
+                             "--arch_timeouts (which take precedence, like '@CT' for --ct).")
     parser.add_argument("--sweep_ctag", nargs="*", type=int, default=None,
                         help="Julia-indexed c_tag (source class) values to sweep (e.g. '1 2 3'). "
                              "Each value is passed to run.jl as --ctag in a separate invocation; "
@@ -2991,9 +3092,10 @@ def main():
     # regeneration paths use in place of the scalar --force_timeout.
     arch_force_timeout = None
     arch_c_targets = None
+    arch_c_sources = None
     if args.arch_timeouts:
-        arch_runs, arch_force_timeout, arch_c_targets = _parse_arch_timeouts(
-            args.arch_timeouts)
+        (arch_runs, arch_force_timeout, arch_c_targets,
+         arch_c_sources) = _parse_arch_timeouts(args.arch_timeouts)
         if args.arch_models:
             print("WARNING: --arch_timeouts overrides --arch_models "
                   "(models are taken from --arch_timeouts)")
@@ -3169,16 +3271,55 @@ def main():
                 print(f"[paper-tables] restricting tables/charts to c_targets "
                       f"(Julia-indexed) {_parse_c_targets(args.ct)}; requested "
                       f"targets with no data are flagged with a red '*'")
+        # --cs / '#CS' groups restrict the SOURCE classes (Cs / c_tag) exactly
+        # like --ct / '@CT' restrict targets: Julia 1-indexed in, 0-indexed out,
+        # per-model #CS groups override the global --cs.
+        pt_global_c_sources = None
+        if args.cs:
+            # --cs is 0-indexed (the c_s labels shown on the chart axis), so it
+            # is NOT shifted -- unlike --ct.
+            pt_global_c_sources = set(_parse_c_targets(args.cs))
+        if arch_c_sources is not None:
+            pt_requested_c_sources = {
+                a: (css if css is not None else pt_global_c_sources)
+                for a, css in arch_c_sources.items()}
+            print("[paper-tables] restricting tables/charts to PER-MODEL "
+                  "c_sources / Cs (0-indexed, matching the c_s chart labels): "
+                  + ", ".join(
+                      f"{a}={sorted(css)}" if css else f"{a}=all"
+                      for a, css in pt_requested_c_sources.items())
+                  + "; a requested Cs with no data is flagged \"missing Cs=k\"")
+        else:
+            pt_requested_c_sources = pt_global_c_sources
+            if pt_global_c_sources is not None:
+                print(f"[paper-tables] restricting tables/charts to c_sources / "
+                      f"Cs (0-indexed) {sorted(pt_global_c_sources)}; a "
+                      f"requested Cs with no data is flagged \"missing Cs=k\"")
+        # Pool BOTH the solve-time cells and the bounds-difference clusters
+        # across every dataset so each lands in ONE combined figure (written
+        # after the per-dataset loop). The per-dataset compile is deferred
+        # (recompile=False) and done once at the end.
+        all_time_cells = []
+        all_bd_groups = []
         for pt_dataset in pt_datasets:
             if len(pt_datasets) > 1:
                 print(f"\n===== Regenerating neta-s-paper tables (from advStd "
                       f"txt) for dataset: {pt_dataset} =====")
-            _regen_paper_tables_from_txt(
+            tc, bd = _regen_paper_tables_from_txt(
                 arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
                 combination_table=args.combination_table,
                 force_timeout=effective_force_timeout,
                 rerun_timeout_eps=args.rerun_timeout_eps,
-                requested_c_targets=pt_requested_c_targets)
+                requested_c_targets=pt_requested_c_targets,
+                requested_c_sources=pt_requested_c_sources,
+                recompile=False)
+            all_time_cells += tc
+            all_bd_groups += bd
+        # One combined solve-time grid + one combined bounds-difference figure
+        # across all datasets, then the single final recompile.
+        _regen_paper_combined_from_txt(
+            cwd, all_time_cells, all_bd_groups,
+            force_timeout=effective_force_timeout)
         return
 
     # ── Analysis mode: find advanced-standard faster than standard ───
@@ -3608,12 +3749,34 @@ def main():
                         ]
                         ready_delta_max_jobs.append((dm_label, dm_cmd))
 
-            if ready_delta_max_jobs:
+            # delta_max jobs feed ONLY the table generators (which run in a
+            # separate later invocation) — nothing in the main verification
+            # phase depends on them.
+            #
+            # MULTI-dataset runs only: a blocking Phase 0.5 put a GLOBAL barrier
+            # before the main phase, so one dataset's fresh delta_max (e.g. a
+            # newly trained cifar arch) stalled EVERY dataset's main jobs — even
+            # datasets whose delta_max was already cached. There we fold the
+            # delta_max jobs into the SAME pool as the main jobs (see
+            # ready_jobs_all below); with per-dataset slot reservation they run
+            # concurrently with other datasets' main jobs and still complete
+            # before this invocation returns (hence before any table regen).
+            #
+            # SINGLE-dataset runs (e.g. mnist-only, fmnist-only): there is no
+            # cross-dataset stall to avoid, so we keep the ORIGINAL blocking
+            # Phase 0.5 pass byte-for-byte — mnist/fmnist behavior is unchanged
+            # from before this feature. (group_slots is None for single-dataset
+            # runs, so this call is identical to the historical one.)
+            if ready_delta_max_jobs and not _multi_ds:
                 run_pool(
                     ready_delta_max_jobs, max_slots, cwd, cores_per_job,
                     "Phase 0.5 (delta_max)",
                     group_slots=group_slots, job_group=_job_group,
                 )
+                ready_delta_max_jobs = []   # consumed here; not merged below
+            elif ready_delta_max_jobs:
+                print(f"\n  delta_max: {len(ready_delta_max_jobs)} job(s) folded into the "
+                      f"main pool (multi-dataset overlap; no global barrier).")
 
             # Pseudo-cost extraction has been retired. Technique 3 (var_hint)
             # now uses a continuous transfer-probability signal built from
@@ -4194,7 +4357,13 @@ def main():
             skip_note = (" " + skip_note.strip()) if skip_note else ""
 
             order_note = " [row-priority]" if row_priority else ""
-            print(f"\n── Phase 1+1.5+2 merged across c_tags={list(sweep_ctag_vals)}{order_note}: "
+            # delta_max jobs are only present here in the multi-dataset overlap
+            # case; single-dataset runs ran them in the blocking Phase 0.5 above,
+            # so this line stays byte-identical to the historical output for them.
+            _phase_label = "0.5+1+1.5+2" if ready_delta_max_jobs else "1+1.5+2"
+            _dm_seg = f"{len(ready_delta_max_jobs)} delta_max + " if ready_delta_max_jobs else ""
+            print(f"\n── Phase {_phase_label} merged across c_tags={list(sweep_ctag_vals)}{order_note}: "
+                  f"{_dm_seg}"
                   f"{total_n1} N1 ({len(ready_n1_jobs)} ready, {n1_locked_count} chained) + "
                   f"{len(ready_std_n2_jobs)} std-N2 + "
                   f"{total_advstd} advstd ({len(ready_advstd_jobs)} ready, {advstd_locked_count} waiting on N1)"
@@ -4216,7 +4385,11 @@ def main():
                 else:
                     n1_pending_count_per_pert[pert_key] = remaining
 
-            ready_jobs_all = ready_n1_jobs + ready_std_n2_jobs + ready_advstd_jobs
+            # delta_max jobs are dependency-free (nothing in this pool waits on
+            # them); folding them in here — instead of a blocking Phase 0.5 —
+            # lets a dataset's fresh delta_max overlap other datasets' main jobs
+            # rather than barriering the whole run behind it.
+            ready_jobs_all = ready_delta_max_jobs + ready_n1_jobs + ready_std_n2_jobs + ready_advstd_jobs
             if ready_jobs_all or locked_jobs_by_label:
                 try:
                     run_pool(

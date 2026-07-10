@@ -300,7 +300,15 @@ class CNN2(nn.Module):
         self.conv1 = nn.Conv2d(self.k, 3, 4, stride=(1, 1), padding='valid')
         self.conv2 = nn.Conv2d(3, 3, 3, stride=(3, 3), padding='valid')
         self.flatten1 = nn.Flatten()
-        self.fc1 = nn.Linear(192, 10)
+        # Flattened conv-output size derived from the input geometry so the net
+        # adapts across datasets: 28x28x1 -> 192 (MNIST/Fashion-MNIST),
+        # 32x32x3 -> 243 (CIFAR-10). valid padding: out = (in - kernel)//stride + 1.
+        w1 = (self.w - 4) // 1 + 1
+        h1 = (self.h - 4) // 1 + 1
+        w2 = (w1 - 3) // 3 + 1
+        h2 = (h1 - 3) // 3 + 1
+        flatten_num = 3 * w2 * h2
+        self.fc1 = nn.Linear(flatten_num, 10)
         self.fc2 = nn.Linear(10, output_size)
         self.m = nn.Dropout(p=0.75)
 

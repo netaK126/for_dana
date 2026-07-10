@@ -230,7 +230,14 @@ function get_nn(model_path, model_name, w, h, k, c, dataset)
         stride_to_use_2 = 3
         conv_filters = 3
         conv_filters2 = 3
-        flatten_num = 192
+        # Flattened conv-output size derived from the input geometry (valid
+        # padding: out = div(in - kernel, stride) + 1), so cnn2 adapts across
+        # datasets: 28x28 -> 192 (MNIST/Fashion-MNIST), 32x32 -> 243 (CIFAR-10).
+        w1 = div(w - 4, stride_to_use_1) + 1
+        h1 = div(h - 4, stride_to_use_1) + 1
+        w2 = div(w1 - 3, stride_to_use_2) + 1
+        h2 = div(h1 - 3, stride_to_use_2) + 1
+        flatten_num = conv_filters2 * w2 * h2
         model_pth = myunpickle(model_path)
         dict1 = Dict{String,Any}("conv1/weight"=>model_pth[1], "conv1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
         "conv2/weight"=>model_pth[3], "conv2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),

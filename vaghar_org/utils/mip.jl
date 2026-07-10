@@ -106,6 +106,14 @@ function mip_set_attr(m, perturbation, d, timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)
     global gurobi_seed
     set_optimizer_attribute(m, "Seed", gurobi_seed)
+    # cnn2 only: the PGD partial warm-start triggers a completion sub-MIP whose
+    # default node budget explodes on this large model (~1h/target, no incumbent).
+    # Bound it so Gurobi stops repairing the start and gets to the real solve.
+    # Every other architecture is left exactly as before (no attribute set).
+    global model_name
+    if model_name == "cnn2"
+        set_optimizer_attribute(m, "StartNodeLimit", 100)
+    end
 end
 
 function mip_log(m, d)
@@ -684,4 +692,12 @@ function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
     set_optimizer_attribute(m, "MIPGap", 0.01)
     global gurobi_seed
     set_optimizer_attribute(m, "Seed", gurobi_seed)
+    # cnn2 only: the PGD partial warm-start triggers a completion sub-MIP whose
+    # default node budget explodes on this large model (~1h/target, no incumbent).
+    # Bound it so Gurobi stops repairing the start and gets to the real solve.
+    # Every other architecture is left exactly as before (no attribute set).
+    global model_name
+    if model_name == "cnn2"
+        set_optimizer_attribute(m, "StartNodeLimit", 100)
+    end
 end

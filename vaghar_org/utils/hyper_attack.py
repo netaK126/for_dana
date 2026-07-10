@@ -328,7 +328,10 @@ def load_dataset( dataset ):
 
     return trainset, testset, (k_dim, h_dim, w_dim)
 
-def load_model( model_arch, model_path):
+def load_model( model_arch, model_path, dims=(1, 28, 28)):
+    # dims = (channels, height, width) from load_dataset; used to build
+    # conv nets with the correct input geometry (e.g. CIFAR-10 3x32x32).
+    k_dim, h_dim, w_dim = dims
     if model_arch == "2x10":
         model = FNN_2_10()
     elif model_arch == "3x10":
@@ -354,7 +357,7 @@ def load_model( model_arch, model_path):
     elif model_arch == "cnn1":
         model = CNN1()
     elif model_arch == "cnn2":
-        model = CNN2()
+        model = CNN2(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "cnn3":
         model = CNN3()
     else:
@@ -438,7 +441,7 @@ if __name__ == '__main__':
           "perturbation size:", perturbation_size, "dataset:", dataset)
 
     trainset, testset, dims = load_dataset(dataset)
-    model = load_model(model_arch, model_path)
+    model = load_model(model_arch, model_path, dims)
     X = create_hyper_input(source, trainset, testset, M, dims)
 
     best_val = attack(model, X, source, target, device, token_signature, model_arch, dims, perturbation_type, perturbation_size, iterations)

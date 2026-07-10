@@ -4764,6 +4764,19 @@ def _ct_for(requested_c_targets, arch):
     return requested_c_targets
 
 
+def _cs_for(requested_c_sources, arch):
+    """Resolve the requested source-class set (0-indexed) for one architecture.
+
+    The c_source (a.k.a. c_tag / Cs) analogue of `_ct_for`: `requested_c_sources`
+    is a set (the same --cs for every arch), a dict {arch: set|None} (a different
+    --cs per architecture, from the per-group #CS lists of --arch_timeouts), or
+    None (no restriction). A dict entry of None -- or an arch absent from the
+    dict -- means no restriction for that arch."""
+    if isinstance(requested_c_sources, dict):
+        return requested_c_sources.get(arch)
+    return requested_c_sources
+
+
 def _aaai_is_timeout_mismatch(row, force_timeout, eps):
     """True iff this row's Gurobi run hit a termination limit at a wall-clock
     cap different from `force_timeout` (within ±eps seconds). Non-timeout
@@ -4903,27 +4916,33 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
     lines = []
     lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
                  f"total_cell_rows={len(rows)}")
-    # Shared header macro so the three per-arch tables stay in sync.
-    header_cells = ["\\multirow{2}{*}{model}",
-                    "\\multirow{2}{*}{pert (size)}"]
-    for _col, hdr in _AAAI_WIDE_COLUMNS:
-        # Every method group is now followed by the trailing diff column,
-        # so each multicolumn group keeps a right rule.
-        header_cells.append("\\multicolumn{3}{c|}{" + hdr + "}")
-    # Two trailing SPEEDUP columns: the vaghar baseline's solve time divided by
-    # \emph{ours} (speedup-single-net) and by \emph{ours with transfer}
-    # (speedup-transfer), reported as a "x" ratio (higher = faster), the same
-    # speedup metric the body uses (t_vaghar / t_ours). Rows are sorted by the
-    # transfer speedup on N2.
-    header_cells.append(r"\multirow{2}{*}{\shortstack{speedup\\single-net}}")
-    header_cells.append(r"\multirow{2}{*}{\shortstack{speedup\\transfer}}")
-    sub_cells = ["", ""]
-    for _ in _AAAI_WIDE_COLUMNS:
-        sub_cells += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
-    sub_cells += ["", ""]  # the two diff columns span both header rows
-    lines.append(r"\providecommand{\aaaisafewideheader}{%")
-    lines.append(" & ".join(header_cells) + r" \\")
-    lines.append(" & ".join(sub_cells) + r" \\}")
+    # Two shared header macros -- the tables differ ONLY in the last two
+    # columns: the "solved" tables carry SPEEDUP columns (t_vaghar / t_method,
+    # a "x" ratio), while the "all-timeout" tables carry BOUND-DIFFERENCE
+    # columns (how many percentage points of delta_max tighter than the baseline
+    # each method's remaining gap is), since the solve times there are all pinned
+    # at the cap and carry no signal.
+    def _wide_header_macro(name, trailing_top):
+        top = ["\\multirow{2}{*}{model}", "\\multirow{2}{*}{pert (size)}"]
+        for _col, hdr in _AAAI_WIDE_COLUMNS:
+            top.append("\\multicolumn{3}{c|}{" + hdr + "}")
+        top += trailing_top
+        sub = ["", ""]
+        for _ in _AAAI_WIDE_COLUMNS:
+            sub += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
+        sub += ["", ""]  # the two trailing columns span both header rows
+        return [f"\\providecommand{{\\{name}}}{{%",
+                " & ".join(top) + r" \\",
+                " & ".join(sub) + r" \\}"]
+
+    lines += _wide_header_macro(
+        "aaaisafewideheader",
+        [r"\multirow{2}{*}{\shortstack{speedup\\single-net}}",
+         r"\multirow{2}{*}{\shortstack{speedup\\transfer}}"])
+    lines += _wide_header_macro(
+        "aaaisafewideheaderbd",
+        [r"\multirow{2}{*}{\shortstack{gap ratio\\ours}}",
+         r"\multirow{2}{*}{\shortstack{gap ratio\\transfer}}"])
     lines.append("")
 
     for arch in archs:
@@ -4944,17 +4963,16 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         if not arch_keys:
             continue
         safe_arch = arch.replace("_", "")
-        lines.append(r"\begin{table*}[!tbp]")
-        lines.append(r"\centering")
-        lines.append(r"\scriptsize")
-        lines.append(r"\setlength{\tabcolsep}{3pt}")
-        lines.append(r"\begin{adjustbox}{max width=\textwidth,center}%")
+        _ft = _ft_for(force_timeout, arch)
+        _cap_min = (_ft / 60.0) if _ft is not None else None
+        _eps_min = rerun_timeout_eps / 60.0
         col_spec = ("@{}l l | " + " | ".join(["r r r"] * len(columns))
                     + " | r r@{}")
-        lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
-        lines.append(r"\toprule")
-        lines.append(r"\aaaisafewideheader")
-        lines.append(r"\midrule")
+        # Collect every (role, c_src) block's rows, each tagged with all_timeout,
+        # so this architecture can be split into TWO tables below: one for cells
+        # where every method hit the solver timeout (no finisher), one for cells
+        # where at least one method finished.
+        arch_blocks = []  # (label_parts, [(data_cells, all_timeout), ...])
 
         # Group by (role, c_src) for the multicolumn section heading
         from itertools import groupby
@@ -5207,11 +5225,48 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 # Two speedup columns, left to right: speedup-single-net (vaghar
                 # over \emph{ours}) then speedup-transfer (vaghar over \emph{ours
                 # with transfer}). On N1 the transfer column has no data, so
-                # speedup-transfer renders "---" for every row.
+                # speedup-transfer renders "---" for every row. These are the
+                # trailing columns for the SOLVED tables (kept OUT of data_cells;
+                # the emitter appends the right trailing pair per table kind).
                 std_frac, std_cell = _speedup_for(columns[1])
                 trans_frac, trans_cell = _speedup_for(columns[2])
-                data_cells.append(std_cell)
-                data_cells.append(trans_cell)
+                speedup_cells = [std_cell, trans_cell]
+
+                # Bound-tightness columns for the ALL-TIMEOUT tables: the RATIO
+                # of the \baseline's remaining gap to each method's,
+                #   ratio = g_baseline / g_method,  g = delta_u - delta_l
+                # so a value > 1 means the method's bound is tighter than the
+                # baseline's and < 1 means the baseline is tighter. Same gap the
+                # bounds-difference graph plots; computed from the geom-preferred,
+                # [0,100]-clamped bounds so it matches the delta_l/delta_u shown.
+                def _gap_pct(c):
+                    # Built from the DISPLAYED (rounded, [0,100]-clamped,
+                    # geom-preferred) delta_l/delta_u so the reader can reproduce
+                    # Delta from the printed bounds -- same reproducibility rule
+                    # the speedup columns use for the printed times.
+                    s2 = stats.get(c)
+                    if not s2:
+                        return None
+                    lb = s2.get("lb_pct_geom", s2.get("lb_pct_base"))
+                    ub = s2.get("ub_pct_geom", s2.get("ub_pct_base"))
+                    if lb is None or ub is None:
+                        return None
+                    lb = float(_fmt_sig(min(100.0, max(0.0, lb))))
+                    ub = float(_fmt_sig(min(100.0, max(0.0, ub))))
+                    return max(0.0, ub - lb)
+
+                def _bounddiff_cell(cmp_c):
+                    gb = _gap_pct(columns[0])   # baseline gap
+                    gc = _gap_pct(cmp_c)        # method gap
+                    # Ratio g_baseline / g_method: >1 => method tighter, <1 =>
+                    # baseline tighter. Blank when a gap is missing or the method
+                    # gap is 0 (ratio undefined / unbounded).
+                    if gb is None or gc is None or gc <= 0:
+                        return "---"
+                    return _fmt_trim(gb / gc) + r"$\times$"
+
+                bounddiff_cells = [_bounddiff_cell(columns[1]),
+                                   _bounddiff_cell(columns[2])]
                 # Order rows by the transfer speedup on N2 (the headline method,
                 # as before); N1 has no transfer, so fall back to the single-net
                 # speedup there. A blank ranking value sinks the row to the end
@@ -5220,7 +5275,20 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 sort_frac = std_frac if role == "N1" else trans_frac
                 row_sort = ((0, -sort_frac) if sort_frac is not None
                             else (1, 0.0))
-                block_rows.append((row_sort, pert, p_size, data_cells))
+                # all_timeout: ALL THREE methods are present AND pinned at the
+                # timeout (per the user's rule "all values -- vaghar, ours and
+                # transfer -- reached timeout"). A row where any method finishes
+                # earlier OR was not run ("---") goes to the "solved" table.
+                # (_repr_time is geom-preferred and already clamped to the cap.)
+                if _cap_min is None:
+                    all_timeout = False
+                else:
+                    all_timeout = all(
+                        (_repr_time(c) is not None
+                         and _repr_time(c) >= _cap_min - _eps_min)
+                        for c in columns)
+                block_rows.append((row_sort, pert, p_size, data_cells,
+                                   all_timeout, speedup_cells, bounddiff_cells))
 
             if not block_rows:
                 continue
@@ -5237,59 +5305,111 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # otherwise, so min(row_sort) over a cluster is its best rank and
             # smaller sorts earlier.
             best_by_pert = {}
-            for row_sort, pert_name, _ps, _dc in block_rows:
+            for row_sort, pert_name, _ps, _dc, _at, _sp, _bd in block_rows:
                 cur = best_by_pert.get(pert_name)
                 if cur is None or row_sort < cur:
                     best_by_pert[pert_name] = row_sort
             block_rows.sort(key=lambda r: (best_by_pert[r[1]], r[1],
                                            r[0], r[2]))
-            block_rows = [r[3] for r in block_rows]
+            # Keep each row as (data_cells, all_timeout, speedup_cells,
+            # bounddiff_cells) in sorted order; the split, the trailing-column
+            # choice, and label distribution happen per emitted table.
+            arch_blocks.append(
+                (label_parts, [(r[3], r[4], r[5], r[6]) for r in block_rows]))
 
-            # Distribute the model label parts down the first column.
-            # More rows than parts -> trailing rows get an empty model
-            # cell. Fewer rows than parts -> pack the leftover parts into
-            # the last row via a left-aligned \shortstack so nothing is
-            # dropped.
-            n_rows = len(block_rows)
-            row_labels = [""] * n_rows
-            for i in range(min(n_rows, len(label_parts))):
-                if i == n_rows - 1 and n_rows < len(label_parts):
-                    leftover = label_parts[i:]
-                    row_labels[i] = (r"\shortstack[l]{"
-                                     + r"\\".join(leftover) + r"}")
-                else:
-                    row_labels[i] = label_parts[i]
+        if not arch_blocks:
+            continue
 
-            for lbl, data_cells in zip(row_labels, block_rows):
-                lines.append(" & ".join([lbl] + data_cells) + r" \\")
-            lines.append(r"\midrule")
-
-        # Trailing \midrule -> \bottomrule
-        if lines[-1].rstrip() == r"\midrule":
-            lines[-1] = r"\bottomrule"
-        lines.append(r"\end{tabular}%")
-        lines.append(r"\end{adjustbox}")
+        # Emit TWO tables for this architecture: first the cells where all three
+        # methods hit the timeout, then the cells where at least one finished.
+        # Each block's model label is distributed over only the rows that land in
+        # the current table. The bare `tab:safe-wide-<arch>` label goes on the
+        # first table emitted (so older \refs resolve), plus a kind-specific
+        # label; empty tables are skipped.
+        base_label = f"tab:safe-wide-{safe_arch}{label_suffix}"
+        bare_emitted = False
         ds_disp = _dataset_display_name(dataset)
         is_n1 = roles is not None and set(roles) == {"N1"}
-        if is_n1:
-            cap = (
-                f"Experiments for {ds_disp} and architecture "
-                f"\\textbf{{{arch}}}, source network $N_{{\\mathrm{{pre}}}}$. "
-                r"Each cell gives $(\delta_l, \delta_u, t)$ for the \baseline "
-                r"baseline and \emph{ours} (the \emph{ours "
-                r"with transfer} columns are blank, as transfer applies to "
-                r"$N$ only). The target network $N$ is in "
-                r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
-        else:
-            cap = (
-                r"Experiments evaluating \tool in comparison to \baseline on "
-                + ds_disp + r" and architecture \textbf{" + arch
-                + r"}, target network $N$.")
-        cap += _timeout_caption_clause(force_timeout, arch)
-        lines.append(f"\\caption{{{cap}}}")
-        lines.append(f"\\label{{tab:safe-wide-{safe_arch}{label_suffix}}}")
-        lines.append(r"\end{table*}")
-        lines.append("")
+        for want_all_timeout, extra_label in ((True, "timeout"),
+                                              (False, "solved")):
+            # Each rendered row = data_cells + the trailing pair for this table:
+            # the bound-difference cells for the all-timeout table, the speedup
+            # cells for the solved table.
+            kind = [(lp, [dc + (bd if want_all_timeout else sp)
+                          for (dc, at, sp, bd) in rows
+                          if at == want_all_timeout])
+                    for (lp, rows) in arch_blocks]
+            kind = [(lp, r) for (lp, r) in kind if r]
+            if not kind:
+                continue
+            lines.append(r"\begin{table*}[!tbp]")
+            lines.append(r"\centering")
+            lines.append(r"\scriptsize")
+            lines.append(r"\setlength{\tabcolsep}{3pt}")
+            lines.append(r"\begin{adjustbox}{max width=\textwidth,center}%")
+            lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
+            lines.append(r"\toprule")
+            lines.append(r"\aaaisafewideheaderbd" if want_all_timeout
+                         else r"\aaaisafewideheader")
+            lines.append(r"\midrule")
+            for label_parts, krows in kind:
+                # Distribute the model label parts down the first column. More
+                # rows than parts -> trailing rows get an empty model cell. Fewer
+                # rows than parts -> pack the leftover parts into the last row via
+                # a left-aligned \shortstack so nothing is dropped.
+                n_rows = len(krows)
+                row_labels = [""] * n_rows
+                for i in range(min(n_rows, len(label_parts))):
+                    if i == n_rows - 1 and n_rows < len(label_parts):
+                        row_labels[i] = (r"\shortstack[l]{"
+                                         + r"\\".join(label_parts[i:]) + r"}")
+                    else:
+                        row_labels[i] = label_parts[i]
+                for lbl, data_cells in zip(row_labels, krows):
+                    lines.append(" & ".join([lbl] + data_cells) + r" \\")
+                lines.append(r"\midrule")
+            if lines[-1].rstrip() == r"\midrule":
+                lines[-1] = r"\bottomrule"
+            lines.append(r"\end{tabular}%")
+            lines.append(r"\end{adjustbox}")
+            if is_n1:
+                cap = (
+                    f"Experiments for {ds_disp} and architecture "
+                    f"\\textbf{{{arch}}}, source network $N_{{\\mathrm{{pre}}}}$. "
+                    r"Each cell gives $(\delta_l, \delta_u, t)$ for the \baseline "
+                    r"baseline and \emph{ours} (the \emph{ours "
+                    r"with transfer} columns are blank, as transfer applies to "
+                    r"$N$ only). The target network $N$ is in "
+                    r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
+            else:
+                cap = (
+                    r"Experiments evaluating \tool in comparison to \baseline on "
+                    + ds_disp + r" and architecture \textbf{" + arch
+                    + r"}, target network $N$.")
+            if want_all_timeout:
+                cap += (r" This table lists only the cells where all three "
+                        r"methods (\baseline, \emph{ours}, and \emph{ours with "
+                        r"transfer}) reach the solver timeout, so no method "
+                        r"finishes. As the solve times carry no signal there, "
+                        r"the last two columns instead report the ratio of the "
+                        r"baseline's remaining bound gap to each method's, "
+                        r"$\dfrac{\delta_u^{\baseline}-\delta_l^{\baseline}}"
+                        r"{\delta_u-\delta_l}$ (with $\delta_u-\delta_l$ the gap "
+                        r"in percentage points of $\delta_{\max}$): a value above "
+                        r"$1$ means the method's bound is tighter than "
+                        r"\baseline's, below $1$ means \baseline is tighter.")
+            else:
+                cap += (r" This table lists the cells where at least one of the "
+                        r"three methods does not reach the solver timeout (it "
+                        r"finishes earlier, or was not run).")
+            cap += _timeout_caption_clause(force_timeout, arch)
+            lines.append(f"\\caption{{{cap}}}")
+            if not bare_emitted:
+                lines.append(f"\\label{{{base_label}}}")
+                bare_emitted = True
+            lines.append(f"\\label{{{base_label}-{extra_label}}}")
+            lines.append(r"\end{table*}")
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -5350,6 +5470,33 @@ def _filter_rows_by_c_targets(rows, requested_c_targets):
     return out
 
 
+def _filter_rows_by_c_sources(rows, requested_c_sources):
+    """Keep only rows whose (0-indexed) c_source is in `requested_c_sources`.
+
+    The c_source (Cs / c_tag) analogue of `_filter_rows_by_c_targets`: used by
+    the --paper_tables_from_txt path to restrict every generated table/chart to a
+    caller-chosen subset of SOURCE classes (--cs / #CS groups). A row with no
+    c_source is kept as-is; a None request is a no-op (full sweep).
+    `requested_c_sources` is 0-indexed (the caller converts Julia's 1-indexed
+    --cs), matching the c_source field the result files store, and may be a
+    per-arch dict so each row is filtered against its own arch's set."""
+    if requested_c_sources is None:
+        return rows
+    out = []
+    for r in rows:
+        req = _cs_for(requested_c_sources, r.get("arch"))
+        cs = r.get("c_source")
+        if req is None or cs is None:
+            out.append(r)
+            continue
+        try:
+            if int(cs) in req:
+                out.append(r)
+        except (TypeError, ValueError):
+            out.append(r)
+    return out
+
+
 def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           parse_result_file,
                                           seeds_filter=None,
@@ -5364,6 +5511,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           perts=None,
                                           combination_filter=None,
                                           requested_c_targets=None,
+                                          requested_c_sources=None,
                                           stale_fn=None):
     """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
     AAAI variant into the neta_s_paper evaluation section. When
@@ -5400,6 +5548,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
             rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
                                                 seeds_filter=seeds_filter)
         rows = _filter_rows_by_c_targets(rows, requested_c_targets)
+        rows = _filter_rows_by_c_sources(rows, requested_c_sources)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
         delta_d_by_key = _load_delta_d_values(cwd, dataset, archs)
         body = _render_aaai_wide_perarch_body(
@@ -5458,6 +5607,21 @@ _AAAI_CHART_SERIES = (
     (("1", "1", "1", "0.5"),    r"ours",                    "fill=oursgreen!42, draw=oursgreen!60!black",
         "pattern=north east lines, pattern color=oursgreen!70!black"),
     ("adv_zono_prevpgd_0.5+sg", r"ours with transfer",      "fill=oursgreen!48!black, draw=oursgreen!25!black",
+        "pattern=vertical lines, pattern color=white"),
+)
+
+# Palette for the "bounds difference" charts (clusters where all three methods
+# hit the timeout). Same series KEYS, same three fill PATTERNS/textures as
+# _AAAI_CHART_SERIES (none / north-east lines / vertical lines), but a DISTINCT
+# colour family (amber baseline + blue light/dark "ours" pair) so a
+# bounds-difference figure never reads as a solve-time figure. Colours are
+# defined in main.tex (bddiffbase, bddiffours).
+_AAAI_CHART_SERIES_GAP = (
+    ("vaghar",                  r"\baseline",               "fill=bddiffbase, draw=bddiffbase!60!black",
+        ""),
+    (("1", "1", "1", "0.5"),    r"ours",                    "fill=bddiffours!38, draw=bddiffours!60!black",
+        "pattern=north east lines, pattern color=bddiffours!70!black"),
+    ("adv_zono_prevpgd_0.5+sg", r"ours with transfer",      "fill=bddiffours!55!black, draw=bddiffours!25!black",
         "pattern=vertical lines, pattern color=white"),
 )
 
@@ -5678,12 +5842,12 @@ def _aaai_hlabel_pt(nmax, ncol_max):
 
 def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                       value_labels=False, label_font=6.5,
-                      draw_ibeam=False, panel_ymax=None):
+                      series=_AAAI_CHART_SERIES):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
-    (type_disp, item_label, {sk:(value, partial[, gap_pp])}). The optional third
-    element `gap_pp` is delta_u - delta_l in percentage points of delta_max; when
-    `draw_ibeam` is set (and `panel_ymax` gives the panel's data range) it is
-    rendered as an I-beam centred on the bar top (see _AAAI_IBEAM_PANEL_FRAC).
+    (type_disp, item_label, {sk:(value, partial)}). `series` is the per-method
+    style table (_AAAI_CHART_SERIES for the solve-time figures,
+    _AAAI_CHART_SERIES_GAP for the bounds-difference figures) and fixes the
+    per-bar fill/draw colour, fill pattern, and left-to-right order.
 
     When `cluster` is set, the bar-groups are CLUSTERED by `type_disp`: the
     types are ordered by mean, the perturbations within a type are ordered by
@@ -5695,14 +5859,14 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
 
     Within every bar-group the bars are drawn in the FIXED order transfer,
     ours, vaghar (left to right), ADJACENT, coloured AND textured per method
-    (each gets its `_AAAI_CHART_SERIES` fill pattern overlaid); a partial bar
+    (each gets its `series` fill pattern overlaid); a partial bar
     gets a red `*`. Heights pass through f(v)=v**power. Returns (lines, xmax,
     xtick_str, xticklabels_str); each item_label is wrapped in braces here."""
-    style_of = {k: sty for k, _l, sty, _pat in _AAAI_CHART_SERIES}
-    pattern_of = {k: pat for k, _l, _s, pat in _AAAI_CHART_SERIES}
+    style_of = {k: sty for k, _l, sty, _pat in series}
+    pattern_of = {k: pat for k, _l, _s, pat in series}
     # Fixed within-group left-to-right order: transfer, ours, vaghar.
     bar_rank = {k: i for i, (k, _l, _s, _p)
-                in enumerate(reversed(_AAAI_CHART_SERIES))}
+                in enumerate(reversed(series))}
     lines = []
     xticks = []  # (xpos, item_label)
 
@@ -5722,7 +5886,6 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
         center0 = x - (k - 1) * stride / 2.0
         for bi, (sk, pair) in enumerate(items):
             v, p = pair[0], pair[1]
-            gap_pp = pair[2] if len(pair) > 2 else None
             xc = center0 + bi * stride
             xl = xc - bar_w / 2.0
             xr = xc + bar_w / 2.0
@@ -5733,40 +5896,13 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                 f"\\filldraw[{style_of[sk]}, line width=0.2pt] {rect};")
             if pattern_of[sk]:
                 lines.append(f"\\fill[{pattern_of[sk]}] {rect};")
-            # I-beam gap marker, centred on the bar top: half its height sits
-            # inside the bar fill, half floats above (arXiv:2511.10576 fig 5).
-            # Height = gap fraction of the panel's data range; short caps make
-            # it read as a narrow capital "I". The value label (below) is lifted
-            # by `label_lift` to clear the upper cap.
-            label_lift = 0.0
-            if (draw_ibeam and panel_ymax and gap_pp is not None
-                    and gap_pp > _AAAI_IBEAM_MIN_PP):
-                half = (gap_pp / 100.0) * _AAAI_IBEAM_PANEL_FRAC * panel_ymax / 2.0
-                yb, yt = h - half, h + half
-                cap = bar_w * _AAAI_IBEAM_CAP_FRAC
-                cl, cr = xc - cap, xc + cap
-                lines.append(
-                    f"\\draw[black, line width=0.5pt, line cap=round]"
-                    f" (axis cs:{xc:.4g},{yb:.4g}) --"
-                    f" (axis cs:{xc:.4g},{yt:.4g});")
-                lines.append(
-                    f"\\draw[black, line width=0.5pt, line cap=round]"
-                    f" (axis cs:{cl:.4g},{yt:.4g}) --"
-                    f" (axis cs:{cr:.4g},{yt:.4g});")
-                lines.append(
-                    f"\\draw[black, line width=0.5pt, line cap=round]"
-                    f" (axis cs:{cl:.4g},{yb:.4g}) --"
-                    f" (axis cs:{cr:.4g},{yb:.4g});")
-                label_lift = half
             if value_labels:
                 # Value label printed HORIZONTALLY, centred just above the bar
                 # top (anchor=south). The figure-wide point size (label_font,
                 # from _aaai_hlabel_pt) is sized so even the widest label fits
                 # the bar WIDTH with a small gap each side, so horizontal numbers
-                # stay separated and readable. When an I-beam is present the
-                # baseline is lifted to just above its upper cap so the number
-                # never sits over the marker.
-                ly = h + label_lift
+                # stay separated and readable.
+                ly = h
                 lines.append(
                     f"\\node[anchor=south,"
                     f" font=\\fontsize{{{label_font:.3g}}}"
@@ -5872,17 +6008,75 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False):
     return out
 
 
-def _aaai_standalone_legend():
+def _aaai_bd_single_figure(groups, force_timeout=None,
+                           label_base="fig:n2-bounddiff"):
+    """Emit the BOUNDS-DIFFERENCE chart as ONE flat grouped-bar figure (not a
+    per-architecture grid, and pooled across ALL datasets, per user request):
+    every all-three-timeout cluster sits on a single axis, ordered by magnitude,
+    and each HORIZONTAL x label names the perturbation type + size, the
+    architecture, and the dataset (plus any "missing Cs=k" note). Bars are the
+    mean delta_u-delta_l (% of delta_max, shorter = tighter) in the distinct
+    bounds-difference palette, keeping the same per-method textures as the time
+    figure. `groups` is a list of ("", full_x_label, {sk:(gap, partial)})."""
+    power = _AAAI_YAXIS_POWER
+    allvals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
+    vmax = max(allvals) if allvals else 1.0
+    ymax, ytick_clause = _aaai_yaxis(vmax)
+    # One figure-wide value-label point size, fitted to a single row of as many
+    # slots as clusters (ncol_max=1 -- the whole \textwidth is one axis).
+    hlabel_pt = _aaai_hlabel_pt(max(len(groups), 1), 1)
+    content, n, xtick, xticklabels = _aaai_bar_content(
+        groups, power, cluster=False, value_labels=True, label_font=hlabel_pt,
+        series=_AAAI_CHART_SERIES_GAP)
+    out = []
+    out.append(r"\begin{figure*}[tp]")
+    out.append(r"\centering")
+    out += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
+    out.append(r"\par\smallskip")
+    out.append(r"\begin{tikzpicture}")
+    out.append(
+        r"\begin{axis}[" "\n"
+        r"  width=\textwidth, height=6cm," "\n"
+        f"  ymin=0, ymax={ymax:.4g}, xmin=0.4, xmax={n + 0.6:g}, "
+        f"{ytick_clause}" "\n"
+        r"  ylabel={bound diff.\ (\% $\delta_{\max}$)}," "\n"
+        r"  ylabel style={font=\small}," "\n"
+        f"  xtick={{{xtick}}}, xticklabels={{{xticklabels}}}," "\n"
+        # HORIZONTAL x labels (user request): not rotated, centred under each
+        # cluster; the multi-line stack (type+size / arch / dataset / notes)
+        # keeps each label narrow.
+        r"  x tick label style={align=center, font=\scriptsize}," "\n"
+        r"  y tick label style={font=\small}," "\n"
+        r"  axis background/.style={fill=black!4}," "\n"
+        r"  ymajorgrids, major grid style={gray!25}]")
+    out += content
+    out.append(r"\end{axis}")
+    out.append(r"\end{tikzpicture}")
+    cap = (r"Remaining bound difference $\delta_u-\delta_l$ (as a percentage of "
+           r"$\delta_{\max}$; shorter is tighter) of \tool compared to "
+           r"\baseline (baseline), for every perturbation cluster where all "
+           r"three methods reach the timeout. Each x label gives the "
+           r"perturbation type and size, the architecture, and the dataset; "
+           r"each bar is the mean over the source classes $c_s$.")
+    out.append(f"\\caption{{{cap}}}")
+    out.append(f"\\label{{{label_base}}}")
+    out.append(r"\end{figure*}")
+    out.append("")
+    return out
+
+
+def _aaai_standalone_legend(series=_AAAI_CHART_SERIES):
     """A centred, self-contained legend -- one box + label per method, drawn
     manually with tikz nodes (chained left-to-right via the `positioning`
     library) so it sits once at the top of a figure. Each box shows the
     method's fill colour AND its fill pattern (overlaid), matching the bars.
-    Entries are in REVERSED `_AAAI_CHART_SERIES` order so the legend reads
+    Entries are in REVERSED `series` order so the legend reads
     left-to-right in the same order the bars are drawn within a group
-    (ours with transfer, ours, vaghar)."""
+    (ours with transfer, ours, vaghar). Pass _AAAI_CHART_SERIES_GAP to match
+    the bounds-difference figures' palette."""
     out = [r"\begin{tikzpicture}[font=\footnotesize]"]
     prev = None
-    for i, (_k, lbl, sty, pat) in enumerate(tuple(reversed(_AAAI_CHART_SERIES))):
+    for i, (_k, lbl, sty, pat) in enumerate(tuple(reversed(series))):
         box, txt = f"lb{i}", f"lt{i}"
         pos = "" if prev is None else f", right=14pt of {prev}"
         out.append(f"\\node[{sty}, line width=0.2pt, minimum width=0.32cm,"
@@ -5898,11 +6092,16 @@ def _aaai_standalone_legend():
 
 
 def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
-                        ncol_max):
-    """One architecture's block: a 2-D groupplot whose COLUMNS are the source
-    classes `c_cols` (left-to-right) and ROWS are the perturbation types
-    `types_order` (top-to-bottom), so every (type, c_s) gets its own little
-    graph. `cell_map[(type_disp, c_src)]` is a list of (type, size, bars) for
+                        ncol_max, series=_AAAI_CHART_SERIES,
+                        unit_label="time (minutes)", col_titles=None):
+    """A 2-D groupplot whose COLUMNS are `c_cols` (left-to-right) and ROWS are
+    the perturbation types `types_order` (top-to-bottom), so every
+    (type, column) gets its own little graph. When `col_titles` is given (a dict
+    column_key -> title string) the top-row title is that string -- used for the
+    merged solve-time grid whose columns are architectures (titled by arch +
+    dataset); otherwise the columns are source classes and the title is the c_s
+    value (or "mean over c_s" for the merged column).
+    `cell_map[(type_disp, column_key)]` is a list of (type, size, bars) for
     that panel (missing -> blank panel). Each GRAPH (panel) carries its OWN
     standalone linear (real-value) y-axis, fitted to that panel's tallest bar
     and printing its OWN y-tick numbers (user request: the y-axis stands on its
@@ -5997,8 +6196,10 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
         r"  ymin=0," "\n"
         r"  ylabel style={font=\footnotesize, align=center},"
         r" y tick label style={font=\scriptsize}," "\n"
-        r"  x tick label style={font=\scriptsize}," "\n"
-        r"  title style={font=\small}," "\n"
+        r"  x tick label style={font=\scriptsize, align=center}," "\n"
+        # align=center lets a column title carry a \\ line break (the merged
+        # solve-time grid puts the architecture on line 1, the dataset on line 2).
+        r"  title style={font=\small, align=center}," "\n"
         r"  ymajorgrids, major grid style={gray!25}]")
     for ri, type_disp in enumerate(types_order):
         for ci, c in enumerate(c_cols):
@@ -6018,13 +6219,11 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
                 x_offset = (slots_global - len(groups)) / 2.0
                 # One figure-wide point size for every horizontal value label,
                 # sized so the widest label fits the bar WIDTH with a small gap
-                # each side (see _aaai_hlabel_pt / _draw_group). Each bar also
-                # carries an I-beam whose height encodes its delta_u-delta_l gap,
-                # scaled against this panel's data range (`pymax`).
+                # each side (see _aaai_hlabel_pt / _draw_group). `series` fixes
+                # the per-method palette (solve-time vs bounds-difference).
                 content, _n, xtick, xticklabels = _aaai_bar_content(
                     groups, power, cluster=False, x_offset=x_offset,
-                    value_labels=True, label_font=hlabel_pt,
-                    draw_ibeam=True, panel_ymax=pymax)
+                    value_labels=True, label_font=hlabel_pt, series=series)
             else:
                 content, xtick, xticklabels = [], "", ""
             opt = f"xmin=0.5, xmax={slots + 0.5:g}, ymax={pymax:.4g}"
@@ -6035,17 +6234,28 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
             else:
                 opt += r", xtick=\empty"
             if ri == 0:
-                opt += r", title={$c_s{=}" + str(c) + r"$}"
+                # Column title (top row only): an explicit `col_titles` entry
+                # (the merged solve-time grid -> arch + dataset) wins; else the
+                # merged c_s column gets "mean over c_s" and a genuine per-Cs
+                # column keeps its "$c_s{=}k$" title.
+                if col_titles is not None:
+                    opt += r", title={" + col_titles.get(c, "") + r"}"
+                elif c == _MERGED_COL:
+                    opt += r", title={mean over $c_s$}"
+                else:
+                    opt += r", title={$c_s{=}" + str(c) + r"$}"
             if ci == 0:
                 # Left-column axis label, written ONCE per row: the perturbation
                 # name plus, on a second (inner) vertical line to its right, the
-                # y-axis unit "time (minutes)". The rotated 2-line label stacks
-                # the first line on the OUTER (left) side and the second on the
-                # INNER (right, axis-facing) side, so "time (minutes)" sits just
-                # right of the perturbation name (see `align=center` in the
-                # ylabel style). Smaller/gray so the name stays dominant.
+                # y-axis unit (`unit_label` -- "time (minutes)" for the solve-time
+                # figures, the bound-difference unit for the bounds-difference
+                # ones). The rotated 2-line label stacks the first line on the
+                # OUTER (left) side and the second on the INNER (right,
+                # axis-facing) side (see `align=center` in the ylabel style).
+                # Smaller/gray so the name stays dominant.
                 opt += (", ylabel={" + type_disp
-                        + r"\\{\scriptsize\color{gray!55!black} time (minutes)}}")
+                        + r"\\{\scriptsize\color{gray!55!black} "
+                        + unit_label + r"}}")
             out.append(f"\\nextgroupplot[{opt}]")
             out += content
     out.append(r"\end{groupplot}")
@@ -6054,7 +6264,8 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
 
 
 def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
-                            force_timeout=None):
+                            force_timeout=None, series=_AAAI_CHART_SERIES,
+                            unit_label="time (minutes)", bounddiff=False):
     """Emit one two-column `figure*` PER architecture (user: separate each
     architecture into its own figure). Each figure has its own shared legend,
     that architecture's 2-D groupplot grid (columns = c_s, rows = perturbation
@@ -6067,7 +6278,11 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
     x-range (`nmax`) and are sized from the figure-wide maximum column count
     (`ncol_max`) under `scale only axis` (see _aaai_arch_typegrid), so a figure
     with fewer columns is simply narrower (centred) rather than carrying wider
-    bars."""
+    bars.
+
+    `series`/`unit_label`/`bounddiff` select the SOLVE-TIME rendering (default)
+    or the BOUNDS-DIFFERENCE one (distinct palette, gap unit, gap-specific
+    caption) for the clusters where all three methods reached the timeout."""
     nmax = max((len(groups)
                 for (_ar, _ad, _c, _t, cm) in arch_rows
                 for groups in cm.values()), default=1)
@@ -6077,13 +6292,32 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
             arch_rows):
         out.append(r"\begin{figure*}[tp]")
         out.append(r"\centering")
-        out += _aaai_standalone_legend()
+        out += _aaai_standalone_legend(series=series)
         out.append(r"\par\smallskip")
         out += _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
-                                   ncol_max)
-        cap = (r"\tool compared to \baseline (baseline) on "
-               + dataset_disp + r" (" + arch_disp + r") across different perturbation "
-               r"types and sizes.")
+                                   ncol_max, series=series,
+                                   unit_label=unit_label)
+        if bounddiff:
+            # Bounds-difference figure: only the all-three-timeout clusters,
+            # where the bar height is the remaining bound gap delta_u-delta_l
+            # (shorter = tighter) rather than a solve time.
+            cap = (r"Remaining bound difference $\delta_u-\delta_l$ (as a "
+                   r"percentage of $\delta_{\max}$; shorter is tighter) of "
+                   r"\tool compared to \baseline (baseline) on "
+                   + dataset_disp + r" (" + arch_disp + r"), for the "
+                   r"perturbation clusters where all three methods reach the "
+                   r"timeout. Each bar is the mean over the source classes "
+                   r"$c_s$; a cluster is only shown for a $c_s$ that has all "
+                   r"three methods, and any $c_s$ absent from a cluster is "
+                   r"marked on its label.")
+        else:
+            cap = (r"\tool compared to \baseline (baseline) on "
+                   + dataset_disp + r" (" + arch_disp + r") across different perturbation "
+                   r"types and sizes. Each bar is the mean solve time over the "
+                   r"source classes $c_s$; a cluster is only shown for a $c_s$ that "
+                   r"has all three methods, and any $c_s$ absent from a cluster is "
+                   r"marked on its label. Clusters where all three methods reach "
+                   r"the timeout are moved to the bounds-difference figure.")
         cap += _timeout_caption_clause(force_timeout, arch)
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
@@ -6094,19 +6328,58 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
     return out
 
 
+def _aaai_combined_time_figure(col_order, col_titles, types_order, cell_map,
+                               caption, labels):
+    """Emit ONE solve-time `figure*`: a 2-D groupplot grid whose COLUMNS are
+    `col_order` (architectures, titled via `col_titles`) and whose ROWS are the
+    perturbation types `types_order`, so every little graph sits at
+    (row=perturbation type, col=architecture). The bars/values are unchanged
+    from the old per-arch figures -- only their layout moves. Bars auto-narrow
+    because the panel width divides `\\textwidth` by the number of columns.
+
+    `cell_map[(type_disp, col_key)]` is the list of per-size bar-groups for that
+    panel. `caption` is the caption TEXT and `labels` the list of `\\label`
+    names to emit (the caller assigns per-database labels + arch aliases)."""
+    nmax = max((len(groups) for groups in cell_map.values()), default=1)
+    ncol_max = max(len(col_order), 1)
+    out = []
+    out.append(r"\begin{figure*}[tp]")
+    out.append(r"\centering")
+    out += _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
+    out.append(r"\par\smallskip")
+    out += _aaai_arch_typegrid(
+        col_order, types_order, cell_map, r"time (min)", nmax, ncol_max,
+        series=_AAAI_CHART_SERIES, unit_label="time (minutes)",
+        col_titles=col_titles)
+    out.append(f"\\caption{{{caption}}}")
+    for lb in labels:
+        out.append(f"\\label{{{lb}}}")
+    out.append(r"\end{figure*}")
+    out.append("")
+    return out
+
+
+# Sentinel column key for the MERGED-over-source-classes chart: the old grid
+# had one column per source class c_s; now the c_s columns are collapsed into a
+# single column whose bars are the mean over c_s (see _render_aaai_n2_charts).
+_MERGED_COL = "__merged_cs__"
+
+
 def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                            force_timeout=None, rerun_timeout_eps=30.0,
-                           requested_c_targets=None):
-    """Emit one solve-time figure per architecture (a c_s x perturbation-type
-    grid of bars for the three methods). Every perturbation is charted here,
-    including cells where all three methods hit the timeout: those simply sit
-    flat at the wall-clock cap and are told apart by their I-beam, which
-    encodes the remaining delta_u - delta_l gap (there is no longer a separate
-    bound-gap figure). Bucketing mirrors the N2 per-cell table so the bar
-    heights equal the table's time cells (geom side where present, else
-    base)."""
+                           requested_c_targets=None,
+                           requested_c_sources=None):
+    """Emit, per architecture, up to TWO merged-over-c_s figures for the three
+    methods: a SOLVE-TIME figure (bar height = mean minutes) for clusters where
+    at least one method finishes, and a BOUNDS-DIFFERENCE figure (bar height =
+    mean delta_u - delta_l as a percentage of delta_max, shorter is tighter)
+    for clusters where all three methods reach the timeout -- there a time bar
+    carries no signal, so the remaining bound gap is charted instead. The two
+    figures use distinct palettes but the SAME bar textures. Bucketing mirrors
+    the N2 per-cell table so the bar heights equal the table's cells (geom side
+    where present, else base)."""
     if not rows:
-        return r"\noindent\textit{No data available.}"
+        return [], []
     if force_timeout is not None:
         rows = [r for r in rows
                 if not _aaai_is_timeout_mismatch(r, force_timeout,
@@ -6145,18 +6418,32 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
 
     dataset_disp = _dataset_display_name(dataset)
     series_keys = [k for k, _lbl, _sty, _pat in _AAAI_CHART_SERIES]
-    lines = []
-    lines.append(f"% auto-generated: archs={archs}, dataset={dataset}, "
-                 f"n2_time_charts")
-    arch_rows = []   # (arch_disp, c_cols, types_order, cell_map) per arch
+    # Two independent figures now: the SOLVE-TIME grid (clusters where at least
+    # one method finished) and the BOUNDS-DIFFERENCE figure (clusters where all
+    # three methods reached the timeout, so a time bar carries no signal and the
+    # remaining delta_u-delta_l gap is charted instead).
+    #
+    # The solve-time charts are merged into ONE grid whose COLUMNS are the
+    # networks -- an (architecture, dataset) pair -- and whose ROWS are the
+    # perturbation types. Since that grid pools EVERY dataset, this function only
+    # COLLECTS its dataset's time cells (each tagged with dataset + arch) and
+    # RETURNS them; the caller pools across datasets and emits the one figure.
+    time_cells = []   # (dataset_disp, arch, arch_disp, type_disp, size_label, bars)
+    # The bounds-difference figure is a SINGLE flat axis (not a per-arch grid):
+    # every all-three-timeout cluster across all architectures is collected here
+    # as ("", full_x_label, bars), the x label naming type+size, arch, dataset.
+    bd_groups = []
     for arch in archs:
         arch_disp = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
         c_sources = sorted({k[3] for k in buckets if k[0] == arch},
                            key=lambda c: int(c))
-        # One panel per (perturbation type, c_s): cell_map[(type, c_s)] is the
-        # list of per-size bar-groups; type_means drives the row order.
-        cell_map = {}
-        type_means = {}
+        # The per-c_s columns are MERGED into one: for each (perturbation type,
+        # size) we average every method's solve time (and I-beam gap) over the
+        # source classes whose cell passed the "all three methods present +
+        # complete" filter, then note any universe Cs that did NOT pass for that
+        # cluster on the x label. merge_acc keeps, per (type_disp, size_disp),
+        # the passing per-Cs bar dicts so they can be averaged below.
+        merge_acc = {}  # (type_disp, size_disp) -> {c_src: bars}
         for c_src in c_sources:
             dmax_ub = None
             if delta_max_by_key is not None:
@@ -6215,41 +6502,76 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                             cells.get(sk), dmax_ub,
                             prefer_geom=(sk != "vaghar"))
                         bars[sk] = (v, partial, gap)
-                # Only include a perturbation that has ALL THREE methods
-                # (ours with transfer, ours, vaghar) and whose bars are all
-                # complete -- i.e. each covers every EXPECTED target class. With
-                # --ct set, `expected_cts` is exactly the requested class set, so
-                # a cell missing any requested c_target is dropped: the bar graphs
-                # show only cells with all three bars AND full --ct coverage. (The
-                # partial-coverage `*` for results missing vs --ct is shown in the
-                # per-cell TABLES only, not in these charts.)
+                # Keep the per-Cs filter (user request): a source class Cs
+                # contributes to the merged cluster ONLY if it has ALL THREE
+                # methods (ours with transfer, ours, vaghar) and each covers
+                # every EXPECTED target class. A Cs failing this is simply not
+                # averaged in (and shows up as a "missing Cs=k" note instead).
                 if (len(bars) == len(series_keys)
                         and not any(pair[1] for pair in bars.values())):
-                    cell_map.setdefault((type_disp, c_src), []).append(
-                        (type_disp, size_disp, bars))
-                    type_means.setdefault(type_disp, []).extend(
-                        pair[0] for pair in bars.values())
+                    merge_acc.setdefault((type_disp, size_disp), {})[c_src] = bars
 
-        # One block per architecture: a (c_s columns) x (type rows) grid; the
-        # type rows are ordered by ascending mean solve time.
-        if cell_map:
-            c_cols = sorted({c for (_t, c) in cell_map},
-                            key=lambda c: int(c))
-            types_order = sorted(
-                type_means,
-                key=lambda t: sum(type_means[t]) / len(type_means[t]))
-            arch_rows.append(
-                (arch, arch_disp, c_cols, types_order, cell_map))
+        # Collapse the passing per-Cs bars into ONE merged column, then ROUTE
+        # each cluster to one of the two figures: if all three merged bars hit
+        # the timeout the cluster goes to the BOUNDS-DIFFERENCE grid (bar height
+        # = mean remaining delta_u-delta_l gap); otherwise it stays in the
+        # SOLVE-TIME grid (bar height = mean solve time). Any universe Cs absent
+        # from a cluster is appended to its x label as "missing Cs=k" in both.
+        _ft = _ft_for(force_timeout, arch)
+        # A merged bar "reached the timeout" when its mean solve time is pinned
+        # at the wall-clock cap (all contributing Cs runs were clamped there);
+        # rerun_timeout_eps (seconds) is the same slack the sweep uses.
+        cap_min = (_ft / 60.0) if _ft is not None else None
+        eps_min = rerun_timeout_eps / 60.0
 
-    # All architectures in ONE figure: one row per architecture (with a bold
-    # title naming it), a single shared legend, and one caption. Timed-out
-    # cells are included here as regular capped bars (their I-beams still carry
-    # the remaining delta_u-delta_l gap), so there is no separate gap figure.
-    if arch_rows:
-        lines += _aaai_group_grid_figure(
-            arch_rows, r"time (min)", dataset_disp, "fig:n2-time",
-            force_timeout=force_timeout)
-    return "\n".join(lines)
+        def _timed_out(v):
+            return cap_min is not None and v >= cap_min - eps_min
+
+        for (type_disp, size_disp), bars_by_cs in merge_acc.items():
+            # Mean solve time and mean bound gap per method over the qualifying
+            # source classes.
+            merged_time = {}
+            merged_gap = {}
+            for sk in series_keys:
+                vals = [b[sk][0] for b in bars_by_cs.values() if sk in b]
+                gaps = [b[sk][2] for b in bars_by_cs.values()
+                        if sk in b and b[sk][2] is not None]
+                if not vals:
+                    continue
+                merged_time[sk] = sum(vals) / len(vals)
+                merged_gap[sk] = (sum(gaps) / len(gaps)) if gaps else None
+            # Only a cluster with all three merged bars survives (the per-Cs
+            # filter already guarantees each contributing Cs had all three, so
+            # this holds whenever at least one Cs passed).
+            if len(merged_time) != len(series_keys):
+                continue
+            label = size_disp
+            # Route: all three timed out AND every method has a finite gap ->
+            # the single bounds-difference figure; else -> the solve-time grid.
+            # (If a gap is missing we cannot chart the difference, so the cluster
+            # stays in the time grid as flat capped bars.)
+            all_timeout = all(_timed_out(merged_time[sk]) for sk in series_keys)
+            gaps_ok = all(merged_gap[sk] is not None for sk in series_keys)
+            if all_timeout and gaps_ok:
+                bd_bars = {sk: (merged_gap[sk], False) for sk in series_keys}
+                # Flat x label for the single figure: perturbation type + size,
+                # then architecture, then dataset, each on its own line.
+                bd_label = (type_disp + r"\ " + size_disp + r"\\" + arch_disp
+                            + r"\\" + dataset_disp)
+                bd_groups.append(("", bd_label, bd_bars))
+            else:
+                t_bars = {sk: (merged_time[sk], False) for sk in series_keys}
+                # Collected (not emitted): the caller pools these across every
+                # dataset into ONE grid, placing this panel at
+                # (row=type_disp, col=(dataset, arch)).
+                time_cells.append(
+                    (dataset_disp, arch, arch_disp, type_disp, label, t_bars))
+
+    # Return the solve-time cells and the bounds-difference clusters; BOTH are
+    # pooled across datasets by the caller and drawn as ONE combined figure each
+    # (the solve-time grid with network columns, the bounds-difference flat
+    # figure). Nothing is emitted per dataset here.
+    return time_cells, bd_groups
 
 
 def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
@@ -6264,6 +6586,7 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
                                       perts=None,
                                       combination_filter=None,
                                       requested_c_targets=None,
+                                      requested_c_sources=None,
                                       stale_fn=None):
     """Collect the same per-cell rows as the N2 table and emit the
     per-perturbation solve-time and bound-gap charts into the evaluation
@@ -6273,7 +6596,11 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
     come from the advStd .txt files directly when `advstd_meta_fn`/`perts` are
     supplied, else from the CSVs. `stale_fn` (_is_pre_fix_dropped) drops
     pre-fix files that relaxed >=1 binary, on both the vaghar/ours and
-    transfer rows."""
+    transfer rows.
+
+    Returns the dataset's BOUNDS-DIFFERENCE clusters (`bd_groups`, each already
+    labelled with this dataset) so the caller can pool them across every dataset
+    into a single combined bounds-difference figure. Returns [] on any error."""
     try:
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                            parse_result_file,
@@ -6292,22 +6619,141 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
             rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
                                                seeds_filter=seeds_filter)
         rows = _filter_rows_by_c_targets(rows, requested_c_targets)
+        rows = _filter_rows_by_c_sources(rows, requested_c_sources)
         delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
-        body = _render_aaai_n2_charts(
+        time_cells, bd_groups = _render_aaai_n2_charts(
             rows, archs, dataset,
             delta_max_by_key=delta_max_by_key,
             force_timeout=force_timeout,
             rerun_timeout_eps=rerun_timeout_eps,
-            requested_c_targets=requested_c_targets)
-        update_aaai_wide_perarch_tex(tex_path, body,
-                                     begin_mark=begin_mark,
-                                     end_mark=end_mark,
-                                     label_suffix=ds_label_suffix)
+            requested_c_targets=requested_c_targets,
+            requested_c_sources=requested_c_sources)
+        # The per-dataset time block is retired: the solve-time charts are now
+        # ONE cross-dataset grid written by regenerate_aaai_time_combined_section.
+        # Clear this dataset's old block so no stale per-dataset figure lingers.
+        update_aaai_wide_perarch_tex(
+            tex_path,
+            r"% (solve-time charts moved to the combined cross-dataset figure)",
+            begin_mark=begin_mark, end_mark=end_mark,
+            label_suffix=ds_label_suffix)
+        return time_cells, bd_groups
     except SystemExit as exc:
         print(f"[update_advstd_tex_tables] aaai_n2_charts block skipped: "
               f"{exc}")
     except Exception as exc:
         print(f"[update_advstd_tex_tables] aaai_n2_charts block error: "
+              f"{exc}")
+    return [], []
+
+
+AAAI_N2_TIME_COMBINED_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_time_combined"
+AAAI_N2_TIME_COMBINED_END_MARK   = "% END AUTO: aaai_n2_time_combined"
+
+
+def regenerate_aaai_time_combined_section(
+        tex_path, time_cells, force_timeout=None,
+        begin_mark=AAAI_N2_TIME_COMBINED_BEGIN_MARK,
+        end_mark=AAAI_N2_TIME_COMBINED_END_MARK):
+    """Emit the solve-time grids, ONE `figure*` PER DATABASE: each figure's
+    COLUMNS are that database's architectures and its ROWS are the perturbation
+    types, so every little graph sits at (row=perturbation type, col=arch), and
+    the database is named in the caption. All figures share the one AUTO block.
+    `time_cells` is a list of
+    (dataset_disp, arch, arch_disp, type_disp, size_label, bars)."""
+    import re
+    try:
+        if time_cells:
+            # Group the cells by database, preserving encounter order.
+            by_ds = {}
+            for cell in time_cells:
+                by_ds.setdefault(cell[0], []).append(cell)
+            parts = []
+            emitted_arch = set()  # dedup fig:n2-time-<arch> aliases across figures
+            first = True
+            for dataset_disp, cells in by_ds.items():
+                cell_map = {}    # (type_disp, arch) -> [(type_disp, size, bars)]
+                col_titles = {}  # arch -> arch_disp
+                col_order = []   # architecture column order (encounter order)
+                type_means = {}  # type_disp -> [values]  (row order)
+                for (_ds, arch, arch_disp, type_disp,
+                     size_label, bars) in cells:
+                    cell_map.setdefault((type_disp, arch), []).append(
+                        (type_disp, size_label, bars))
+                    type_means.setdefault(type_disp, []).extend(
+                        pair[0] for pair in bars.values())
+                    if arch not in col_titles:
+                        col_titles[arch] = arch_disp
+                        col_order.append(arch)
+                types_order = sorted(
+                    type_means,
+                    key=lambda t: sum(type_means[t]) / len(type_means[t]))
+                caption = (
+                    r"\tool compared to \baseline (baseline) on " + dataset_disp
+                    + r" across architectures (columns), perturbation types "
+                    r"(rows), and sizes. Each bar is the mean solve time over the "
+                    r"source classes $c_s$; a cluster is only shown for a $c_s$ "
+                    r"that has all three methods, and any $c_s$ absent from a "
+                    r"cluster is marked on its label. Clusters where all three "
+                    r"methods reach the timeout are moved to the "
+                    r"bounds-difference figure.")
+                # Labels: the bare fig:n2-time on the first figure, a
+                # per-database fig:n2-time-<dataset>, plus deduped
+                # fig:n2-time-<arch> aliases so older per-arch \refs resolve.
+                dslug = re.sub(r"[^a-z0-9]+", "-", dataset_disp.lower()).strip("-")
+                labels = (["fig:n2-time"] if first else []) + [
+                    f"fig:n2-time-{dslug}"]
+                for arch in col_order:
+                    a = arch.replace("_", "")
+                    if a not in emitted_arch:
+                        emitted_arch.add(a)
+                        labels.append(f"fig:n2-time-{a}")
+                parts += _aaai_combined_time_figure(
+                    col_order, col_titles, types_order, cell_map,
+                    caption, labels)
+                first = False
+            body = "\n".join(parts)
+        else:
+            body = r"% (no solve-time clusters)"
+        update_aaai_wide_perarch_tex(tex_path, body,
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark,
+                                     label_suffix="")
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_time_combined block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_time_combined block error: "
+              f"{exc}")
+
+
+AAAI_N2_BOUNDDIFF_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_bounddiff"
+AAAI_N2_BOUNDDIFF_END_MARK   = "% END AUTO: aaai_n2_bounddiff"
+
+
+def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
+                                      begin_mark=AAAI_N2_BOUNDDIFF_BEGIN_MARK,
+                                      end_mark=AAAI_N2_BOUNDDIFF_END_MARK):
+    """Emit the SINGLE combined bounds-difference figure, pooling `bd_groups`
+    from every dataset (each cluster is already labelled with its perturbation
+    type+size, architecture, and dataset). Written into its OWN dataset-agnostic
+    AUTO block, so there is exactly ONE bounds-difference figure regardless of
+    how many datasets were regenerated."""
+    try:
+        if bd_groups:
+            body = "\n".join(_aaai_bd_single_figure(
+                bd_groups, force_timeout=force_timeout))
+        else:
+            body = (r"% (no cluster has all three methods at the timeout -- "
+                    r"no bounds-difference figure)")
+        update_aaai_wide_perarch_tex(tex_path, body,
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark,
+                                     label_suffix="")
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_bounddiff block skipped: "
+              f"{exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_bounddiff block error: "
               f"{exc}")
 
 

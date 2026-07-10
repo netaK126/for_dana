@@ -458,7 +458,7 @@ end
 function main()
     args = parse_commandline()
     dataset = args["dataset"]
-    model_name = args["model_name"]
+    global model_name = args["model_name"]   # global so mip_set_attr can gate the cnn2 StartNodeLimit cap
     model_path = args["model_path"]
     perturbation = args["perturbation"]
     name_to_save = args["name_to_save"]
@@ -586,13 +586,12 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
         if nn1_use_zono_bounds
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size_b = perturbation_size[1]
-            if size(input_dummy)[4] > 1
-                I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy)[4], 1)
-                I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy)[4], 1)
-            else
-                I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy))
-                I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy))
-            end
+            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
+            # inputs. The old size[4]>1 branch seeded a malformed (k,1) matrix that
+            # collapsed the spatial dims, so conv bound-propagation computed a
+            # negative output size on multi-channel (e.g. CIFAR-10) nets.
+            I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy))
+            I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy))
             global use_zonotope = true
             println("Standard-mode boost: computing absolute zonotope bounds (Source B) on N1...")
             compute_n2_bounds_zonotope_with_n1_tighten(nn, I_pert_up_b, I_pert_down_b)
@@ -625,13 +624,10 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
                 input_dummy_s = zeros(Float64, 1, w, h, k)
                 p_size_s = perturbation_size[1]
-                if size(input_dummy_s)[4] > 1
-                    I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s)[4], 1)
-                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s)[4], 1)
-                else
-                    I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s))
-                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
-                end
+                # Full 4D per-pixel box for single- and multi-channel inputs
+                # (the size[4]>1 multichannel branch was malformed — see fix above).
+                I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s))
+                I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
                 compute_n2_pert_relaxation_bounds(nn, I_pert_up_s, I_pert_down_s)
             end
 
@@ -1036,13 +1032,12 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if use_bound_tightening
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size = perturbation_size[1]
-            if size(input_dummy)[4] > 1
-                I_pert_up_init = p_size .* ones(Float64, size(input_dummy)[4], 1)
-                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy)[4], 1)
-            else
-                I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
-                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-            end
+            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
+            # inputs; the old size[4]>1 branch seeded a malformed (k,1) matrix that
+            # collapsed spatial dims and broke conv bound-propagation on multi-
+            # channel (e.g. CIFAR-10) nets.
+            I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
+            I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
 
             if load_n1_from_disk
                 # Phase-2 loads from disk. diff_bounds.bin is mandatory;
@@ -1403,13 +1398,12 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size = perturbation_size[1]
-            if size(input_dummy)[4] > 1
-                I_pert_up_init = p_size .* ones(Float64, size(input_dummy)[4], 1)
-                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy)[4], 1)
-            else
-                I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
-                I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-            end
+            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
+            # inputs; the old size[4]>1 branch seeded a malformed (k,1) matrix that
+            # collapsed spatial dims and broke conv bound-propagation on multi-
+            # channel (e.g. CIFAR-10) nets.
+            I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
+            I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
             if args["adv_std_zono_bounds"]
                 global use_zonotope = true
                 println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
