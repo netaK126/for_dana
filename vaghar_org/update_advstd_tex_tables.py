@@ -4074,6 +4074,8 @@ _ARCH_TO_MODEL_CLASS_NAME = {
 _FASHION_DATASET_ALIASES = frozenset(
     {"fashion-mnist", "fashion_mnist", "fashion", "fmnist"})
 
+_CIFAR_DATASET_ALIASES = frozenset({"cifar", "cifar10", "cifar-10"})
+
 
 def _dataset_display_name(dataset):
     """Human-readable dataset name for captions, tolerant of the
@@ -4087,10 +4089,22 @@ def _dataset_display_name(dataset):
 def _torchvision_dataset_for(dataset):
     """(torchvision folder name, torchvision dataset class name) for the
     given (possibly aliased) dataset name. Fashion-MNIST lives under
-    {root}/FashionMNIST/raw/*; plain MNIST under {root}/MNIST/raw/*."""
+    {root}/FashionMNIST/raw/*; plain MNIST under {root}/MNIST/raw/*;
+    CIFAR-10 under {root}/cifar-10-batches-py/*."""
     if dataset in _FASHION_DATASET_ALIASES:
         return "FashionMNIST", "FashionMNIST"
+    if dataset in _CIFAR_DATASET_ALIASES:
+        return "cifar-10-batches-py", "CIFAR10"
     return "MNIST", "MNIST"
+
+
+def _dataset_input_dims(dataset):
+    """(channels, width, height) of the dataset's images, used to build a model
+    with the correct input shape before loading its state_dict. MNIST and
+    Fashion-MNIST are 1x28x28 (the model default); CIFAR-10 is 3x32x32."""
+    if dataset in _CIFAR_DATASET_ALIASES:
+        return 3, 32, 32
+    return 1, 28, 28
 
 
 def _find_mnist_data_root(cwd, dataset="mnist"):
@@ -4105,6 +4119,14 @@ def _find_mnist_data_root(cwd, dataset="mnist"):
         cwd,
         os.path.join(cwd, "..", folder),
     ]
+    # CIFAR-10 uses torchvision's {root}/cifar-10-batches-py/ layout (pickled
+    # batches), not the MNIST {Folder}/raw/*-ubyte layout.
+    if dataset in _CIFAR_DATASET_ALIASES:
+        for c in cands:
+            if os.path.isfile(os.path.join(c, "cifar-10-batches-py",
+                                           "batches.meta")):
+                return c
+        return None
     for c in cands:
         if os.path.isfile(os.path.join(c, folder, "raw",
                                        "train-images-idx3-ubyte")):
@@ -4145,7 +4167,12 @@ def _compute_delta_d_for_arch_role(arch, model_pth_path, c_srcs, cwd,
         return None
     try:
         state = torch.load(model_pth_path, map_location="cpu")
-        model = cls()
+        # Build with the dataset's real input shape: MNIST/Fashion default to
+        # 1x28x28, but CIFAR-10 is 3x32x32, so cls() (the MNIST default) would
+        # size-mismatch the CIFAR state_dict. All arch classes share the
+        # (k, w, h, output_size) signature, so this is safe for every arch.
+        k, w, h = _dataset_input_dims(dataset)
+        model = cls(k=k, w=w, h=h)
         model.load_state_dict(state)
         model.eval()
     except Exception:
@@ -4183,10 +4210,35 @@ def _compute_delta_d_for_arch_role(arch, model_pth_path, c_srcs, cwd,
     return {c: v for c, v in deltas.items() if math.isfinite(v)}
 
 
+def _discover_model_role_tags(arch_root):
+    """Fallback (role, tag) discovery for delta_d when the delta_max sibling
+    dir is absent (e.g. CIFAR, whose delta_max pre-phase has not run). Scans
+    model dirs holding a model.pth directly under {arch}_exp and classifies
+    each by the repo's N1/N2 naming: an "_sgd_itr" suffix marks the
+    SGD-boosted target network N2, the base model is the source N1. Skips the
+    _collapsed_bak / _stale / _try scratch dirs. Returns [(role, tag), ...]."""
+    import glob as _glob
+    out = []
+    for d in sorted(_glob.glob(os.path.join(arch_root, "model_*"))):
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(d)
+        if any(s in name for s in
+               ("_collapsed_bak", "_stale", "_try", "_bak")):
+            continue
+        # Flat layout {tag}/model.pth, or nested {tag}/*/model.pth.
+        if not (os.path.isfile(os.path.join(d, "model.pth"))
+                or _glob.glob(os.path.join(d, "*", "model.pth"))):
+            continue
+        role = "N2" if "_sgd_itr" in name else "N1"
+        out.append((role, name))
+    return out
+
+
 def _load_delta_d_values(cwd, dataset, archs, c_srcs=range(10)):
-    """For each (arch, role, tag) discovered under the delta_max sibling
-    dir, compute (or load from JSON cache) the dataset-empirical
-        delta_d(c_src) = max over MNIST(train+test) of
+    """For each (arch, role, tag), compute (or load from JSON cache) the
+    dataset-empirical
+        delta_d(c_src) = max over dataset(train+test) of
                          N(x)[c_src] - max_{k!=c_src} N(x)[k]
     using the model.pth at
         paper_experiments/{dataset}/{arch}_exp/{tag}/model.pth.
@@ -4194,68 +4246,78 @@ def _load_delta_d_values(cwd, dataset, archs, c_srcs=range(10)):
         paper_experiments/{dataset}/{arch}_exp/delta_d/
             delta_d_{arch}_{role}_{tag}.json.
     Returns {(arch, role, c_src_0indexed): float}.
+
+    (role, tag) pairs come from the delta_max sibling dir when it exists (the
+    cached path used for MNIST/Fashion). delta_d itself needs only the model
+    .pth -- not delta_max -- so when that dir is absent (e.g. CIFAR, whose
+    delta_max pre-phase has not run) we fall back to discovering the model dirs
+    directly, letting the tables show a real delta_d even where delta_max is
+    still '?'.
     """
     import glob, json
     out = {}
     c_srcs_list = list(c_srcs)
     for arch in archs:
-        dm_base = os.path.join(cwd, "paper_experiments", dataset,
-                               f"{arch}_exp", "delta_max")
-        if not os.path.isdir(dm_base):
+        arch_root = os.path.join(cwd, "paper_experiments", dataset,
+                                 f"{arch}_exp")
+        dm_base = os.path.join(arch_root, "delta_max")
+        role_tags = []
+        if os.path.isdir(dm_base):
+            for role in ("N1", "N2"):
+                for d in glob.glob(os.path.join(
+                        dm_base, f"delta_max_{arch}_{role}_*")):
+                    tag = os.path.basename(d)[len(f"delta_max_{arch}_{role}_"):]
+                    if tag:
+                        role_tags.append((role, tag))
+        if not role_tags:
+            role_tags = _discover_model_role_tags(arch_root)
+        if not role_tags:
             continue
-        cache_base = os.path.join(cwd, "paper_experiments", dataset,
-                                  f"{arch}_exp", "delta_d")
+        cache_base = os.path.join(arch_root, "delta_d")
         os.makedirs(cache_base, exist_ok=True)
-        for role in ("N1", "N2"):
-            for d in glob.glob(os.path.join(dm_base,
-                                            f"delta_max_{arch}_{role}_*")):
-                tag = os.path.basename(d)[len(f"delta_max_{arch}_{role}_"):]
-                if not tag:
-                    continue
-                cache_fp = os.path.join(
-                    cache_base, f"delta_d_{arch}_{role}_{tag}.json")
-                deltas = None
-                if os.path.isfile(cache_fp):
+        for role, tag in role_tags:
+            cache_fp = os.path.join(
+                cache_base, f"delta_d_{arch}_{role}_{tag}.json")
+            deltas = None
+            if os.path.isfile(cache_fp):
+                try:
+                    with open(cache_fp) as f:
+                        raw = json.load(f)
+                    deltas = {int(k): float(v) for k, v in raw.items()}
+                except (OSError, ValueError):
+                    deltas = None
+            if deltas is None:
+                # Two on-disk layouts in this repo:
+                #   cnn1/cnn2: {arch}_exp/{tag}/model.pth
+                #     (tag is e.g. model_seed42_itr19_sgd_itr1)
+                #   3x10/3x50: {arch}_exp/model_seed42_itr20/{tag}/model.pth
+                #     (tag is an SGD iteration like 19 or 19_sgd_itr1)
+                # Try the flat layout first, then the nested fallback, then any
+                # model.pth one level deeper as a last resort.
+                import glob as _glob
+                candidates = [
+                    os.path.join(arch_root, tag, "model.pth"),
+                    os.path.join(arch_root, "model_seed42_itr20",
+                                 tag, "model.pth"),
+                ]
+                candidates += _glob.glob(os.path.join(
+                    arch_root, "*", tag, "model.pth"))
+                model_pth = next(
+                    (c for c in candidates if os.path.isfile(c)),
+                    candidates[0])
+                deltas = _compute_delta_d_for_arch_role(
+                    arch, model_pth, c_srcs_list, cwd, dataset)
+                if deltas is not None:
                     try:
-                        with open(cache_fp) as f:
-                            raw = json.load(f)
-                        deltas = {int(k): float(v) for k, v in raw.items()}
-                    except (OSError, ValueError):
-                        deltas = None
-                if deltas is None:
-                    # Two on-disk layouts in this repo:
-                    #   cnn1: {arch}_exp/{tag}/model.pth
-                    #     (tag is e.g. model_seed42_itr20)
-                    #   3x10/3x50: {arch}_exp/model_seed42_itr20/{tag}/model.pth
-                    #     (tag is an SGD iteration like 19 or 19_sgd_itr1)
-                    # Try the flat layout first, then the nested fallback,
-                    # then any model.pth one level deeper as a last resort.
-                    import glob as _glob
-                    arch_root = os.path.join(
-                        cwd, "paper_experiments", dataset, f"{arch}_exp")
-                    candidates = [
-                        os.path.join(arch_root, tag, "model.pth"),
-                        os.path.join(arch_root, "model_seed42_itr20",
-                                     tag, "model.pth"),
-                    ]
-                    candidates += _glob.glob(os.path.join(
-                        arch_root, "*", tag, "model.pth"))
-                    model_pth = next(
-                        (c for c in candidates if os.path.isfile(c)),
-                        candidates[0])
-                    deltas = _compute_delta_d_for_arch_role(
-                        arch, model_pth, c_srcs_list, cwd, dataset)
-                    if deltas is not None:
-                        try:
-                            with open(cache_fp, "w") as f:
-                                json.dump({str(k): v
-                                           for k, v in deltas.items()}, f)
-                        except OSError:
-                            pass
-                if deltas is None:
-                    continue
-                for cs, v in deltas.items():
-                    out[(arch, role, cs)] = v
+                        with open(cache_fp, "w") as f:
+                            json.dump({str(k): v
+                                       for k, v in deltas.items()}, f)
+                    except OSError:
+                        pass
+            if deltas is None:
+                continue
+            for cs, v in deltas.items():
+                out[(arch, role, cs)] = v
     return out
 
 
@@ -4996,9 +5058,17 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             dd_val = None
             if delta_d_by_key is not None:
                 dd_val = delta_d_by_key.get((arch, role, c_src))
-            if (dd_val is not None and math.isfinite(dd_val)
-                    and dmax_ub is not None):
-                dd_str = _fmt_sig((dd_val / dmax_ub) * 100.0) + "\\%"
+            if dd_val is not None and math.isfinite(dd_val):
+                if dmax_ub is not None:
+                    dd_str = _fmt_sig((dd_val / dmax_ub) * 100.0) + "\\%"
+                else:
+                    # delta_max unavailable: show the RAW delta_d (the absolute
+                    # margin, not a percentage) flagged with a blue "*", matching
+                    # the raw delta_l/delta_u fallback in the bound cells. This
+                    # label is emitted INSIDE math ($\delta_d{=}...$), so the star
+                    # must be a math superscript ({}^{*}); a text-mode $^*$ here
+                    # would close the surrounding math and break the build.
+                    dd_str = _fmt_sig(dd_val) + r"\textcolor{blue!60!cyan}{{}^{*}}"
             # role is stored as "N1"/"N2"; render per the paper's notation:
             # the target network N2 is written N, and the source network N1
             # is written N_{\mathrm{pre}} (so the model cell reads
@@ -5111,7 +5181,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 # Blue "*" flags a RAW (un-normalized) bound shown because
                 # delta_max was unavailable, distinct from the red "*" (partial
                 # c_target coverage). See the raw-bound fallback above.
-                BLUESTAR = r"\textcolor{blue}{$^*$}"
+                BLUESTAR = r"\textcolor{blue!60!cyan}{$^*$}"
                 for c in columns:
                     s = stats.get(c)
                     if s is None:
