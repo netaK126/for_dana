@@ -5072,6 +5072,25 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         if cell["ub_geom"]:
                             s["ub_pct_geom"] = (sum(cell["ub_geom"])
                                 / len(cell["ub_geom"]) / dmax_ub) * 100.0
+                    else:
+                        # delta_max unavailable for this (arch, role, c_src): we
+                        # cannot normalize the bounds to a percentage, so keep the
+                        # RAW (un-normalized) delta_l/delta_u means. The renderer
+                        # shows these real values flagged with a blue "*" instead
+                        # of a bare dash, so no data is hidden just because the
+                        # delta_max pre-phase has not been run for this cell.
+                        if cell["lb_base"]:
+                            s["lb_raw_base"] = (sum(cell["lb_base"])
+                                / len(cell["lb_base"]))
+                        if cell["lb_geom"]:
+                            s["lb_raw_geom"] = (sum(cell["lb_geom"])
+                                / len(cell["lb_geom"]))
+                        if cell["ub_base"]:
+                            s["ub_raw_base"] = (sum(cell["ub_base"])
+                                / len(cell["ub_base"]))
+                        if cell["ub_geom"]:
+                            s["ub_raw_geom"] = (sum(cell["ub_geom"])
+                                / len(cell["ub_geom"]))
                     stats[c] = s
                     # A side is partial iff at least one expected c_target
                     # wasn't run on that side. Don't penalise extra c_targets
@@ -5089,6 +5108,10 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 pert_str = pert_str.replace("linf", r"$\ell_\infty$")
                 data_cells = [pert_str]
                 STAR = r"\textcolor{red}{$^*$}"
+                # Blue "*" flags a RAW (un-normalized) bound shown because
+                # delta_max was unavailable, distinct from the red "*" (partial
+                # c_target coverage). See the raw-bound fallback above.
+                BLUESTAR = r"\textcolor{blue}{$^*$}"
                 for c in columns:
                     s = stats.get(c)
                     if s is None:
@@ -5119,12 +5142,23 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     # delta_u. The raw incumbent <= best_bound invariant holds;
                     # this is purely a display cap. The diff/gap column is
                     # computed from the pre-clamp values, so it is unaffected.
-                    lb_v, _ = _pick("lb_pct_base", "lb_pct_geom")
-                    ub_v, _ = _pick("ub_pct_base", "ub_pct_geom")
-                    data_cells.append("---" if lb_v is None
-                                      else _fmt_sig(min(100.0, max(0.0, lb_v))))
-                    data_cells.append("---" if ub_v is None
-                                      else _fmt_sig(min(100.0, max(0.0, ub_v))))
+                    def _bound_cell(pct_bk, pct_gk, raw_bk, raw_gk):
+                        # Prefer the percentage-of-delta_max value (clamped to
+                        # [0, 100] as before). When delta_max was unavailable no
+                        # percentage exists, so fall back to the RAW bound mean
+                        # (un-clamped -- it is not a percentage) flagged with a
+                        # blue "*". "---" only when the cell has no bound at all.
+                        v, _ = _pick(pct_bk, pct_gk)
+                        if v is not None:
+                            return _fmt_sig(min(100.0, max(0.0, v)))
+                        raw, _ = _pick(raw_bk, raw_gk)
+                        if raw is not None:
+                            return _fmt_sig(raw) + BLUESTAR
+                        return "---"
+                    data_cells.append(_bound_cell(
+                        "lb_pct_base", "lb_pct_geom", "lb_raw_base", "lb_raw_geom"))
+                    data_cells.append(_bound_cell(
+                        "ub_pct_base", "ub_pct_geom", "ub_raw_base", "ub_raw_geom"))
                     # Solve time (minutes), same geom-preferred side. When
                     # --force_timeout is set, a mean above the cap is overhead
                     # beyond the solver limit and is clamped. The partial "*"
