@@ -4068,6 +4068,7 @@ _ARCH_TO_MODEL_CLASS_NAME = {
     "cnn1": "CNN1",
     "cnn2": "CNN2",
     "cnn3": "CNN3",
+    "cnn5": "CNN5",   # paper "conv4"
 }
 
 
@@ -5025,6 +5026,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         if not arch_keys:
             continue
         safe_arch = arch.replace("_", "")
+        # Displayed architecture name (conv1/conv3/3x50/...); the \label ids keep
+        # the raw key via safe_arch so cross-refs stay stable.
+        arch_disp = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
         _ft = _ft_for(force_timeout, arch)
         _cap_min = (_ft / 60.0) if _ft is not None else None
         _eps_min = rerun_timeout_eps / 60.0
@@ -5080,7 +5084,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # part per row, across the block's rows (rather than a wide
             # full-width heading that overflows into the data columns).
             label_parts = [
-                r"\textbf{" + arch.replace("_", r"\_")
+                r"\textbf{" + arch_disp
                 + r" / $" + role_tex + r"$}",
                 r"$c_s{=}" + str(c_src) + r"$",
                 r"$\delta_{\max}{=}" + dmax_str + r"$",
@@ -5478,8 +5482,8 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             lines.append(r"\end{adjustbox}")
             if is_n1:
                 cap = (
-                    f"Experiments for {ds_disp} and architecture "
-                    f"\\textbf{{{arch}}}, source network $N_{{\\mathrm{{pre}}}}$. "
+                    f"\\baseline and \\emph{{ours}} on {ds_disp} for architecture "
+                    f"\\textbf{{{arch_disp}}}, source network $N_{{\\mathrm{{pre}}}}$. "
                     r"Each cell gives $(\delta_l, \delta_u, t)$ for the \baseline "
                     r"baseline and \emph{ours} (the \emph{ours "
                     r"with transfer} columns are blank, as transfer applies to "
@@ -5487,25 +5491,25 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     r"Table~\ref{tab:safe-wide-" + safe_arch + r"}.")
             else:
                 cap = (
-                    r"Experiments evaluating \tool in comparison to \baseline on "
-                    + ds_disp + r" and architecture \textbf{" + arch
-                    + r"}, target network $N$.")
-            if want_all_timeout:
-                cap += (r" This table lists only the cells where all three "
-                        r"methods (\baseline, \emph{ours}, and \emph{ours with "
-                        r"transfer}) reach the solver timeout, so no method "
-                        r"finishes. As the solve times carry no signal there, "
-                        r"the last two columns instead report the ratio of the "
-                        r"baseline's remaining bound gap to each method's, "
-                        r"$\dfrac{\delta_u^{\baseline}-\delta_l^{\baseline}}"
-                        r"{\delta_u-\delta_l}$ (with $\delta_u-\delta_l$ the gap "
-                        r"in percentage points of $\delta_{\max}$): a value above "
-                        r"$1$ means the method's bound is tighter than "
-                        r"\baseline's, below $1$ means \baseline is tighter.")
-            else:
-                cap += (r" This table lists the cells where at least one of the "
-                        r"three methods does not reach the solver timeout (it "
-                        r"finishes earlier, or was not run).")
+                    r"\tool vs. \baseline on "
+                    + ds_disp + r" for architecture \textbf{" + arch_disp
+                    + r"}, target network $N$")
+                if want_all_timeout:
+                    cap += (r", over the cells where all three methods "
+                            r"(\baseline, \emph{ours}, and \emph{ours with "
+                            r"transfer}) reach the solver timeout. As the solve "
+                            r"times carry no signal there, the last two columns "
+                            r"give the ratio of the baseline's remaining bound "
+                            r"gap to each method's, "
+                            r"$\dfrac{\delta_u^{\baseline}-\delta_l^{\baseline}}"
+                            r"{\delta_u-\delta_l}$ (with $\delta_u-\delta_l$ the "
+                            r"gap in percentage points of $\delta_{\max}$): above "
+                            r"$1$ the method's bound is tighter than \baseline's, "
+                            r"below $1$ \baseline is tighter.")
+                else:
+                    cap += (r", over the cells where at least one method "
+                            r"finishes before the solver timeout (or was not "
+                            r"run).")
             cap += _timeout_caption_clause(force_timeout, arch)
             lines.append(f"\\caption{{{cap}}}")
             if not bare_emitted:
@@ -5639,7 +5643,9 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                             parse_result_file,
                                             seeds_filter=seeds_filter,
                                             stale_fn=stale_fn)
-        archs = [a for a, _ in arch_runs]
+        # Emit archs in Table-1 order so the per-cell tables follow the paper's
+        # Networks table rather than the --arch_timeouts command order.
+        archs = sorted((a for a, _ in arch_runs), key=_tab1_arch_sort_key)
         if advstd_meta_fn is not None and perts is not None:
             rows += _load_advstd_rows_for_wide_from_txt(
                 cwd, dataset, archs, perts, parse_result_file, advstd_meta_fn,
@@ -6113,15 +6119,19 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False):
 
 
 def _aaai_bd_single_figure(groups, force_timeout=None,
-                           label_base="fig:n2-bounddiff"):
+                           label_base="fig:n2-bounddiff", dataset_disp=None):
     """Emit the BOUNDS-DIFFERENCE chart as ONE flat grouped-bar figure (not a
-    per-architecture grid, and pooled across ALL datasets, per user request):
-    every all-three-timeout cluster sits on a single axis, ordered by magnitude,
-    and each HORIZONTAL x label names the perturbation type + size, the
-    architecture, and the dataset (plus any "missing Cs=k" note). Bars are the
-    mean delta_u-delta_l (% of delta_max, shorter = tighter) in the distinct
-    bounds-difference palette, keeping the same per-method textures as the time
-    figure. `groups` is a list of ("", full_x_label, {sk:(gap, partial)})."""
+    per-architecture grid) for a SINGLE dataset (the pooled-across-datasets
+    figure was split per dataset on user request -- one call per dataset, see
+    regenerate_aaai_bounddiff_section): every all-three-timeout cluster of that
+    dataset sits on a single axis, ordered by magnitude, and each HORIZONTAL x
+    label names the perturbation type + size and the architecture (plus any
+    "missing Cs=k" note). The dataset (`dataset_disp`, when given) names the
+    figure via its title, caption, and label suffix rather than being repeated
+    on every x label. Bars are the mean delta_u-delta_l (% of delta_max,
+    shorter = tighter) in the distinct bounds-difference palette, keeping the
+    same per-method textures as the time figure. `groups` is a list of
+    (dataset_disp, full_x_label, {sk:(gap, partial)})."""
     power = _AAAI_YAXIS_POWER
     allvals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
     vmax = max(allvals) if allvals else 1.0
@@ -6135,6 +6145,8 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
     out = []
     out.append(r"\begin{figure*}[tp]")
     out.append(r"\centering")
+    if dataset_disp:
+        out.append(r"{\small\textbf{" + dataset_disp + r"}}\par\smallskip")
     out += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
     out.append(r"\par\smallskip")
     out.append(r"\begin{tikzpicture}")
@@ -6147,8 +6159,8 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
         r"  ylabel style={font=\small}," "\n"
         f"  xtick={{{xtick}}}, xticklabels={{{xticklabels}}}," "\n"
         # HORIZONTAL x labels (user request): not rotated, centred under each
-        # cluster; the multi-line stack (type+size / arch / dataset / notes)
-        # keeps each label narrow.
+        # cluster; the multi-line stack (type+size / arch / notes) keeps each
+        # label narrow (the dataset now titles the whole figure, not each label).
         r"  x tick label style={align=center, font=\scriptsize}," "\n"
         r"  y tick label style={font=\small}," "\n"
         r"  axis background/.style={fill=black!4}," "\n"
@@ -6156,12 +6168,13 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
     out += content
     out.append(r"\end{axis}")
     out.append(r"\end{tikzpicture}")
+    ds_phrase = (r" on " + dataset_disp) if dataset_disp else ""
     cap = (r"Remaining bound difference $\delta_u-\delta_l$ (as a percentage of "
            r"$\delta_{\max}$; shorter is tighter) of \tool compared to "
-           r"\baseline (baseline), for every perturbation cluster where all "
-           r"three methods reach the timeout. Each x label gives the "
-           r"perturbation type and size, the architecture, and the dataset; "
-           r"each bar is the mean over the source classes $c_s$.")
+           r"\baseline (baseline)" + ds_phrase + r", for every perturbation "
+           r"cluster where all three methods reach the timeout. Each x label "
+           r"gives the perturbation type and size and the architecture; each "
+           r"bar is the mean over the source classes $c_s$.")
     out.append(f"\\caption{{{cap}}}")
     out.append(f"\\label{{{label_base}}}")
     out.append(r"\end{figure*}")
@@ -6658,11 +6671,16 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
             gaps_ok = all(merged_gap[sk] is not None for sk in series_keys)
             if all_timeout and gaps_ok:
                 bd_bars = {sk: (merged_gap[sk], False) for sk in series_keys}
-                # Flat x label for the single figure: perturbation type + size,
-                # then architecture, then dataset, each on its own line.
-                bd_label = (type_disp + r"\ " + size_disp + r"\\" + arch_disp
-                            + r"\\" + dataset_disp)
-                bd_groups.append(("", bd_label, bd_bars))
+                # Flat x label for the per-dataset figure: perturbation type +
+                # size, then architecture, each on its own line. The dataset is
+                # NOT repeated on every x label anymore -- the figure is now
+                # split per dataset (see regenerate_aaai_bounddiff_section), so
+                # the dataset names its own figure (title/caption/label) instead.
+                # It rides in the group's first slot (the `type_disp` position,
+                # ignored by _aaai_bar_content when cluster=False) purely as the
+                # grouping key.
+                bd_label = (type_disp + r"\ " + size_disp + r"\\" + arch_disp)
+                bd_groups.append((dataset_disp, bd_label, bd_bars))
             else:
                 t_bars = {sk: (merged_time[sk], False) for sk in series_keys}
                 # Collected (not emitted): the caller pools these across every
@@ -6710,7 +6728,10 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
                                            parse_result_file,
                                            seeds_filter=seeds_filter,
                                            stale_fn=stale_fn)
-        archs = [a for a, _ in arch_runs]
+        # Emit archs in Table-1 order so the per-arch charts (and the combined
+        # cross-dataset grids, which follow encounter order) match the paper's
+        # Networks table rather than the --arch_timeouts command order.
+        archs = sorted((a for a, _ in arch_runs), key=_tab1_arch_sort_key)
         if advstd_meta_fn is not None and perts is not None:
             rows += _load_advstd_rows_for_wide_from_txt(
                 cwd, dataset, archs, perts, parse_result_file, advstd_meta_fn,
@@ -6837,15 +6858,30 @@ AAAI_N2_BOUNDDIFF_END_MARK   = "% END AUTO: aaai_n2_bounddiff"
 def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                                       begin_mark=AAAI_N2_BOUNDDIFF_BEGIN_MARK,
                                       end_mark=AAAI_N2_BOUNDDIFF_END_MARK):
-    """Emit the SINGLE combined bounds-difference figure, pooling `bd_groups`
-    from every dataset (each cluster is already labelled with its perturbation
-    type+size, architecture, and dataset). Written into its OWN dataset-agnostic
-    AUTO block, so there is exactly ONE bounds-difference figure regardless of
-    how many datasets were regenerated."""
+    """Emit the bounds-difference figures, SPLIT one per dataset (user request:
+    the single pooled figure grew too crowded). `bd_groups` is the pooled list
+    of (dataset_disp, x_label, {sk:(gap, partial)}) clusters from every dataset;
+    here they are bucketed by their dataset (first-seen order preserved) and each
+    bucket is drawn as its own flat bounds-difference `figure*`, titled/captioned
+    and labelled by that dataset. All figures are written into the one
+    dataset-agnostic AUTO block."""
     try:
         if bd_groups:
-            body = "\n".join(_aaai_bd_single_figure(
-                bd_groups, force_timeout=force_timeout))
+            # Bucket by dataset, keeping first-seen order (the caller appends
+            # datasets in the order requested on the command line).
+            by_ds = {}
+            for g in bd_groups:
+                by_ds.setdefault(g[0], []).append(g)
+            figs = []
+            for ds_disp, ds_groups in by_ds.items():
+                dslug = re.sub(r"[^a-z0-9]+", "-",
+                               (ds_disp or "").lower()).strip("-")
+                label_base = ("fig:n2-bounddiff-" + dslug
+                              if dslug else "fig:n2-bounddiff")
+                figs += _aaai_bd_single_figure(
+                    ds_groups, force_timeout=force_timeout,
+                    label_base=label_base, dataset_disp=ds_disp or None)
+            body = "\n".join(figs)
         else:
             body = (r"% (no cluster has all three methods at the timeout -- "
                     r"no bounds-difference figure)")
@@ -6875,9 +6911,36 @@ _AAAI_SUMMARY_EXACT_REL_GAP = 0.05
 _AAAI_ARCH_DISPLAY = {
     "cnn1": r"\emph{conv1}",
     "cnn2": r"\emph{conv2}",
+    # CIFAR-10 convolutional nets: internal/data keys cnn4/cnn5 render as the
+    # paper's conv3/conv4 (matching the Networks table in sec_evaluation.tex).
+    "cnn4": r"\emph{conv3}",
+    "cnn5": r"\emph{conv4}",
     "3x50": r"3$\times$50",
     "3x10": r"3$\times$10",
 }
+
+
+# Canonical architecture order matching Table 1 (tab:networks) in
+# sec_evaluation.tex: fully-connected nets by width, then the convolutional
+# nets conv1..conv4 (internal keys cnn1, cnn2, cnn4, cnn5 -- see
+# _AAAI_ARCH_DISPLAY), then the ACAS/HAR nets. Every per-cell table and
+# per-arch chart iterates archs through _tab1_arch_sort_key so their sequence
+# matches the paper's Networks table. Archs not listed here sort last, in
+# alphabetical order, so a new arch never silently jumps to the front.
+_TAB1_ARCH_ORDER = [
+    "3x10", "3x50", "3x100", "6x100", "9x200",
+    "cnn0", "cnn1", "cnn2", "cnn3", "cnn4", "cnn5",
+    "6x50", "fc",
+]
+
+
+def _tab1_arch_sort_key(arch):
+    """Sort key placing `arch` in Table-1 (tab:networks) order; unknown archs
+    sort after all known ones, alphabetically."""
+    try:
+        return (0, _TAB1_ARCH_ORDER.index(arch))
+    except ValueError:
+        return (1, arch)
 
 
 _AAAI_SUMMARY_NUM_CLASSES = {"mnist": 10, "cifar10": 10, "fashion_mnist": 10}

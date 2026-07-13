@@ -1,0 +1,51 @@
+/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+source: 0 target: 1 model_arch: 3x50 perturbation type: rotation perturbation size: [0, 10.0] dataset: mnist
+Attack:   0%|          | 0/50 [00:00<?, ?it/s]Attack:   2%|▏         | 1/50 [00:00<00:27,  1.78it/s]Attack:   4%|▍         | 2/50 [00:01<00:23,  2.00it/s]Attack:   6%|▌         | 3/50 [00:01<00:22,  2.09it/s]Attack:   8%|▊         | 4/50 [00:01<00:21,  2.14it/s]Attack:  10%|█         | 5/50 [00:02<00:20,  2.17it/s]Attack:  12%|█▏        | 6/50 [00:02<00:20,  2.17it/s]Attack:  14%|█▍        | 7/50 [00:03<00:19,  2.18it/s]Attack:  16%|█▌        | 8/50 [00:03<00:19,  2.18it/s]Attack:  18%|█▊        | 9/50 [00:04<00:18,  2.18it/s]Attack:  20%|██        | 10/50 [00:04<00:18,  2.19it/s]Attack:  22%|██▏       | 11/50 [00:05<00:17,  2.18it/s]Attack:  24%|██▍       | 12/50 [00:05<00:17,  2.19it/s]Attack:  26%|██▌       | 13/50 [00:06<00:16,  2.19it/s]Attack:  28%|██▊       | 14/50 [00:06<00:16,  2.19it/s]Attack:  30%|███       | 15/50 [00:06<00:16,  2.18it/s]Attack:  32%|███▏      | 16/50 [00:07<00:15,  2.18it/s]Attack:  34%|███▍      | 17/50 [00:07<00:15,  2.19it/s]Attack:  36%|███▌      | 18/50 [00:08<00:14,  2.16it/s]Attack:  38%|███▊      | 19/50 [00:08<00:14,  2.17it/s]Attack:  40%|████      | 20/50 [00:09<00:13,  2.18it/s]Attack:  42%|████▏     | 21/50 [00:09<00:13,  2.18it/s]Attack:  44%|████▍     | 22/50 [00:10<00:12,  2.19it/s]Attack:  46%|████▌     | 23/50 [00:10<00:12,  2.20it/s]Attack:  48%|████▊     | 24/50 [00:11<00:11,  2.21it/s]Attack:  50%|█████     | 25/50 [00:11<00:11,  2.21it/s]Attack:  52%|█████▏    | 26/50 [00:11<00:10,  2.21it/s]Attack:  54%|█████▍    | 27/50 [00:12<00:10,  2.20it/s]Attack:  56%|█████▌    | 28/50 [00:12<00:09,  2.20it/s]Attack:  58%|█████▊    | 29/50 [00:13<00:09,  2.20it/s]Attack:  60%|██████    | 30/50 [00:13<00:09,  2.19it/s]Attack:  62%|██████▏   | 31/50 [00:14<00:08,  2.19it/s]Attack:  64%|██████▍   | 32/50 [00:14<00:08,  2.18it/s]Attack:  66%|██████▌   | 33/50 [00:15<00:07,  2.18it/s]Attack:  68%|██████▊   | 34/50 [00:15<00:07,  2.18it/s]Attack:  70%|███████   | 35/50 [00:16<00:06,  2.18it/s]Attack:  72%|███████▏  | 36/50 [00:16<00:06,  2.19it/s]Attack:  74%|███████▍  | 37/50 [00:16<00:05,  2.19it/s]Attack:  76%|███████▌  | 38/50 [00:17<00:05,  2.19it/s]Attack:  78%|███████▊  | 39/50 [00:17<00:05,  2.20it/s]Attack:  80%|████████  | 40/50 [00:18<00:04,  2.20it/s]Attack:  82%|████████▏ | 41/50 [00:18<00:04,  2.20it/s]Attack:  84%|████████▍ | 42/50 [00:19<00:03,  2.19it/s]Attack:  86%|████████▌ | 43/50 [00:19<00:03,  2.19it/s]Attack:  88%|████████▊ | 44/50 [00:20<00:02,  2.19it/s]Attack:  90%|█████████ | 45/50 [00:20<00:02,  2.19it/s]Attack:  92%|█████████▏| 46/50 [00:21<00:01,  2.19it/s]Attack:  94%|█████████▍| 47/50 [00:21<00:01,  2.19it/s]Attack:  96%|█████████▌| 48/50 [00:22<00:00,  2.20it/s]Attack:  98%|█████████▊| 49/50 [00:22<00:00,  2.21it/s]Attack:  98%|█████████▊| 49/50 [00:22<00:00,  2.14it/s]
+Traceback (most recent call last):
+  File "./utils/hyper_attack.py", line 449, in <module>
+    best_val = attack(model, X, source, target, device, token_signature, model_arch, dims, perturbation_type, perturbation_size, iterations)
+  File "./utils/hyper_attack.py", line 177, in attack
+    layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, 784))))), dim=0))
+  File "./utils/hyper_attack.py", line 52, in create_attacked
+    Xout[:, :, i, j] = (1-di)*(1-dj) * X[:, :, int(np.floor(i_r)), int(np.floor(j_r))]+\
+IndexError: index 15 is out of bounds for dimension 3 with size 1
+ERROR: LoadError: failed process: Process(`python3 ./utils/hyper_attack.py --dataset mnist --source 0 --target 1 --token 63919556146417 --model 3x50 --model_path /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/model_seed42_itr20/19/model.pth --perturbation rotation --perturbation_size 10.0`, ProcessExited(1)) [1]
+
+Stacktrace:
+  [1] pipeline_error
+    @ ./process.jl:597 [inlined]
+  [2] run(::Cmd; wait::Bool)
+    @ Base ./process.jl:512
+  [3] run
+    @ ./process.jl:509 [inlined]
+  [4] macro expansion
+    @ ~/Downloads/for_dana/vaghar_org/utils/hyper_attack.jl:109 [inlined]
+  [5] macro expansion
+    @ ./timing.jl:461 [inlined]
+  [6] hyper_attack(dataset::String, c_tag::Int64, c_target::Int64, token_signature::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}; force_cpu::Bool)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/hyper_attack.jl:102
+  [7] main_advanced_standard_n1(args::Dict{String, Any}, dataset::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}, name_to_save::String, use_hyper_attack::Bool)
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:1445
+  [8] main()
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:498
+  [9] top-level scope
+    @ ~/Downloads/for_dana/vaghar_org/run.jl:2122
+ [10] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [11] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [12] _start()
+    @ Base ./client.jl:550
+in expression starting at /root/Downloads/for_dana/vaghar_org/run.jl:2122
+Model accuracy: 0.9684
+Model accuracy: 0.9694
+Advanced-standard-N1: computing diff bounds between N1 and N2...
+compute_diff_and_comp_bounds: last hidden layer size = 50, diff width = 0.8242261925354941
+compute_diff_and_comp_bounds: output-layer diff bounds width = 7.376631158194602
+compute_diff_and_comp_bounds: N1 pert bounds width = 28180.306719651224
+compute_diff_and_comp_bounds: N2 pert bounds width = 28186.384402925214
+compute_diff_and_comp_bounds: populated 2 ReLU layers
+Advanced-standard-N1: preserved existing diff_bounds.bin + n1_preact_bounds.bin at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x50_exp/rotation/eps_10/n1_state_3x50_19 (partial-completion mode)
+
+══ Advanced-standard-N1: solving N1 (c_tag=1, c_target=2) ══

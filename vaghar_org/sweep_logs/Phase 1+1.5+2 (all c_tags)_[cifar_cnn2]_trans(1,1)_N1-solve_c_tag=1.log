@@ -25,3 +25,40 @@ Set parameter LicenseID to value 2478548
 Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
 Set parameter TimeLimit to value 5
 Set parameter TimeLimit to value 5
+ERROR: LoadError: Gurobi Error 10022: Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)
+Stacktrace:
+  [1] _check_ret
+    @ ~/.julia/packages/Gurobi/K2XSK/src/MOI_wrapper/MOI_wrapper.jl:417 [inlined]
+  [2] _check_ret_GRBoptimize(model::Gurobi.Optimizer)
+    @ Gurobi ~/.julia/packages/Gurobi/K2XSK/src/MOI_wrapper/MOI_wrapper.jl:434
+  [3] optimize!(model::Gurobi.Optimizer)
+    @ Gurobi ~/.julia/packages/Gurobi/K2XSK/src/MOI_wrapper/MOI_wrapper.jl:2823
+  [4] optimize!
+    @ ~/.julia/packages/MathOptInterface/Q3V1z/src/Bridges/bridge_optimizer.jl:367 [inlined]
+  [5] optimize!(m::MathOptInterface.Utilities.CachingOptimizer{MathOptInterface.Bridges.LazyBridgeOptimizer{Gurobi.Optimizer}, MathOptInterface.Utilities.UniversalFallback{MathOptInterface.Utilities.Model{Float64}}})
+    @ MathOptInterface.Utilities ~/.julia/packages/MathOptInterface/Q3V1z/src/Utilities/cachingoptimizer.jl:379
+  [6] optimize!(model::Model; ignore_optimize_hook::Bool, _differentiation_backend::MathOptInterface.Nonlinear.SparseReverseMode, kwargs::@Kwargs{})
+    @ JuMP ~/.julia/packages/JuMP/0tD10/src/optimizer_interface.jl:610
+  [7] optimize!
+    @ ~/.julia/packages/JuMP/0tD10/src/optimizer_interface.jl:560 [inlined]
+  [8] encode_dependencies(m::Model, layers_n::Int64, phi_dep::Array{Float64, 4}, activation_cnt::Int64, non_equality_tolerance::Float64)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/perturbation_dependencies.jl:194
+  [9] encode_dependencies(m::Model, layers_n::Int64, phi_dep::Array{Float64, 4}, activation_cnt::Int64)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/perturbation_dependencies.jl:125
+ [10] perturbation_dependencies(m::Model, nn::Sequential, perturbation::String, perturbation_size::Vector{Float64}, w::Int64, h::Int64, k::Int64; activation_start::Int64, layers_offset::Nothing, perturbation_var::String)
+    @ Main ~/Downloads/for_dana/vaghar_org/utils/perturbation_dependencies.jl:241
+ [11] main_advanced_standard_n1(args::Dict{String, Any}, dataset::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}, name_to_save::String, use_hyper_attack::Bool)
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:1465
+ [12] main()
+    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:498
+ [13] top-level scope
+    @ ~/Downloads/for_dana/vaghar_org/run.jl:2122
+ [14] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [15] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [16] _start()
+    @ Base ./client.jl:550
+in expression starting at /root/Downloads/for_dana/vaghar_org/run.jl:2122
+Encoding the two copies...
+Encoding dependencies (activation_start=1, layers_offset=3)...

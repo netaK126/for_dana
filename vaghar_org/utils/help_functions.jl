@@ -1009,9 +1009,11 @@ end
 
 function update_results_str(results, c_tag, c_target, d)
     hyper_time = haskey(d, :suboptimal_time) ? d[:suboptimal_time] : 0.0
+    pgd_lower_bound = haskey(d, :suboptimal_solution) ? d[:suboptimal_solution] : 0.0
+    lower_bound = max(d[:incumbent_obj], pgd_lower_bound)
     row = "c_source=" * string(c_tag-1) * "," *
           "c_target=" * string(c_target-1) * "," *
-          "lower_bound=" * string(d[:incumbent_obj]) * "," *
+          "lower_bound=" * string(lower_bound) * "," *
           "upper_bound=" * string(d[:best_bound]) * "," *
           "optimization_time=" * string(d[:solve_time]) * "," *
           "hyper_attack_time=" * string(hyper_time) * "," *

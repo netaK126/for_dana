@@ -360,6 +360,8 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
         model = CNN2(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "cnn3":
         model = CNN3()
+    elif model_arch == "cnn5":
+        model = CNN5(k=k_dim, w=w_dim, h=h_dim)
     else:
         assert False, "New model arch has been detected, please expand models.py and this if condition."
 

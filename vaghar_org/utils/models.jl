@@ -271,6 +271,31 @@ function get_nn(model_path, model_name, w, h, k, c, dataset)
         fc2 = get_matrix_params(dict1, "fc2", (10, 10))
         fc3 = get_matrix_params(dict1, "fc3", (10, c))
         nn = Sequential( [ conv1,ReLU(),conv2,ReLU(),conv3,ReLU(),conv4,ReLU(),conv5,ReLU(), Flatten([1, 2, 3, 4]), fc1, ReLU(), fc2, ReLU(), fc3, ],"nn", )
+    elseif model_name == "cnn5"
+        is_conv = true
+        stride_to_use_1 = 1
+        stride_to_use_2 = 4
+        conv_filters = 10
+        conv_filters2 = 10
+        # Larger 2-CONV + 2-FC net (10 channels), sized so the CIFAR-10 (32x32x3)
+        # instance has ~8910 hidden ReLU neurons. Flattened conv-output size is
+        # derived from the input geometry (valid padding: out = div(in-kernel,stride)+1)
+        # so cnn5 adapts across datasets: 32x32 -> 490 (CIFAR-10), 28x28 -> 360.
+        w1 = div(w - 4, stride_to_use_1) + 1
+        h1 = div(h - 4, stride_to_use_1) + 1
+        w2 = div(w1 - 4, stride_to_use_2) + 1
+        h2 = div(h1 - 4, stride_to_use_2) + 1
+        flatten_num = conv_filters2 * w2 * h2
+        model_pth = myunpickle(model_path)
+        dict1 = Dict{String,Any}("conv1/weight"=>model_pth[1], "conv1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+        "conv2/weight"=>model_pth[3], "conv2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+        "fc1/weight"=>model_pth[5],"fc1/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+        "fc2/weight"=>model_pth[7], "fc2/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+        conv1 = get_conv_params(dict1, "conv1", (4, 4, k, conv_filters), expected_stride = stride_to_use_1)
+        conv2 = get_conv_params(dict1, "conv2", (4, 4, conv_filters, conv_filters2), expected_stride = stride_to_use_2)
+        fc1 = get_matrix_params(dict1, "fc1", (flatten_num, 10))
+        fc2 = get_matrix_params(dict1, "fc2", (10, c))
+        nn = Sequential( [ conv1,ReLU(),conv2,ReLU(), Flatten([1, 2, 3, 4]), fc1, ReLU(), fc2, ],"nn", )
     elseif model_name == "acas"
         # ACAS Xu (Julian et al. 2016): 5 inputs -> 6 hidden ReLU layers of 50
         # -> 5 outputs (300 hidden neurons). Weights from the standard

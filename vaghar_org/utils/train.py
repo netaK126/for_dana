@@ -95,7 +95,7 @@ if __name__ == '__main__':
     MODEL_CLASSES = {
         "3x10": FNN_3_10, "3x50": FNN_3_50, "3x100": FNN_3_100,
         "6x100": FNN_6_100, "9x200": FNN_9_200,
-        "cnn0": CNN0, "cnn1": CNN1, "cnn2": CNN2,
+        "cnn0": CNN0, "cnn1": CNN1, "cnn2": CNN2, "cnn5": CNN5,
     }
     if model_type not in MODEL_CLASSES:
         assert ("New model arch has been detected, please expand models.py and this if condition.")
