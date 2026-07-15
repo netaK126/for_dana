@@ -33,6 +33,7 @@ import time
 import re
 import glob
 import itertools
+import shutil
 
 # ── Child-process lifecycle ──────────────────────────────────────────────
 # Goal: a Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM) of this supervisor
@@ -172,10 +173,11 @@ PERTURBATIONS = [
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("trans(1,1)",        "translation:1,1"),
     ("occ(14,14,9)",        "occ:14,14,9"),
-    ("contrast(1.5)",      "contrast:1.5"),
-    ("rotation(10)",      "rotation:10"),
-    ("linf(0.1)",         "linf:0.1"), 
-    ("brightness(0.25)",  "brightness:0.25"), 
+    # ("contrast(1.5)",      "contrast:1.5"),
+    # ("rotation(10)",      "rotation:10"),
+    # ("linf(0.1)",         "linf:0.1"), 
+    # ("brightness(0.25)",  "brightness:0.25"), 
+    
     # ("trans(1,3)",        "translation:1,3"),
     # ("trans(3,1)",        "translation:3,1"),
     # ("trans(3,3)",        "translation:3,3"),
@@ -2406,6 +2408,20 @@ def _recompile_neta_s_paper(cwd):
         print(f"[paper-build] no {job}.pdf produced; keeping previous main.pdf")
         return
     os.replace(built_pdf, os.path.join(paper_dir, "main.pdf"))
+    # Seed the plain "main" jobname's .aux/.bbl from this resolved build. An
+    # editor (e.g. VSCode LaTeX Workshop) that recompiles main.tex in a single
+    # pdflatex pass, with no bibtex, reads these at \begin{document}. Without
+    # them main.aux has no \bibcite and main.bbl is absent, so every \cite
+    # renders undefined and that stale single-pass main.pdf overwrites this
+    # good one. Copying keeps the editor preview fully resolved after each
+    # rebuild.
+    for _ext in ("aux", "bbl"):
+        _src = os.path.join(paper_dir, f"{job}.{_ext}")
+        if os.path.exists(_src):
+            try:
+                shutil.copyfile(_src, os.path.join(paper_dir, f"main.{_ext}"))
+            except OSError as _exc:
+                print(f"[paper-build] could not seed main.{_ext}: {_exc}")
     print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
 
 

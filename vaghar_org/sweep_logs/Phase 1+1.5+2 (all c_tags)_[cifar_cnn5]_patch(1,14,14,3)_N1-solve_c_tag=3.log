@@ -1,51 +1,0 @@
-/usr/local/lib/python3.8/dist-packages/torch/cuda/__init__.py:546: UserWarning: Can't initialize NVML
-  warnings.warn("Can't initialize NVML")
-source: 2 target: 1 model_arch: cnn5 perturbation type: patch perturbation size: [1.0, 14.0, 14.0, 3.0] dataset: cifar10
-Files already downloaded and verified
-Files already downloaded and verified
-Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 1/500 [00:00<02:26,  3.40it/s]Attack:   3%|▎         | 15/500 [00:00<00:10, 47.59it/s]Attack:   6%|▌         | 29/500 [00:00<00:06, 76.24it/s]Attack:   9%|▉         | 44/500 [00:00<00:04, 97.10it/s]Attack:  12%|█▏        | 58/500 [00:00<00:04, 109.50it/s]Attack:  14%|█▍        | 72/500 [00:00<00:03, 118.35it/s]Attack:  17%|█▋        | 87/500 [00:00<00:03, 126.52it/s]Attack:  20%|██        | 101/500 [00:01<00:03, 128.62it/s]Attack:  23%|██▎       | 115/500 [00:01<00:02, 131.23it/s]Attack:  26%|██▌       | 130/500 [00:01<00:02, 134.01it/s]Attack:  29%|██▉       | 145/500 [00:01<00:02, 136.38it/s]Attack:  32%|███▏      | 159/500 [00:01<00:02, 137.00it/s]Attack:  35%|███▍      | 174/500 [00:01<00:02, 137.95it/s]Attack:  38%|███▊      | 188/500 [00:01<00:02, 137.39it/s]Attack:  41%|████      | 203/500 [00:01<00:02, 138.62it/s]Attack:  43%|████▎     | 217/500 [00:01<00:02, 138.60it/s]Attack:  46%|████▌     | 231/500 [00:01<00:01, 137.95it/s]Attack:  49%|████▉     | 245/500 [00:02<00:01, 138.34it/s]Attack:  52%|█████▏    | 260/500 [00:02<00:01, 140.66it/s]Attack:  55%|█████▌    | 276/500 [00:02<00:01, 143.89it/s]Attack:  58%|█████▊    | 292/500 [00:02<00:01, 146.75it/s]Attack:  62%|██████▏   | 309/500 [00:02<00:01, 151.21it/s]Attack:  65%|██████▌   | 327/500 [00:02<00:01, 157.71it/s]Attack:  70%|███████   | 350/500 [00:02<00:00, 177.73it/s]Attack:  75%|███████▌  | 376/500 [00:02<00:00, 199.97it/s]Attack:  81%|████████  | 404/500 [00:02<00:00, 221.26it/s]Attack:  87%|████████▋ | 433/500 [00:02<00:00, 240.49it/s]Attack:  92%|█████████▏| 462/500 [00:03<00:00, 253.86it/s]Attack:  98%|█████████▊| 491/500 [00:03<00:00, 263.24it/s]Attack: 100%|█████████▉| 499/500 [00:03<00:00, 154.95it/s]
-Traceback (most recent call last):
-  File "./utils/hyper_attack.py", line 449, in <module>
-    best_val = attack(model, X, source, target, device, token_signature, model_arch, dims, perturbation_type, perturbation_size, iterations)
-  File "./utils/hyper_attack.py", line 278, in attack
-    layers_outputs.append(torch.mean(torch.sign((model.flatten1(F.relu(model.conv1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, dims[0], dims[1], dims[2])))))), dim=0))
-  File "./utils/hyper_attack.py", line 37, in create_attacked
-    Xout[:, :, row_start:row_start+length, col_start:col_start+length] = torch.clamp(X[:, :, row_start:row_start+length, col_start:col_start+length]+eps,0,1)
-RuntimeError: The size of tensor a (32) must match the size of tensor b (3) at non-singleton dimension 5
-ERROR: LoadError: failed process: Process(`python3 ./utils/hyper_attack.py --dataset cifar10 --source 2 --target 1 --token 63919610545758 --model cnn5 --model_path /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/model_seed42_itr19/model.pth --perturbation patch --perturbation_size 1.0,14.0,14.0,3.0`, ProcessExited(1)) [1]
-
-Stacktrace:
-  [1] pipeline_error
-    @ ./process.jl:597 [inlined]
-  [2] run(::Cmd; wait::Bool)
-    @ Base ./process.jl:512
-  [3] run
-    @ ./process.jl:509 [inlined]
-  [4] macro expansion
-    @ ~/Downloads/for_dana/vaghar_org/utils/hyper_attack.jl:109 [inlined]
-  [5] macro expansion
-    @ ./timing.jl:461 [inlined]
-  [6] hyper_attack(dataset::String, c_tag::Int64, c_target::Int64, token_signature::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}; force_cpu::Bool)
-    @ Main ~/Downloads/for_dana/vaghar_org/utils/hyper_attack.jl:102
-  [7] main_advanced_standard_n1(args::Dict{String, Any}, dataset::String, model_name::String, model_path::String, perturbation::String, perturbation_size::Vector{Float64}, name_to_save::String, use_hyper_attack::Bool)
-    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:1445
-  [8] main()
-    @ Main ~/Downloads/for_dana/vaghar_org/run.jl:498
-  [9] top-level scope
-    @ ~/Downloads/for_dana/vaghar_org/run.jl:2122
- [10] include(mod::Module, _path::String)
-    @ Base ./Base.jl:306
- [11] exec_options(opts::Base.JLOptions)
-    @ Base ./client.jl:317
- [12] _start()
-    @ Base ./client.jl:550
-in expression starting at /root/Downloads/for_dana/vaghar_org/run.jl:2122
-Advanced-standard-N1: computing diff bounds between N1 and N2...
-compute_diff_and_comp_bounds: last hidden layer size = 10, diff width = 33.91211375553037
-compute_diff_and_comp_bounds: output-layer diff bounds width = 60.41598630497241
-compute_diff_and_comp_bounds: N1 pert bounds width = 508.4077596637278
-compute_diff_and_comp_bounds: N2 pert bounds width = 589.434549551512
-compute_diff_and_comp_bounds: populated 3 ReLU layers
-Advanced-standard-N1: preserved existing diff_bounds.bin + n1_preact_bounds.bin at /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/patch/eps_1,14,14,3/n1_state_cnn5_model_seed42_itr19 (partial-completion mode)
-
-══ Advanced-standard-N1: solving N1 (c_tag=3, c_target=2) ══

@@ -5759,6 +5759,31 @@ def _aaai_chart_time(cell, force_timeout, prefer_geom):
     return v, side
 
 
+def _aaai_chart_times_list(cell, force_timeout, prefer_geom):
+    """The individual per-target solve times (minutes, each clamped to the
+    timeout) on the SAME base/geom side `_aaai_chart_time` averages, plus that
+    side. These per-(c_s, c_t) values are the samples the confidence-interval
+    I-beam pools across a cluster's source classes, so the interval reflects
+    every class pair rather than only the handful of source-class means. Returns
+    ([], None) when the chosen side has no timing."""
+    if cell is None:
+        return [], None
+    tb = cell.get("t_base")
+    tg = cell.get("t_geom")
+    if prefer_geom:
+        chosen, side = (tg, "geom") if tg else ((tb, "base") if tb else (None, None))
+    else:
+        chosen, side = (tb, "base") if tb else ((tg, "geom") if tg else (None, None))
+    if not chosen:
+        return [], None
+    cap = (force_timeout / 60.0) if force_timeout is not None else None
+    out = []
+    for t in chosen:
+        m = t / 60.0
+        out.append(min(m, cap) if cap is not None else m)
+    return out, side
+
+
 def _aaai_chart_gap(cell, dmax_ub, prefer_geom):
     """delta_u - delta_l (percentage points of delta_max) for one method's
     cell, plus which side ('base'/'geom') it came from, using the same
@@ -5881,6 +5906,51 @@ _AAAI_IBEAM_PANEL_FRAC = 0.60
 _AAAI_IBEAM_CAP_FRAC = 0.20
 _AAAI_IBEAM_MIN_PP = 0.05
 
+# Visual scale for the confidence-interval I-beam on the SOLVE-TIME bars: the
+# drawn half-height is (CI half-width) * _AAAI_IBEAM_SCALE, so the I-beam is
+# NOT 1:1 on the minute axis -- solve times are heavy-tailed, so a true-scale CI
+# half-width is ~the mean itself and the marker would swamp the panel. A value
+# below 1 makes the axis LESS dense (the same CI draws a SHORTER I-beam); the
+# caption states the marker is shown at a reduced scale, not on the time axis.
+# Lower this to shrink every I-beam uniformly (kept global so I-beams stay
+# comparable across panels).
+_AAAI_IBEAM_SCALE = 0.3
+
+# Student-t two-sided 0.975 critical values keyed by degrees of freedom (df =
+# n-1), the 95% confidence multiplier for a mean estimated from n observations.
+# The per-bar I-beam sample is small (df ~ 2-17), so the flat 1.96 Gaussian value
+# understates the interval; the exact multiplier is the 95% point of the
+# Student-t density with n-1 df (heavier tails -> larger than 1.96, approaching
+# 1.96 as n grows). We look it up here and fall back to 1.96 only for df > 30.
+_T975_BY_DF = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056,
+    27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+
+
+def _aaai_ci_halfwidth(vals):
+    """Half-width of the 95% confidence interval of the MEAN of `vals` -- the
+    individual c_s-against-c_t experiment solve times (minutes) under ONE bar --
+    i.e. the I-beam's half-height in the bar's own units. Multiplies the standard
+    error of the mean s/sqrt(n) by the Student-t 95% critical value
+    t_{0.975, n-1} (`_T975_BY_DF`), the multiplier that fits a small sample whose
+    spread is estimated from the data. Returns None when n < 3 (a 1- or 2-point
+    interval is degenerate/misleading); returns 0.0 when every value is identical
+    (e.g. all runs pinned at the timeout cap)."""
+    n = len(vals)
+    if n < 3:
+        return None
+    mean = sum(vals) / n
+    var = sum((x - mean) ** 2 for x in vals) / (n - 1)
+    if var <= 0.0:
+        return 0.0
+    sem = math.sqrt(var) / math.sqrt(n)
+    tcrit = _T975_BY_DF.get(n - 1, 1.96)
+    return tcrit * sem
+
 
 def _aaai_draw_color(sty):
     """Pull the `draw=` colour out of a series style string (e.g.
@@ -5954,7 +6024,10 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                       value_labels=False, label_font=6.5,
                       series=_AAAI_CHART_SERIES):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
-    (type_disp, item_label, {sk:(value, partial)}). `series` is the per-method
+    (type_disp, item_label, {sk:(value, partial[, ci_half])}). An optional third
+    element `ci_half` (the solve-time bars supply it) is the confidence-interval
+    half-width in the bar's units and draws a black I-beam centred on the bar
+    top; when absent or None no I-beam is drawn. `series` is the per-method
     style table (_AAAI_CHART_SERIES for the solve-time figures,
     _AAAI_CHART_SERIES_GAP for the bounds-difference figures) and fixes the
     per-bar fill/draw colour, fill pattern, and left-to-right order.
@@ -5996,6 +6069,7 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
         center0 = x - (k - 1) * stride / 2.0
         for bi, (sk, pair) in enumerate(items):
             v, p = pair[0], pair[1]
+            ci = pair[2] if len(pair) > 2 else None
             xc = center0 + bi * stride
             xl = xc - bar_w / 2.0
             xr = xc + bar_w / 2.0
@@ -6006,13 +6080,39 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                 f"\\filldraw[{style_of[sk]}, line width=0.2pt] {rect};")
             if pattern_of[sk]:
                 lines.append(f"\\fill[{pattern_of[sk]}] {rect};")
+            # Confidence-interval I-beam, CENTRED on the bar top (the mean): the
+            # stem runs mean+-ci through the axis transform, the two short caps
+            # span _AAAI_IBEAM_CAP_FRAC of the bar width to each side. Drawn in
+            # black (not the bar colour) so the lower half stays legible inside
+            # the fill and the marker survives grayscale printing. `ci` is None
+            # when n<3 (see _aaai_ci_halfwidth) -> no marker.
+            deco_top = h
+            if ci is not None:
+                # Drawn at a reduced visual scale (_AAAI_IBEAM_SCALE), not 1:1 on
+                # the minute axis: the true CI half-width is ~the mean for these
+                # heavy-tailed times and would swamp the panel.
+                ci_draw = ci * _AAAI_IBEAM_SCALE
+                y_hi = (v + ci_draw) ** power
+                y_lo = max(v - ci_draw, 0.0) ** power
+                cap = bar_w * _AAAI_IBEAM_CAP_FRAC
+                lines.append(
+                    f"\\draw[black, line width=0.5pt] "
+                    f"(axis cs:{xc:.4g},{y_lo:.4g}) -- "
+                    f"(axis cs:{xc:.4g},{y_hi:.4g});")
+                for yy in (y_hi, y_lo):
+                    lines.append(
+                        f"\\draw[black, line width=0.5pt] "
+                        f"(axis cs:{xc - cap:.4g},{yy:.4g}) -- "
+                        f"(axis cs:{xc + cap:.4g},{yy:.4g});")
+                deco_top = y_hi
             if value_labels:
-                # Value label printed HORIZONTALLY, centred just above the bar
-                # top (anchor=south). The figure-wide point size (label_font,
-                # from _aaai_hlabel_pt) is sized so even the widest label fits
-                # the bar WIDTH with a small gap each side, so horizontal numbers
-                # stay separated and readable.
-                ly = h
+                # Value label printed HORIZONTALLY, centred just above the bar's
+                # decoration stack -- the bar top, or the I-beam's upper cap when
+                # a CI is drawn -- with anchor=south. The figure-wide point size
+                # (label_font, from _aaai_hlabel_pt) is sized so even the widest
+                # label fits the bar WIDTH with a small gap each side, so
+                # horizontal numbers stay separated and readable.
+                ly = deco_top
                 lines.append(
                     f"\\node[anchor=south,"
                     f" font=\\fontsize{{{label_font:.3g}}}"
@@ -6262,13 +6362,16 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
         # smallest pymax per bar and take the max.
         need = vmax
         for pair in bars_all:
-            h = pair[0] ** power
-            gap_pp = pair[2] if len(pair) > 2 else None
-            ibeam_frac = 0.0
-            if gap_pp is not None and gap_pp > _AAAI_IBEAM_MIN_PP:
-                ibeam_frac = (gap_pp / 100.0) * _AAAI_IBEAM_PANEL_FRAC / 2.0
-            denom = max(1.0 - ibeam_frac - label_frac, 0.35)
-            need = max(need, h / denom)
+            v = pair[0]
+            ci = pair[2] if len(pair) > 2 else None
+            # Top of the bar's decoration stack: the bar top, or the I-beam's
+            # upper cap (mean + reduced-scale CI half-width, matching _draw_group)
+            # when a confidence interval is drawn. The value label then needs
+            # `label_frac` above that.
+            top = ((v + ci * _AAAI_IBEAM_SCALE) ** power) if ci is not None \
+                else (v ** power)
+            denom = max(1.0 - label_frac, 0.35)
+            need = max(need, top / denom)
         # Cap at the previous blanket headroom so this only ever SHRINKS the
         # gap, never grows it (a rare panel whose tallest bar is a timed-out bar
         # with a very tall I-beam would otherwise want slightly more room; the
@@ -6546,6 +6649,11 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
     # COLLECTS its dataset's time cells (each tagged with dataset + arch) and
     # RETURNS them; the caller pools across datasets and emits the one figure.
     time_cells = []   # (dataset_disp, arch, arch_disp, type_disp, size_label, bars)
+    # Per-bar CI-I-beam coverage: how many bars got an I-beam vs. how many were
+    # skipped for having < 3 experiments (reported once so nothing is silently
+    # dropped).
+    n_ci_ok = 0
+    n_ci_skip = 0
     # The bounds-difference figure is a SINGLE flat axis (not a per-arch grid):
     # every all-three-timeout cluster across all architectures is collected here
     # as ("", full_x_label, bars), the x label naming type+size, arch, dataset.
@@ -6618,7 +6726,12 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                         gap, _gside = _aaai_chart_gap(
                             cells.get(sk), dmax_ub,
                             prefer_geom=(sk != "vaghar"))
-                        bars[sk] = (v, partial, gap)
+                        # Individual per-target times (minutes) for this cell:
+                        # the raw class-pair samples the cluster pools for the
+                        # confidence-interval I-beam.
+                        tlist, _tside = _aaai_chart_times_list(
+                            cells.get(sk), _ft, prefer_geom=(sk != "vaghar"))
+                        bars[sk] = (v, partial, gap, tlist)
                 # Keep the per-Cs filter (user request): a source class Cs
                 # contributes to the merged cluster ONLY if it has ALL THREE
                 # methods (ours with transfer, ours, vaghar) and each covers
@@ -6649,6 +6762,7 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
             # source classes.
             merged_time = {}
             merged_gap = {}
+            merged_ci = {}
             for sk in series_keys:
                 vals = [b[sk][0] for b in bars_by_cs.values() if sk in b]
                 gaps = [b[sk][2] for b in bars_by_cs.values()
@@ -6657,6 +6771,14 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                     continue
                 merged_time[sk] = sum(vals) / len(vals)
                 merged_gap[sk] = (sum(gaps) / len(gaps)) if gaps else None
+                # PER-BAR confidence interval: pool only THIS bar's own
+                # (c_s, c_t) experiment times (same dataset, arch, perturbation
+                # type, size, method) and reduce them to one CI half-width. Each
+                # bar gets its own I-beam; nothing is shared across bars. Bar
+                # height stays the mean over source classes (tied to the N2 table).
+                pool = [t for b in bars_by_cs.values() if sk in b
+                        for t in (b[sk][3] if len(b[sk]) > 3 else [])]
+                merged_ci[sk] = _aaai_ci_halfwidth(pool)
             # Only a cluster with all three merged bars survives (the per-Cs
             # filter already guarantees each contributing Cs had all three, so
             # this holds whenever at least one Cs passed).
@@ -6682,13 +6804,25 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                 bd_label = (type_disp + r"\ " + size_disp + r"\\" + arch_disp)
                 bd_groups.append((dataset_disp, bd_label, bd_bars))
             else:
-                t_bars = {sk: (merged_time[sk], False) for sk in series_keys}
+                # (mean_time, partial=False, ci_half): the per-bar CI half-height
+                # (minutes; None if this bar had < 3 experiments) that _draw_group
+                # renders as the I-beam.
+                t_bars = {sk: (merged_time[sk], False, merged_ci.get(sk))
+                          for sk in series_keys}
+                for sk in series_keys:
+                    if merged_ci.get(sk) is None:
+                        n_ci_skip += 1
+                    else:
+                        n_ci_ok += 1
                 # Collected (not emitted): the caller pools these across every
                 # dataset into ONE grid, placing this panel at
                 # (row=type_disp, col=(dataset, arch)).
                 time_cells.append(
                     (dataset_disp, arch, arch_disp, type_disp, label, t_bars))
 
+    if n_ci_ok or n_ci_skip:
+        print(f"[paper-tables] solve-time CI I-beams ({dataset_disp}): "
+              f"{n_ci_ok} drawn, {n_ci_skip} skipped (fewer than 3 experiments)")
     # Return the solve-time cells and the bounds-difference clusters; BOTH are
     # pooled across datasets by the caller and drawn as ONE combined figure each
     # (the solve-time grid with network columns, the bounds-difference flat
@@ -6788,6 +6922,9 @@ def regenerate_aaai_time_combined_section(
     import re
     try:
         if time_cells:
+            # Each bar already carries its own per-bar CI (3rd tuple element),
+            # computed in _render_aaai_n2_charts from that bar's own experiments;
+            # nothing to pool here.
             # Group the cells by database, preserving encounter order.
             by_ds = {}
             for cell in time_cells:
@@ -6816,7 +6953,31 @@ def regenerate_aaai_time_combined_section(
                     r"\tool compared to \baseline (baseline) on " + dataset_disp
                     + r" across architectures (columns), perturbation types "
                     r"(rows), and sizes. Each bar is the mean solve time over the "
-                    r"source classes $c_s$; a cluster is only shown for a $c_s$ "
+                    r"source classes $c_s$. Its I-beam is the 95\% confidence "
+                    r"interval of that mean over the $c_s$-against-$c_t$ "
+                    r"experiments under the bar, so it widens when their solve "
+                    r"times are spread out and narrows when they agree. Writing "
+                    r"$\#\mathrm{exp}$ for the number of those experiments, $t$ "
+                    r"for the solve time of one, and $\bar t$ for their mean, the "
+                    r"interval is $\bar t \pm t_{0.975,\,\#\mathrm{exp}-1}\,"
+                    r"\sqrt{\tfrac{1}{\#\mathrm{exp}-1}\sum(t-\bar t)^2}\,/\,"
+                    r"\sqrt{\#\mathrm{exp}}$: the mean plus or minus the multiplier "
+                    r"times the standard error, the sample standard deviation "
+                    r"$\sqrt{\tfrac{1}{\#\mathrm{exp}-1}\sum(t-\bar t)^2}$ over "
+                    r"$\sqrt{\#\mathrm{exp}}$. The multiplier "
+                    r"$t_{0.975,\,\#\mathrm{exp}-1}$ is the two-sided $95\%$ point "
+                    r"of the Student-$t$ density with $\#\mathrm{exp}-1$ degrees "
+                    r"of freedom, $f(x)=\frac{\Gamma(\#\mathrm{exp}/2)}"
+                    r"{\sqrt{(\#\mathrm{exp}-1)\pi}\,\Gamma((\#\mathrm{exp}-1)/2)}"
+                    r"\bigl(1+\tfrac{x^2}{\#\mathrm{exp}-1}\bigr)^{-\#\mathrm{exp}/2}$"
+                    r", namely the $m$ with $\int_{-m}^{m} f(x)\,dx = 0.95$ "
+                    r"(approaching $1.96$ as $\#\mathrm{exp}$ grows). For "
+                    r"legibility the I-beam is drawn at $0.3\times$ this interval, "
+                    r"not on the time axis, so it reaches $0.3\,"
+                    r"t_{0.975,\,\#\mathrm{exp}-1}\,\sqrt{\tfrac{1}{\#\mathrm{exp}-1}"
+                    r"\sum(t-\bar t)^2}/\sqrt{\#\mathrm{exp}}$ above and below the "
+                    r"bar. A "
+                    r"cluster is only shown for a $c_s$ "
                     r"that has all three methods, and any $c_s$ absent from a "
                     r"cluster is marked on its label. Clusters where all three "
                     r"methods reach the timeout are moved to the "
