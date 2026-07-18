@@ -3960,6 +3960,16 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                 "lb_total": val.get("lower_bound"),
                                 "ub_total": val.get("upper_bound"),
                                 "solve_status": val.get("solve_status", ""),
+                                # Binaries the BoundTightPertRelax gate dropped,
+                                # per copy. Constant across c_targets within a
+                                # file (the gate reads only the bounds, which do
+                                # not depend on the target class); carried per
+                                # row so the relaxation table pairs them under
+                                # the same filters every other table applies.
+                                "relaxed_org": _as_int(
+                                    val.get("n2_org_relaxed_binaries")),
+                                "relaxed_pert": _as_int(
+                                    val.get("n2_pert_relaxed_binaries")),
                                 # geometric_intervals twin (same cell, same
                                 # delta, faster/slower solve): paired as base,geom
                                 # in the time column by the renderer.
@@ -4782,6 +4792,44 @@ _AAAI_WIDE_COLUMNS = (
 )
 
 
+def _as_int(v):
+    """Parse a result-file count into an int, or None when absent/unparsable.
+    The .txt fields arrive as strings ('' when the run predates the field)."""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# AAAI relaxation / precision-cost table (Evaluation body)
+# ---------------------------------------------------------------------------
+AAAI_RELAX_PREC_BEGIN_MARK = "% BEGIN AUTO: aaai_relax_precision_table"
+AAAI_RELAX_PREC_END_MARK = "% END AUTO: aaai_relax_precision_table"
+
+# The three columns the relaxation table compares, as combo keys. They must
+# match _AAAI_WIDE_COLUMNS so this table describes exactly the runs the per-cell
+# tables display.
+_AAAI_RELAX_BASE_COMBO = _AAAI_WIDE_COLUMNS[0][0]
+_AAAI_RELAX_OURS_COMBO = _AAAI_WIDE_COLUMNS[1][0]
+_AAAI_RELAX_TRANSFER_COMBO = _AAAI_WIDE_COLUMNS[2][0]
+
+
+def _norm_dataset_key(dataset):
+    """Canonical dataset key for _AAAI_TAB1_NEURONS, tolerant of the
+    hyphen/underscore spellings used across this repo."""
+    return {"fashion_mnist": "fashion-mnist", "fashion": "fashion-mnist",
+            "fmnist": "fashion-mnist", "cifar10": "cifar"}.get(dataset, dataset)
+
+
+# Row highlight for the per-cell tables: fires only when the [delta_l, delta_u]
+# intervals of _AAAI_WIDE_COLUMNS[1] ("ours") and [2] ("ours with transfer") are
+# disjoint AND transfer landed below ours, which its relaxed superset of ours'
+# neurons should make impossible. Kept light so the black cell text stays
+# readable.
+_AAAI_WIDE_DISJOINT_COLOR = "red!25"
+
+
 _AAAI_TIMEOUT_STATUSES = frozenset({
     "TIME_LIMIT", "TIME LIMIT", "USER_OBJ_LIMIT", "USER_LIMIT",
     "ITERATION_LIMIT", "NODE_LIMIT", "SOLUTION_LIMIT",
@@ -5347,11 +5395,12 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 # baseline's and < 1 means the baseline is tighter. Same gap the
                 # bounds-difference graph plots; computed from the geom-preferred,
                 # [0,100]-clamped bounds so it matches the delta_l/delta_u shown.
-                def _gap_pct(c):
-                    # Built from the DISPLAYED (rounded, [0,100]-clamped,
-                    # geom-preferred) delta_l/delta_u so the reader can reproduce
-                    # Delta from the printed bounds -- same reproducibility rule
-                    # the speedup columns use for the printed times.
+                def _bounds_pct(c):
+                    # The DISPLAYED (rounded, [0,100]-clamped, geom-preferred)
+                    # delta_l/delta_u pair, so both the gap columns and the row
+                    # highlight below are reproducible from the printed bounds --
+                    # same reproducibility rule the speedup columns use for the
+                    # printed times.
                     s2 = stats.get(c)
                     if not s2:
                         return None
@@ -5361,7 +5410,11 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         return None
                     lb = float(_fmt_sig(min(100.0, max(0.0, lb))))
                     ub = float(_fmt_sig(min(100.0, max(0.0, ub))))
-                    return max(0.0, ub - lb)
+                    return lb, max(lb, ub)
+
+                def _gap_pct(c):
+                    b = _bounds_pct(c)
+                    return None if b is None else b[1] - b[0]
 
                 def _bounddiff_cell(cmp_c):
                     gb = _gap_pct(columns[0])   # baseline gap
@@ -5375,6 +5428,38 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
 
                 bounddiff_cells = [_bounddiff_cell(columns[1]),
                                    _bounddiff_cell(columns[2])]
+
+                # Row highlight from how the two INTERVALS [delta_l, delta_u] of
+                # \emph{ours} and \emph{ours with transfer} sit relative to each
+                # other. Both bracket the same true delta, so they are expected
+                # to overlap; a row where they do not is worth the reader's eye:
+                #
+                #   * disjoint (they share no point at all) AND transfer sits
+                #     BELOW ours -> red. Transfer relaxes a superset of ours'
+                #     neurons, so its delta can only be the higher of the two;
+                #     landing below ours contradicts that and marks a row worth
+                #     a second look.
+                #   * anything else -> no highlight. Transfer sitting ABOVE ours
+                #     is the expected direction (the extra relaxed neurons
+                #     enlarge its feasible set), and overlapping or nested
+                #     intervals are simply consistent.
+                #
+                # Compared on the DISPLAYED bounds (via _bounds_pct), so the
+                # color always matches what the printed cells show. A row where
+                # either column has no bounds ("---", or the raw-bound fallback
+                # when delta_max is unavailable) stays uncolored.
+                def _overlap_color():
+                    a = _bounds_pct(columns[1])   # ours
+                    b = _bounds_pct(columns[2])   # ours with transfer
+                    if a is None or b is None:
+                        return None
+                    if max(a[0], b[0]) <= min(a[1], b[1]):
+                        return None             # they meet: consistent
+                    if b[0] > a[0]:
+                        return None             # transfer above ours: expected
+                    return _AAAI_WIDE_DISJOINT_COLOR
+
+                row_color = _overlap_color()
                 # Order rows by the transfer speedup on N2 (the headline method,
                 # as before); N1 has no transfer, so fall back to the single-net
                 # speedup there. A blank ranking value sinks the row to the end
@@ -5396,7 +5481,8 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                          and _repr_time(c) >= _cap_min - _eps_min)
                         for c in columns)
                 block_rows.append((row_sort, pert, p_size, data_cells,
-                                   all_timeout, speedup_cells, bounddiff_cells))
+                                   all_timeout, speedup_cells, bounddiff_cells,
+                                   row_color))
 
             if not block_rows:
                 continue
@@ -5413,17 +5499,19 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # otherwise, so min(row_sort) over a cluster is its best rank and
             # smaller sorts earlier.
             best_by_pert = {}
-            for row_sort, pert_name, _ps, _dc, _at, _sp, _bd in block_rows:
+            for row_sort, pert_name, _ps, _dc, _at, _sp, _bd, _rc in block_rows:
                 cur = best_by_pert.get(pert_name)
                 if cur is None or row_sort < cur:
                     best_by_pert[pert_name] = row_sort
             block_rows.sort(key=lambda r: (best_by_pert[r[1]], r[1],
                                            r[0], r[2]))
             # Keep each row as (data_cells, all_timeout, speedup_cells,
-            # bounddiff_cells) in sorted order; the split, the trailing-column
-            # choice, and label distribution happen per emitted table.
+            # bounddiff_cells, row_color) in sorted order; the split, the
+            # trailing-column choice, and label distribution happen per emitted
+            # table.
             arch_blocks.append(
-                (label_parts, [(r[3], r[4], r[5], r[6]) for r in block_rows]))
+                (label_parts,
+                 [(r[3], r[4], r[5], r[6], r[7]) for r in block_rows]))
 
         if not arch_blocks:
             continue
@@ -5443,8 +5531,8 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # Each rendered row = data_cells + the trailing pair for this table:
             # the bound-difference cells for the all-timeout table, the speedup
             # cells for the solved table.
-            kind = [(lp, [dc + (bd if want_all_timeout else sp)
-                          for (dc, at, sp, bd) in rows
+            kind = [(lp, [(dc + (bd if want_all_timeout else sp), rc)
+                          for (dc, at, sp, bd, rc) in rows
                           if at == want_all_timeout])
                     for (lp, rows) in arch_blocks]
             kind = [(lp, r) for (lp, r) in kind if r]
@@ -5473,8 +5561,12 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                                          + r"\\".join(label_parts[i:]) + r"}")
                     else:
                         row_labels[i] = label_parts[i]
-                for lbl, data_cells in zip(row_labels, krows):
-                    lines.append(" & ".join([lbl] + data_cells) + r" \\")
+                for lbl, (data_cells, row_color) in zip(row_labels, krows):
+                    # \rowcolor must open the row, before the model label.
+                    prefix = (f"\\rowcolor{{{row_color}}} " if row_color
+                              else "")
+                    lines.append(prefix + " & ".join([lbl] + data_cells)
+                                 + r" \\")
                 lines.append(r"\midrule")
             if lines[-1].rstrip() == r"\midrule":
                 lines[-1] = r"\bottomrule"
@@ -5603,6 +5695,266 @@ def _filter_rows_by_c_sources(rows, requested_c_sources):
         except (TypeError, ValueError):
             out.append(r)
     return out
+
+
+def _relax_gap_loss(m_row, b_row, dmax):
+    """Precision loss of method row `m_row` against baseline row `b_row`: the
+    DISTANCE BETWEEN THE TWO BOUND INTERVALS, as a percentage of delta_max.
+
+        loss = 100 * max(0, max(dl_m, dl_b) - min(du_m, du_b)) / delta_max
+
+    This is the standard distance (gap) between two sets, inf{|a-b| : a in A,
+    b in B} (Boyd and Vandenberghe 2004), written out for two intervals. Its
+    defining property is the one we want: it is 0 exactly when the intervals
+    overlap, and positive only when they are disjoint.
+
+    Why it is sound on EVERY cell, including the ones where the baseline times
+    out: the baseline relaxes no binary, so its [dl, du] soundly contains the
+    exact delta whether it proves optimality or returns a wide anytime interval.
+    A method interval disjoint from it therefore differs from the exact delta by
+    AT LEAST this distance, making the gap a certified lower bound on the error;
+    a method interval that overlaps it is consistent with the same delta, so no
+    error is provable and the loss is 0. A wide (timed-out) baseline overlaps
+    more easily, so it proves less loss -- the measure is conservative, never
+    wrong. Contrast the Hausdorff distance, which is symmetric and would score a
+    method that converged TIGHTER than a timed-out baseline as a large loss.
+
+    Normalized by delta_max, the scale the per-cell tables render dl/du on.
+    Returns None when a bound or delta_max is missing."""
+    ml, mu = m_row.get("lb_total"), m_row.get("ub_total")
+    bl, bu = b_row.get("lb_total"), b_row.get("ub_total")
+    vals = (ml, mu, bl, bu, dmax)
+    if any(v is None for v in vals):
+        return None
+    if not all(math.isfinite(v) for v in vals) or abs(dmax) < 1e-9:
+        return None
+    return max(0.0, max(ml, bl) - min(mu, bu)) / abs(dmax) * 100.0
+
+
+def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
+                                      parse_result_file,
+                                      seeds_filter=None,
+                                      force_timeout=None,
+                                      rerun_timeout_eps=30.0,
+                                      advstd_meta_fn=None,
+                                      perts=None,
+                                      combination_filter=None,
+                                      requested_c_targets=None,
+                                      requested_c_sources=None,
+                                      stale_fn=None):
+    """Aggregate one dataset's N2 runs into per-network relaxation/precision
+    rows for the Evaluation relaxation table.
+
+    Assembles rows exactly as regenerate_aaai_wide_perarch_section does, so this
+    table describes the same runs the per-cell tables display (same seed, combo,
+    timeout, c_target/c_source and staleness filters, and the same
+    geometric-range side preference). Returns a list of dicts, one per network:
+
+        {"dataset", "arch",
+         "relaxed_ours", "relaxed_transfer",   # mean binaries dropped, N+N'
+         "loss_ours", "loss_transfer",         # mean interval-gap loss, % dmax
+         "cells_ours", "cells_transfer"}       # runs behind each mean
+    """
+    rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
+                                       parse_result_file,
+                                       seeds_filter=seeds_filter,
+                                       stale_fn=stale_fn)
+    archs = sorted((a for a, _ in arch_runs), key=_tab1_arch_sort_key)
+    if advstd_meta_fn is not None and perts is not None:
+        rows += _load_advstd_rows_for_wide_from_txt(
+            cwd, dataset, archs, perts, parse_result_file, advstd_meta_fn,
+            seeds_filter=seeds_filter,
+            combination_filter=combination_filter,
+            force_timeout=force_timeout,
+            rerun_timeout_eps=rerun_timeout_eps,
+            stale_fn=stale_fn)
+    rows = _filter_rows_by_c_targets(rows, requested_c_targets)
+    rows = _filter_rows_by_c_sources(rows, requested_c_sources)
+    # Drop timeout cells recorded under a different wall-clock cap, the same
+    # dedup the per-cell tables apply to the vaghar/ours rows.
+    if force_timeout is not None:
+        rows = [r for r in rows
+                if not _aaai_is_timeout_mismatch(r, force_timeout,
+                                                 rerun_timeout_eps)]
+
+    wanted = {_AAAI_RELAX_BASE_COMBO, _AAAI_RELAX_OURS_COMBO,
+              _AAAI_RELAX_TRANSFER_COMBO}
+    # One slot per (arch, pert, size, c_src, c_tgt) x column. Geom-preferred with
+    # a base fallback, matching the per-cell tables' _pick, so the runs counted
+    # here are the runs those tables print.
+    by_cell = {}
+    for r in rows:
+        if r.get("role") != "N2" or r.get("combo") not in wanted:
+            continue
+        key = (r["arch"], r["perturbation"], r["perturbation_size"],
+               r["c_source"], r["c_target"])
+        slot = by_cell.setdefault(key, {})
+        prev = slot.get(r["combo"])
+        if prev is None or (r.get("geom") and not prev.get("geom")):
+            slot[r["combo"]] = r
+
+    ds_key = _norm_dataset_key(dataset)
+    # delta_max per (arch, role, c_src): the scale the loss is normalized by,
+    # the same one the per-cell tables render delta_l/delta_u against.
+    delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
+    from collections import defaultdict
+    acc = defaultdict(lambda: {"relax_ours": [], "relax_transfer": [],
+                               "loss_ours": [], "loss_transfer": []})
+    for (arch, _p, _s, cs, _ct), slot in by_cell.items():
+        base = slot.get(_AAAI_RELAX_BASE_COMBO)
+        dm_entry = (delta_max_by_key or {}).get((arch, "N2", cs))
+        dmax = dm_entry.get("upper") if dm_entry else None
+        # Only cells where ALL THREE methods ran, the same rule the N2 bar charts
+        # use for a cluster and the per-cell tables use for a full row. Without
+        # it the two method columns would average over different cells (on MNIST
+        # conv1, 72 for ours against 42 for transfer), so their losses would not
+        # be comparable to each other.
+        if any(slot.get(c) is None for c in (_AAAI_RELAX_BASE_COMBO,
+                                             _AAAI_RELAX_OURS_COMBO,
+                                             _AAAI_RELAX_TRANSFER_COMBO)):
+            continue
+        # Every such cell counts whether or not the baseline proved optimality:
+        # its interval is sound either way, so the interval distance below is a
+        # certified lower bound on the method's error. A timed-out baseline is
+        # simply wide, which makes the gap harder to prove, not invalid. See
+        # _relax_gap_loss.
+        for combo, rk, lk in ((_AAAI_RELAX_OURS_COMBO, "relax_ours", "loss_ours"),
+                              (_AAAI_RELAX_TRANSFER_COMBO, "relax_transfer",
+                               "loss_transfer")):
+            m = slot[combo]
+            # Binaries the relaxation dropped, summed over BOTH MIP copies: the
+            # clean N(x) and the perturbed N(x') each drop their own.
+            org, pert = m.get("relaxed_org"), m.get("relaxed_pert")
+            if org is not None and pert is not None:
+                acc[arch][rk].append(org + pert)
+            loss = _relax_gap_loss(m, base, dmax)
+            if loss is not None:
+                acc[arch][lk].append(loss)
+
+    def _mean(v):
+        return (sum(v) / len(v)) if v else None
+
+    out = []
+    for arch in archs:
+        a = acc.get(arch)
+        if not a or not (a["relax_ours"] or a["relax_transfer"]
+                         or a["loss_ours"] or a["loss_transfer"]):
+            continue
+        out.append({
+            "dataset": ds_key,
+            "arch": arch,
+            "relaxed_ours": _mean(a["relax_ours"]),
+            "relaxed_transfer": _mean(a["relax_transfer"]),
+            "loss_ours": _mean(a["loss_ours"]),
+            "loss_transfer": _mean(a["loss_transfer"]),
+            "cells_ours": len(a["loss_ours"]),
+            "cells_transfer": len(a["loss_transfer"]),
+        })
+    return out
+
+
+_AAAI_RELAX_DATASET_ORDER = ["mnist", "fashion-mnist", "cifar"]
+
+
+def _render_aaai_relax_precision_body(model_rows):
+    """Render the single Evaluation relaxation/precision table from the pooled
+    per-network rows of collect_aaai_relax_precision_rows (all datasets)."""
+    if not model_rows:
+        return "% auto-generated: aaai_relax_precision -- no data"
+
+    def _ds_key(r):
+        try:
+            return (0, _AAAI_RELAX_DATASET_ORDER.index(r["dataset"]))
+        except ValueError:
+            return (1, r["dataset"])
+
+    rows = sorted(model_rows,
+                  key=lambda r: (_ds_key(r), _tab1_arch_sort_key(r["arch"])))
+
+    def _relaxed(v):
+        # Counts, so render whole binaries; the mean over runs is fractional only
+        # because a few cells relax a different number.
+        return "---" if v is None else f"{int(round(v))}"
+
+    def _loss(v):
+        if v is None:
+            return "---"
+        # Two decimals throughout, so a 0 reads as an exact 0 rather than a
+        # rounded-down small loss, and a leading zero is always present.
+        return f"{v:.2f}\\%"
+
+    lines = [f"% auto-generated: aaai_relax_precision, networks={len(rows)}"]
+    lines.append(r"\begin{table}[t]")
+    lines.append(r"\centering")
+    lines.append(r"\small")
+    # Fitting one column: the dataset and the network share a single model cell,
+    # and the adjustbox only shrinks if a longer network name overruns, so the
+    # table can never bleed into the neighbouring column the way a bare tabular
+    # does.
+    lines.append(r"\setlength{\tabcolsep}{3pt}")
+    lines.append(r"\begin{adjustbox}{max width=\columnwidth,center}%")
+    lines.append(r"\begin{tabular}{@{}l r r r r@{}}")
+    lines.append(r"\toprule")
+    lines.append(r"\multirow{2}{*}{\textbf{Model}} & "
+                 r"\multicolumn{2}{c}{\textbf{\emph{ours}}} & "
+                 r"\multicolumn{2}{c}{\textbf{\emph{transfer}}} \\")
+    lines.append(r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}")
+    lines.append(r" & \textbf{\#relaxed} & \textbf{loss} & "
+                 r"\textbf{\#relaxed} & \textbf{loss} \\")
+    lines.append(r"\midrule")
+    for r in rows:
+        model = (_dataset_display_name(r["dataset"]) + " "
+                 + _AAAI_ARCH_DISPLAY.get(r["arch"],
+                                          r["arch"].replace("_", r"\_")))
+        lines.append(" & ".join([
+            model,
+            _relaxed(r["relaxed_ours"]), _loss(r["loss_ours"]),
+            _relaxed(r["relaxed_transfer"]), _loss(r["loss_transfer"]),
+        ]) + r" \\")
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}%")
+    lines.append(r"\end{adjustbox}")
+    # AAAI puts the caption UNDER the table, so it follows the tabular.
+    lines.append(
+        r"\caption{The binaries the relaxation drops and the precision it "
+        r"costs, for \emph{ours} and \emph{ours with transfer}, abbreviated "
+        r"\emph{transfer}, on the target "
+        r"network $N$. \#relaxed counts the ReLU binaries a method drops and "
+        r"replaces by a triangle, summed over the two copies of the network, "
+        r"$N(x)$ and $N(x')$. The loss of a method is the distance between "
+        r"its bounds $[\delta_l,\delta_u]$ and \baseline's, "
+        r"$\max(0,\ \max(\delta_l,\delta_l^{\baseline}) - "
+        r"\min(\delta_u,\delta_u^{\baseline}))$, as a percentage of "
+        r"$\delta_{\max}$. This is the standard distance between two "
+        r"sets~\cite{boyd2004convex} written out for intervals, so it is $0$ "
+        r"exactly when the two intervals overlap. \baseline relaxes no neuron, "
+        r"so its bounds hold the exact $\delta$ whether or not it reaches the "
+        r"timeout: a method whose interval is disjoint from them is off by at "
+        r"least this distance, and a method whose interval overlaps them is "
+        r"consistent with the same $\delta$. All columns are averaged over the "
+        r"class pairs and perturbations on which all three of \baseline, "
+        r"\emph{ours} and \emph{transfer} ran, so the two methods are compared "
+        r"over the same runs.}")
+    lines.append(r"\label{tab:relax-precision}")
+    lines.append(r"\end{table}")
+    return "\n".join(lines)
+
+
+def regenerate_aaai_relax_precision_section(tex_path, model_rows):
+    """Rewrite the aaai_relax_precision AUTO block in tex_path with the single
+    table pooled over every dataset. Run once, after the per-dataset
+    collect_aaai_relax_precision_rows calls."""
+    try:
+        body = _render_aaai_relax_precision_body(model_rows)
+        update_aaai_wide_perarch_tex(tex_path, body,
+                                     begin_mark=AAAI_RELAX_PREC_BEGIN_MARK,
+                                     end_mark=AAAI_RELAX_PREC_END_MARK)
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_relax_precision block "
+              f"skipped: {exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_relax_precision block "
+              f"error: {exc}")
 
 
 def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
@@ -6001,6 +6353,96 @@ _AAAI_LABEL_PT_MIN = 4.0
 _AAAI_LABEL_PT_MAX = 8.5
 
 
+# ---------------------------------------------------------------------------
+# Standalone chart rendering.
+#
+# AAAI forbids pgfplots in the SUBMITTED paper source, and directs authors to
+# pre-generate such figures, export them as PDF, and import them with
+# \includegraphics. pgfplots still draws the charts -- it just runs in the
+# separate build below instead of in main.tex, so the chart code, geometry, and
+# palettes are unchanged and only the delivery differs.
+#
+# The standalone document pins \textwidth to _AAAI_TEXTWIDTH_PT (the same value
+# the panel geometry above is computed against) and preview/tightpage crops the
+# page to the content. The emitted PDF is therefore exactly \textwidth wide, so
+# \includegraphics[width=\textwidth] scales it by 1.0 and every font reaches the
+# page at the size it was authored at -- scaling here would shrink the figure
+# text and push it under the 9pt floor.
+_AAAI_FIGDIR = "figures"
+
+_AAAI_STANDALONE_DOC = r"""%% AUTO-GENERATED by update_advstd_tex_tables.py -- do not edit by hand.
+%% Standalone build of one paper figure. This file is NOT part of the paper
+%% source: it exists so pgfplots runs here rather than in main.tex (AAAI bans
+%% pgfplots in submitted source). Only the PDF it produces is imported.
+\documentclass[10pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{newtxtext}
+\usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{tikz}
+\usetikzlibrary{patterns,positioning}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usepgfplotslibrary{groupplots}
+%% \tool/\baseline and the bar palette come from the paper's figure_defs.tex --
+%% the SAME file main.tex \inputs -- so the chart bodies and the prose can never
+%% disagree about the tool name or a colour. This file sits in <paper>/figures/.
+\input{../figure_defs}
+\setlength{\textwidth}{%(width).2fpt}
+\setlength{\parindent}{0pt}
+%% tightpage crops the page to the minipage. PreviewBorder is zeroed so the PDF
+%% comes out exactly \textwidth wide and \includegraphics[width=\textwidth]
+%% scales it by exactly 1.0 -- any border would force a slight rescale, and
+%% shrinking a chart shrinks its text toward the 9pt floor.
+\usepackage[active,tightpage]{preview}
+\setlength\PreviewBorder{0pt}
+\PreviewEnvironment{minipage}
+\begin{document}
+\begin{minipage}{\textwidth}
+\centering
+%(body)s
+\end{minipage}
+\end{document}
+"""
+
+
+def _aaai_render_chart_pdf(body_lines, basename, tex_dir):
+    """Compile the tikz/pgfplots `body_lines` of ONE figure into a standalone
+    PDF under `tex_dir`/_AAAI_FIGDIR and return the \\includegraphics line that
+    replaces them in the paper.
+
+    `basename` names the .tex/.pdf pair and must be stable across runs so the
+    figure keeps one filename. Raises RuntimeError if pdflatex fails, rather
+    than leaving the paper pointing at a stale or missing PDF."""
+    import subprocess
+
+    figdir = os.path.join(tex_dir, _AAAI_FIGDIR)
+    os.makedirs(figdir, exist_ok=True)
+    body = "\n".join(body_lines)
+    src = _AAAI_STANDALONE_DOC % {"width": _AAAI_TEXTWIDTH_PT, "body": body}
+    tex_file = os.path.join(figdir, basename + ".tex")
+    with open(tex_file, "w") as fh:
+        fh.write(src)
+    proc = subprocess.run(
+        ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+         basename + ".tex"],
+        cwd=figdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    pdf_file = os.path.join(figdir, basename + ".pdf")
+    if proc.returncode != 0 or not os.path.exists(pdf_file):
+        tail = proc.stdout.decode("utf8", "replace").splitlines()[-25:]
+        raise RuntimeError(
+            "pdflatex failed for figure %s:\n%s" % (basename, "\n".join(tail)))
+    # Drop the per-figure build droppings; keep only .tex (the source of record)
+    # and .pdf (what the paper imports).
+    for ext in (".aux", ".log"):
+        try:
+            os.remove(os.path.join(figdir, basename + ext))
+        except OSError:
+            pass
+    return "\\includegraphics[width=\\textwidth]{%s/%s}" % (
+        _AAAI_FIGDIR, basename)
+
+
 def _aaai_hlabel_pt(nmax, ncol_max):
     """Figure-wide point size for the HORIZONTAL per-bar value labels, chosen so
     the widest possible label ('XX.XX') fits within one bar's physical width
@@ -6219,7 +6661,8 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False):
 
 
 def _aaai_bd_single_figure(groups, force_timeout=None,
-                           label_base="fig:n2-bounddiff", dataset_disp=None):
+                           label_base="fig:n2-bounddiff", dataset_disp=None,
+                           tex_dir=None, basename=None):
     """Emit the BOUNDS-DIFFERENCE chart as ONE flat grouped-bar figure (not a
     per-architecture grid) for a SINGLE dataset (the pooled-across-datasets
     figure was split per dataset on user request -- one call per dataset, see
@@ -6242,15 +6685,16 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
     content, n, xtick, xticklabels = _aaai_bar_content(
         groups, power, cluster=False, value_labels=True, label_font=hlabel_pt,
         series=_AAAI_CHART_SERIES_GAP)
-    out = []
-    out.append(r"\begin{figure*}[tp]")
-    out.append(r"\centering")
+    # As in _aaai_combined_time_figure: the pgfplots graphic is pre-rendered to
+    # a PDF (AAAI bans pgfplots in the paper source) while the caption/label stay
+    # in the paper so the AAAI style typesets them.
+    graphic = []
     if dataset_disp:
-        out.append(r"{\small\textbf{" + dataset_disp + r"}}\par\smallskip")
-    out += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
-    out.append(r"\par\smallskip")
-    out.append(r"\begin{tikzpicture}")
-    out.append(
+        graphic.append(r"{\small\textbf{" + dataset_disp + r"}}\par\smallskip")
+    graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
+    graphic.append(r"\par\smallskip")
+    graphic.append(r"\begin{tikzpicture}")
+    graphic.append(
         r"\begin{axis}[" "\n"
         r"  width=\textwidth, height=6cm," "\n"
         f"  ymin=0, ymax={ymax:.4g}, xmin=0.4, xmax={n + 0.6:g}, "
@@ -6265,9 +6709,13 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
         r"  y tick label style={font=\small}," "\n"
         r"  axis background/.style={fill=black!4}," "\n"
         r"  ymajorgrids, major grid style={gray!25}]")
-    out += content
-    out.append(r"\end{axis}")
-    out.append(r"\end{tikzpicture}")
+    graphic += content
+    graphic.append(r"\end{axis}")
+    graphic.append(r"\end{tikzpicture}")
+    out = []
+    out.append(r"\begin{figure*}[tp]")
+    out.append(r"\centering")
+    out.append(_aaai_render_chart_pdf(graphic, basename, tex_dir))
     ds_phrase = (r" on " + dataset_disp) if dataset_disp else ""
     cap = (r"Remaining bound difference $\delta_u-\delta_l$ (as a percentage of "
            r"$\delta_{\max}$; shorter is tighter) of \tool compared to "
@@ -6549,7 +6997,7 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
 
 
 def _aaai_combined_time_figure(col_order, col_titles, types_order, cell_map,
-                               caption, labels):
+                               caption, labels, tex_dir=None, basename=None):
     """Emit ONE solve-time `figure*`: a 2-D groupplot grid whose COLUMNS are
     `col_order` (architectures, titled via `col_titles`) and whose ROWS are the
     perturbation types `types_order`, so every little graph sits at
@@ -6562,15 +7010,21 @@ def _aaai_combined_time_figure(col_order, col_titles, types_order, cell_map,
     names to emit (the caller assigns per-database labels + arch aliases)."""
     nmax = max((len(groups) for groups in cell_map.values()), default=1)
     ncol_max = max(len(col_order), 1)
-    out = []
-    out.append(r"\begin{figure*}[tp]")
-    out.append(r"\centering")
-    out += _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
-    out.append(r"\par\smallskip")
-    out += _aaai_arch_typegrid(
+    # The graphic (legend + grid) is pgfplots, which the AAAI style bans in the
+    # paper source, so it is rendered to a PDF here and imported. The caption and
+    # labels stay in the paper: they are typeset by the AAAI style at 10pt roman
+    # and must not be baked into the image.
+    graphic = []
+    graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
+    graphic.append(r"\par\smallskip")
+    graphic += _aaai_arch_typegrid(
         col_order, types_order, cell_map, r"time (min)", nmax, ncol_max,
         series=_AAAI_CHART_SERIES, unit_label="time (minutes)",
         col_titles=col_titles)
+    out = []
+    out.append(r"\begin{figure*}[tp]")
+    out.append(r"\centering")
+    out.append(_aaai_render_chart_pdf(graphic, basename, tex_dir))
     out.append(f"\\caption{{{caption}}}")
     for lb in labels:
         out.append(f"\\label{{{lb}}}")
@@ -6932,6 +7386,10 @@ def regenerate_aaai_time_combined_section(
             parts = []
             emitted_arch = set()  # dedup fig:n2-time-<arch> aliases across figures
             first = True
+            # Charts are pre-rendered to PDFs next to the paper (AAAI bans
+            # pgfplots in the source); tex_path is <paper>/sections/<file>.tex.
+            tex_dir = os.path.dirname(os.path.dirname(os.path.abspath(tex_path)))
+            fig_n = 0
             for dataset_disp, cells in by_ds.items():
                 cell_map = {}    # (type_disp, arch) -> [(type_disp, size, bars)]
                 col_titles = {}  # arch -> arch_disp
@@ -6993,9 +7451,11 @@ def regenerate_aaai_time_combined_section(
                     if a not in emitted_arch:
                         emitted_arch.add(a)
                         labels.append(f"fig:n2-time-{a}")
+                fig_n += 1
                 parts += _aaai_combined_time_figure(
                     col_order, col_titles, types_order, cell_map,
-                    caption, labels)
+                    caption, labels, tex_dir=tex_dir,
+                    basename=f"n2_time_{fig_n}")
                 first = False
             body = "\n".join(parts)
         else:
@@ -7034,14 +7494,20 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
             for g in bd_groups:
                 by_ds.setdefault(g[0], []).append(g)
             figs = []
+            # See regenerate_aaai_time_combined_section: charts are pre-rendered
+            # to PDFs next to the paper, so derive the paper root from tex_path.
+            tex_dir = os.path.dirname(os.path.dirname(os.path.abspath(tex_path)))
+            fig_n = 0
             for ds_disp, ds_groups in by_ds.items():
                 dslug = re.sub(r"[^a-z0-9]+", "-",
                                (ds_disp or "").lower()).strip("-")
                 label_base = ("fig:n2-bounddiff-" + dslug
                               if dslug else "fig:n2-bounddiff")
+                fig_n += 1
                 figs += _aaai_bd_single_figure(
                     ds_groups, force_timeout=force_timeout,
-                    label_base=label_base, dataset_disp=ds_disp or None)
+                    label_base=label_base, dataset_disp=ds_disp or None,
+                    tex_dir=tex_dir, basename=f"n2_bounddiff_{fig_n}")
             body = "\n".join(figs)
         else:
             body = (r"% (no cluster has all three methods at the timeout -- "
@@ -7078,6 +7544,7 @@ _AAAI_ARCH_DISPLAY = {
     "cnn5": r"\emph{conv4}",
     "3x50": r"3$\times$50",
     "3x10": r"3$\times$10",
+    "3x100": r"3$\times$100",
 }
 
 
@@ -7531,6 +7998,12 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                                 "lb_total": lb,
                                 "ub_total": ub,
                                 "solve_status": val.get("solve_status", ""),
+                                # Dropped binaries per copy; see the same fields
+                                # in _collect_wide_perarch_cells.
+                                "relaxed_org": _as_int(
+                                    val.get("n2_org_relaxed_binaries")),
+                                "relaxed_pert": _as_int(
+                                    val.get("n2_pert_relaxed_binaries")),
                                 "geom": is_geom,
                             }
                             # Honor --force_timeout: drop a timeout cell whose

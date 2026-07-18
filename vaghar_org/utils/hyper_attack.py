@@ -162,8 +162,7 @@ def attack(model, X, source_, target_, device, token_signature,\
     best_val = torch.Tensor([0])
 
     if k_to_use > 0:
-        if k_to_use>1:
-            s_indices = s_indices.squeeze()
+        s_indices = s_indices.reshape(-1)
         values, indices = torch.topk(diff1[s_indices], k=k_to_use)
         best_val = values[0]
         indices = s_indices[indices]
@@ -373,12 +372,19 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
 def create_hyper_input(source, trainset, testset, M, dims):
 
     train_images = [image for image, _ in trainset]
-    train_images = torch.stack(train_images).to(device)
+    train_images = torch.stack(train_images)
     test_images = [image for image, _ in testset]
-    test_images = torch.stack(test_images).to(device)
-    random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2]).to(device)
-    all_samples = torch.cat((random_images, train_images, test_images), dim=0).to(device)
-    classification = model(all_samples).to(device)
+    test_images = torch.stack(test_images)
+    random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2])
+    all_samples = torch.cat((random_images, train_images, test_images), dim=0)
+    model.eval()
+    batch_size = 1024
+    classification_batches = []
+    with torch.no_grad():
+        for start in range(0, all_samples.shape[0], batch_size):
+            batch = all_samples[start:start+batch_size].to(device)
+            classification_batches.append(model(batch).cpu())
+    classification = torch.cat(classification_batches, dim=0).to(device)
     _, predicted_labels = torch.max(classification, dim=1)
     indices_of_s = (predicted_labels == source).nonzero().squeeze()
     source_samples_classification = classification[indices_of_s]
@@ -388,7 +394,7 @@ def create_hyper_input(source, trainset, testset, M, dims):
     sorted_indices_of_s = indices_of_s[sorted_indices]
     step_size = max(1, len(sorted_indices_of_s) // M)
     uniform_indices = sorted_indices_of_s[::step_size][:M]
-    hyper_input = all_samples[uniform_indices]
+    hyper_input = all_samples[uniform_indices.cpu()].to(device)
     return hyper_input
 
 

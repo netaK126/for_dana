@@ -171,7 +171,7 @@ def _timeout_row_is_stale_rerun(status, runtime):
 PERTURBATIONS = [
     
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-    ("trans(1,1)",        "translation:1,1"),
+    # ("trans(1,1)",        "translation:1,1"),
     ("occ(14,14,9)",        "occ:14,14,9"),
     # ("contrast(1.5)",      "contrast:1.5"),
     # ("rotation(10)",      "rotation:10"),
@@ -2636,15 +2636,27 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
             print(f"[paper-tables] aaai_safe_wide (N2 appendix) block "
                   f"error: {exc}")
 
+    # Per-network relaxation + precision-cost rows for the single Evaluation
+    # table. Pooled across datasets by the caller and emitted once, like the
+    # combined figures.
+    relax_rows = []
+    if hasattr(updater, "collect_aaai_relax_precision_rows"):
+        try:
+            relax_rows = updater.collect_aaai_relax_precision_rows(
+                cwd, dataset, arch_runs, **common)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_relax_precision collect error: {exc}")
+
     # Both combined figures (solve-time + bounds-difference) are written once,
     # after ALL datasets are collected, so the caller defers the compile
     # (recompile=False) and returns the pooled data.
     if recompile:
         _recompile_neta_s_paper(cwd)
-    return time_cells, bd_groups
+    return time_cells, bd_groups, relax_rows
 
 
 def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
+                                   relax_rows=None,
                                    force_timeout=None):
     """Emit the SINGLE combined solve-time grid (columns = networks) AND the
     SINGLE combined bounds-difference figure, pooling `time_cells`/`bd_groups`
@@ -2671,6 +2683,14 @@ def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
                 body_tex, bd_groups, force_timeout=force_timeout)
         except Exception as exc:
             print(f"[paper-tables] aaai_n2_bounddiff block error: {exc}")
+    # The relaxation / precision-cost table: one table for every dataset.
+    if os.path.exists(body_tex) and hasattr(
+            updater, "regenerate_aaai_relax_precision_section"):
+        try:
+            updater.regenerate_aaai_relax_precision_section(
+                body_tex, relax_rows or [])
+        except Exception as exc:
+            print(f"[paper-tables] aaai_relax_precision block error: {exc}")
     _recompile_neta_s_paper(cwd)
 
 
@@ -3317,11 +3337,12 @@ def main():
         # (recompile=False) and done once at the end.
         all_time_cells = []
         all_bd_groups = []
+        all_relax_rows = []
         for pt_dataset in pt_datasets:
             if len(pt_datasets) > 1:
                 print(f"\n===== Regenerating neta-s-paper tables (from advStd "
                       f"txt) for dataset: {pt_dataset} =====")
-            tc, bd = _regen_paper_tables_from_txt(
+            tc, bd, rx = _regen_paper_tables_from_txt(
                 arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
                 combination_table=args.combination_table,
                 force_timeout=effective_force_timeout,
@@ -3331,10 +3352,13 @@ def main():
                 recompile=False)
             all_time_cells += tc
             all_bd_groups += bd
+            all_relax_rows += rx
         # One combined solve-time grid + one combined bounds-difference figure
-        # across all datasets, then the single final recompile.
+        # + one relaxation/precision table across all datasets, then the single
+        # final recompile.
         _regen_paper_combined_from_txt(
             cwd, all_time_cells, all_bd_groups,
+            relax_rows=all_relax_rows,
             force_timeout=effective_force_timeout)
         return
 
