@@ -313,21 +313,30 @@ def _csrc_color(c_src):
 def parse_combination_spec(spec):
     """Parse comma-separated 'bt:varHint:tau' specs for --combination_table.
 
-    Format: '<bt>:<varHint>:<tau>[+sg][,<bt>:<varHint>:<tau>[+sg],...]'.
+    Two accepted forms:
+      - '<bt>:<varHint>[+sg]'        — tau-free. The threshold is supplied
+                                       separately (--paper_taus), so the two
+                                       flags stay orthogonal: this one picks
+                                       the technique, that one picks the
+                                       thresholds. Expanded to one combo per
+                                       tau by expand_combination_spec_taus.
+      - '<bt>:<varHint>:<tau>[+sg]'  — explicit tau, as before.
     Examples:
-      - 'zono:prev_pgd:0.5'
-      - 'interval:prev_pgd:0.5+sg,zono:prev_pgd:0.5+sg'
+      - 'zono:prev_pgd+sg'                              (tau from --paper_taus)
+      - 'interval:prev_pgd:0.5+sg,zono:prev_pgd:0.5+sg' (explicit)
     Per-combo fields:
       - bt   ∈ {none, interval, zono, interval+lp, zono+lp} — matches the
                bound_tight column rendered in the per-arch tables.
       - vh   ∈ {no, off, prev, direct, direct_pgd, prev_pgd} — matches the
                CSV var_hint column verbatim ('off' is accepted as an alias
                for 'no').
-      - tau  ∈ {off, 0.0, 0.01, 0.05, 0.1, 0.5, 1.0}, optionally with
-               '+sg' suffix for SibGate (Technique 4).
+      - tau  ∈ {off, 0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0}, optionally with
+               '+sg' suffix for SibGate (Technique 4). In the tau-free form
+               '+sg' rides on varHint instead.
     Returns None if spec is empty / None; otherwise a list of
     (bt, vh, tau) tuples suitable for membership testing against
-    _combo_label.
+    _combo_label. A tau-free combo carries tau '*' (or '*+sg'), a wildcard
+    that expand_combination_spec_taus resolves before any matching happens.
     """
     if not spec:
         return None
@@ -337,12 +346,21 @@ def parse_combination_spec(spec):
         if not combo_str:
             continue
         parts = [p.strip() for p in combo_str.split(":")]
-        if len(parts) != 3:
+        if len(parts) == 2:
+            # Tau-free form: '+sg' is attached to varHint, so move it onto the
+            # wildcard tau where the rest of the pipeline expects to find it.
+            bt, vh = parts
+            sg = "+sg" if vh.endswith("+sg") else ""
+            vh = vh[:-3] if sg else vh
+            tau = "*" + sg
+        elif len(parts) == 3:
+            bt, vh, tau = parts
+        else:
             raise SystemExit(
                 "--combination_table: expected "
-                "'bt:varHint:tau[,bt:varHint:tau,...]', "
+                "'bt:varHint[+sg]' or 'bt:varHint:tau[+sg]' "
+                "(comma-separated), "
                 f"got {spec!r}")
-        bt, vh, tau = parts
         if vh.lower() == "off":
             vh = "no"
         combo = (bt, vh, tau)
@@ -351,6 +369,31 @@ def parse_combination_spec(spec):
     if not combos:
         return None
     return combos
+
+
+def expand_combination_spec_taus(combos, taus):
+    """Resolve tau-wildcard combos ('zono:prev_pgd+sg') into one concrete combo
+    per tau, so every downstream matcher keeps doing a plain membership test
+    against _combo_label output and needs no wildcard awareness.
+
+    This is what keeps --combination_table and --paper_taus from overlapping:
+    the spec names the technique, the tau list names the thresholds, and the
+    admitted set is their cross product. Combos with an explicit tau pass
+    through untouched."""
+    if not combos:
+        return combos
+    out = []
+    for bt, vh, tau in combos:
+        if not str(tau).startswith("*"):
+            if (bt, vh, tau) not in out:
+                out.append((bt, vh, tau))
+            continue
+        sg = "+sg" if str(tau).endswith("+sg") else ""
+        for t in taus:
+            combo = (bt, vh, f"{t}{sg}")
+            if combo not in out:
+                out.append(combo)
+    return out
 
 
 def _format_combination_filter(combination_filter):
@@ -3777,6 +3820,24 @@ _ADVSTD_WIDE_COMBOS = (
 )
 
 
+def _advstd_wide_combos():
+    """_ADVSTD_WIDE_COMBOS widened to every tau the per-cell tables currently
+    render (--paper_taus), so a threshold beyond the built-in 0.0 / 0.5 pair
+    (e.g. 0.25) is admitted by the .txt loader instead of being filtered out
+    before it can reach a row. Evaluated per call because --paper_taus is
+    applied at runtime; a tau with no result files just contributes nothing."""
+    combos = list(_ADVSTD_WIDE_COMBOS)
+    known = {c[3] for c in combos}
+    # Union of the table taus and the chart taus: a threshold drawn in a figure
+    # must be loadable even if it is not rendered as a table row, and vice
+    # versa.
+    for tau in tuple(_AAAI_WIDE_TAUS) + tuple(_AAAI_CHART_TAUS):
+        if tau not in known:
+            combos.append((f"adv_zono_prevpgd_{tau}+sg",
+                           "yes", "prev_pgd", tau, "yes"))
+    return tuple(combos)
+
+
 def _wide_column_order():
     """Yield the columns in the order they appear in the table.
     A column is either a baseline tag ('vaghar' or 'PI') or a tuple
@@ -4768,6 +4829,28 @@ AAAI_WIDE_N1_END_MARK   = "% END AUTO: aaai_safe_wide_n1_tables"
 AAAI_WIDE_N2_APPENDIX_BEGIN_MARK = "% BEGIN AUTO: aaai_safe_wide_n2_appendix_tables"
 AAAI_WIDE_N2_APPENDIX_END_MARK   = "% END AUTO: aaai_safe_wide_n2_appendix_tables"
 
+# When True, regenerate_aaai_wide_perarch_section DROPS every row that would
+# carry the red partial-coverage "*" in any of its time sub-cells, so the
+# rendered table shows only rows averaged over every expected c_target. The
+# rows are discarded before the model label is distributed, so the left-hand
+# label column re-flows over exactly the surviving rows (no dangling
+# delta_max / delta_d line, no empty block).
+#
+# The paper appendix renders with this ON; the standalone
+# table_full_results.tex renders the SAME tables with it OFF, so the full,
+# starred data is still reported somewhere. run_relaxation_sweep.py flips it
+# around the two calls -- do not set it globally.
+_AAAI_WIDE_DROP_PARTIAL_ROWS = False
+
+
+def set_aaai_wide_drop_partial_rows(flag):
+    """Set the drop-starred-rows toggle; returns the PREVIOUS value so the
+    caller can restore it."""
+    global _AAAI_WIDE_DROP_PARTIAL_ROWS
+    prev = _AAAI_WIDE_DROP_PARTIAL_ROWS
+    _AAAI_WIDE_DROP_PARTIAL_ROWS = bool(flag)
+    return prev
+
 # Target-network (N2) per-perturbation solve-time charts. These live in
 # the evaluation body (sec_evaluation.tex) and replace the N2 per-cell
 # tables there; one grouped-bar figure per (architecture, source class).
@@ -4782,14 +4865,78 @@ AAAI_SUMMARY_BEGIN_MARK = "% BEGIN AUTO: aaai_summary_table"
 AAAI_SUMMARY_END_MARK   = "% END AUTO: aaai_summary_table"
 
 # 3 columns: the original VHAGaR baseline (PI=off, no boosts), the
-# standard-mode safe combo zono+SibGate+PI at tau=0.5, and the
-# transfer-mode safe combo adv+zono+prev_pgd+SibGate at tau=0.5.
-# Each entry: (column_key, multicolumn header label).
-_AAAI_WIDE_COLUMNS = (
-    ("vaghar",                   r"\baseline"),
-    (("1", "1", "1", "0.5"),     r"ours ($\tau{=}0.5$)"),
-    ("adv_zono_prevpgd_0.5+sg",  r"ours with transfer ($\tau{=}0.5$)"),
+# standard-mode safe combo zono+SibGate+PI, and the transfer-mode safe combo
+# adv+zono+prev_pgd+SibGate. The relaxation threshold tau is NOT baked into
+# the column keys: it is its own table column, so one (arch, role, pert,
+# c_source) cell renders one row PER tau value that has data. The header
+# labels below are therefore tau-free.
+_AAAI_WIDE_COLUMN_HEADERS = (
+    r"\baseline",
+    r"ours",
+    r"ours with transfer",
 )
+
+# Tau values the per-cell tables render, in row order. This is the DEFAULT;
+# --paper_taus overrides it via set_aaai_wide_taus() so an extra threshold
+# (e.g. 0.25) can be pulled into the tables without editing the source.
+_AAAI_WIDE_TAUS_DEFAULT = ("0.0", "0.5")
+_AAAI_WIDE_TAUS = _AAAI_WIDE_TAUS_DEFAULT
+
+
+def set_aaai_wide_taus(taus):
+    """Set which tau values the per-cell tables render as rows (--paper_taus).
+
+    Each tau gets its own row per cell, so this only widens the table
+    vertically. A tau with no data on a given cell simply yields no row for
+    that cell. Passing None/empty restores the default."""
+    global _AAAI_WIDE_TAUS
+    if not taus:
+        _AAAI_WIDE_TAUS = _AAAI_WIDE_TAUS_DEFAULT
+        return _AAAI_WIDE_TAUS
+    # Normalize ("0.50" -> "0.5") so the strings match the tau tags parsed out
+    # of the result filenames, and keep the caller's order (row order).
+    seen, norm = set(), []
+    for t in taus:
+        t = str(t).strip()
+        if not t:
+            continue
+        try:
+            t = repr(float(t)) if float(t) != int(float(t)) else f"{float(t):.1f}"
+        except ValueError:
+            pass
+        if t not in seen:
+            seen.add(t)
+            norm.append(t)
+    _AAAI_WIDE_TAUS = tuple(norm) or _AAAI_WIDE_TAUS_DEFAULT
+    return _AAAI_WIDE_TAUS
+
+
+def _aaai_wide_columns_for_tau(tau):
+    """The three column keys for one tau. The \\baseline column is
+    tau-independent (the baseline runs no relaxation), so it repeats on every
+    tau row; only ours / ours-with-transfer are tau-specific."""
+    return ["vaghar", ("1", "1", "1", tau), f"adv_zono_prevpgd_{tau}+sg"]
+
+
+def _aaai_wide_cell_has_data(cell_dict, col):
+    """True iff this cell has at least one run (base or geom twin) for `col`."""
+    cell = cell_dict.get(col)
+    return bool(cell and (cell.get("t_base") or cell.get("t_geom")))
+
+
+def _aaai_wide_taus_for_cell(cell_dict):
+    """The tau values this cell actually has ours / ours-with-transfer data
+    for, in _AAAI_WIDE_TAUS order. Empty when only the baseline ran, in which
+    case the caller still emits one row so the baseline stays visible."""
+    return [t for t in _AAAI_WIDE_TAUS
+            if any(_aaai_wide_cell_has_data(cell_dict, c)
+                   for c in _aaai_wide_columns_for_tau(t)[1:])]
+
+
+# The tau=0.5 instance, kept as a module-level constant because the Evaluation
+# relaxation/precision table (which has no tau column) pins itself to it below.
+_AAAI_WIDE_COLUMNS = tuple(
+    zip(_aaai_wide_columns_for_tau("0.5"), _AAAI_WIDE_COLUMN_HEADERS))
 
 
 def _as_int(v):
@@ -5034,12 +5181,13 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
     # each method's remaining gap is), since the solve times there are all pinned
     # at the cap and carry no signal.
     def _wide_header_macro(name, trailing_top):
-        top = ["\\multirow{2}{*}{model}", "\\multirow{2}{*}{pert (size)}"]
-        for _col, hdr in _AAAI_WIDE_COLUMNS:
+        top = ["\\multirow{2}{*}{model}", "\\multirow{2}{*}{pert (size)}",
+               "\\multirow{2}{*}{$\\tau$}"]
+        for hdr in _AAAI_WIDE_COLUMN_HEADERS:
             top.append("\\multicolumn{3}{c|}{" + hdr + "}")
         top += trailing_top
-        sub = ["", ""]
-        for _ in _AAAI_WIDE_COLUMNS:
+        sub = ["", "", ""]
+        for _ in _AAAI_WIDE_COLUMN_HEADERS:
             sub += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
         sub += ["", ""]  # the two trailing columns span both header rows
         return [f"\\providecommand{{\\{name}}}{{%",
@@ -5064,12 +5212,12 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         )
         if not arch_keys:
             continue
-        # Drop rows where every one of the 4 columns has no data (base or geom)
+        # Drop cells where no column at ANY tau has data (base or geom).
+        _all_cols = {c for t in _AAAI_WIDE_TAUS
+                     for c in _aaai_wide_columns_for_tau(t)}
         arch_keys = [
             k for k in arch_keys
-            if any(buckets[k].get(c)
-                   and (buckets[k][c].get("t_base") or buckets[k][c].get("t_geom"))
-                   for c in columns)
+            if any(_aaai_wide_cell_has_data(buckets[k], c) for c in _all_cols)
         ]
         if not arch_keys:
             continue
@@ -5080,7 +5228,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         _ft = _ft_for(force_timeout, arch)
         _cap_min = (_ft / 60.0) if _ft is not None else None
         _eps_min = rerun_timeout_eps / 60.0
-        col_spec = ("@{}l l | " + " | ".join(["r r r"] * len(columns))
+        # l l l = model, pert (size), tau; then one "r r r" group per method.
+        col_spec = ("@{}l l l | "
+                    + " | ".join(["r r r"] * len(_AAAI_WIDE_COLUMN_HEADERS))
                     + " | r r@{}")
         # Collect every (role, c_src) block's rows, each tagged with all_timeout,
         # so this architecture can be split into TWO tables below: one for cells
@@ -5163,9 +5313,25 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # model column) for every row that actually has data, so the
             # model label can be spread across exactly the rendered rows.
             block_rows = []
+            # One rendered row per (cell, tau): a cell that ran ours /
+            # ours-with-transfer at several thresholds gets one row per
+            # threshold, with the tau column naming which one. `columns` is
+            # rebound per row to that tau's three column keys, so every
+            # downstream lookup (stats, speedups, gap ratios, highlight,
+            # all_timeout) is automatically tau-scoped. A cell with baseline
+            # data only still yields a single row so the baseline stays
+            # visible; its tau cell reads "---".
+            _cell_tau_rows = []
             for key in list(gkeys):
+                _taus = _aaai_wide_taus_for_cell(buckets[key])
+                for _t in (_taus or [None]):
+                    _cell_tau_rows.append((key, _t))
+            for key, tau in _cell_tau_rows:
                 _, role, pert, p_size, c_src = key
                 cell_dict = buckets[key]
+                columns = _aaai_wide_columns_for_tau(
+                    tau if tau is not None else _AAAI_WIDE_TAUS[-1])
+                tau_cell = "---" if tau is None else f"${tau}$"
                 # Pre-compute stats for each rendered column
                 stats = {}
                 partial = {}
@@ -5228,7 +5394,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 pert_str = f"{pert} ({p_size})".replace("_", r"\_")
                 # Replace "linf" textual key with the math glyph
                 pert_str = pert_str.replace("linf", r"$\ell_\infty$")
-                data_cells = [pert_str]
+                data_cells = [pert_str, tau_cell]
                 STAR = r"\textcolor{red}{$^*$}"
                 # Blue "*" flags a RAW (un-normalized) bound shown because
                 # delta_max was unavailable, distinct from the red "*" (partial
@@ -5480,6 +5646,28 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         (_repr_time(c) is not None
                          and _repr_time(c) >= _cap_min - _eps_min)
                         for c in columns)
+                # Partial-coverage filter: drop the row entirely when any
+                # rendered cell carries the red "*" (a mean taken over only
+                # some of the expected c_targets). Only the RED star counts --
+                # the blue "*" flags a raw, un-normalized bound, which is a
+                # complete measurement and stays. See
+                # _AAAI_WIDE_DROP_PARTIAL_ROWS.
+                if _AAAI_WIDE_DROP_PARTIAL_ROWS and any(
+                        STAR in str(cell) for cell in
+                        list(data_cells) + list(speedup_cells)
+                        + list(bounddiff_cells)):
+                    continue
+                # Incomplete-comparison filter: a row only earns a place in the
+                # paper if ALL THREE methods ran on it. data_cells is
+                # [pert, tau] followed by the (delta_l, delta_u, t) triple of
+                # each rendered column, so a "---" anywhere past the first two
+                # means some method has no data and the row is not a full
+                # three-way comparison. The trailing speedup / gap-ratio cells
+                # are NOT checked: they legitimately read "---" when the regime
+                # makes them meaningless.
+                if _AAAI_WIDE_DROP_PARTIAL_ROWS and any(
+                        "---" in str(cell) for cell in data_cells[2:]):
+                    continue
                 block_rows.append((row_sort, pert, p_size, data_cells,
                                    all_timeout, speedup_cells, bounddiff_cells,
                                    row_color))
@@ -6087,6 +6275,95 @@ _AAAI_CHART_SERIES_GAP = (
         "pattern=vertical lines, pattern color=white"),
 )
 
+# Which relaxation thresholds get their own PAIR of series (ours + ours with
+# transfer) in the charts. Default is the single headline threshold, which
+# reproduces the three-series figures above byte for byte; --paper_chart_taus
+# adds more. Kept SEPARATE from _AAAI_WIDE_TAUS (the appendix-table rows)
+# because a chart cluster only fits a few bars before the per-bar value labels
+# stop fitting, whereas a table simply grows another row.
+_AAAI_CHART_TAUS_DEFAULT = ("0.5",)
+_AAAI_CHART_TAUS = _AAAI_CHART_TAUS_DEFAULT
+
+# Per-tau bar styling, as (ours fill/draw, ours pattern, transfer fill/draw,
+# transfer pattern). Within one figure the METHOD is carried by the pattern
+# family and the THRESHOLD by luminance, so every bar stays separable in
+# colour, in grayscale, and under colour-blindness (the same three-way rule the
+# base palette follows). The '0.5' entries are verbatim the styles used above,
+# so a default single-tau run emits identical TikZ.
+_AAAI_CHART_TAU_STYLES = {
+    "0.5": ("fill=oursgreen!42, draw=oursgreen!60!black",
+            "pattern=north east lines, pattern color=oursgreen!70!black",
+            "fill=oursgreen!48!black, draw=oursgreen!25!black",
+            "pattern=vertical lines, pattern color=white"),
+    "0.25": ("fill=oursgreen!18, draw=oursgreen!55!black",
+             "pattern=crosshatch, pattern color=oursgreen!75!black",
+             "fill=oursgreen!72!black, draw=oursgreen!20!black",
+             "pattern=horizontal lines, pattern color=white"),
+    "0.0": ("fill=oursgreen!8, draw=oursgreen!50!black",
+            "pattern=dots, pattern color=oursgreen!80!black",
+            "fill=oursgreen!88!black, draw=oursgreen!15!black",
+            "pattern=grid, pattern color=white"),
+}
+_AAAI_CHART_TAU_STYLES_GAP = {
+    "0.5": ("fill=bddiffours!38, draw=bddiffours!60!black",
+            "pattern=north east lines, pattern color=bddiffours!70!black",
+            "fill=bddiffours!55!black, draw=bddiffours!25!black",
+            "pattern=vertical lines, pattern color=white"),
+    "0.25": ("fill=bddiffours!16, draw=bddiffours!55!black",
+             "pattern=crosshatch, pattern color=bddiffours!75!black",
+             "fill=bddiffours!75!black, draw=bddiffours!20!black",
+             "pattern=horizontal lines, pattern color=white"),
+    "0.0": ("fill=bddiffours!6, draw=bddiffours!50!black",
+            "pattern=dots, pattern color=bddiffours!80!black",
+            "fill=bddiffours!90!black, draw=bddiffours!15!black",
+            "pattern=grid, pattern color=white"),
+}
+
+
+def _aaai_build_chart_series(baseline_entry, style_table):
+    """Series tuple for one figure family: the \\baseline bar, then an
+    (ours, ours with transfer) pair per tau in _AAAI_CHART_TAUS. The tau is
+    named in the legend label only when more than one is drawn, so the
+    single-tau default keeps the original unqualified 'ours' / 'ours with
+    transfer' labels."""
+    show_tau = len(_AAAI_CHART_TAUS) > 1
+    out = [baseline_entry]
+    for tau in _AAAI_CHART_TAUS:
+        styles = style_table.get(tau)
+        if styles is None:
+            # Unknown tau: fall back to the headline styling rather than
+            # dropping the series, so a new threshold still renders.
+            styles = style_table["0.5"]
+        o_fill, o_pat, t_fill, t_pat = styles
+        suffix = (r" ($\tau{=}" + tau + r"$)") if show_tau else ""
+        out.append((("1", "1", "1", tau), r"ours" + suffix, o_fill, o_pat))
+        out.append((f"adv_zono_prevpgd_{tau}+sg",
+                    r"ours with transfer" + suffix, t_fill, t_pat))
+    return tuple(out)
+
+
+def set_aaai_chart_taus(taus):
+    """Set which thresholds the charts draw (--paper_chart_taus) and rebuild
+    both series tables. Passing None/empty restores the single-tau default."""
+    global _AAAI_CHART_TAUS, _AAAI_CHART_SERIES, _AAAI_CHART_SERIES_GAP
+    norm = []
+    for t in (taus or ()):
+        t = str(t).strip()
+        if not t:
+            continue
+        try:
+            t = repr(float(t)) if float(t) != int(float(t)) else f"{float(t):.1f}"
+        except ValueError:
+            pass
+        if t not in norm:
+            norm.append(t)
+    _AAAI_CHART_TAUS = tuple(norm) or _AAAI_CHART_TAUS_DEFAULT
+    _AAAI_CHART_SERIES = _aaai_build_chart_series(
+        _AAAI_CHART_SERIES[0], _AAAI_CHART_TAU_STYLES)
+    _AAAI_CHART_SERIES_GAP = _aaai_build_chart_series(
+        _AAAI_CHART_SERIES_GAP[0], _AAAI_CHART_TAU_STYLES_GAP)
+    return _AAAI_CHART_TAUS
+
 
 def _aaai_chart_time(cell, force_timeout, prefer_geom):
     """Mean solve time in minutes for one method's cell, clamped to the
@@ -6464,7 +6741,7 @@ def _aaai_hlabel_pt(nmax, ncol_max):
 
 def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                       value_labels=False, label_font=6.5,
-                      series=_AAAI_CHART_SERIES):
+                      series=None):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
     (type_disp, item_label, {sk:(value, partial[, ci_half])}). An optional third
     element `ci_half` (the solve-time bars supply it) is the confidence-interval
@@ -6487,6 +6764,10 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
     (each gets its `series` fill pattern overlaid); a partial bar
     gets a red `*`. Heights pass through f(v)=v**power. Returns (lines, xmax,
     xtick_str, xticklabels_str); each item_label is wrapped in braces here."""
+    # Resolve against the LIVE global (set_aaai_chart_taus may have
+    # rebuilt it); a default arg would have frozen it at import time.
+    if series is None:
+        series = _AAAI_CHART_SERIES
     style_of = {k: sty for k, _l, sty, _pat in series}
     pattern_of = {k: pat for k, _l, _s, pat in series}
     # Fixed within-group left-to-right order: transfer, ours, vaghar.
@@ -6730,7 +7011,7 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
     return out
 
 
-def _aaai_standalone_legend(series=_AAAI_CHART_SERIES):
+def _aaai_standalone_legend(series=None):
     """A centred, self-contained legend -- one box + label per method, drawn
     manually with tikz nodes (chained left-to-right via the `positioning`
     library) so it sits once at the top of a figure. Each box shows the
@@ -6739,6 +7020,10 @@ def _aaai_standalone_legend(series=_AAAI_CHART_SERIES):
     left-to-right in the same order the bars are drawn within a group
     (ours with transfer, ours, vaghar). Pass _AAAI_CHART_SERIES_GAP to match
     the bounds-difference figures' palette."""
+    # Resolve against the LIVE global (set_aaai_chart_taus may have
+    # rebuilt it); a default arg would have frozen it at import time.
+    if series is None:
+        series = _AAAI_CHART_SERIES
     out = [r"\begin{tikzpicture}[font=\footnotesize]"]
     prev = None
     for i, (_k, lbl, sty, pat) in enumerate(tuple(reversed(series))):
@@ -6757,7 +7042,7 @@ def _aaai_standalone_legend(series=_AAAI_CHART_SERIES):
 
 
 def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
-                        ncol_max, series=_AAAI_CHART_SERIES,
+                        ncol_max, series=None,
                         unit_label="time (minutes)", col_titles=None):
     """A 2-D groupplot whose COLUMNS are `c_cols` (left-to-right) and ROWS are
     the perturbation types `types_order` (top-to-bottom), so every
@@ -6776,6 +7061,10 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
     row -- the perturbation name plus, on an inner vertical line to its right,
     the y-axis unit "time (minutes)"; within a panel the bars are the per-size
     groups (mean-sorted)."""
+    # Resolve against the LIVE global (set_aaai_chart_taus may have
+    # rebuilt it); a default arg would have frozen it at import time.
+    if series is None:
+        series = _AAAI_CHART_SERIES
     power = _AAAI_YAXIS_POWER
 
     # Per-PANEL (per graph) y-axis: each (type, c_s) graph is scaled to its OWN
@@ -6932,7 +7221,7 @@ def _aaai_arch_typegrid(c_cols, types_order, cell_map, ylabel, nmax,
 
 
 def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
-                            force_timeout=None, series=_AAAI_CHART_SERIES,
+                            force_timeout=None, series=None,
                             unit_label="time (minutes)", bounddiff=False):
     """Emit one two-column `figure*` PER architecture (user: separate each
     architecture into its own figure). Each figure has its own shared legend,
@@ -6951,6 +7240,10 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
     `series`/`unit_label`/`bounddiff` select the SOLVE-TIME rendering (default)
     or the BOUNDS-DIFFERENCE one (distinct palette, gap unit, gap-specific
     caption) for the clusters where all three methods reached the timeout."""
+    # Resolve against the LIVE global (set_aaai_chart_taus may have
+    # rebuilt it); a default arg would have frozen it at import time.
+    if series is None:
+        series = _AAAI_CHART_SERIES
     nmax = max((len(groups)
                 for (_ar, _ad, _c, _t, cm) in arch_rows
                 for groups in cm.values()), default=1)
@@ -7939,9 +8232,10 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                             continue
                         if seeds_filter and meta.get("seed") not in seeds_filter:
                             continue
-                        # Restrict to the two wide-table advstd combos.
+                        # Restrict to the wide-table advstd combos (one per
+                        # rendered tau; see _advstd_wide_combos).
                         combo_label = None
-                        for label, zb, vh, rt, sg in _ADVSTD_WIDE_COMBOS:
+                        for label, zb, vh, rt, sg in _advstd_wide_combos():
                             if (meta.get("zono_bounds") == zb
                                     and meta.get("var_hint") == vh
                                     and meta.get("relax_threshold") == rt

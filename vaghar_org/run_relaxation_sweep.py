@@ -2423,15 +2423,464 @@ def _recompile_neta_s_paper(cwd):
             except OSError as _exc:
                 print(f"[paper-build] could not seed main.{_ext}: {_exc}")
     print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
+    _build_full_results_tex(cwd)
+
+
+#: Marker pairs mirrored into table_full_results.tex, in output order. Each
+#: entry is (source .tex under neta-s-paper/sections, bare marker name); every
+#: dataset-scoped variant (":<ds>") of the marker is picked up automatically.
+_FULL_RESULTS_BLOCKS = [
+    ("sec_full_results_tables.tex", "aaai_safe_wide_n2_appendix_tables"),
+]
+
+#: Hand-written floats copied verbatim into table_full_results.tex, ahead of
+#: the per-cell blocks. Each entry is (source .tex under neta-s-paper/sections,
+#: \label of the float). These are NOT auto-generated, so they are lifted by
+#: label and travel unchanged; edit them in their own section file.
+_FULL_RESULTS_FLOATS = [
+    # Table 1: the FULL networks table, read from the frozen master snapshot
+    # (see _TAB_NETWORKS_MASTER) rather than from sec_evaluation.tex, whose
+    # copy is filtered down to the run's own models by _filter_tab_networks.
+    ("tab_networks_full.tex", "tab:networks"),
+]
+
+#: Frozen full copy of Table 1. Written ONCE from the hand-written table in
+#: sec_evaluation.tex and never rewritten afterwards, so table_full_results.pdf
+#: keeps listing every network no matter which subset a given run sweeps. Edit
+#: it by hand to change the full table.
+_TAB_NETWORKS_MASTER = "tab_networks_full.tex"
+_TAB_NETWORKS_BEGIN = "% BEGIN AUTO: tab_networks"
+_TAB_NETWORKS_END = "% END AUTO: tab_networks"
+
+#: --dataset key -> the Dataset column value used in Table 1.
+_TAB1_DATASET_LABEL = {
+    "mnist": "MNIST",
+    "fashion-mnist": "Fashion-MNIST",
+    "fashion_mnist": "Fashion-MNIST",
+    "cifar": "CIFAR-10",
+    "cifar-10": "CIFAR-10",
+}
+
+
+def _extract_labeled_float(text, label, env="table*"):
+    """Return the full '\\begin{<env>} ... \\end{<env>}' block whose body
+    carries '\\label{<label>}', or None. table*/figure* environments do not
+    nest, so a non-greedy scan over each block is unambiguous."""
+    pat = re.compile(r"\\begin\{" + re.escape(env) + r"\}.*?"
+                     r"\\end\{" + re.escape(env) + r"\}", re.S)
+    for m in pat.finditer(text):
+        if "\\label{" + label + "}" in m.group(0):
+            return m.group(0)
+    return None
+
+
+def _snapshot_tab_networks(cwd):
+    """Freeze the FULL Table 1 into sections/tab_networks_full.tex, once.
+
+    The first call copies the hand-written table out of sec_evaluation.tex --
+    before any filtering has touched it -- and every later call is a no-op, so
+    the frozen copy keeps every network row even after the paper's own copy is
+    reduced to a single run's models. Returns the master's table text, or None.
+    """
+    sec_dir = os.path.join(cwd, "neta-s-paper", "sections")
+    master = os.path.join(sec_dir, _TAB_NETWORKS_MASTER)
+    if os.path.exists(master):
+        with open(master, encoding="utf-8") as fh:
+            return _extract_labeled_float(fh.read(), "tab:networks")
+    src = os.path.join(sec_dir, "sec_evaluation.tex")
+    if not os.path.exists(src):
+        return None
+    with open(src, encoding="utf-8") as fh:
+        block = _extract_labeled_float(fh.read(), "tab:networks")
+    if block is None:
+        print("[tab1] tab:networks not found in sec_evaluation.tex; "
+              "no master snapshot written")
+        return None
+    with open(master, "w", encoding="utf-8") as fh:
+        fh.write("%% FROZEN full copy of Table 1 (tab:networks), snapshotted\n"
+                 "%% from sec_evaluation.tex by run_relaxation_sweep.py.\n"
+                 "%% run_relaxation_sweep.py NEVER rewrites this file: it feeds\n"
+                 "%% table_full_results.tex, which must keep listing every\n"
+                 "%% network even when a run sweeps only some of them. The\n"
+                 "%% paper's own copy in sec_evaluation.tex IS filtered per run.\n"
+                 "%% Edit this file by hand to change the full table.\n"
+                 "%% Not \\input by main.tex.\n\n")
+        fh.write(block + "\n")
+    print(f"[tab1] froze the full Table 1 into sections/{_TAB_NETWORKS_MASTER}")
+    return block
+
+
+def _rendered_ds_arch_pairs(cwd):
+    """Return {(dataset, arch_key)} for every per-cell table actually rendered,
+    read back from the unfiltered sec_full_results_tables.tex.
+
+    This is the ground truth for Table 1: a (dataset, arch) pair only earns a
+    row if the sweep produced a table for it. The cross product of --dataset
+    and the --arch_timeouts archs is NOT a substitute -- it would claim, say, a
+    CIFAR-10 3x50 network that this sweep has no results for.
+
+    Labels are 'tab:safe-wide-<arch>[-solved|-timeout][-<dataset>]' and no arch
+    key contains a hyphen, so the arch is the first '-' segment.
+    """
+    path = os.path.join(cwd, "neta-s-paper", "sections",
+                        "sec_full_results_tables.tex")
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    pairs = set()
+    for suffix, block in _extract_auto_blocks(
+            text, "aaai_safe_wide_n2_appendix_tables"):
+        ds = suffix[1:] if suffix else "mnist"
+        for lab in re.findall(r"\\label\{tab:safe-wide-([^}]*)\}", block):
+            pairs.add((ds, lab.split("-", 1)[0]))
+    return pairs
+
+
+def _filter_tab_networks(cwd, pairs, updater):
+    """Rewrite Table 1 in sec_evaluation.tex so it lists ONLY the networks this
+    run actually produced results for: `pairs` is {(dataset, arch_key)} from
+    _rendered_ds_arch_pairs, matched against the table's Dataset column and,
+    through the updater's arch display names (cnn5 -> \\emph{conv4}), its
+    Network column.
+
+    Rows are taken from the frozen master, so the filter is always applied to
+    the FULL table and successive runs with different --arch_timeouts never
+    erode it. A \\midrule that ends up separating nothing is dropped with the
+    rows it grouped.
+    """
+    master_block = _snapshot_tab_networks(cwd)
+    if master_block is None:
+        return
+    if not pairs:
+        print("[tab1] no rendered per-cell table found; leaving Table 1 "
+              "unchanged")
+        return
+    disp = getattr(updater, "_AAAI_ARCH_DISPLAY", {})
+    # (Dataset column value, Network column value) for every rendered pair.
+    want = {(_TAB1_DATASET_LABEL.get(d.strip().lower(), d.strip()),
+             disp.get(a, a)) for d, a in pairs}
+
+    kept, dropped, out_lines = [], [], []
+    for line in master_block.splitlines():
+        cells = line.split("&")
+        # A data row is '<Dataset> & <Network> & ... \\'; anything else
+        # (\toprule, \midrule, \caption, the header row, ...) passes through.
+        if len(cells) >= 3 and line.rstrip().endswith(r"\\") \
+                and "textbf{Dataset}" not in line:
+            ds = cells[0].strip()
+            net = cells[1].strip()
+            if (ds, net) in want:
+                kept.append((ds, net))
+                out_lines.append(line)
+            else:
+                dropped.append((ds, net))
+            continue
+        out_lines.append(line)
+
+    # Collapse rule runs left behind by dropped groups: a \midrule immediately
+    # followed by another rule (or by \bottomrule / \end{tabular}) now groups
+    # nothing.
+    cleaned, pending = [], []
+    for line in out_lines:
+        if line.strip() in (r"\midrule",):
+            pending.append(line)
+            continue
+        if pending:
+            if not line.strip().startswith((r"\bottomrule", r"\end{tabular}")):
+                cleaned.append(pending[0])
+            pending = []
+        cleaned.append(line)
+    cleaned += pending
+    new_block = "\n".join(cleaned)
+
+    if not kept:
+        print("[tab1] no Table 1 row matches this run's datasets/archs; "
+              "leaving the paper's table unchanged")
+        return
+    sec_path = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    with open(sec_path, encoding="utf-8") as fh:
+        text = fh.read()
+    cur = _extract_labeled_float(text, "tab:networks")
+    if cur is None:
+        print("[tab1] tab:networks not found in sec_evaluation.tex; skipped")
+        return
+    wrapped = f"{_TAB_NETWORKS_BEGIN}\n{new_block}\n{_TAB_NETWORKS_END}"
+    text = text.replace(cur, wrapped, 1)
+    # Drop the marker pair left by an earlier run so they never nest.
+    text = re.sub(re.escape(_TAB_NETWORKS_BEGIN) + r"\n(?="
+                  + re.escape(_TAB_NETWORKS_BEGIN) + r")", "", text)
+    text = re.sub(re.escape(_TAB_NETWORKS_END) + r"\n"
+                  + re.escape(_TAB_NETWORKS_END), _TAB_NETWORKS_END, text)
+    with open(sec_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print(f"[tab1] sec_evaluation.tex Table 1: kept {len(kept)} row(s) "
+          f"({', '.join(f'{d}/{n}' for d, n in kept)}); "
+          f"dropped {len(dropped)}")
+
+
+def _report_paper_table_averages(cwd):
+    """Print the average speedup and average bound-gap ratio of the 'ours' and
+    'ours with transfer' columns, computed over the PAPER's appendix tables
+    only (sec_appendix_percell.tex), i.e. over exactly the rows the paper
+    prints after the full-row filter.
+
+    Four numbers in total: {ours, transfer} x {avg speedup, avg gap ratio}.
+    The two live in different tables by construction:
+      * speedup columns   -- the '-solved' tables (\\aaaisafewideheader), where
+        at least one method finished, so wall-clock times carry signal and the
+        cell is t_VHAGaR / t_method;
+      * gap-ratio columns -- the '-timeout' tables (\\aaaisafewideheaderbd),
+        where all three methods hit the cap, so the times are pinned and the
+        cell compares the remaining MIP optimality gap instead,
+        (delta_u - delta_l)_VHAGaR / (delta_u - delta_l)_method.
+    """
+    path = os.path.join(cwd, "neta-s-paper", "sections",
+                        "sec_appendix_percell.tex")
+    if not os.path.exists(path):
+        print("[paper-averages] sec_appendix_percell.tex missing; skipped")
+        return
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+
+    def _val(cell):
+        # Cells render as '1.4$\times$'; '---' means the ratio is undefined for
+        # that row and is skipped (it is not a 1.0).
+        m = re.match(r"^\s*([0-9.]+)\s*\$\\times\$\s*$", cell)
+        return float(m.group(1)) if m else None
+
+    def _tau(cell):
+        # The tau column renders as '$0.25$'; '---' (no threshold recorded)
+        # sorts last so a numbered tau always wins the min.
+        m = re.search(r"([0-9]*\.?[0-9]+)", cell)
+        return float(m.group(1)) if m else float("inf")
+
+    # One entry per (table, block, perturbation+size) -- i.e. per (dataset,
+    # arch, c_s, pert, size), since each table is one (dataset, arch) and each
+    # \midrule-separated block is one c_s. Several tau rows can share that key;
+    # only the SMALLEST tau is counted, so a cell is never represented more
+    # than once in the averages.
+    picked = {}
+    n_tables = {"speedup": 0, "gap_ratio": 0}
+    n_rows_seen = {"speedup": 0, "gap_ratio": 0}
+    for t_i, tab in enumerate(
+            re.findall(r"\\begin\{table\*\}.*?\\end\{table\*\}", src, re.S)):
+        # 'bd' must be tested first: \aaaisafewideheaderbd starts with
+        # \aaaisafewideheader, so the plain test would match both.
+        if "\\aaaisafewideheaderbd" in tab:
+            metric = "gap_ratio"
+        elif "\\aaaisafewideheader" in tab:
+            metric = "speedup"
+        else:
+            continue
+        n_tables[metric] += 1
+        body = tab[tab.index("\\midrule"):tab.index("\\bottomrule")]
+        block = 0
+        for line in body.splitlines():
+            if line.strip() == r"\midrule":
+                block += 1          # next c_s group
+                continue
+            if not line.rstrip().endswith(r"\\"):
+                continue
+            cells = line.rstrip().rstrip("\\").split("&")
+            if len(cells) < 4:
+                continue
+            n_rows_seen[metric] += 1
+            key = (t_i, block, cells[1].strip())    # pert (size)
+            tau = _tau(cells[2])
+            prev = picked.get(key)
+            if prev is None or tau < prev[0]:
+                picked[key] = (tau, metric, cells[-2], cells[-1])
+
+    # {metric: {"ours": [...], "transfer": [...]}}
+    vals = {"speedup": {"ours": [], "transfer": []},
+            "gap_ratio": {"ours": [], "transfer": []}}
+    for _tau_v, metric, ours_cell, transfer_cell in picked.values():
+        for key, cell in (("ours", ours_cell), ("transfer", transfer_cell)):
+            v = _val(cell)
+            if v is not None:
+                vals[metric][key].append(v)
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else float("nan")
+
+    print("\n" + "=" * 72)
+    print("PAPER TABLE AVERAGE AND MAX VALUES "
+          "(neta-s-paper appendix tables only)")
+    print("=" * 72)
+    for metric, label in (("speedup", "speed_up"),
+                          ("gap_ratio", "gap_ratio")):
+        for stat, fn in (("avg", _mean), ("max", max)):
+            for key, col in (("ours", "ours"),
+                             ("transfer", "ours with transfer")):
+                xs = vals[metric][key]
+                v = fn(xs) if xs else float("nan")
+                print(f"  {stat}_{label:<10} [{col:<18}] = {v:7.2f}   "
+                      f"(#rows = {len(xs)})")
+    n_sp = len(vals["speedup"]["ours"])
+    n_gp = len(vals["gap_ratio"]["ours"])
+    print(f"\n  avg_speed_up  = sum{{ speed_up values over rows }}  / #rows"
+          f"   (#rows = {n_sp})")
+    print(f"  max_speed_up  = max{{ speed_up values over rows }}")
+    print(f"  avg_gap_ratio = sum{{ gap_ratio values over rows }} / #rows"
+          f"   (#rows = {n_gp})")
+    print(f"  max_gap_ratio = max{{ gap_ratio values over rows }}")
+    print("=" * 72)
+
+
+def _ensure_full_results_section(path, updater, marker_suffix=""):
+    """Make sure `path` holds a BEGIN/END AUTO marker pair for this dataset,
+    creating the file (or appending the dataset's pair) when missing.
+
+    This file is never \\input by main.tex -- it exists only as the unfiltered
+    render of the per-cell tables, which _build_full_results_tex wraps into the
+    standalone table_full_results.tex.
+    """
+    begin = updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + marker_suffix
+    end = updater.AAAI_WIDE_N2_APPENDIX_END_MARK + marker_suffix
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = ("%% AUTO-GENERATED by run_relaxation_sweep.py -- DO NOT EDIT.\n"
+                "%% Unfiltered render of the per-cell result tables (rows with\n"
+                "%% partial c_target coverage INCLUDED, red \"*\" and all). The\n"
+                "%% paper appendix renders the same tables with those rows\n"
+                "%% dropped; this file feeds table_full_results.tex only and is\n"
+                "%% not \\input by main.tex.\n")
+    if begin in text:
+        return
+    text = text.rstrip("\n") + f"\n\n{begin}\n{end}\n"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        print(f"[full-results] could not prepare {path}: {exc}")
+
+
+def _extract_auto_blocks(text, marker):
+    """Yield (suffix, block_text) for every '% BEGIN/END AUTO: <marker>[:ds]'
+    pair in `text`, in file order. The suffix is "" for the default (MNIST)
+    block and ":<dataset>" for a dataset-scoped one."""
+    pat = re.compile(
+        r"^% BEGIN AUTO: " + re.escape(marker) + r"(:[^\n]*)?\n"
+        r"(.*?)"
+        r"^% END AUTO: " + re.escape(marker) + r"(?::[^\n]*)?$",
+        re.S | re.M)
+    for m in pat.finditer(text):
+        yield (m.group(1) or ""), m.group(2)
+
+
+def _build_full_results_tex(cwd):
+    """Mirror the auto-generated per-cell tables into a STANDALONE
+    neta-s-paper/table_full_results.tex and compile it to
+    table_full_results.pdf.
+
+    The tables themselves are never re-derived here: the AUTO blocks that
+    _regen_paper_tables_from_txt just wrote into the appendix sections are
+    copied verbatim, so the two documents can never drift. The preamble is
+    main.tex's own preamble (everything before \\begin{document}), which keeps
+    the AAAI two-column table* floats, \\baseline/\\tool and the adjustbox /
+    multirow / colortbl setup identical to the paper.
+    """
+    paper_dir = os.path.join(cwd, "neta-s-paper")
+    main_tex = os.path.join(paper_dir, "main.tex")
+    if not os.path.exists(main_tex):
+        return
+    with open(main_tex, encoding="utf-8") as fh:
+        main_src = fh.read()
+    preamble = main_src.split("\\begin{document}", 1)[0]
+
+    chunks, n_blocks = [], 0
+    # Hand-written floats first (Table 1 and friends), so the reader meets the
+    # networks before the per-cell numbers about them.
+    for fname, label in _FULL_RESULTS_FLOATS:
+        src = os.path.join(paper_dir, "sections", fname)
+        if not os.path.exists(src):
+            continue
+        with open(src, encoding="utf-8") as fh:
+            float_tex = _extract_labeled_float(fh.read(), label)
+        if float_tex is None:
+            print(f"[full-results] {label} not found in sections/{fname}; "
+                  f"skipped")
+            continue
+        chunks.append(f"%% ---- {label} (copied from sections/{fname}) ----\n"
+                      f"{float_tex}")
+        n_blocks += 1
+
+    for fname, marker in _FULL_RESULTS_BLOCKS:
+        src = os.path.join(paper_dir, "sections", fname)
+        if not os.path.exists(src):
+            continue
+        with open(src, encoding="utf-8") as fh:
+            body = fh.read()
+        for suffix, block in _extract_auto_blocks(body, marker):
+            ds = suffix[1:] if suffix else "mnist"
+            chunks.append(f"%% ---- {marker} [{ds}] (copied from "
+                          f"sections/{fname}) ----\n"
+                          f"\\section*{{{ds}}}\n{block}")
+            n_blocks += 1
+    if not chunks:
+        print("[full-results] no AUTO table blocks found; "
+              "table_full_results.tex not written")
+        return
+
+    # \label/\ref inside the copied blocks point at labels that live in the
+    # paper; they resolve here too because the blocks carry their own \label,
+    # and anything they reference outside just prints "??" in this side file.
+    out_tex = os.path.join(paper_dir, "table_full_results.tex")
+    with open(out_tex, "w", encoding="utf-8") as fh:
+        fh.write("%% AUTO-GENERATED by run_relaxation_sweep.py -- DO NOT EDIT.\n"
+                 "%% Standalone copy of the per-cell result tables that the\n"
+                 "%% paper prints in its appendix. Regenerated on every paper\n"
+                 "%% rebuild; hand edits are overwritten.\n")
+        fh.write(preamble)
+        fh.write("\\begin{document}\n\n")
+        fh.write("\n\n".join(chunks))
+        fh.write("\n\n\\end{document}\n")
+    print(f"[full-results] wrote {out_tex} ({n_blocks} table block(s))")
+
+    job = "table_full_results"
+    for ext in ("aux", "out", "toc"):
+        try:
+            os.remove(os.path.join(paper_dir, f"{job}.{ext}"))
+        except OSError:
+            pass
+    # Two passes so the \ref/\label cross-references inside the tables settle.
+    # No -halt-on-error: unresolved references to the paper's own labels are
+    # expected in this side document and must not abort the build.
+    step = ["pdflatex", "-interaction=nonstopmode", f"{job}.tex"]
+    for _ in range(2):
+        try:
+            proc = subprocess.run(step, cwd=paper_dir,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            print(f"[full-results] skipped compile ({step[0]} not installed)")
+            return
+    if not os.path.exists(os.path.join(paper_dir, f"{job}.pdf")):
+        tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+        print(f"[full-results] no {job}.pdf produced. Last lines:")
+        for line in tail:
+            print(f"  {line}")
+        return
+    print(f"[full-results] built {os.path.join(paper_dir, job + '.pdf')}")
 
 
 def _parse_arch_timeouts(spec):
     """Parse --arch_timeouts into (arch_runs, force_timeout_by_arch,
-    c_targets_by_arch, c_sources_by_arch).
+    c_targets_by_arch, c_sources_by_arch, dataset_scoped).
 
     Grammar: '|'-separated groups, each 'SECS:arch=path,arch=path[@CT][#CS]':
       * SECS     -- wall-clock cap in seconds, shared by the group's models.
-      * arch=path,... -- same syntax as --arch_models.
+      * arch=path,... -- same syntax as --arch_models. An entry may be
+                    DATASET-SCOPED as '<dataset>:<arch>=path', e.g.
+                    'cifar:cnn1=.', in which case its cap, '@CT' and '#CS'
+                    apply to that dataset ONLY and override any unscoped entry
+                    for the same arch. This is what lets one arch carry a
+                    different class grid per dataset -- CIFAR's cnn1 was swept
+                    on '@3,4,6#0,1' while MNIST's cnn1 used '@2,4,5#0,2', and
+                    a single per-arch grid cannot describe both.
       * @CT      -- OPTIONAL per-group target-class list, Julia 1-indexed and
                     comma-separated (same syntax as --ct), e.g. '@2,4,5'.
       * #CS      -- OPTIONAL per-group SOURCE-class (Cs) list, 0-indexed (the
@@ -2453,6 +2902,12 @@ def _parse_arch_timeouts(spec):
                                overall when NO group carried a '#CS' (caller
                                keeps using the global --cs). A group without
                                '#CS' maps its archs to None.
+      * dataset_scoped      -- {dataset: {arch: {"path", "secs", "ct", "cs"}}}
+                               for the '<dataset>:<arch>=path' entries, empty
+                               when none were used. Resolve it per dataset with
+                               _arch_setup_for_dataset; the four values above
+                               describe the UNSCOPED entries only, so a caller
+                               that ignores this stays on the old behavior.
 
     Combines --arch_models, a per-model --force_timeout, a per-model --ct, and a
     per-model --cs so different models can carry different caps, target-class
@@ -2461,6 +2916,7 @@ def _parse_arch_timeouts(spec):
     ft_by_arch = {}
     ct_by_arch = {}
     cs_by_arch = {}
+    ds_scoped = {}
     any_group_ct = False
     any_group_cs = False
     for group in spec.split("|"):
@@ -2521,6 +2977,21 @@ def _parse_arch_timeouts(spec):
                 sys.exit(1)
             a, mp = pair.split("=", 1)
             a = a.strip()
+            # '<dataset>:<arch>' scopes this entry to one dataset. The arch
+            # itself never contains ':', so the split is unambiguous.
+            ds_key = None
+            if ":" in a:
+                ds_key, a = (p.strip() for p in a.split(":", 1))
+                ds_key = ds_key.lower()
+            if ds_key is not None:
+                if a in ds_scoped.get(ds_key, {}):
+                    print(f"ERROR: --arch_timeouts lists arch '{a}' more than "
+                          f"once for dataset '{ds_key}'")
+                    sys.exit(1)
+                ds_scoped.setdefault(ds_key, {})[a] = {
+                    "path": mp.strip(), "secs": secs,
+                    "ct": group_ct, "cs": group_cs}
+                continue
             if a in ft_by_arch:
                 print(f"ERROR: --arch_timeouts lists arch '{a}' more than once")
                 sys.exit(1)
@@ -2528,12 +2999,50 @@ def _parse_arch_timeouts(spec):
             ft_by_arch[a] = secs
             ct_by_arch[a] = group_ct
             cs_by_arch[a] = group_cs
-    if not arch_runs:
+    if not arch_runs and not ds_scoped:
         print("ERROR: --arch_timeouts listed no arch=model_path pairs")
         sys.exit(1)
     return (arch_runs, ft_by_arch,
             (ct_by_arch if any_group_ct else None),
-            (cs_by_arch if any_group_cs else None))
+            (cs_by_arch if any_group_cs else None),
+            ds_scoped)
+
+
+def _arch_setup_for_dataset(dataset, arch_runs, ft_by_arch, ct_by_arch,
+                            cs_by_arch, ds_scoped):
+    """Resolve the dataset-scoped '<dataset>:<arch>=path' entries for one
+    dataset, returning (arch_runs, force_timeout, c_targets, c_sources) with the
+    scoped values layered over the unscoped ones.
+
+    A scoped entry REPLACES the unscoped entry for the same arch (keeping its
+    position, so the table order does not change) and is appended when the arch
+    is otherwise absent. Datasets with no scoped entry get the unscoped setup
+    unchanged.
+    """
+    scoped = (ds_scoped or {}).get(str(dataset).strip().lower(), {})
+    runs = list(arch_runs)
+    ft = dict(ft_by_arch or {})
+    ct = dict(ct_by_arch) if ct_by_arch is not None else None
+    cs = dict(cs_by_arch) if cs_by_arch is not None else None
+    if not scoped:
+        return runs, ft, ct, cs
+    for arch, cfg in scoped.items():
+        for i, (a, _p) in enumerate(runs):
+            if a == arch:
+                runs[i] = (arch, cfg["path"])
+                break
+        else:
+            runs.append((arch, cfg["path"]))
+        ft[arch] = cfg["secs"]
+        if cfg["ct"] is not None:
+            ct = dict(ct or {})
+            ct[arch] = cfg["ct"]
+        if cfg["cs"] is not None:
+            cs = dict(cs or {})
+            cs[arch] = cfg["cs"]
+    print(f"[arch-scope] {dataset}: applied dataset-scoped entries for "
+          + ", ".join(sorted(scoped)))
+    return runs, ft, ct, cs
 
 
 def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
@@ -2541,6 +3050,8 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                                  rerun_timeout_eps=30.0,
                                  requested_c_targets=None,
                                  requested_c_sources=None,
+                                 paper_taus=None,
+                                 paper_chart_taus=None,
                                  recompile=True):
     """Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, sourcing
     the transfer (advstd N2) column DIRECTLY from the advStd .txt files (no
@@ -2574,6 +3085,34 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     except SystemExit as exc:
         print(f"[paper-tables] {exc}")
         return
+
+    # --paper_taus owns the tau dimension for these tables; --combination_table
+    # owns the technique (bt / varHint / SibGate). They do not overlap: a
+    # tau-free spec carries a wildcard tau that is expanded against the tau
+    # list here, so the admitted combos are exactly the cross product and the
+    # two flags cannot disagree.
+    _taus = updater._AAAI_WIDE_TAUS
+    if paper_taus and hasattr(updater, "set_aaai_wide_taus"):
+        _taus = updater.set_aaai_wide_taus(
+            [t for t in str(paper_taus).split(",") if t.strip()])
+    print(f"[paper-tables] per-cell tables render tau rows: "
+          f"{', '.join(_taus)}")
+    _chart_taus = updater._AAAI_CHART_TAUS
+    if paper_chart_taus and hasattr(updater, "set_aaai_chart_taus"):
+        _chart_taus = updater.set_aaai_chart_taus(
+            [t for t in str(paper_chart_taus).split(",") if t.strip()])
+    print(f"[paper-tables] charts draw tau series: "
+          f"{', '.join(_chart_taus)} "
+          f"({1 + 2 * len(_chart_taus)} bars per cluster)")
+    if combination_filter is not None and hasattr(
+            updater, "expand_combination_spec_taus"):
+        # Expand over the UNION so a tau drawn only in the charts (or shown
+        # only as a table row) still passes the combo filter.
+        _union = list(_taus) + [t for t in _chart_taus if t not in _taus]
+        combination_filter = updater.expand_combination_spec_taus(
+            combination_filter, _union)
+        print(f"[paper-tables] combos admitted: "
+              f"{updater._format_combination_filter(combination_filter)}")
 
     # Dataset-scoped AUTO markers: MNIST (the default) keeps the bare markers
     # and labels; every other dataset writes into its OWN ":<ds>" marker pair
@@ -2625,16 +3164,33 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     # intentionally not regenerated in the --paper_tables_from_txt path.)
     percell_tex = os.path.join(cwd, "neta-s-paper", "sections",
                                "sec_appendix_percell.tex")
-    if os.path.exists(percell_tex):
+    # The SAME tables are rendered twice from the same data, differing only in
+    # the partial-coverage filter:
+    #   * sec_full_results_tables.tex -- every row, including the ones carrying
+    #     the red "*" (feeds the standalone table_full_results.pdf);
+    #   * sec_appendix_percell.tex    -- only rows with no red "*" in any cell,
+    #     i.e. means taken over every expected c_target.
+    full_tex = os.path.join(cwd, "neta-s-paper", "sections",
+                            "sec_full_results_tables.tex")
+    _ensure_full_results_section(full_tex, updater, _mslug)
+    _drop_supported = hasattr(updater, "set_aaai_wide_drop_partial_rows")
+    for _target, _drop in ((full_tex, False), (percell_tex, True)):
+        if not os.path.exists(_target):
+            continue
+        _prev = (updater.set_aaai_wide_drop_partial_rows(_drop)
+                 if _drop_supported else None)
         try:
             updater.regenerate_aaai_wide_perarch_section(
-                percell_tex, cwd, dataset, arch_runs, roles={"N2"},
+                _target, cwd, dataset, arch_runs, roles={"N2"},
                 begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
                 end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug,
                 ds_label_suffix=_lslug, **common)
         except Exception as exc:
-            print(f"[paper-tables] aaai_safe_wide (N2 appendix) block "
-                  f"error: {exc}")
+            print(f"[paper-tables] aaai_safe_wide (N2, {os.path.basename(_target)}) "
+                  f"block error: {exc}")
+        finally:
+            if _drop_supported:
+                updater.set_aaai_wide_drop_partial_rows(_prev)
 
     # Per-network relaxation + precision-cost rows for the single Evaluation
     # table. Pooled across datasets by the caller and emitted once, like the
@@ -2866,17 +3422,45 @@ def main():
                              "(per-model cap): every model renders in one pass, each "
                              "filtered/clamped to its own cap and target-class set.")
     parser.add_argument("--combination_table", type=str, default=None,
-                        metavar="BT:VH:TAU[,BT:VH:TAU,...]",
+                        metavar="BT:VH[:TAU][,BT:VH[:TAU],...]",
                         help="Restrict the advstd tables in advstd_techniques.tex (overall "
                              "ranking, per-arch c_src-tinted green/yellow/pink blocks, and "
                              "per-arch TIME_LIMIT gap-comparison tables) to one or more "
-                             "combinations. Format '<bound_tight>:<varHint>:<tau>' per combo, "
-                             "comma-separated. Examples: 'zono:prev_pgd:0.5' or "
-                             "'interval:prev_pgd:0.5+sg,zono:prev_pgd:0.5+sg'. Use the '+sg' "
-                             "suffix on tau to select SibGate (Technique 4) rows. Only takes "
+                             "combinations. Format '<bound_tight>:<varHint>[:<tau>]' per "
+                             "combo, comma-separated. PREFER the tau-free form, e.g. "
+                             "'zono:prev_pgd+sg': it names only the technique and lets "
+                             "--paper_taus name the thresholds, so the two flags stay "
+                             "orthogonal and the combos read are their cross product. The "
+                             "explicit-tau form ('zono:prev_pgd:0.5+sg') is still accepted. "
+                             "Use the '+sg' suffix to select SibGate (Technique 4) rows. "
+                             "Only takes "
                              "effect when the tex tables are rewritten (after "
                              "--find_advstd_faster_than_standard). 'off' is accepted as an "
                              "alias for varHint='no'.")
+    parser.add_argument("--paper_taus", type=str, default=None,
+                        metavar="TAU[,TAU,...]",
+                        help="Relaxation thresholds the neta-s-paper per-cell appendix "
+                             "tables render, as ROWS (one row per tau per cell), in the "
+                             "given order. Default '0.0,0.5'; pass e.g. "
+                             "'0.0,0.25,0.5' to also pull in the tau=0.25 runs. This "
+                             "widens the tables vertically only -- the tau column names "
+                             "which threshold each row is -- and never adds a column. A "
+                             "tau with no result files simply yields no rows. This flag "
+                             "owns the tau dimension; --combination_table owns the "
+                             "technique (bt/varHint/+sg), and the combos actually read "
+                             "are their cross product. Only affects "
+                             "--paper_tables_from_txt.")
+    parser.add_argument("--paper_chart_taus", type=str, default=None,
+                        metavar="TAU[,TAU,...]",
+                        help="Relaxation thresholds the neta-s-paper CHARTS draw, as an "
+                             "(ours, ours with transfer) BAR PAIR per tau, on top of the "
+                             "\\baseline bar. Default '0.5' (3 bars per cluster), which "
+                             "reproduces the existing figures exactly. Kept separate from "
+                             "--paper_taus because a cluster only fits a few bars before "
+                             "the per-bar value labels stop fitting, whereas a table just "
+                             "grows another row: e.g. '0.25,0.5' gives 5 bars. The legend "
+                             "names the tau only when more than one is drawn. Only affects "
+                             "--paper_tables_from_txt.")
     parser.add_argument("--transfer_opt_time_only", action="store_true",
                         help="When comparing times, use only optimization_time for transfer "
                              "(no hyper_attack_time) while standard still uses total_time.")
@@ -3129,9 +3713,11 @@ def main():
     arch_force_timeout = None
     arch_c_targets = None
     arch_c_sources = None
+    arch_ds_scoped = {}
     if args.arch_timeouts:
         (arch_runs, arch_force_timeout, arch_c_targets,
-         arch_c_sources) = _parse_arch_timeouts(args.arch_timeouts)
+         arch_c_sources, arch_ds_scoped) = _parse_arch_timeouts(
+            args.arch_timeouts)
         if args.arch_models:
             print("WARNING: --arch_timeouts overrides --arch_models "
                   "(models are taken from --arch_timeouts)")
@@ -3342,17 +3928,44 @@ def main():
             if len(pt_datasets) > 1:
                 print(f"\n===== Regenerating neta-s-paper tables (from advStd "
                       f"txt) for dataset: {pt_dataset} =====")
+            # Layer this dataset's '<dataset>:<arch>=path' entries over the
+            # unscoped setup, so one arch can carry a different class grid per
+            # dataset (CIFAR's cnn1 vs MNIST's cnn1).
+            (ds_arch_runs, ds_ft, ds_ct,
+             ds_cs) = _arch_setup_for_dataset(
+                pt_dataset, arch_runs, arch_force_timeout, arch_c_targets,
+                arch_c_sources, arch_ds_scoped)
+            ds_force_timeout = (ds_ft if arch_force_timeout is not None
+                                else effective_force_timeout)
+            ds_req_ct = (ds_ct if (arch_c_targets is not None
+                                   or ds_ct) else pt_requested_c_targets)
+            ds_req_cs = (ds_cs if (arch_c_sources is not None
+                                   or ds_cs) else pt_requested_c_sources)
             tc, bd, rx = _regen_paper_tables_from_txt(
-                arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
+                ds_arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
                 combination_table=args.combination_table,
-                force_timeout=effective_force_timeout,
+                force_timeout=ds_force_timeout,
                 rerun_timeout_eps=args.rerun_timeout_eps,
-                requested_c_targets=pt_requested_c_targets,
-                requested_c_sources=pt_requested_c_sources,
+                requested_c_targets=ds_req_ct,
+                requested_c_sources=ds_req_cs,
+                paper_taus=args.paper_taus,
+                paper_chart_taus=args.paper_chart_taus,
                 recompile=False)
             all_time_cells += tc
             all_bd_groups += bd
             all_relax_rows += rx
+        # Table 1 in the paper lists only the networks this run produced
+        # results for. It runs AFTER the per-dataset loop because it reads back
+        # which per-cell tables were rendered; the frozen master keeps the full
+        # table for table_full_results.tex, so no row is ever lost for good.
+        try:
+            sys.path.insert(0, cwd)
+            import update_advstd_tex_tables as _tab1_updater
+            _filter_tab_networks(cwd, _rendered_ds_arch_pairs(cwd),
+                                 _tab1_updater)
+        except Exception as _exc:
+            print(f"[tab1] skipped ({_exc})")
+
         # One combined solve-time grid + one combined bounds-difference figure
         # + one relaxation/precision table across all datasets, then the single
         # final recompile.
@@ -3360,6 +3973,9 @@ def main():
             cwd, all_time_cells, all_bd_groups,
             relax_rows=all_relax_rows,
             force_timeout=effective_force_timeout)
+        # Headline averages of the paper's own tables, printed last so they are
+        # the final thing on screen.
+        _report_paper_table_averages(cwd)
         return
 
     # ── Analysis mode: find advanced-standard faster than standard ───
