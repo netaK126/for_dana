@@ -885,8 +885,7 @@ function compute_activation_bounds_ia(nn; input_h::Int=28, input_w::Int=28)
             b = Float64.(l.bias)
             if !initialized
                 n_in = size(W, 2)
-                current_up = ones(Float64, n_in)
-                current_down = zeros(Float64, n_in)
+                current_down, current_up = input_domain_flat(n_in)
                 initialized = true
             end
             new_up = zeros(Float64, size(W, 1))
@@ -959,8 +958,15 @@ function compute_activation_bounds_perturbed_ia(nn, I_pert_up, I_pert_down; inpu
                 pert_up_flat = reshape(I_pert_up, :)
                 pert_down_flat = reshape(I_pert_down, :)
                 n_use = min(n_in, length(pert_up_flat))
-                current_up = min.(1.0, ones(Float64, n_in) .+ pert_up_flat[1:n_use])
-                current_down = max.(0.0, zeros(Float64, n_in) .+ pert_down_flat[1:n_use])
+                dom_lo, dom_hi = input_domain_flat(n_in)
+                if perturbed_input_in_domain
+                    current_up = min.(dom_hi, dom_hi .+ pert_up_flat[1:n_use])
+                    current_down = max.(dom_lo, dom_lo .+ pert_down_flat[1:n_use])
+                else
+                    # brightness: x' may leave the domain, so do not clip to it.
+                    current_up = dom_hi .+ max.(0.0, pert_up_flat[1:n_use])
+                    current_down = dom_lo .+ min.(0.0, pert_down_flat[1:n_use])
+                end
                 initialized = true
             end
             new_up = zeros(Float64, size(W, 1))
@@ -1167,9 +1173,9 @@ function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init
     pert_up   = copy(Float64.(I_pert_up_init))          # z_n2_pert - z_n2_org
     pert_down = copy(Float64.(I_pert_down_init))
 
-    # N1 post-activation bounds (initialised to input domain [0,1])
-    n1_act_up   = ones(Float64,  size(I_pert_up_init))
-    n1_act_down = zeros(Float64, size(I_pert_down_init))
+    # N1 post-activation bounds, initialised to the input domain ([0,1] for the
+    # image nets, the per-coordinate box under --internet_nets_benchmarks)
+    n1_act_down, n1_act_up = input_domain_shaped(size(I_pert_up_init))
 
     # Will be set at each Linear layer, read at the following ReLU layer
     n1_pre_up_cur   = Float64[]
@@ -1471,8 +1477,7 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     diff_down = zeros(Float64, size(I_pert_down_init))
     pert_up   = copy(Float64.(I_pert_up_init))
     pert_down = copy(Float64.(I_pert_down_init))
-    n1_act_up   = ones(Float64,  size(I_pert_up_init))
-    n1_act_down = zeros(Float64, size(I_pert_down_init))
+    n1_act_down, n1_act_up = input_domain_shaped(size(I_pert_up_init))
     n1_pre_up_cur   = Float64[]
     n1_pre_down_cur = Float64[]
 
@@ -1937,11 +1942,17 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
     pert_radius = max.(abs.(I_pert_up_flat), abs.(I_pert_down_flat))
 
     input_is_4d = ndims(I_pert_up_init) == 4
+    # Centre/radius of the input domain. For [0,1] this is the historical
+    # 0.5 / 0.5; for the ACAS box it is per-coordinate and asymmetric, so a
+    # uniform fill would not cover the region.
+    dom_lo_flat, dom_hi_flat = input_domain_flat(length(I_pert_up_flat))
+    dom_centre_flat = (dom_lo_flat .+ dom_hi_flat) ./ 2
+    dom_halfwidth_flat = (dom_hi_flat .- dom_lo_flat) ./ 2
     if input_is_4d
         in_shape_4d = size(I_pert_up_init)
         n_flat = prod(in_shape_4d)
-        center_4d = fill(0.5, in_shape_4d)
-        radius_4d = reshape(0.5 .+ pert_radius, in_shape_4d)
+        center_4d = reshape(dom_centre_flat, in_shape_4d)
+        radius_4d = reshape(dom_halfwidth_flat .+ pert_radius, in_shape_4d)
     else
         n_flat = length(I_pert_up_flat)
         center_4d = nothing
@@ -1956,8 +1967,8 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
 
     # Interval state for pre-zonotope conv/flatten propagation (matches the
     # convention used by compute_diff_bounds_zonotope)
-    abs_up   = input_is_4d ? (ones(Float64, in_shape_4d) .+ reshape(pert_radius, in_shape_4d))   : (1.0 .+ pert_radius)
-    abs_down = input_is_4d ? (zeros(Float64, in_shape_4d) .- reshape(pert_radius, in_shape_4d)) : (0.0 .- pert_radius)
+    abs_up   = input_is_4d ? (reshape(dom_hi_flat, in_shape_4d) .+ reshape(pert_radius, in_shape_4d)) : (dom_hi_flat .+ pert_radius)
+    abs_down = input_is_4d ? (reshape(dom_lo_flat, in_shape_4d) .- reshape(pert_radius, in_shape_4d)) : (dom_lo_flat .- pert_radius)
 
     relu_layer_idx = 0
     for (layer_idx, l2) in enumerate(nn2.layers)
@@ -2148,9 +2159,8 @@ function compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init
     pert_up   = copy(Float64.(I_pert_up_init))
     pert_down = copy(Float64.(I_pert_down_init))
 
-    # N2 post-activation bounds (initialised to input domain [0,1])
-    n2_act_up   = ones(Float64,  size(I_pert_up_init))
-    n2_act_down = zeros(Float64, size(I_pert_down_init))
+    # N2 post-activation bounds, initialised to the input domain
+    n2_act_down, n2_act_up = input_domain_shaped(size(I_pert_up_init))
 
     n2_pre_up_cur   = Float64[]
     n2_pre_down_cur = Float64[]
@@ -2274,8 +2284,7 @@ function compute_output_diff_bounds_only(nn1, nn2)
         end
     end
 
-    act_up   = ones(Float64, input_shape)
-    act_down = zeros(Float64, input_shape)
+    act_down, act_up = input_domain_shaped(input_shape)
     diff_up   = zeros(Float64, input_shape)
     diff_down = zeros(Float64, input_shape)
 

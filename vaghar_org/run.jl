@@ -486,6 +486,17 @@ function main()
                   "model_path=\"$model_path\" (expected a <model>_box.txt sidecar).")
         global input_box_lo = input_box[1]
         global input_box_hi = input_box[2]
+        # N2 gets encoded over N1's box. That is right only if the two nets share
+        # a normalization; assert it rather than silently reusing N1's.
+        _mp2 = get(args, "model_path2", "")
+        if _mp2 !== nothing && _mp2 != ""
+            box2 = get_input_box(dataset, _mp2, input_width, input_height, input_channels)
+            if box2 !== nothing && (box2[1] != input_box_lo || box2[2] != input_box_hi)
+                error("model_path2's input box differs from model_path's; the " *
+                      "encoders use a single box, so the two networks must share " *
+                      "one normalization.")
+            end
+        end
     end
 
     if mode == "transfer"

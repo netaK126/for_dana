@@ -191,6 +191,47 @@ PERTURBATIONS = [
     # ("brightness(0.1)",  "brightness:0.1")
 ]
 
+# Perturbations for the pretrained benchmark nets (acas/har). Only linf is
+# usable: every other encoder in perturbation_models.jl hard-codes the [0,1]
+# domain and ignores the input box, and the geometric ones (patch/occ/
+# translation/rotation) index a 2D pixel grid, which a 5-input vector does not
+# have -- patch:1,14,14,3 would index element 79 of 5. eps = 1e-3 matches the
+# ACAS row of the TwoSafe paper (arXiv 2606.21282, Table 1).
+BENCHMARK_PERTURBATIONS = [
+    # linf only. Every other encoder either indexes a 2D pixel grid (patch/occ/
+    # translation/rotation -- a 5-vector has no such grid) or hardcodes the
+    # [0,1] domain. eps = 1e-3 matches the ACAS row of the TwoSafe paper
+    # (arXiv 2606.21282, Table 1).
+    ("linf(0.001)", "linf:0.001"),
+]
+
+
+# Set from --perturbations in main(); applied inside perturbations_for so the
+# filter reaches the per-dataset list rather than only the image constant.
+_PERT_NAME_FILTER = None
+
+
+def _num_classes_for(dataset):
+    """Output-class count, so c_target/dummy_ct never exceed the net's outputs."""
+    jd = _julia_dataset_name(dataset)
+    if jd == "acas":
+        return 5
+    if jd == "har":
+        return 6
+    return 10
+
+
+def perturbations_for(dataset):
+    """Perturbation list valid for `dataset`, after any --perturbations filter."""
+    base = (BENCHMARK_PERTURBATIONS
+            if _julia_dataset_name(dataset) in ("acas", "har")
+            else PERTURBATIONS)
+    if _PERT_NAME_FILTER:
+        base = [p for p in base
+                if any(p[0].lower().startswith(pf) for pf in _PERT_NAME_FILTER)]
+    return base
+
+
 # ── Transfer sweep parameters ────────────────────────────────────────────
 THRESHOLDS = [0]#[0, 0.05] # focused on best T_relax candidate
 OPT_INTERVALS = ["true"]#["true", "false"]
@@ -1005,7 +1046,7 @@ def _julia_dataset_name(name):
 # data, so their N2 comes from reducing weight precision and is tagged for that
 # instead. Several tools read the suffix to tell N1 from N2, so both spellings
 # have to be recognised anywhere that inference is made.
-N2_BENCHMARK_SUFFIX = "_bf16"
+N2_BENCHMARK_SUFFIX = "_int8"
 N2_SUFFIXES = ("_sgd_itr", N2_BENCHMARK_SUFFIX)
 
 
@@ -1018,9 +1059,34 @@ def n2_glob_patterns(prefix):
     """Glob patterns matching N2 result dirs for `prefix`, across both suffixes.
 
     e.g. n2_glob_patterns("vagharNoPerturbed") ->
-         ["vagharNoPerturbed_*_sgd_itr*", "vagharNoPerturbed_*_bf16*"]
+         ["vagharNoPerturbed_*_sgd_itr*", "vagharNoPerturbed_*_int8*"]
     """
     return [f"{prefix}_*{s}*" for s in N2_SUFFIXES]
+
+
+def _delta_max_boost_args(julia_dataset):
+    """PGD warm start + absolute-zonotope bounds for the delta_max job.
+
+    Gated to the benchmark nets. Both are sound for the image datasets too, but
+    they make delta_max solve faster, and a delta_max that previously hit the
+    timeout would now reach optimality and change the normaliser behind every
+    published image table cell. Widen this only with a before/after check.
+    """
+    if julia_dataset not in ("acas", "har"):
+        return ["--use_hyper_attack", "false"]
+    return ["--use_hyper_attack", "true", "--nn1_zono_bounds", "true"]
+
+
+def _benchmark_args(julia_dataset):
+    """--internet_nets_benchmarks for the pretrained tabular nets (acas/har).
+
+    run.jl hard-errors for these datasets without it -- it is the master switch
+    that also loads the per-coordinate input box from the <model>_box.txt
+    sidecar. Returns [] for the image datasets, so their command lines are
+    byte-identical to before.
+    """
+    return (["--internet_nets_benchmarks", "true"]
+            if julia_dataset in ("acas", "har") else [])
 
 
 def glob_n2_dirs(eps_dir, prefix):
@@ -1032,7 +1098,7 @@ def glob_n2_dirs(eps_dir, prefix):
 
 
 def _save_truncated_n2(model, n1_dir, n2_dir, device):
-    """Write N2 as N1 with its weights rounded to bfloat16 precision.
+    """Write N2 as N1 with its weights quantized to per-channel int8.
 
     ReluDiff produces its second network this way ("truncating each network's
     weights from 32-bit floats to 16-bit floats"); VeryDiff, which TwoSafe builds
@@ -1040,14 +1106,21 @@ def _save_truncated_n2(model, n1_dir, n2_dir, device):
     without training data, which is what the ACAS nets need since their original
     lookup-table data is not public.
 
-    bfloat16 rather than float16: it keeps 7 mantissa bits instead of 10, giving
-    roughly 16x the weight drift (6.2e-2 vs 3.9e-3 max) and a measurable advisory
-    disagreement rate, while remaining a named standard format rather than an
-    arbitrary bit count chosen to taste.
+    Post-training int8 quantization rather than a reduced-precision float:
+    float formats preserve RELATIVE precision, so shrinking the mantissa barely
+    perturbs the network (bfloat16 and fp8 both leave advisory disagreement near
+    zero inside the phi1/phi2 region). Integer quantization uses a uniform
+    ABSOLUTE step, which on this net's wide weight range (max |w| ~ 20) produces
+    a drift comparable to the image models' N1/N2 pairs.
 
-    The rounded values are stored back in the original dtype rather than as
-    bfloat16, so model.p / model.pth stay byte-compatible with every consumer.
+    Scales are PER OUTPUT CHANNEL, not per tensor. A single tensor-wide scale is
+    dominated by the largest weight and flattens the small ones, giving ~59%
+    disagreement -- a different network, not a perturbed one.
+
+    The quantized values are stored back in the original dtype, so model.p /
+    model.pth stay byte-compatible with every consumer.
     """
+    import pickle
     import shutil
 
     import numpy as np
@@ -1055,18 +1128,27 @@ def _save_truncated_n2(model, n1_dir, n2_dir, device):
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'utils'))
     from run_experiment import save_model
-    from acas_data import acas_domain
+    from acas_box import verification_box
+
+    def _quantize_int8_per_channel(t, bits=8):
+        qmax = 2 ** (bits - 1) - 1
+        if t.dim() >= 2:
+            # Linear weight is (out_features, in_features): one scale per output.
+            scale = t.abs().amax(dim=1, keepdim=True) / qmax
+        else:
+            scale = t.abs().max() / qmax
+        scale = torch.clamp(scale, min=1e-30)
+        return torch.round(t / scale).clamp(-qmax - 1, qmax) * scale
 
     with torch.no_grad():
         for p in model.parameters():
-            p.copy_(p.bfloat16().float())
+            p.copy_(_quantize_int8_per_channel(p))
     save_model(model, n2_dir)
 
     # save_model writes model.p as float32, but N1 came from nnet_to_pickle as
     # float64. Handing the Julia loader a mismatched pair would put a second,
     # unintended rounding on N2 on top of the float16 truncation, so re-dump at
     # N1's precision -- the truncation is meant to change values, not storage.
-    import pickle
     params = [np.transpose(p.cpu().detach().numpy()).astype(np.float64)
               for p in model.parameters()]
     with open(os.path.join(n2_dir, 'model.p'), 'wb') as f:
@@ -1084,14 +1166,17 @@ def _save_truncated_n2(model, n1_dir, n2_dir, device):
     # experiment, so this is worth seeing at build time.
     n1_sd = torch.load(os.path.join(n1_dir, 'model.pth'), map_location='cpu')
     n2_sd = torch.load(os.path.join(n2_dir, 'model.pth'), map_location='cpu')
-    max_d = max(float((n1_sd[k] - n2_sd[k]).abs().max()) for k in n1_sd)
-    print(f"  N2 = N1 rounded to bfloat16: max |w1-w2| = {max_d:.3e}")
+    # Report the model.p delta: that is the file Julia verifies. N1's .p is
+    # float64 straight from the .nnet while its .pth is float32, so the .pth
+    # delta is not quite the number that matters.
+    with open(os.path.join(n1_dir, 'model.p'), 'rb') as f:
+        n1_p = pickle.load(f)
+    with open(os.path.join(n2_dir, 'model.p'), 'rb') as f:
+        n2_p = pickle.load(f)
+    max_d = max(float(np.abs(x - y).max()) for x, y in zip(n1_p, n2_p))
+    print(f"  N2 = N1 quantized to per-channel int8: max |w1-w2| = {max_d:.3e} (model.p)")
 
-    lo, hi = acas_domain(n1_dir)
-    box_path = os.path.join(n1_dir, 'model_box.txt')
-    if os.path.exists(box_path):
-        from acas_data import read_box_file
-        lo, hi = read_box_file(box_path)
+    lo, hi = verification_box(n1_dir)
     rng = np.random.default_rng(0)
     x = torch.from_numpy(
         rng.uniform(lo, hi, size=(20000, lo.size)).astype(np.float32)
@@ -1134,8 +1219,8 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
         model_path = os.path.dirname(model_path)
     n1_dir = model_path
     # The benchmark nets get no SGD at all (see below), so their N2 is named for
-    # what actually produced it rather than inheriting the image pipeline's
-    # _sgd_itr tag. is_n2_model_name() knows both spellings.
+    # what actually produced it (int8 quantization) rather than inheriting the
+    # image pipeline's _sgd_itr tag. is_n2_model_name() knows both spellings.
     n2_dir = (f"{n1_dir}{N2_BENCHMARK_SUFFIX}" if julia_ds in ('acas', 'har')
               else f"{n1_dir}_sgd_itr{sgd_epochs}")
 
@@ -2584,6 +2669,7 @@ _TAB1_DATASET_LABEL = {
     "fashion_mnist": "Fashion-MNIST",
     "cifar": "CIFAR-10",
     "cifar-10": "CIFAR-10",
+    "acas": "ACAS Xu",
 }
 
 
@@ -3256,7 +3342,7 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         force_timeout=force_timeout,
         rerun_timeout_eps=rerun_timeout_eps,
         advstd_meta_fn=_extract_advstd_file_metadata,
-        perts=PERTURBATIONS,
+        perts=perturbations_for(dataset),
         combination_filter=combination_filter,
         # Restrict every table/chart to the requested target classes (--ct);
         # None keeps the full-sweep behavior.
@@ -3866,14 +3952,15 @@ def main():
                                else args.force_timeout)
 
     # Filter perturbations if requested
-    perts = PERTURBATIONS
     if args.perturbations:
-        prefixes = [p.lower() for p in args.perturbations]
-        perts = [p for p in PERTURBATIONS if any(p[0].lower().startswith(pf) for pf in prefixes)]
-        if not perts:
-            print(f"ERROR: No perturbations matched {args.perturbations}")
-            print(f"Available: {[p[0] for p in PERTURBATIONS]}")
-            sys.exit(1)
+        global _PERT_NAME_FILTER
+        _PERT_NAME_FILTER = [p.lower() for p in args.perturbations]
+    perts = perturbations_for(args.dataset)
+    if args.perturbations and not perts:
+        print(f"ERROR: No perturbations matched {args.perturbations}")
+        print(f"Available for {args.dataset}: "
+              f"{[p[0] for p in perturbations_for(args.dataset)] or _PERT_NAME_FILTER}")
+        sys.exit(1)
 
     cwd = os.path.dirname(os.path.abspath(__file__))
 
@@ -4507,12 +4594,14 @@ def main():
                     else:
                         print(f"  {arch_prefix}{role} delta_max missing — computing for c_srcs={missing_c_srcs}")
                     for c_src in missing_c_srcs:
-                        dummy_ct = c_src + 1 if c_src < 10 else 1
+                        _ncls = _num_classes_for(dataset)
+                        dummy_ct = c_src % _ncls + 1
                         dm_label = f"{arch_prefix}{role} delta_max c_src={c_src}"
                         dm_cmd = [
                             "julia", "run.jl",
                             "--mode", "standard",
                             "--dataset", julia_dataset,
+                            *_benchmark_args(julia_dataset),
                             "--model_name", model_name,
                             "--model_path", role_model_p,
                             "--perturbation", "max",
@@ -4522,7 +4611,16 @@ def main():
                             "--timout", str(args.timeout),
                             "--output_dir", dm_out_dir + "/",
                             "--c_tag_mode", "false",
-                            "--use_hyper_attack", "false",
+                            # delta_max maximises the source-class margin over
+                            # the input region. The PGD warm start supplies a
+                            # feasible incumbent, and the absolute zonotope
+                            # (Source B) tightens the per-neuron bounds, which
+                            # main_standard already supports for a single
+                            # network (run.jl: "Standard-mode reuse ... still
+                            # propagate the absolute zonotope"). With
+                            # perturbation_size 0 the zonotope seed is the input
+                            # box itself, which is exactly what delta_max needs.
+                            *_delta_max_boost_args(julia_dataset),
                             "--activate_vaghgar_deps", "false",
                             "--use_perturbed_intervals", "false",
                             "--use_relaxations", "false",
@@ -4594,7 +4692,7 @@ def main():
                 # Phase 1 (this c_tag): N1 jobs.
                 for dataset, arch, model_path in arch_runs:
                     n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
-                    for pert_name, pert_spec in perts:
+                    for pert_name, pert_spec in perturbations_for(dataset):
                         pert_type, eps_str = pert_spec.split(":", 1)
                         arch_prefix = _aprefix(dataset, arch)
                         pkey = (dataset, arch, pert_spec)  # per-dataset N1 lock/chain key
@@ -4651,6 +4749,7 @@ def main():
                             "julia", "run.jl",
                             "--mode", "advanced_standard_n1",
                             "--dataset", julia_dataset,
+                            *_benchmark_args(julia_dataset),
                             "--model_name", model_name,
                             "--model_path", n1_model_p,
                             "--model_path2", n2_model_p,
@@ -4691,7 +4790,7 @@ def main():
                     arch_iter_phase1_5 = arch_runs
                 for dataset, arch, model_path in arch_iter_phase1_5:
                     n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
-                    for pert_name, pert_spec in perts:
+                    for pert_name, pert_spec in perturbations_for(dataset):
                         pert_type, eps_str = pert_spec.split(":", 1)
                         arch_prefix = _aprefix(dataset, arch)
 
@@ -4722,6 +4821,7 @@ def main():
                             "julia", "run.jl",
                             "--mode", "standard",
                             "--dataset", julia_dataset,
+                            *_benchmark_args(julia_dataset),
                             "--model_name", model_name,
                             "--model_path", n2_model_p,
                             "--perturbation", pert_type,
@@ -4742,7 +4842,7 @@ def main():
                 # Phase 2 (this c_tag): advstd jobs.
                 for dataset, arch, model_path in arch_runs:
                     n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
-                    for pert_name, pert_spec in perts:
+                    for pert_name, pert_spec in perturbations_for(dataset):
                         pert_type, eps_str = pert_spec.split(":", 1)
                         arch_prefix = _aprefix(dataset, arch)
 
@@ -4818,6 +4918,7 @@ def main():
                                     "julia", "run.jl",
                                     "--mode", "advanced_standard_n2",
                                     "--dataset", julia_dataset,
+                                    *_benchmark_args(julia_dataset),
                                     "--model_name", model_name,
                                     "--model_path", n1_model_p,
                                     "--model_path2", n2_model_p,
@@ -4958,7 +5059,7 @@ def main():
                 if explicit_stdboost_combos:
                     for dataset, arch, model_path in arch_runs:
                         n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
-                        for pert_name, pert_spec in perts:
+                        for pert_name, pert_spec in perturbations_for(dataset):
                             pert_type, eps_str = pert_spec.split(":", 1)
                             arch_prefix = _aprefix(dataset, arch)
 
@@ -5012,6 +5113,7 @@ def main():
                                         "julia", "run.jl",
                                         "--mode", "standard",
                                         "--dataset", julia_dataset,
+                                        *_benchmark_args(julia_dataset),
                                         "--model_name", model_name,
                                         "--model_path", target_model_p,
                                         "--perturbation", pert_type,
@@ -5072,7 +5174,7 @@ def main():
                 for ds, aruns in dataset_groups:
                     ri = 0
                     for a, _ in aruns:
-                        for _, pert_spec in perts:
+                        for _, pert_spec in perturbations_for(ds):
                             _within_row[(ds, a, pert_spec)] = ri
                             ri += 1
                 _n_rows = len(_within_row)
@@ -5238,7 +5340,7 @@ def main():
 
             arch_prefix = f"[{arch}] "
 
-            for pert_name, pert_spec in perts:
+            for pert_name, pert_spec in perturbations_for(dataset):
                 job_key = f"{arch}/{pert_name}"
                 std_exists = not args.skip_standard and standard_results_exist(pert_spec, cwd, arch, dataset)
                 if std_exists and not args.double_check_standard:

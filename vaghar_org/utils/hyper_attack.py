@@ -65,8 +65,19 @@ def create_attacked(X, eps, perturbation_type,size_,dims):
             Xout = padded_img[:, :, :-m, :]
         else:
             Xout = padded_img[:, :, :-m, :-k]
+    elif perturbation_type == "max":
+        # delta_max maximises the source-class margin over the input region with
+        # NO perturbation (mip.jl skips set_max_indexes for "max"), so the
+        # "attacked" copy is the clean input itself.
+        Xout = X + 0.0
     elif perturbation_type == "linf":
-        Xout = torch.clamp(X+eps, 0, 1)
+        if ACAS_BOX is None:
+            Xout = torch.clamp(X+eps, 0, 1)
+        else:
+            lo, hi = ACAS_BOX
+            lo_t = torch.as_tensor(lo, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
+            hi_t = torch.as_tensor(hi, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
+            Xout = torch.max(torch.min(X + eps, hi_t), lo_t)
     elif perturbation_type == "filterv":
         f_coeff = [size_[1], size_[2], size_[3]]
         filter = torch.tensor(f_coeff).reshape(1, 1, len(f_coeff), 1).to(DEVICE)
@@ -139,9 +150,15 @@ def attack(model, X, source_, target_, device, token_signature,\
         diff1 = output[torch.arange(M), ss] - output[torch.arange(M), max_labels_ss]
         max_scores, max_labels = output2.max(dim=1)
         diff2 = output2[torch.arange(M), tt] - output2[torch.arange(M), max_labels]
-        lambdas_ = torch.tensor((torch.absolute(diff1) / (torch.absolute(diff2) + 1e-9)).detach().cpu().numpy()).to(device)
-        lambdas_.requires_grad = False
-        diff = diff1 + lambda_0 * lambdas_ * diff2
+        if type_ == "max":
+            # No perturbation copy exists, so output2 == output and diff2 would
+            # push the TARGET to be the argmax, fighting diff1's push for the
+            # SOURCE. delta_max's objective is the source margin alone.
+            diff = diff1
+        else:
+            lambdas_ = torch.tensor((torch.absolute(diff1) / (torch.absolute(diff2) + 1e-9)).detach().cpu().numpy()).to(device)
+            lambdas_.requires_grad = False
+            diff = diff1 + lambda_0 * lambdas_ * diff2
         loss = torch.sum(diff)
         model.zero_grad()
         loss.backward()
@@ -149,12 +166,24 @@ def attack(model, X, source_, target_, device, token_signature,\
         max_labels_1 = max_inds[:, 0]
         max_vals, max_inds = torch.topk(output2, k=2, dim=1)
         max_labels_2 = max_inds[:, 0]
-        s_indices = ((max_labels_1 == source_) & (max_labels_2 == target_) & (~nan_rows)).nonzero()
+        if type_ == "max":
+            s_indices = ((max_labels_1 == source_) & (~nan_rows)).nonzero()
+        else:
+            s_indices = ((max_labels_1 == source_) & (max_labels_2 == target_) & (~nan_rows)).nonzero()
         if t == iterations - 1:
             break
         with torch.no_grad():
             X_pgd += alpha * X_pgd.grad.sign()
-            X_pgd = torch.clamp(X_pgd, 0, 1)
+            if ACAS_BOX is None:
+                X_pgd = torch.clamp(X_pgd, 0, 1)
+            else:
+                # Project into the verified box, not [0,1]: for ACAS the latter
+                # is mostly outside the region, so every iterate would be an
+                # infeasible warm start.
+                _lo, _hi = ACAS_BOX
+                _lo_t = torch.as_tensor(_lo, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
+                _hi_t = torch.as_tensor(_hi, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
+                X_pgd = torch.max(torch.min(X_pgd, _hi_t), _lo_t)
             X_pgd.requires_grad = True
             eps_pgd = update_attack(X_pgd, eps_pgd, alpha, size_, type_, dims)
 
@@ -270,6 +299,19 @@ def attack(model, X, source_, target_, device, token_signature,\
         elif "2x" in model_name:
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, 784))))), dim=0))
+        elif model_name in ("acas", "har"):
+            # Pretrained tabular FC nets: every fc except the last is a ReLU
+            # layer. Clean pass first, then the attacked pass, matching the
+            # order the other branches use (num_relu_layers = len//2).
+            n_in = model.k * model.w * model.h
+            hidden = [getattr(model, f"fc{i}") for i in range(1, 8)
+                      if hasattr(model, f"fc{i}")][:-1]
+            for src in (images_to,
+                        create_attacked(images_to, eps_to, type_, size_, dims)):
+                x = src.reshape(-1, n_in)
+                for fc in hidden:
+                    x = F.relu(fc(x))
+                    layers_outputs.append(torch.mean(torch.sign(x), dim=0))
         elif "cnn" in model_name:
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.conv1(images_to.reshape(-1, dims[0], dims[1], dims[2]))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.conv2((F.relu(model.conv1(images_to.reshape(-1, dims[0], dims[1], dims[2])))))))), dim=0))
@@ -277,6 +319,14 @@ def attack(model, X, source_, target_, device, token_signature,\
             layers_outputs.append(torch.mean(torch.sign((model.flatten1(F.relu(model.conv1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1, dims[0], dims[1], dims[2])))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.conv2((F.relu(model.conv1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1,  dims[0], dims[1], dims[2])))))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign(model.flatten1(F.relu(model.fc1(model.flatten1(F.relu(model.conv2((F.relu(model.conv1((create_attacked(images_to, eps_to, type_, size_,dims)).reshape(-1,  dims[0], dims[1], dims[2]))))))))))), dim=0))
+        if not layers_outputs:
+            # No branch above matched this architecture. Writing empty hint
+            # files without a fail marker makes hyper_attack_hints parse "" as
+            # Float64 and abort the Julia run, so fail loudly instead.
+            raise SystemExit(
+                f"hyper_attack: no activation-pattern extraction for model_arch "
+                f"'{model_name}'; add a branch in attack() before using it with "
+                f"--use_hyper_attack true.")
         bools = ""
         strings = ""
         num_relu_layers = len(layers_outputs) // 2
@@ -301,7 +351,27 @@ def attack(model, X, source_, target_, device, token_signature,\
     return best_val
 
 
-def load_dataset( dataset ):
+# Per-coordinate input box for the benchmark nets, set by load_dataset and read
+# by the sampling/clamping helpers. None for the image datasets, which keep the
+# historical [0,1] domain.
+ACAS_BOX = None
+# Sample count for the benchmark nets' hyper-input pool. Large because rare
+# advisories are very rare inside the verified region.
+ACAS_N_SAMPLES = 1000000
+
+
+def load_dataset( dataset, model_path=None ):
+    if dataset in ("acas", "har"):
+        # No dataset exists for these pretrained nets, and none is needed: the
+        # attack seeds itself from random points in the verified input region
+        # (see create_hyper_input), exactly as random_images already does for
+        # the image datasets. Return empty splits and record the box.
+        global ACAS_BOX
+        from acas_box import verification_box
+        model_dir = os.path.dirname(model_path) if model_path and os.path.isfile(model_path) else model_path
+        lo, hi = verification_box(model_dir)
+        ACAS_BOX = (lo, hi)
+        return [], [], (1, int(lo.size), 1)
     if dataset == "mnist":
         h_dim, w_dim, k_dim = 28, 28, 1
         transform = transforms.Compose([transforms.ToTensor()])
@@ -361,6 +431,10 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
         model = CNN3()
     elif model_arch == "cnn5":
         model = CNN5(k=k_dim, w=w_dim, h=h_dim)
+    elif model_arch == "acas":
+        model = FNN_ACAS(k=k_dim, w=w_dim, h=h_dim)
+    elif model_arch == "har":
+        model = FNN_HAR(k=k_dim, w=w_dim, h=h_dim)
     else:
         assert False, "New model arch has been detected, please expand models.py and this if condition."
 
@@ -369,14 +443,31 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
     return model
 
 
-def create_hyper_input(source, trainset, testset, M, dims):
+def create_hyper_input(source, trainset, testset, M, dims, perturbation_type=None):
 
     train_images = [image for image, _ in trainset]
-    train_images = torch.stack(train_images)
     test_images = [image for image, _ in testset]
-    test_images = torch.stack(test_images)
-    random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2])
-    all_samples = torch.cat((random_images, train_images, test_images), dim=0)
+    if ACAS_BOX is None:
+        random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2])
+    else:
+        # The benchmark nets have no train/test split, so every sample is drawn
+        # from the verified input region; torch.rand's [0,1) would fall outside
+        # it entirely.
+        import numpy as _np
+        lo, hi = ACAS_BOX
+        # Far more samples than the image path uses. The verified box is
+        # dominated by one advisory (in the ACAS phi1/phi2 region roughly
+        # 99.997% of points are COC), so a source class can otherwise end up
+        # with only a handful of points -- or one, which used to crash below.
+        random_images = torch.from_numpy(
+            _np.random.default_rng(1).uniform(lo, hi, size=(ACAS_N_SAMPLES, lo.size)).astype(_np.float32)
+        ).view(-1, dims[0], dims[1], dims[2])
+    parts = [random_images]
+    if train_images:
+        parts.append(torch.stack(train_images))
+    if test_images:
+        parts.append(torch.stack(test_images))
+    all_samples = torch.cat(parts, dim=0)
     model.eval()
     batch_size = 1024
     classification_batches = []
@@ -386,14 +477,29 @@ def create_hyper_input(source, trainset, testset, M, dims):
             classification_batches.append(model(batch).cpu())
     classification = torch.cat(classification_batches, dim=0).to(device)
     _, predicted_labels = torch.max(classification, dim=1)
-    indices_of_s = (predicted_labels == source).nonzero().squeeze()
+    indices_of_s = (predicted_labels == source).nonzero().reshape(-1)
+    if indices_of_s.numel() == 0:
+        raise SystemExit(
+            f"hyper_attack: no sampled input is classified as source class {source} "
+            f"within the input region; cannot build a warm start. Widen the region "
+            f"or raise ACAS_N_SAMPLES.")
+    if indices_of_s.numel() < M:
+        print(f"  WARNING: only {indices_of_s.numel()} of {len(all_samples)} samples "
+              f"are class {source} (wanted {M}); the warm start will be weak.")
     source_samples_classification = classification[indices_of_s]
     values, _ = torch.sort(source_samples_classification, descending=True, dim=1)
     differences = values[:, 0] - values[:, 1]
     _, sorted_indices = differences.sort(descending=True)
     sorted_indices_of_s = indices_of_s[sorted_indices]
-    step_size = max(1, len(sorted_indices_of_s) // M)
-    uniform_indices = sorted_indices_of_s[::step_size][:M]
+    if perturbation_type == "max":
+        # delta_max's objective IS this margin, so the best seeds are the
+        # highest-margin samples. Spacing them out (below) is right for a
+        # targeted attack, where diverse starting points matter, but here it
+        # throws away the incumbent we are trying to maximise.
+        uniform_indices = sorted_indices_of_s[:M]
+    else:
+        step_size = max(1, len(sorted_indices_of_s) // M)
+        uniform_indices = sorted_indices_of_s[::step_size][:M]
     hyper_input = all_samples[uniform_indices.cpu()].to(device)
     return hyper_input
 
@@ -448,9 +554,9 @@ if __name__ == '__main__':
     print("source:", source, "target:", target, "model_arch:", model_arch, "perturbation type:", perturbation_type, \
           "perturbation size:", perturbation_size, "dataset:", dataset)
 
-    trainset, testset, dims = load_dataset(dataset)
+    trainset, testset, dims = load_dataset(dataset, model_path)
     model = load_model(model_arch, model_path, dims)
-    X = create_hyper_input(source, trainset, testset, M, dims)
+    X = create_hyper_input(source, trainset, testset, M, dims, perturbation_type)
 
     best_val = attack(model, X, source, target, device, token_signature, model_arch, dims, perturbation_type, perturbation_size, iterations)
 

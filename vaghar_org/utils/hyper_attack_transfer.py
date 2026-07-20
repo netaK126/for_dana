@@ -67,7 +67,20 @@ def define_attack(perturbation_type, size_, M, dims, device):
     return eps_pgd
 
 
-def load_dataset(dataset):
+ACAS_BOX = None
+ACAS_N_SAMPLES = 1000000
+
+
+def load_dataset(dataset, model_path=None):
+    if dataset in ("acas", "har"):
+        # Mirrors hyper_attack.py: no dataset exists for these pretrained nets,
+        # so the attack seeds itself from random points in the verified region.
+        global ACAS_BOX
+        from acas_box import verification_box
+        model_dir = os.path.dirname(model_path) if model_path and os.path.isfile(model_path) else model_path
+        lo, hi = verification_box(model_dir)
+        ACAS_BOX = (lo, hi)
+        return [], [], (1, int(lo.size), 1)
     if dataset == "mnist":
         h_dim, w_dim, k_dim = 28, 28, 1
         transform = transforms.Compose([transforms.ToTensor()])
@@ -121,6 +134,10 @@ def load_model(model_arch, model_path, device):
     elif model_arch == "cnn2":
         model = CNN2()
     else:
+        if model_arch == "acas":
+            return FNN_ACAS(k=k_dim, w=w_dim, h=h_dim).to(device)
+        if model_arch == "har":
+            return FNN_HAR(k=k_dim, w=w_dim, h=h_dim).to(device)
         raise ValueError(f"Unknown model architecture: {model_arch}")
     model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
@@ -211,16 +228,26 @@ def build_str_transfer(layer_data, rel_layer, abs_layer, network_version, th=0.0
 def create_hyper_input(model1, source, trainset, testset, M, dims, device, delta1):
     """Sample inputs classified as source by model1 with sufficient confidence."""
     train_images = [image for image, _ in trainset]
-    train_images = torch.stack(train_images).to(device)
     test_images = [image for image, _ in testset]
-    test_images = torch.stack(test_images).to(device)
-    random_images = torch.rand(len(trainset) + len(testset), dims[0], dims[1], dims[2]).to(device)
-    all_samples = torch.cat((random_images, train_images, test_images), dim=0).to(device)
+    if ACAS_BOX is None:
+        random_images = torch.rand(len(trainset) + len(testset), dims[0], dims[1], dims[2]).to(device)
+    else:
+        import numpy as _np
+        _lo, _hi = ACAS_BOX
+        random_images = torch.from_numpy(
+            _np.random.default_rng(1).uniform(_lo, _hi, size=(ACAS_N_SAMPLES, _lo.size)).astype(_np.float32)
+        ).view(-1, dims[0], dims[1], dims[2]).to(device)
+    parts = [random_images]
+    if train_images:
+        parts.append(torch.stack(train_images).to(device))
+    if test_images:
+        parts.append(torch.stack(test_images).to(device))
+    all_samples = torch.cat(parts, dim=0).to(device)
 
     with torch.no_grad():
         classification = model1(all_samples)
     _, predicted_labels = torch.max(classification, dim=1)
-    indices_of_s = (predicted_labels == source).nonzero().squeeze()
+    indices_of_s = (predicted_labels == source).nonzero().reshape(-1)
 
     if indices_of_s.dim() == 0:
         indices_of_s = indices_of_s.unsqueeze(0)
@@ -298,7 +325,13 @@ def attack_transfer(model1, model2, X, source_, target_, device, token_signature
 
         with torch.no_grad():
             X_pgd += alpha * X_pgd.grad.sign()
-            X_pgd = torch.clamp(X_pgd, 0, 1)
+            if ACAS_BOX is None:
+                X_pgd = torch.clamp(X_pgd, 0, 1)
+            else:
+                _lo, _hi = ACAS_BOX
+                _lo_t = torch.as_tensor(_lo, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
+                _hi_t = torch.as_tensor(_hi, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
+                X_pgd = torch.max(torch.min(X_pgd, _hi_t), _lo_t)
             X_pgd.requires_grad = True
             eps_pgd = update_attack(X_pgd, eps_pgd, alpha, size_, type_, dims)
 
@@ -453,7 +486,7 @@ if __name__ == '__main__':
           "perturbation:", perturbation_type, "size:", perturbation_size,
           "delta1:", delta1, "c_tag_mode:", c_tag_mode)
 
-    trainset, testset, dims = load_dataset(dataset)
+    trainset, testset, dims = load_dataset(dataset, model_path)
     model1 = load_model(model_arch, model_path, device)
     model2 = load_model(model_arch2, model_path2, device)
     X = create_hyper_input(model1, source, trainset, testset, M, dims, device, delta1)

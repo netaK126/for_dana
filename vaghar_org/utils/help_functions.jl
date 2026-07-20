@@ -15,6 +15,39 @@ global internet_nets_benchmarks = false
 # (1,w,h,k) or `nothing` (⇒ historical [0,1] box). Set from get_input_box.
 global input_box_lo = nothing
 global input_box_hi = nothing
+# Input domain for the interval/zonotope seeds. The image pipeline reasons over
+# [0,1]^n; the ACAS box is NOT a subset of it (it spans negative coordinates),
+# so seeding those passes with zeros/ones would cut away feasible region while
+# the MIP variable bounds stayed correct -- an unsound tightening that would not
+# surface as an error. These helpers are the single place that decision is made:
+# with the master switch off, or no sidecar loaded, they return exactly the
+# historical zeros/ones, so every image caller is bit-identical to before.
+# Whether the PERTURBED input variable is confined to the clean input domain.
+# True for linf (x' carries the same box bounds as x); false for brightness,
+# where x' = x + e with e >= 0 may exceed the domain's upper bound. The interval
+# passes clip to the domain only when this holds -- clipping unconditionally
+# would assert x' <= hi while the MIP admits x' > hi, an unsound tightening.
+# Encoders set it; default true preserves the historical behaviour.
+global perturbed_input_in_domain = true
+
+function input_domain_flat(n::Int)
+    if internet_nets_benchmarks && input_box_lo !== nothing
+        length(vec(input_box_lo)) == n ||
+            error("input box has $(length(vec(input_box_lo))) coordinates but the " *
+                  "input layer expects $n; check the <model>_box.txt sidecar.")
+        return (Float64.(vec(input_box_lo)[1:n]), Float64.(vec(input_box_hi)[1:n]))
+    end
+    return (zeros(Float64, n), ones(Float64, n))
+end
+
+function input_domain_shaped(shape)
+    if internet_nets_benchmarks && input_box_lo !== nothing
+        return (reshape(Float64.(vec(input_box_lo)), shape),
+                reshape(Float64.(vec(input_box_hi)), shape))
+    end
+    return (zeros(Float64, shape), ones(Float64, shape))
+end
+
 # Verification-mode selector for the TwoSafe comparison (Def 2.10 / 3.1):
 # "none" ⇒ optimization (Max delta); "asymmetric"/"symmetric" ⇒ decision at
 # fixed (ε, τ). τ is the softmax-confidence threshold.

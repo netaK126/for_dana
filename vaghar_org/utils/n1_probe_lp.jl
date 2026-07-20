@@ -48,12 +48,17 @@ perturbation-specific constraints linking them. Returns (v_in, v_x0).
 """
 function _setup_probe_inputs(m, perturbation::String, perturbation_size::Vector{Float64},
                               input_shape, input_range, w::Int, h::Int, k::Int)
-    v_in = map(_ -> @variable(m, lower_bound=0.0, upper_bound=1.0), input_range)
+    # The probe LP does OBBT and its bounds are used as HARD per-neuron bounds,
+    # so solving over the wrong polytope yields bounds tighter than legal.
+    _use_box = internet_nets_benchmarks && input_box_lo !== nothing
+    _lo(i) = _use_box ? input_box_lo[i] : 0.0
+    _hi(i) = _use_box ? input_box_hi[i] : 1.0
+    v_in = map(i -> @variable(m, lower_bound=_lo(i), upper_bound=_hi(i)), input_range)
 
     if perturbation == "linf"
         p_size = perturbation_size[1]
         v_e  = map(_ -> @variable(m, lower_bound=-p_size, upper_bound=p_size), input_range)
-        v_x0 = map(_ -> @variable(m, lower_bound=0.0, upper_bound=1.0), input_range)
+        v_x0 = map(i -> @variable(m, lower_bound=_lo(i), upper_bound=_hi(i)), input_range)
         @constraint(m, v_x0 .== v_in .+ v_e)
 
     elseif perturbation == "brightness"

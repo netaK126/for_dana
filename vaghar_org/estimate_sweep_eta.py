@@ -437,8 +437,8 @@ class Job:
 def n1_tags(n1_dir):
     n1_tag = os.path.basename(os.path.normpath(n1_dir))
     # acas/har derive N2 by reducing weight precision rather than extra SGD, so
-    # their N2 carries a _bf16 tag instead of _sgd_itr1.
-    n2_tag = n1_tag + ("_bf16" if os.path.exists(n1_dir + "_bf16") else "_sgd_itr1")
+    # their N2 carries a _int8 tag instead of _sgd_itr1.
+    n2_tag = n1_tag + ("_int8" if os.path.exists(n1_dir + "_int8") else "_sgd_itr1")
     return n1_tag, n2_tag
 
 

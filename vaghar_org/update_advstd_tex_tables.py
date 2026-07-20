@@ -3467,9 +3467,9 @@ def _role_of_stdboost_dir(cd):
     Falls back to N1 for legacy 'vaghar_*' dirs.
     """
     base = os.path.basename(cd.rstrip(os.sep))
-    # _sgd_itr is the image pipeline's N2 tag; _bf16 is the benchmark nets'
+    # _sgd_itr is the image pipeline's N2 tag; _int8 is the benchmark nets'
     # (acas/har), whose N2 comes from reduced weight precision, not extra SGD.
-    if base.startswith("N2stdBoost_") or any(s in base for s in ("_sgd_itr", "_bf16")):
+    if base.startswith("N2stdBoost_") or any(s in base for s in ("_sgd_itr", "_int8")):
         return "N2"
     return "N1"
 
@@ -4157,7 +4157,8 @@ def _dataset_display_name(dataset):
     return {"mnist": "MNIST",
             "fashion_mnist": "Fashion-MNIST", "fashion-mnist": "Fashion-MNIST",
             "fashion": "Fashion-MNIST", "fmnist": "Fashion-MNIST",
-            "cifar10": "CIFAR-10", "cifar": "CIFAR-10"}.get(dataset, dataset)
+            "cifar10": "CIFAR-10", "cifar": "CIFAR-10",
+            "acas": "ACAS Xu"}.get(dataset, dataset)
 
 
 def _torchvision_dataset_for(dataset):
@@ -4304,7 +4305,7 @@ def _discover_model_role_tags(arch_root):
         if not (os.path.isfile(os.path.join(d, "model.pth"))
                 or _glob.glob(os.path.join(d, "*", "model.pth"))):
             continue
-        role = "N2" if any(s in name for s in ("_sgd_itr", "_bf16")) else "N1"
+        role = "N2" if any(s in name for s in ("_sgd_itr", "_int8")) else "N1"
         out.append((role, name))
     return out
 
@@ -4996,6 +4997,24 @@ def _ft_for(force_timeout, arch):
     if isinstance(force_timeout, dict):
         return force_timeout.get(arch)
     return force_timeout
+
+
+def _acas_provenance_clause(dataset):
+    """A caption sentence naming the ACAS Xu source network and how the target
+    network was derived from it. Empty string for the image datasets, so their
+    captions are unchanged.
+
+    Mirrors the phrasing the evaluation section already uses for the image
+    models ("$\\Npre$ is trained using Adam, and $N$ is obtained by fine-tuning
+    $\\Npre$"), since ACAS has no training data and its pair is built by
+    quantization instead.
+    """
+    key = str(dataset).strip().lower().replace(" ", "")
+    if key not in ("acas", "acasxu"):
+        return ""
+    return (r" $\Npre$ is the ACAS Xu network $N_{1,1}$ of "
+            r"\citet{julian2016policy}, and $N$ is obtained by quantizing its "
+            r"weights to 8-bit integers, one scale per output channel.")
 
 
 def _timeout_caption_clause(force_timeout, arch):
@@ -5793,6 +5812,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                             r"finishes before the solver timeout (or was not "
                             r"run).")
             cap += _timeout_caption_clause(force_timeout, arch)
+            cap += _acas_provenance_clause(dataset)
             lines.append(f"\\caption{{{cap}}}")
             if not bare_emitted:
                 lines.append(f"\\label{{{base_label}}}")
@@ -7282,6 +7302,7 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
                    r"marked on its label. Clusters where all three methods reach "
                    r"the timeout are moved to the bounds-difference figure.")
         cap += _timeout_caption_clause(force_timeout, arch)
+        cap += _acas_provenance_clause(dataset_disp)
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
             out.append(f"\\label{{{label_base}}}")

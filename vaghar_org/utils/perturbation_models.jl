@@ -62,6 +62,8 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = map(_ -> @variable(m, lower_bound = -p_size, upper_bound = p_size), input_range,)
+    # x' is box-bounded here, so the interval passes may clip to the domain.
+    global perturbed_input_in_domain = true
     if internet_nets_benchmarks
         # ACAS/HAR: use the per-coordinate input box. A missing box under the
         # flag is a misconfiguration (e.g. absent <model>_box.txt sidecar), so
@@ -122,8 +124,19 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 0, upper_bound = p_size)
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),input_range,)
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
+    # x' = x + e with e >= 0, so x' can exceed the clean domain's upper bound.
+    # perturbed_input_in_domain records that for the interval passes.
+    global perturbed_input_in_domain = false
+    if internet_nets_benchmarks
+        (input_box_lo === nothing || input_box_hi === nothing) &&
+            error("--internet_nets_benchmarks is on but no input box was loaded; " *
+                  "check the <model>_box.txt sidecar next to model_path.")
+        v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]+p_size), input_range,)
+    else
+        v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
+    end
     @constraint(m, v_x0 .== v_in .+ v_e)
 
     # Perturbation interval: Δ = x' - x = e, e ∈ [0, ε] → Δ ∈ [0, ε]
@@ -150,7 +163,17 @@ function get_perturbation_specific_keys_max(perturbation_size, nn::NeuralNet, in
     global layer_counter, nueron_counter, network_version
     println("HERE")
     input_range = CartesianIndices(size(input))
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    # delta_max optimises over the whole input region. For ACAS [0,1] is almost
+    # disjoint from the real box (coordinate 5 lives in [-0.5,-0.45]), so
+    # without this the normaliser would be computed outside the net's domain.
+    if internet_nets_benchmarks
+        (input_box_lo === nothing || input_box_hi === nothing) &&
+            error("--internet_nets_benchmarks is on but no input box was loaded; " *
+                  "check the <model>_box.txt sidecar next to model_path.")
+        v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
+    else
+        v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
+    end
     layer_counter = 0
     nueron_counter = 0
     network_version = "org"
@@ -512,14 +535,30 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
     global I_z_prev_up_perturbation
     global I_z_prev_down
     global I_z_prev_down_perturbation
+    global internet_nets_benchmarks
+    global input_box_lo
+    global input_box_hi
 
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
 
     # Shared input variables: x (clean) and x_p (perturbed)
     v_e = map(_ -> @variable(m, lower_bound = -p_size, upper_bound = p_size), input_range)
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    # x' is box-bounded here, so the interval passes may clip to the domain.
+    global perturbed_input_in_domain = true
+    if internet_nets_benchmarks
+        # Same per-coordinate box as the standard encoder. Without this the
+        # transfer/advStd path would verify over [0,1]^n, which for ACAS is
+        # neither the box nor a superset of it (the box spans negatives).
+        (input_box_lo === nothing || input_box_hi === nothing) &&
+            error("--internet_nets_benchmarks is on but no input box was loaded; " *
+                  "check the <model>_box.txt sidecar next to model_path.")
+        v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range)
+        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range)
+    else
+        v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range)
+    end
     @constraint(m, v_x0 .== v_in + v_e)
 
     # Initialize interval globals (same pattern as lucid: append! on untyped [])
@@ -534,11 +573,14 @@ function get_perturbation_specific_keys_linf_transfer(perturbation_size, nn1::Ne
         I_z_prev_up_perturbation = zeros(Float64, size(input)[4], 1)
         I_z_prev_down_perturbation = zeros(Float64, size(input)[4], 1)
     else
-        # FC input
-        append!(all_bounds_of_original, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        # FC input. These are input-layer ACTIVATION boxes consumed by
+        # propagate_intervals; [0,1] is not a superset of the ACAS box, so
+        # seeding it there emits unsound interval cuts on the MIP.
+        _dom_lo, _dom_hi = input_domain_shaped(size(input))
+        append!(all_bounds_of_original, [[_dom_hi, _dom_lo]])
         I_z_prev_up = zeros(Float64, size(input))
         I_z_prev_down = zeros(Float64, size(input))
-        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        append!(all_bounds_of_perturbation, [[_dom_hi, _dom_lo]])
         I_z_prev_up_perturbation = zeros(Float64, size(input))
         I_z_prev_down_perturbation = zeros(Float64, size(input))
     end
@@ -733,10 +775,12 @@ function _four_network_passes_transfer!(nn1, nn2, v_in, v_x0, input, I_pert_up, 
         I_z_prev_up_perturbation      = zeros(Float64, size(input)[4], 1)
         I_z_prev_down_perturbation    = zeros(Float64, size(input)[4], 1)
     else
-        append!(all_bounds_of_original,    [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        # Input-layer activation boxes; see the note in the linf transfer encoder.
+        _dom_lo, _dom_hi = input_domain_shaped(size(input))
+        append!(all_bounds_of_original,    [[_dom_hi, _dom_lo]])
         I_z_prev_up                   = zeros(Float64, size(input))
         I_z_prev_down                 = zeros(Float64, size(input))
-        append!(all_bounds_of_perturbation, [[ones(Float64, size(input)), zeros(Float64, size(input))]])
+        append!(all_bounds_of_perturbation, [[_dom_hi, _dom_lo]])
         I_z_prev_up_perturbation      = zeros(Float64, size(input))
         I_z_prev_down_perturbation    = zeros(Float64, size(input))
     end
@@ -867,8 +911,17 @@ function get_perturbation_specific_keys_brightness_transfer(perturbation_size, n
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e  = @variable(m, lower_bound = 0, upper_bound = p_size)
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),       input_range)
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range)
+    global perturbed_input_in_domain = false
+    if internet_nets_benchmarks
+        (input_box_lo === nothing || input_box_hi === nothing) &&
+            error("--internet_nets_benchmarks is on but no input box was loaded; " *
+                  "check the <model>_box.txt sidecar next to model_path.")
+        v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]),         input_range)
+        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]+p_size), input_range)
+    else
+        v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),       input_range)
+        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range)
+    end
     @constraint(m, v_x0 .== v_in .+ v_e)
 
     # Δ = e ∈ [0, ε] for every pixel — uniform, non-negative shift
