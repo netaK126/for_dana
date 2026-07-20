@@ -436,7 +436,10 @@ class Job:
 
 def n1_tags(n1_dir):
     n1_tag = os.path.basename(os.path.normpath(n1_dir))
-    return n1_tag, n1_tag + "_sgd_itr1"
+    # acas/har derive N2 by reducing weight precision rather than extra SGD, so
+    # their N2 carries a _bf16 tag instead of _sgd_itr1.
+    n2_tag = n1_tag + ("_bf16" if os.path.exists(n1_dir + "_bf16") else "_sgd_itr1")
+    return n1_tag, n2_tag
 
 
 def geom_adv(pert_type):

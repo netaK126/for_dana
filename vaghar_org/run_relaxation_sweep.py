@@ -220,7 +220,8 @@ def standard_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist"):
     if not os.path.isdir(eps_dir):
         return False
     # Look for vagharNoPerturbed_*_sgd_itr* dirs with .txt results
-    n2_dirs = glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*_sgd_itr*"))
+    n2_dirs = [d for pat in n2_glob_patterns("vagharNoPerturbed")
+               for d in glob.glob(os.path.join(eps_dir, pat))]
     for d in n2_dirs:
         if glob.glob(os.path.join(d, "*.txt")):
             return True
@@ -554,10 +555,9 @@ def _standard_n2_missing_c_targets(pert_spec, cwd, arch, dataset, n2_tag,
     if not os.path.isdir(eps_dir):
         return list(c_targets)
     if n2_tag:
-        dir_pattern = f"vagharWithPerturbed_{arch}_{n2_tag}"
+        n2_dirs = glob.glob(os.path.join(eps_dir, f"vagharWithPerturbed_{arch}_{n2_tag}"))
     else:
-        dir_pattern = "vagharWithPerturbed_*_sgd_itr*"
-    n2_dirs = glob.glob(os.path.join(eps_dir, dir_pattern))
+        n2_dirs = glob_n2_dirs(eps_dir, "vagharWithPerturbed")
     src0 = c_tag - 1
     covered = set()
     for d in n2_dirs:
@@ -1000,6 +1000,114 @@ def _julia_dataset_name(name):
     return name
 
 
+# N2 directory suffixes. The image pipeline derives N2 by extra SGD epochs and
+# tags it _sgd_itr{n}; the pretrained benchmark nets (acas/har) have no training
+# data, so their N2 comes from reducing weight precision and is tagged for that
+# instead. Several tools read the suffix to tell N1 from N2, so both spellings
+# have to be recognised anywhere that inference is made.
+N2_BENCHMARK_SUFFIX = "_bf16"
+N2_SUFFIXES = ("_sgd_itr", N2_BENCHMARK_SUFFIX)
+
+
+def is_n2_model_name(name):
+    """True if a model/result directory name denotes an N2 (target) network."""
+    return any(s in name for s in N2_SUFFIXES)
+
+
+def n2_glob_patterns(prefix):
+    """Glob patterns matching N2 result dirs for `prefix`, across both suffixes.
+
+    e.g. n2_glob_patterns("vagharNoPerturbed") ->
+         ["vagharNoPerturbed_*_sgd_itr*", "vagharNoPerturbed_*_bf16*"]
+    """
+    return [f"{prefix}_*{s}*" for s in N2_SUFFIXES]
+
+
+def glob_n2_dirs(eps_dir, prefix):
+    """Sorted N2 result dirs under `eps_dir` for `prefix`, across both suffixes."""
+    out = []
+    for pat in n2_glob_patterns(prefix):
+        out.extend(glob.glob(os.path.join(eps_dir, pat)))
+    return sorted(set(out))
+
+
+def _save_truncated_n2(model, n1_dir, n2_dir, device):
+    """Write N2 as N1 with its weights rounded to bfloat16 precision.
+
+    ReluDiff produces its second network this way ("truncating each network's
+    weights from 32-bit floats to 16-bit floats"); VeryDiff, which TwoSafe builds
+    on, uses pruning for the same purpose. Either gives a tightly-coupled pair
+    without training data, which is what the ACAS nets need since their original
+    lookup-table data is not public.
+
+    bfloat16 rather than float16: it keeps 7 mantissa bits instead of 10, giving
+    roughly 16x the weight drift (6.2e-2 vs 3.9e-3 max) and a measurable advisory
+    disagreement rate, while remaining a named standard format rather than an
+    arbitrary bit count chosen to taste.
+
+    The rounded values are stored back in the original dtype rather than as
+    bfloat16, so model.p / model.pth stay byte-compatible with every consumer.
+    """
+    import shutil
+
+    import numpy as np
+    import torch
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'utils'))
+    from run_experiment import save_model
+    from acas_data import acas_domain
+
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(p.bfloat16().float())
+    save_model(model, n2_dir)
+
+    # save_model writes model.p as float32, but N1 came from nnet_to_pickle as
+    # float64. Handing the Julia loader a mismatched pair would put a second,
+    # unintended rounding on N2 on top of the float16 truncation, so re-dump at
+    # N1's precision -- the truncation is meant to change values, not storage.
+    import pickle
+    params = [np.transpose(p.cpu().detach().numpy()).astype(np.float64)
+              for p in model.parameters()]
+    with open(os.path.join(n2_dir, 'model.p'), 'wb') as f:
+        pickle.dump(params, f, protocol=2)
+
+    # Julia derives the box sidecar from the model path, so N2 needs its own
+    # copies or a --model_path2 box lookup would miss.
+    for sidecar in ('model_box.txt', 'model_box.json', 'model_domain.txt'):
+        src = os.path.join(n1_dir, sidecar)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(n2_dir, sidecar))
+
+    # Report the drift, and how often it flips the advisory inside the region we
+    # actually verify -- a pair that never disagrees there makes for a vacuous
+    # experiment, so this is worth seeing at build time.
+    n1_sd = torch.load(os.path.join(n1_dir, 'model.pth'), map_location='cpu')
+    n2_sd = torch.load(os.path.join(n2_dir, 'model.pth'), map_location='cpu')
+    max_d = max(float((n1_sd[k] - n2_sd[k]).abs().max()) for k in n1_sd)
+    print(f"  N2 = N1 rounded to bfloat16: max |w1-w2| = {max_d:.3e}")
+
+    lo, hi = acas_domain(n1_dir)
+    box_path = os.path.join(n1_dir, 'model_box.txt')
+    if os.path.exists(box_path):
+        from acas_data import read_box_file
+        lo, hi = read_box_file(box_path)
+    rng = np.random.default_rng(0)
+    x = torch.from_numpy(
+        rng.uniform(lo, hi, size=(20000, lo.size)).astype(np.float32)
+    ).view(-1, 1, int(lo.size), 1).to(device)
+    n1_model = type(model)()
+    n1_model.load_state_dict(n1_sd)
+    n1_model.to(device).eval()
+    model.eval()
+    with torch.no_grad():
+        a = n1_model(x).argmax(dim=1)
+        b = model(x).argmax(dim=1)
+    disagree = int((a != b).sum())
+    print(f"  advisory disagreement inside the verification box: "
+          f"{disagree}/{x.shape[0]} ({100.0 * disagree / x.shape[0]:.3f}%)")
+
+
 def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_size=128):
     """Load model from model_path, train sgd_epochs more with SGD, save N2.
 
@@ -1025,7 +1133,11 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
     if os.path.isfile(model_path):
         model_path = os.path.dirname(model_path)
     n1_dir = model_path
-    n2_dir = f"{n1_dir}_sgd_itr{sgd_epochs}"
+    # The benchmark nets get no SGD at all (see below), so their N2 is named for
+    # what actually produced it rather than inheriting the image pipeline's
+    # _sgd_itr tag. is_n2_model_name() knows both spellings.
+    n2_dir = (f"{n1_dir}{N2_BENCHMARK_SUFFIX}" if julia_ds in ('acas', 'har')
+              else f"{n1_dir}_sgd_itr{sgd_epochs}")
 
     # Skip training if N2 already exists
     n2_model_p = os.path.join(n2_dir, 'model.p')
@@ -1046,6 +1158,19 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
     model = model_cls(k=channels, w=w, h=h).to(device)
     model.load_state_dict(torch.load(model_pth, map_location=device))
     print(f"  Loaded model from {model_pth}")
+
+    # The benchmark nets (acas/har) ship pretrained with no public training set,
+    # and extra SGD cannot produce an N2 for them: any oracle labelled by N1 is
+    # fit exactly by N1 at step 0, so the gradient is zero and N2 == N1. Follow
+    # the differential-verification literature instead and derive N2 by reducing
+    # weight precision -- ReluDiff: "We produce f' by truncating each network's
+    # weights from 32-bit floats to 16-bit floats." The truncated values are kept
+    # in the original dtype so every downstream consumer is unchanged.
+    if julia_ds in ('acas', 'har'):
+        _save_truncated_n2(model, n1_dir, n2_dir, device)
+        print(f"  N1: {n1_dir}")
+        print(f"  N2: {n2_dir}")
+        return n1_dir, n2_dir
 
     # Prepare data
     transform = transforms.Compose([transforms.ToTensor()])
@@ -1316,12 +1441,13 @@ def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv
 
         # Find standard N2 directories
         if double_check_standard:
-            std_pattern = "double_check_vhagarNoPertubed_*_sgd_itr*"
+            std_prefix = "double_check_vhagarNoPertubed"
         elif compare_to_with_perturbed:
-            std_pattern = "vagharWithPerturbed_*_sgd_itr*"
+            std_prefix = "vagharWithPerturbed"
         else:
-            std_pattern = "vagharNoPerturbed_*_sgd_itr*"
-        standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, std_pattern)))
+            std_prefix = "vagharNoPerturbed"
+        std_pattern = " or ".join(n2_glob_patterns(std_prefix))
+        standard_n2_dirs = glob_n2_dirs(eps_dir, std_prefix)
         if not standard_n2_dirs:
             print(f"  [{pert_name}] No standard N2 ({std_pattern}) found in {eps_dir}")
             continue
@@ -1597,11 +1723,10 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
             continue
 
         # Find standard N2 directories (regular standard mode results)
-        if compare_to_with_perturbed:
-            std_pattern = "vagharWithPerturbed_*_sgd_itr*"
-        else:
-            std_pattern = "vagharNoPerturbed_*_sgd_itr*"
-        standard_n2_dirs = sorted(glob.glob(os.path.join(eps_dir, std_pattern)))
+        std_prefix = ("vagharWithPerturbed" if compare_to_with_perturbed
+                      else "vagharNoPerturbed")
+        std_pattern = " or ".join(n2_glob_patterns(std_prefix))
+        standard_n2_dirs = glob_n2_dirs(eps_dir, std_prefix)
         if not standard_n2_dirs:
             print(f"  [{pert_name}] No standard N2 ({std_pattern}) found in {eps_dir}")
             continue

@@ -3467,7 +3467,9 @@ def _role_of_stdboost_dir(cd):
     Falls back to N1 for legacy 'vaghar_*' dirs.
     """
     base = os.path.basename(cd.rstrip(os.sep))
-    if base.startswith("N2stdBoost_") or "_sgd_itr" in base:
+    # _sgd_itr is the image pipeline's N2 tag; _bf16 is the benchmark nets'
+    # (acas/har), whose N2 comes from reduced weight precision, not extra SGD.
+    if base.startswith("N2stdBoost_") or any(s in base for s in ("_sgd_itr", "_bf16")):
         return "N2"
     return "N1"
 
@@ -4302,7 +4304,7 @@ def _discover_model_role_tags(arch_root):
         if not (os.path.isfile(os.path.join(d, "model.pth"))
                 or _glob.glob(os.path.join(d, "*", "model.pth"))):
             continue
-        role = "N2" if "_sgd_itr" in name else "N1"
+        role = "N2" if any(s in name for s in ("_sgd_itr", "_bf16")) else "N1"
         out.append((role, name))
     return out
 
