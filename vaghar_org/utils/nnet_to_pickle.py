@@ -95,6 +95,12 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--box", default=None,
                     help="uniform LO,HI box overriding the .nnet header")
+    ap.add_argument("--box-per-input", default=None,
+                    help="per-coordinate box 'lo1,..,loN;hi1,..,hiN' overriding "
+                         "the .nnet header, for verifying a property region "
+                         "(e.g. ACAS phi1/phi2) rather than the whole input "
+                         "space. Clipped to the header box, which is the range "
+                         "the net was normalized for.")
     ap.add_argument("--negate-output", action="store_true",
                     help="negate the final layer (argmin->argmax, for ACAS)")
     ap.add_argument("--emit-pth", action="store_true",
@@ -119,10 +125,37 @@ def main():
         pickle.dump(flat, f, protocol=2)
 
     # Verification box, in the NORMALIZED coordinates the saved net consumes.
+    if args.box is not None and args.box_per_input is not None:
+        raise SystemExit("pass at most one of --box / --box-per-input")
     if args.box is not None:
         lo_s, hi_s = (float(v) for v in args.box.split(","))
         lo = np.full(input_size, lo_s)
         hi = np.full(input_size, hi_s)
+    elif args.box_per_input is not None:
+        lo_s, hi_s = args.box_per_input.split(";")
+        lo = np.array([float(v) for v in lo_s.split(",")], dtype=np.float64)
+        hi = np.array([float(v) for v in hi_s.split(",")], dtype=np.float64)
+        if lo.shape != (input_size,) or hi.shape != (input_size,):
+            raise SystemExit(
+                "--box-per-input needs %d values per side, got %d and %d"
+                % (input_size, lo.size, hi.size))
+        if np.any(lo > hi):
+            raise SystemExit("--box-per-input has lo > hi on some coordinate")
+        # Property regions are often quoted rounded (the ACAS phi1/phi2 upper
+        # bound on rho is written 0.6799 but the net normalizes to 0.67985777).
+        # Taken literally that asks the net to extrapolate past the range it was
+        # normalized for, so clip and say so rather than propagate it.
+        hdr_lo = (mins - means) / ranges
+        hdr_hi = (maxes - means) / ranges
+        if np.all(np.isfinite(hdr_lo)) and np.all(np.isfinite(hdr_hi)):
+            clipped_lo = np.maximum(lo, hdr_lo)
+            clipped_hi = np.minimum(hi, hdr_hi)
+            for i in range(input_size):
+                if clipped_lo[i] != lo[i] or clipped_hi[i] != hi[i]:
+                    print("  clipped input %d to header range: [%r, %r] -> [%r, %r]"
+                          % (i, float(lo[i]), float(hi[i]),
+                             float(clipped_lo[i]), float(clipped_hi[i])))
+            lo, hi = clipped_lo, clipped_hi
     else:
         lo = (mins - means) / ranges
         hi = (maxes - means) / ranges
@@ -137,6 +170,17 @@ def main():
         f.write(",".join(repr(float(v)) for v in lo) + "\n")
         f.write(",".join(repr(float(v)) for v in hi) + "\n")
     box_path = box_stub + ".json"
+
+    # The net's full normalized domain, always the .nnet header and independent
+    # of --box/--box-per-input. The box above is the region we VERIFY; this is
+    # the region the net was normalized for, and is what training samples are
+    # drawn from. They differ whenever a property region is requested.
+    dom_lo = (mins - means) / ranges
+    dom_hi = (maxes - means) / ranges
+    if np.all(np.isfinite(dom_lo)) and np.all(np.isfinite(dom_hi)):
+        with open(os.path.splitext(args.out)[0] + "_domain.txt", "w") as f:
+            f.write(",".join(repr(float(v)) for v in dom_lo) + "\n")
+            f.write(",".join(repr(float(v)) for v in dom_hi) + "\n")
 
     # ---- validation: saved (in,out) weights on normalized input must match the
     # (possibly negated) reference MLP on the same normalized samples ----
