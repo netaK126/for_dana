@@ -202,7 +202,7 @@ BENCHMARK_PERTURBATIONS = [
     # translation/rotation -- a 5-vector has no such grid) or hardcodes the
     # [0,1] domain. eps = 1e-3 matches the ACAS row of the TwoSafe paper
     # (arXiv 2606.21282, Table 1).
-    ("linf(0.001)", "linf:0.001"),
+    ("linf(0.01)", "linf:0.01"),
 ]
 
 

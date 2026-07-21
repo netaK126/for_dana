@@ -5012,8 +5012,8 @@ def _acas_provenance_clause(dataset):
     key = str(dataset).strip().lower().replace(" ", "")
     if key not in ("acas", "acasxu"):
         return ""
-    return (r" $\Npre$ is the ACAS Xu network $N_{1,1}$ of "
-            r"\citet{julian2016policy}, and $N$ is obtained by quantizing its "
+    return (r" $\Npre$ is the ACAS Xu network \texttt{ACASXU\_run2a\_1\_1} "
+            r"of \citet{katz2017reluplex}, and $N$ is obtained by quantizing its "
             r"weights to 8-bit integers, one scale per output channel.")
 
 
