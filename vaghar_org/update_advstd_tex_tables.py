@@ -3446,6 +3446,12 @@ def _classify_stdboost_filename(name):
     """
     if "_stdBoost_" not in name:
         return None
+    # Leave-one-out ablation runs (--stdboost_ablations, filename marker
+    # _ablation) are excluded from the nn-boost tables: their flag combos can
+    # coincide with legitimate grid columns (e.g. zono+pi+tau=0), which would
+    # silently mix ablation rows into paper cells.
+    if "_ablation" in name:
+        return None
     seed_match = re.search(r"_seed(\d+)(?=_)(?!_itr)", name)
     btpr_match = re.search(r"_BTPR([-0-9.]+)", name)
     return {
@@ -3910,6 +3916,46 @@ def _wide_column_short_label(col):
     return "+".join(parts)
 
 
+def _wide_row_file_rank(row):
+    """Sort key deciding WHICH result file wins when several of them carry a
+    line for the same (column, c_source, c_target) cell. Prefer a file from a
+    stdBoost_*/advStd_* dir over one from a vaghar{No,With}Perturbed_*
+    baseline dir, then the most recent run (the leading timestamp in the file
+    name), then the name itself so the choice never depends on glob order."""
+    fname = row.get("src_file") or ""
+    m = re.match(r"(\d+)", fname)
+    stamp = int(m.group(1)) if m else -1
+    return (1 if row.get("src_baseline_dir") else 0, -stamp, fname)
+
+
+def _dedupe_wide_rows(rows):
+    """Keep ONE row per (arch, role, perturbation, size, combo, c_source,
+    c_target, geom) cell.
+
+    A c_target that was solved more than once -- a re-run after a timeout, or
+    a cell that exists both in a vaghar{No,With}Perturbed_* dir and as the
+    pooled 'all-off' stdBoost file -- otherwise contributes one row per file.
+    The column mean is then taken over an unbalanced multiset: the repeated
+    target carries several times the weight of its siblings while the other
+    columns still average one run per target, so the columns no longer
+    describe the same set of experiments. That is what let delta_l of a
+    column whose slow target was run three times exceed delta_u of a column
+    that ran each target once (mnist / conv1 / patch, c_s=0).
+
+    `seed` is deliberately NOT part of the key: the baseline dirs bypass
+    --combo_ranking_seeds, so a seed-0 baseline file and the seed-filtered
+    boost file describe the SAME cell and must not both survive."""
+    best = {}
+    for r in rows:
+        key = (r.get("arch"), r.get("role"), r.get("perturbation"),
+               r.get("perturbation_size"), r.get("combo"),
+               r.get("c_source"), r.get("c_target"), bool(r.get("geom")))
+        cur = best.get(key)
+        if cur is None or _wide_row_file_rank(r) < _wide_row_file_rank(cur):
+            best[key] = r
+    return list(best.values())
+
+
 def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                  seeds_filter=None, stale_fn=None):
     """Walk each arch's results dir and yield per-cell timing rows for the
@@ -4037,8 +4083,13 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                 # delta, faster/slower solve): paired as base,geom
                                 # in the time column by the renderer.
                                 "geom": ("_geomInt" in fname),
+                                # Which file this line came from, and whether
+                                # that file sits in a vaghar{No,With}Perturbed_*
+                                # baseline dir. Both feed _dedupe_wide_rows.
+                                "src_file": fname,
+                                "src_baseline_dir": (src_kind != "boost"),
                             })
-    return rows
+    return _dedupe_wide_rows(rows)
 
 
 def _load_delta_max_values(cwd, dataset, archs):
@@ -8237,6 +8288,14 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                         fname = os.path.basename(tf)
                         if "_N2_advStd" not in fname:
                             continue
+                        # Leave-one-out ablation files never feed the paper
+                        # columns. _ablation marks all component-removed combos
+                        # from the sweep's --advstd_ablations; _noPI is the
+                        # defensive net for any pi=false run (its
+                        # (zb, vh, rt, sg) tags are identical to the paper
+                        # run's and would pool into "ours with transfer").
+                        if "_ablation" in fname or "_noPI" in fname:
+                            continue
                         # Drop only files made stale by the perturbation-dependency
                         # soundness fix: a pre-fix file is unsound ONLY if it relaxed
                         # (dropped) >=1 ReLU binary, because the missing
@@ -8322,6 +8381,10 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                                 "relaxed_pert": _as_int(
                                     val.get("n2_pert_relaxed_binaries")),
                                 "geom": is_geom,
+                                # Source file for _dedupe_wide_rows; advStd
+                                # rows never come from a baseline dir.
+                                "src_file": fname,
+                                "src_baseline_dir": False,
                             }
                             # Honor --force_timeout: drop a timeout cell whose
                             # wall-clock does not match the requested cap (the
@@ -8330,7 +8393,7 @@ def _load_advstd_rows_for_wide_from_txt(cwd, dataset, archs, perts,
                                                          rerun_timeout_eps):
                                 continue
                             rows.append(row)
-    return rows
+    return _dedupe_wide_rows(rows)
 
 
 def regenerate_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
@@ -8361,6 +8424,502 @@ def regenerate_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
               f"{exc}")
     except Exception as exc:
         print(f"[update_advstd_tex_tables] wide_perarch block error: {exc}")
+
+
+# ── Ablation appendix tables (leave-one-out component study) ────────────────
+# Rendered from the `_ablation`-tagged result files the sweep's
+# --advstd_ablations / --stdboost_ablations runs produce. One table per
+# (dataset, arch) that has ablation data; rows are the two paper methods
+# ("ours" = N2stdBoost, "ours with transfer" = advstd-N2), columns are the
+# removed component, cells are the mean solve time over the (c_s, c_t) cells
+# completed by EVERY variant of that row (so times are comparable).
+
+ABLATION_BEGIN_MARK = "% BEGIN AUTO: ablation_tables"
+ABLATION_END_MARK = "% END AUTO: ablation_tables"
+
+_ABLATION_COLUMNS = ("full", "zono", "triangle", "zono_triangle",
+                     "pert_intervals", "var_hint", "warm_start")
+_ABLATION_COL_HEADERS = {
+    "full": r"as is",
+    "zono": r"w/o zono",
+    "triangle": r"w/o triangle",
+    # Both bound-tightening techniques removed together: zono and triangle
+    # tighten the same ReLU bounds, so either alone can be masked by the
+    # other still doing the work.
+    "zono_triangle": r"w/o zono \& triangle",
+    "pert_intervals": r"w/o pert.\ int.",
+    # Two separate warm-start ablations: var_hint drops only the N1-derived
+    # variable hints (the PGD warm start still runs, so those files keep the
+    # _HyperAttackHints tag); warm_start drops both and has no warm start at
+    # all. The tag's presence is what tells the two apart on disk.
+    "var_hint": r"w/o \texttt{prev\_pgd}",
+    "warm_start": r"w/o \texttt{prev\_pgd} \& hyper",
+}
+_ABLATION_ROW_LABELS = {"ours": r"\emph{ours}",
+                        "transfer": r"\emph{ours with transfer}"}
+
+_ABL_SEED_RE = re.compile(r"_seed(\d+)(?=_)(?!_itr)")
+_ABL_BTPR_RE = re.compile(r"_(?:BTPR|BoundTightPertRelax)(\d+(?:\.\d+)?)")
+
+
+def _classify_ablation_filename(fname):
+    """Map a result filename to ('ours'|'transfer', variant) or None.
+
+    variant is 'full' for the un-ablated control combo and the removed
+    component ('zono' | 'triangle' | 'zono_triangle' | 'pert_intervals' |
+    'var_hint') for the `_ablation`-tagged runs -- leave-one-out except
+    'zono_triangle', which removes both bound-tightening techniques at once.
+    Non-control non-ablation files (grid combos, τ=0 rows, ...) return None.
+    """
+    is_abl = "_ablation" in fname
+    bm = _ABL_BTPR_RE.search(fname)
+    tau = float(bm.group(1)) if bm else -1.0
+    if "_N2_advStd" in fname:
+        if is_abl:
+            if "_noPI" in fname:
+                return ("transfer", "pert_intervals")
+            if "_varHint" not in fname:
+                # Both warm-start ablations set var_hint=off; the PGD tag is
+                # the only on-disk difference. Present => hints removed but
+                # the warm start kept (var_hint); absent => no warm start at
+                # all (warm_start).
+                if ("_HyperAttackHints" in fname
+                        or "_HyperAttackCutoff" in fname):
+                    return ("transfer", "var_hint")
+                return ("transfer", "warm_start")
+            # Combined removal first: it is the only variant missing BOTH
+            # tags, so testing it after the single-component checks would
+            # let it be swallowed by the 'zono' branch.
+            if "_zonoBounds" not in fname and "_SibGate" not in fname:
+                return ("transfer", "zono_triangle")
+            if "_zonoBounds" not in fname:
+                return ("transfer", "zono")
+            if "_SibGate" not in fname:
+                return ("transfer", "triangle")
+            return None
+        # control: the full paper combo at τ > 0 (τ=0 wide-grid rows and
+        # partial combos are not the ablation reference).
+        if ("_noPI" not in fname and "_varHintPrevPGD" in fname
+                and "_zonoBounds" in fname and "_SibGate" in fname
+                and tau > 0.0):
+            return ("transfer", "full")
+        return None
+    if "_stdBoost_" in fname:
+        if is_abl:
+            if "_PertruebedIntervals" not in fname:
+                return ("ours", "pert_intervals")
+            if "_stdBoost_zono" not in fname and "_SibGate" not in fname:
+                return ("ours", "zono_triangle")
+            if "_stdBoost_zono" not in fname:
+                return ("ours", "zono")
+            if "_SibGate" not in fname:
+                return ("ours", "triangle")
+            return None
+        if ("_PertruebedIntervals" in fname and "_stdBoost_zono" in fname
+                and "_SibGate" in fname and tau > 0.0):
+            return ("ours", "full")
+        return None
+    return None
+
+
+def _collect_ablation_cells(cwd, dataset, arch, perts, parse_result_file,
+                            seeds_filter=None, stale_fn=None):
+    """{(row, variant): {(pert, eps, cs, ct): (total_time, solve_status,
+                                               lower_bound, upper_bound)}}.
+
+    'ours' cells come from N2stdBoost_* dirs (target network only), 'transfer'
+    cells from advStd_* dirs. Later files (higher timestamp token) win on key
+    collisions, matching the sweep's newest-run-wins convention.
+    """
+    import glob  # module convention: glob is imported locally
+    seeds = ({str(s) for s in seeds_filter} if seeds_filter else None)
+    exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
+    out = {}
+    for _pname, pert_spec in perts:
+        pert_type, eps_str = pert_spec.split(":", 1)
+        eps_glob = os.path.join(exp_base, pert_type, "eps_*")
+        for eps_dir in sorted(glob.glob(eps_glob)):
+            dir_globs = (glob.glob(os.path.join(eps_dir, "advStd_*"))
+                         + glob.glob(os.path.join(eps_dir, "N2stdBoost_*")))
+            for d in sorted(dir_globs):
+                for tf in sorted(glob.glob(os.path.join(d, "*.txt"))):
+                    fname = os.path.basename(tf)
+                    cls = _classify_ablation_filename(fname)
+                    if cls is None:
+                        continue
+                    if stale_fn is not None and stale_fn(fname):
+                        continue
+                    sm = _ABL_SEED_RE.search(fname)
+                    if seeds is not None and (sm.group(1) if sm else "0") not in seeds:
+                        continue
+                    cells = out.setdefault(cls, {})
+                    for (cs, ct), info in parse_result_file(tf).items():
+                        t = info.get("total_time")
+                        if t is None or t <= 0:
+                            continue
+                        status = (info.get("solve_status", "") or "") \
+                            .upper().replace(" ", "_")
+                        if status == "INTERRUPTED":
+                            continue
+                        cells[(pert_type, eps_str, cs, ct)] = (
+                            t, status,
+                            info.get("lower_bound"), info.get("upper_bound"))
+    return out
+
+
+def _collect_ablation_baseline(cwd, dataset, arch, perts, parse_result_file,
+                               seeds_filter=None):
+    """{(pert, eps, cs, ct): (t, status, lower_bound, upper_bound)} for the
+    \\baseline (vaghar) runs on the ABLATION's target network (N2).
+
+    The \\baseline column of the per-cell tables is the combo key 'vaghar'
+    (see _aaai_wide_columns_for_tau) -- the NO-perturbed-intervals,
+    no-relaxation baseline: dependencies + hyper-attack alone. This mirrors
+    the two sources _collect_wide_perarch_cells pools into that bucket, so
+    the ablation tables compare against exactly the same runs the paper
+    tables call \\baseline:
+
+      * `vagharNoPerturbed_*` dirs whose role is N2, and
+      * all-off N2stdBoost cells (zono=no, SibGate=no, tau=0, PI=no) -- that
+        MIP is identical to the baseline, only the Gurobi seed differs, so
+        _collect_wide_perarch_cells relabels them 'vaghar' too.
+
+    `vagharWithPerturbed_*` is the SEPARATE 'PI' column, not \\baseline, and
+    is deliberately excluded. Later files (higher timestamp token) win on key
+    collisions, matching the sweep's newest-run-wins convention.
+    """
+    import glob  # module convention: glob is imported locally
+    seeds = ({str(s) for s in seeds_filter} if seeds_filter else None)
+    exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
+    out = {}
+    for _pname, pert_spec in perts:
+        pert_type, eps_str = pert_spec.split(":", 1)
+        eps_glob = os.path.join(exp_base, pert_type, "eps_*")
+        for eps_dir in sorted(glob.glob(eps_glob)):
+            dir_globs = sorted(set(
+                glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*"))
+                + glob.glob(os.path.join(eps_dir, "N2stdBoost_*"))))
+            for d in dir_globs:
+                if _role_of_stdboost_dir(d) != "N2":
+                    continue
+                is_boost_dir = _wide_combo_of_dir(d) == "boost"
+                for tf in sorted(glob.glob(os.path.join(d, "*.txt"))):
+                    fname = os.path.basename(tf)
+                    if is_boost_dir:
+                        combo = _classify_stdboost_filename(fname)
+                        if combo is None:
+                            continue
+                        if seeds and combo["seed"] not in seeds:
+                            continue
+                        z, sg, pi, tau = _wide_boost_key(combo)
+                        # Only the all-off, PI-off cell IS the baseline MIP.
+                        if not (z == "0" and sg == "0" and pi == "0"
+                                and tau in ("0", "0.0")):
+                            continue
+                    elif "_stdBoost_" in fname:
+                        # A boost file that landed in a baseline dir is not
+                        # the baseline (same guard _collect_wide_perarch_cells
+                        # applies). Plain baseline files carry no seed tag, so
+                        # they intentionally bypass `seeds`.
+                        continue
+                    for (cs, ct), info in parse_result_file(tf).items():
+                        lb = info.get("lower_bound")
+                        ub = info.get("upper_bound")
+                        if lb is None or ub is None:
+                            continue
+                        if lb != lb or ub != ub:   # NaN from a missing field
+                            continue
+                        t = info.get("total_time")
+                        status = (info.get("solve_status", "") or "") \
+                            .upper().replace(" ", "_")
+                        out[(pert_type, eps_str, cs, ct)] = (t, status, lb, ub)
+    return out
+
+
+def _ablation_mean_gap(cells, keys, delta_max_by_key=None, arch=None):
+    """Mean bound gap over `keys`, in percentage points of delta_max when the
+    Phase-0.5 delta_max is known for that (arch, N2, c_s) and raw units
+    otherwise. Returns None when any key is missing or has no usable bounds.
+
+    `cells` maps key -> (lb, ub) or (t, status, lb, ub)."""
+    gaps = []
+    for k in keys:
+        val = cells.get(k)
+        if not val:
+            return None
+        lb, ub = (val[2], val[3]) if len(val) >= 4 else (val[0], val[1])
+        if lb is None or ub is None or lb != lb or ub != ub:
+            return None
+        gap = ub - lb
+        if gap < 0:
+            gap = 0.0
+        dm = None
+        if delta_max_by_key is not None and arch is not None:
+            entry = delta_max_by_key.get((arch, "N2", k[2]))
+            if entry:
+                dm = entry.get("upper")
+        if dm:
+            gap = gap / dm * 100.0
+        gaps.append(gap)
+    if not gaps:
+        return None
+    return sum(gaps) / len(gaps)
+
+
+def _fmt_ablation_time(sec):
+    return f"{sec:.0f}" if sec >= 100 else f"{sec:.1f}"
+
+
+def _render_ablation_table(dataset, arch, cells, label_suffix="",
+                           expected=None, baseline=None,
+                           delta_max_by_key=None):
+    """One booktabs table for (dataset, arch), or None when no ablation
+    variant has data. Cells: mean total solve time in seconds over the
+    row's common cell set; $^{k\\,TO}$ counts cells that hit a solver limit.
+
+    `expected` is the planned grid from --ablation_expected as
+    (ct0s, css_or_None): a variant is starred when it is missing any
+    (pert, eps, cs, ct) cell of that grid (perts restricted to the ones the
+    row has any data for -- an untested perturbation does not flag anything).
+    Without `expected`, the star falls back to the relative rule: missing a
+    cell that another variant of the same row already has.
+
+    `baseline` ({(pert, eps, cs, ct): (lb, ub)}, from
+    _collect_ablation_baseline) adds a second sub-row per method: the gap
+    ratio against \\baseline, the same quantity the per-cell timeout tables
+    report for the \\emph{as is} method,
+    (delta_u^base - delta_l^base) / (delta_u - delta_l), over the row's
+    common cells. Above 1 the variant's bound is tighter than \\baseline's."""
+    have_abl = any(v != "full" and cells.get(("ours", v)) or
+                   v != "full" and cells.get(("transfer", v))
+                   for v in _ABLATION_COLUMNS)
+    if not have_abl:
+        return None
+    lines = [
+        # table* (full page width): in this paper's two-column style a
+        # single-column `table` leaves \textwidth = the whole page, so the
+        # adjustbox below never shrinks 7 technique columns to the column
+        # width and the table runs into the margin. Same convention as the
+        # per-cell appendix tables.
+        r"\begin{table*}[!tbp]",
+        r"\centering",
+        r"\small",
+        r"\setlength{\tabcolsep}{4pt}",
+        # 7 technique columns + 2 label columns overflow a single text column;
+        # shrink to fit the same way the per-cell appendix tables do.
+        r"\begin{adjustbox}{max width=\textwidth,center}%",
+        r"\begin{tabular}{ll" + "c" * len(_ABLATION_COLUMNS) + "}",
+        r"\toprule",
+        " &  & " + " & ".join(_ABLATION_COL_HEADERS[c]
+                              for c in _ABLATION_COLUMNS) + r" \\",
+        r"\midrule",
+    ]
+    STAR = r"\textcolor{red}{$^*$}"  # same partial-coverage mark as the
+    #                                   per-cell appendix tables
+    common_note = []
+    any_star = False
+    for row in ("ours", "transfer"):
+        variants = {v: cells.get((row, v)) for v in _ABLATION_COLUMNS}
+        if row == "ours":
+            # Neither warm-start ablation is produced for standard mode:
+            # var_hint needs N1 (which standard mode has no notion of), and
+            # --stdboost_ablations has no warm_start token yet.
+            variants["var_hint"] = None
+            variants["warm_start"] = None
+        # Perturbation scope: only perturbations the ABLATION variants have
+        # data for belong to this experiment. Control ("full") results exist
+        # for every paper perturbation (e.g. occ), and without this filter
+        # they would drag those perturbations into the grid and star every
+        # ablation variant for cells the ablation never targeted.
+        abl_pe = {(k[0], k[1]) for v, c in variants.items()
+                  if v != "full" and c for k in c}
+        if abl_pe:
+            variants = {v: ({k: val for k, val in c.items()
+                             if (k[0], k[1]) in abl_pe} if c else None)
+                        for v, c in variants.items()}
+        # With --ablation_expected, the table is COMPUTED over the provided
+        # (c_s, c_t) grid only: cells outside it (e.g. leftovers from an
+        # earlier, wider sweep) are dropped before any mean/star/coverage.
+        exp_keys = None
+        if expected is not None:
+            union_raw = set()
+            for c in variants.values():
+                if c:
+                    union_raw |= set(c.keys())
+            if union_raw:
+                ct0s, css = expected
+                cs_ref = (css if css is not None
+                          else {cs for (_p, _e, cs, _ct) in union_raw})
+                variants = {
+                    v: ({k: val for k, val in c.items()
+                         if k[2] in cs_ref and k[3] in ct0s} if c else None)
+                    for v, c in variants.items()}
+                pe_pairs = {(p, e) for (p, e, _cs, _ct) in union_raw}
+                exp_keys = {(p, e, cs, ct) for (p, e) in pe_pairs
+                            for cs in cs_ref for ct in ct0s if ct != cs}
+        present = {v: c for v, c in variants.items() if c}
+        common, union = None, set()
+        for c in present.values():
+            keys = set(c.keys())
+            union |= keys
+            common = keys if common is None else (common & keys)
+        common = common or set()
+        # Completeness reference for the red "*": the planned grid when
+        # given, otherwise the union of observed cells (relative rule).
+        if exp_keys is None:
+            exp_keys = union
+        # "precision" sub-row: how much bound gap this variant gives up
+        # against \baseline, (delta_u - delta_l)_variant - (delta_u -
+        # delta_l)_\baseline, both means taken over the SAME common cells and
+        # normalized to percentage points of delta_max. Positive => the
+        # variant is LESS precise than \baseline, 0 => equally precise. Needs
+        # every common cell to have a \baseline run, else "---" (a mean over
+        # a different cell set is not comparable).
+        base_keys = (common & set(baseline.keys())) if baseline else set()
+        base_gap = (_ablation_mean_gap(baseline, common, delta_max_by_key,
+                                       arch)
+                    if baseline and common and base_keys == common else None)
+        rendered = [r"\multirow{2}{*}{" + _ABLATION_ROW_LABELS[row] + "}",
+                    r"$t$ (s)"]
+        gap_rendered = ["", r"precision"]
+        for v in _ABLATION_COLUMNS:
+            c = variants.get(v)
+            if not c or not common:
+                rendered.append("---")
+                gap_rendered.append("---")
+                continue
+            times = [c[k][0] for k in common]
+            cell = _fmt_ablation_time(sum(times) / len(times))
+            # Red "*" (same convention as the per-cell tables): this
+            # variant has not yet completed every cell of the completeness
+            # reference (planned grid, or the row's best-covered variant).
+            if exp_keys - set(c.keys()):
+                cell += STAR
+                any_star = True
+            rendered.append(cell)
+            var_gap = _ablation_mean_gap(c, common, delta_max_by_key, arch)
+            if base_gap is None or var_gap is None:
+                gap_rendered.append("---")
+            else:
+                # Absolute distance from \baseline's precision (per user):
+                # 0 = identical, larger = further off, direction not shown.
+                # _fmt_sig keeps two significant figures, which the near-ties
+                # (~0.01%) need and _fmt_trim would round away.
+                gap_rendered.append(
+                    _fmt_sig(abs(var_gap - base_gap)) + r"\%")
+        lines.append(" & ".join(rendered) + r" \\")
+        lines.append(" & ".join(gap_rendered) + r" \\")
+        if row == "ours":
+            lines.append(r"\midrule")
+        if present:
+            common_note.append(
+                f"{len(common)}/{len(exp_keys)} cells "
+                f"({'ours' if row == 'ours' else 'transfer'})")
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}%",
+        r"\end{adjustbox}",
+        r"\caption{Ablation study on \textsf{" + arch + r"} (" + dataset
+        + r"): mean solve time in seconds when removing one component at a "
+        + r"time (\emph{as is} = full method; the \emph{w/o zono \& triangle} "
+        + r"column removes both bound-tightening techniques together, since "
+        + r"they tighten the same ReLU bounds and either alone can be masked "
+        + r"by the other). Each row averages over the "
+        + r"$(c_s, c_t)$ cells"
+        + (r" of the planned ablation grid" if expected is not None else "")
+        + r" completed by every rendered variant of that "
+        + r"row (" + "; ".join(common_note) + r"). "
+        + r"The \emph{precision} sub-row is how far this variant's bound gap "
+        + r"sits from \baseline's over those same cells, "
+        + r"$\bigl|(\delta_u-\delta_l) - (\delta_u^{\baseline}-"
+        + r"\delta_l^{\baseline})\bigr|$, as a percentage of "
+        + r"$\delta_{\max}$: $0\%$ means precision identical to \baseline's, "
+        + r"and since every variant here is tighter than \baseline a larger "
+        + r"value means more precision gained over it. It is "
+        + r"a dash where \baseline has not been run on all of the cells. "
+        + r"The two warm-start columns exist only in transfer mode: "
+        + r"\emph{w/o \texttt{prev\_pgd}} drops the $N_1$-derived variable "
+        + r"hints but keeps the PGD hyper-attack warm start, while "
+        + r"\emph{w/o \texttt{prev\_pgd} \& hyper} drops both, leaving no "
+        + r"warm start at all."
+        + ((r" A red $^*$ marks a variant whose experiments are not yet "
+            r"complete"
+            + (r" (relative to the planned ablation grid)" if expected
+               is not None else
+               r" (it is missing cells that another variant of the row "
+               r"already has)")
+            + r"; the row's mean covers only the common subset.")
+           if any_star else "")
+        + r"}",
+        r"\label{tab:ablation-" + dataset + label_suffix + "-" + arch + r"}",
+        r"\end{table*}",
+    ]
+    return "\n".join(lines)
+
+
+def regenerate_ablation_appendix_section(tex_path, cwd, dataset, arch_runs,
+                                         parse_result_file, perts,
+                                         seeds_filter=None, stale_fn=None,
+                                         begin_mark=ABLATION_BEGIN_MARK,
+                                         end_mark=ABLATION_END_MARK,
+                                         ds_label_suffix="",
+                                         expected_map=None):
+    """Rewrite the ablation_tables AUTO block in `tex_path` with one table
+    per arch of `arch_runs` that has `_ablation` result files.
+
+    `expected_map` ({(dataset_or_None, arch): (ct0s, css)}, from
+    --ablation_expected) supplies the planned grid the red '*' is judged
+    against; dataset-scoped entries win over unscoped ones."""
+    bodies = []
+    # delta_max (Phase 0.5) normalizes the gap ratio's two gaps into
+    # percentage points; it cancels out of the ratio whenever a row's cells
+    # share a c_s, and keeps multi-c_s grids from being weighted by scale.
+    try:
+        delta_max_by_key = _load_delta_max_values(
+            cwd, dataset, [a for a, _ in arch_runs])
+    except Exception:
+        delta_max_by_key = None
+    for arch, _mp in arch_runs:
+        expected = None
+        if expected_map:
+            expected = (expected_map.get((dataset, arch))
+                        or expected_map.get((None, arch)))
+        try:
+            cells = _collect_ablation_cells(cwd, dataset, arch, perts,
+                                            parse_result_file,
+                                            seeds_filter=seeds_filter,
+                                            stale_fn=stale_fn)
+            baseline = _collect_ablation_baseline(cwd, dataset, arch, perts,
+                                                  parse_result_file,
+                                                  seeds_filter=seeds_filter)
+            tab = _render_ablation_table(dataset, arch, cells,
+                                         label_suffix=ds_label_suffix,
+                                         expected=expected,
+                                         baseline=baseline,
+                                         delta_max_by_key=delta_max_by_key)
+        except Exception as exc:
+            print(f"[update_advstd_tex_tables] ablation table {dataset}/{arch} "
+                  f"error: {exc}")
+            continue
+        if tab:
+            bodies.append(tab)
+    body = ("\n\n".join(bodies) if bodies
+            else "% (no _ablation result files found for this dataset)")
+    with open(tex_path) as f:
+        text = f.read()
+    if begin_mark not in text or end_mark not in text:
+        raise SystemExit(f"ablation_tables markers not found in {tex_path}")
+    pre, rest = text.split(begin_mark, 1)
+    _old, post = rest.split(end_mark, 1)
+    updated = f"{pre}{begin_mark}\n{body}\n{end_mark}{post}"
+    if updated == text:
+        print(f"[update_advstd_tex_tables] no changes to ablation_tables "
+              f"block ({dataset})")
+        return
+    with open(tex_path, "w") as f:
+        f.write(updated)
+    print(f"[update_advstd_tex_tables] wrote ablation_tables block "
+          f"({dataset}, {len(bodies)} table(s)) in {tex_path}")
 
 
 def main():

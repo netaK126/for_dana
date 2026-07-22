@@ -427,6 +427,18 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--allow_relax_without_pi"
+        help = "Ablation escape hatch: demote the two UNSOUND-COMBINATION hard-exits " *
+               "(relax_threshold > 0 with --use_perturbed_intervals=false) to warnings and run " *
+               "anyway. Still a sound over-approximation (δ_relaxed ≥ δ_exact: the emitted " *
+               "triangle/SibGate cuts are exact-point-valid on their own — the chord uses the " *
+               "exact encoding's (l, u), and SibGate's drift interval is a computed enclosure, " *
+               "not a model constraint), but without the PI coupling the relaxed copy is only " *
+               "loosely tied to the exact one, so the bound may be much looser and the solve " *
+               "slower. Intended ONLY for perturbed-interval ablation runs; leave false otherwise."
+        arg_type = Bool
+        required = false
+        default = false
 
         # ── ACAS/HAR benchmark support (pretrained tabular nets) ──
         "--internet_nets_benchmarks"
@@ -553,13 +565,25 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     # δ_exact is not guaranteed. τ = 0.0 emits no triangle (gap > 0 for every
     # split neuron), so the guard only fires for τ > 0.
     if nn1_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
-        println("UNSOUND COMBINATION: --nn1_relax_threshold > 0 (Per-Copy Triangle Drop, " *
-                "standard-mode boost §3.3) requires --use_perturbed_intervals=true for soundness. " *
-                "Without the perturbed-interval coupling constraints the relaxed and exact " *
-                "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
-                "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
-                "the relaxation with --nn1_relax_threshold off (or use τ = 0).")
-        return
+        if args["allow_relax_without_pi"]
+            # Ablation mode: the emitted cuts are exact-point-valid on their own
+            # (chord uses the exact encoding's (l, u); SibGate's drift interval is
+            # a computed enclosure, not a model constraint), so δ_relaxed ≥ δ_exact
+            # still holds — only tightness/speed degrade. See --allow_relax_without_pi.
+            println("WARNING (--allow_relax_without_pi): running --nn1_relax_threshold > 0 " *
+                    "WITHOUT --use_perturbed_intervals. Sound (δ_relaxed ≥ δ_exact) but the " *
+                    "relaxed copy is only loosely tied to the exact one — expect a looser " *
+                    "bound and a slower solve. Perturbed-interval ablation runs only.")
+        else
+            println("UNSOUND COMBINATION: --nn1_relax_threshold > 0 (Per-Copy Triangle Drop, " *
+                    "standard-mode boost §3.3) requires --use_perturbed_intervals=true for soundness. " *
+                    "Without the perturbed-interval coupling constraints the relaxed and exact " *
+                    "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
+                    "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
+                    "the relaxation with --nn1_relax_threshold off (or use τ = 0), or pass " *
+                    "--allow_relax_without_pi true for a perturbed-interval ablation run.")
+            return
+        end
     end
     if nn1_use_sibling_gate && nn1_relax_threshold < 0.0
         println("WARNING: --nn1_sibling_gate=true but --nn1_relax_threshold < 0; " *
@@ -934,14 +958,26 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     # stable-both short-circuit skips it. No actual triangle relaxation is
     # emitted at τ = 0, so no coupling constraint is needed.
     if adv_std_n2_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
-        println("UNSOUND COMBINATION: --adv_std_n2_relax_threshold > 0 (Technique 4, " *
-                "BoundTightPertRelax) requires --use_perturbed_intervals=true for soundness. " *
-                "Without the perturbed-interval coupling constraints the relaxed and exact " *
-                "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
-                "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
-                "Technique 4 with --adv_std_n2_relax_threshold off (or use τ = 0, which " *
-                "emits no actual relaxations).")
-        return
+        if args["allow_relax_without_pi"]
+            # Ablation mode: the emitted cuts are exact-point-valid on their own
+            # (chord uses the exact encoding's (l, u); SibGate's drift interval is
+            # a computed enclosure, not a model constraint), so δ_relaxed ≥ δ_exact
+            # still holds — only tightness/speed degrade. See --allow_relax_without_pi.
+            println("WARNING (--allow_relax_without_pi): running --adv_std_n2_relax_threshold > 0 " *
+                    "WITHOUT --use_perturbed_intervals. Sound (δ_relaxed ≥ δ_exact) but the " *
+                    "relaxed copy is only loosely tied to the exact one — expect a looser " *
+                    "bound and a slower solve. Perturbed-interval ablation runs only.")
+        else
+            println("UNSOUND COMBINATION: --adv_std_n2_relax_threshold > 0 (Technique 4, " *
+                    "BoundTightPertRelax) requires --use_perturbed_intervals=true for soundness. " *
+                    "Without the perturbed-interval coupling constraints the relaxed and exact " *
+                    "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
+                    "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
+                    "Technique 4 with --adv_std_n2_relax_threshold off (or use τ = 0, which " *
+                    "emits no actual relaxations), or pass --allow_relax_without_pi true " *
+                    "for a perturbed-interval ablation run.")
+            return
+        end
     end
     n1_state_dir = args["n1_state_dir"]
 
@@ -1007,7 +1043,14 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     end
     if use_hyper_attack && !use_mip_start; n2_check = n2_check * "_HyperAttackHints"; end
     if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps_depGuardFix"; end  # must mirror the saved name's tag (see line ~666)
-    if args["use_perturbed_intervals"];     n2_check = n2_check * "_PerturbedIntervals"; end
+    if args["use_perturbed_intervals"]
+        n2_check = n2_check * "_PerturbedIntervals"
+    else
+        # Perturbed-interval ablation runs (--allow_relax_without_pi): stamp an
+        # explicit _noPI so these files never alias the PI runs of the same combo
+        # (the sweep's skip-check globs the tag tail with a wildcard).
+        n2_check = n2_check * "_noPI"
+    end
     if geometric_intervals;                 n2_check = n2_check * "_geomInt"; end
 
     # Check if ALL results already exist — if so, skip entirely
@@ -1328,6 +1371,10 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name * "_PerturbedIntervals"
                 if geometric_intervals; n2_name = n2_name * "_geomInt"; end
                 perturbed_interval_constraints(m_n2, nn2, "org", "perturbation")
+            else
+                # Mirror the n2_check pre-flight tag: mark PI-ablation results
+                # so they stay distinguishable from same-combo PI runs.
+                n2_name = n2_name * "_noPI"
             end
             mip_set_delta_property(m_n2, perturbation, d_n2)
             set_optimizer(m_n2, optimizer)
