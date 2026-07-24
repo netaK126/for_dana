@@ -394,9 +394,10 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
     I_pert_prev_up   = reshape(flat_up,   size(input))
     I_pert_prev_down = reshape(flat_down, size(input))
 
-    # --geometric_intervals: hand the move's exact (T-I) map to perturbed_interval_constraints (FC nets only).
+    # --geometric_intervals: hand the move's exact (T-I) map to perturbed_interval_constraints
+    # (geometric_interval_diff_bounds handles Flatten/Linear/Conv2d nets, FC and conv alike).
     global geometric_intervals, geometric_diff_map, geometric_input_shape
-    if geometric_intervals && !isempty(nn.layers) && occursin("Flatten", string(typeof(nn.layers[1])))
+    if geometric_intervals && !isempty(nn.layers)
         geometric_diff_map = geometric_diff_map_translation(t_down, t_right, w, h, k)
         geometric_input_shape = size(input)
     end
@@ -1046,9 +1047,9 @@ function get_perturbation_specific_keys_translation_transfer(w_, h_, k_, perturb
     I_pert_down = reshape(flat_down, size(input))
 
     # --geometric_intervals: the move's (T-I) map is net-independent; perturbed_interval_constraints on nn1/nn2
-    # each applies its own W1. Gate on nn1 being Flatten-first FC (transfer compares same-architecture nets).
+    # each applies its own affine prefix (transfer compares same-architecture nets, FC or conv alike).
     global geometric_intervals, geometric_diff_map, geometric_input_shape
-    if geometric_intervals && !isempty(nn1.layers) && occursin("Flatten", string(typeof(nn1.layers[1])))
+    if geometric_intervals && !isempty(nn1.layers)
         geometric_diff_map = geometric_diff_map_translation(t_down, t_right, w, h, k)
         geometric_input_shape = size(input)
     end
@@ -1237,10 +1238,15 @@ function get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation
             end
         end
     end
-    # Zero-pad pixels whose rotated source falls outside the image
+    # Zero-pad pixels whose rotated source falls outside the image (all channels:
+    # the flat_up tightening below assumes every channel of a padded pixel is pinned)
     for tt in 1:res_
         if !(tt in mapped)
             @constraint(m, v_x0[tt] == 0)
+            if k==3
+                @constraint(m, v_x0[tt+res_] == 0)
+                @constraint(m, v_x0[tt+2*res_] == 0)
+            end
         end
     end
 
@@ -1256,9 +1262,10 @@ function get_perturbation_specific_keys_rotate_transfer(w_, h_, k_, perturbation
     I_pert_up   = reshape(flat_up,   size(input))
     I_pert_down = reshape(flat_down, size(input))
 
-    # --geometric_intervals: bilinear (T-I) map (net-independent), FC + k==1 only.
+    # --geometric_intervals: bilinear (T-I) map (net-independent, block-diagonal over channels;
+    # geometric_interval_diff_bounds handles Flatten/Linear/Conv2d nets alike).
     global geometric_intervals, geometric_diff_map, geometric_input_shape
-    if geometric_intervals && k_ == 1 && !isempty(nn1.layers) && occursin("Flatten", string(typeof(nn1.layers[1])))
+    if geometric_intervals && !isempty(nn1.layers)
         geometric_diff_map = geometric_diff_map_rotation(angle, w_, h_, k_)
         geometric_input_shape = size(input)
     end
@@ -1314,30 +1321,37 @@ function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn
             continue
         end
         @constraint(m,v_x0[tt] == 0)
+        if k==3
+            @constraint(m,v_x0[tt+res_] == 0)
+            @constraint(m,v_x0[tt+2*res_] == 0)
+        end
     end
 
     # Per-pixel perturbation intervals:
     #   rotated (interior) pixels: Δ ∈ [-1, 1] (bilinear interp of unknowns)
     #   zero-padded pixels: x' = 0 ⟹ Δ = -x ∈ [-1, 0] (tighter up bound)
-    # The zero-padding @constraint loop above iterates only 1:res_, so only
-    # channel-1 indices not in `l` are actually pinned to 0. For k=3 the
-    # other channels are not pinned by that loop, so we conservatively leave
-    # their upper bound at 1 to keep this initialization sound.
+    # The zero-padding @constraint loop above pins every channel of a padded
+    # pixel, so the tighter upper bound applies to all channels.
     flat_up   = ones(Float64,  Int(w_*h_*k_))
     flat_down = -ones(Float64, Int(w_*h_*k_))
     for tt in 1:res_
         if !(tt in l)
             flat_up[tt] = 0.0
+            if k==3
+                flat_up[tt+res_] = 0.0
+                flat_up[tt+2*res_] = 0.0
+            end
         end
     end
     global I_pert_prev_up, I_pert_prev_down
     I_pert_prev_up   = reshape(flat_up,   size(input))
     I_pert_prev_down = reshape(flat_down, size(input))
 
-    # --geometric_intervals: hand the single angle's exact bilinear (T-I) map to perturbed_interval_constraints
-    # (FC nets, k==1 only — the encoder leaves k=3 channels 2/3 unpinned).
+    # --geometric_intervals: hand the single angle's exact bilinear (T-I) map to perturbed_interval_constraints.
+    # The map is block-diagonal over channels (the encoder pins all k channels), and
+    # geometric_interval_diff_bounds handles Flatten/Linear/Conv2d nets alike.
     global geometric_intervals, geometric_diff_map, geometric_input_shape
-    if geometric_intervals && k_ == 1 && !isempty(nn.layers) && occursin("Flatten", string(typeof(nn.layers[1])))
+    if geometric_intervals && !isempty(nn.layers)
         geometric_diff_map = geometric_diff_map_rotation(angle, w_, h_, k_)
         geometric_input_shape = size(input)
     end

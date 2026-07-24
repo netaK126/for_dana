@@ -633,8 +633,9 @@ end
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # --geometric_intervals : relocation-aware INTERVAL bounds for translation/rotation (no zonotope).
-# All gated behind the geometric_intervals flag; geometric_diff_map !== nothing only for translation/rotation
-# on FC (Flatten-first) nets (k==1 for rotation). δ is unchanged — this is a sound bound tightening.
+# All gated behind the geometric_intervals flag; geometric_diff_map !== nothing only for translation/rotation.
+# Supports Flatten/Linear/Conv2d nets (FC and conv alike) and both k==1 and k==3 (the encoders pin
+# every channel of mapped and zero-padded pixels). δ is unchanged — this is a sound bound tightening.
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 # Correct per-pixel input-difference envelope for a relocation move: mapped dst Δ∈[-1,1]; zero-padded dst Δ∈[-1,0].
@@ -684,52 +685,102 @@ function geometric_diff_map_translation(sd, sr, w, h, k)
     return S
 end
 
-# (T-I) for rotation: accumulate the 4 bilinear weights at the 4 neighbours, then subtract identity. k==1 only
-# (encoder leaves k=3 channels 2/3 unpinned) -> nothing -> caller falls back to the plain per-pixel propagation.
+# (T-I) for rotation: accumulate the 4 bilinear weights at the 4 neighbours, then subtract identity.
+# The same spatial map applies to every channel (block-diagonal over k), matching the encoder, which
+# pins all k channels of mapped and zero-padded pixels alike.
 function geometric_diff_map_rotation(angle, w, h, k)
-    k == 1 || return nothing
-    n = w*h; center = [w/2, h/2]; T = zeros(Float64, n, n)
+    n = w*h*k; res = w*h; center = [w/2, h/2]
+    channel_offsets = (k == 3) ? (0, res, 2*res) : (0,)
+    T = zeros(Float64, n, n)
     for i = 1:h, j = 1:w
         j_c = j - center[1]; i_c = i - center[2]
         j_r = j_c*cos(angle*pi/180) - i_c*sin(angle*pi/180) + center[1]
         i_r = j_c*sin(angle*pi/180) + i_c*cos(angle*pi/180) + center[2]
         if floor(Int,j_r)>=1 && ceil(Int,j_r)<=w && floor(Int,i_r)>=1 && ceil(Int,i_r)<=h
-            di = i_r-floor(i_r); dj = j_r-floor(j_r); dst = i + (j-1)*h
+            di = i_r-floor(i_r); dj = j_r-floor(j_r)
             fi=floor(Int,i_r); ci=ceil(Int,i_r); fj=floor(Int,j_r); cj=ceil(Int,j_r)
-            T[dst, fi+(fj-1)*h] += (1-di)*(1-dj);  T[dst, ci+(fj-1)*h] += (di)*(1-dj)
-            T[dst, fi+(cj-1)*h] += (1-di)*(dj);    T[dst, ci+(cj-1)*h] += (di)*(dj)
+            for off in channel_offsets
+                dst = off + i + (j-1)*h
+                T[dst, off+fi+(fj-1)*h] += (1-di)*(1-dj);  T[dst, off+ci+(fj-1)*h] += (di)*(1-dj)
+                T[dst, off+fi+(cj-1)*h] += (1-di)*(dj);    T[dst, off+ci+(cj-1)*h] += (di)*(dj)
+            end
         end
     end
     for dst in 1:n; T[dst, dst] -= 1.0; end
     return T
 end
 
-# Per-ReLU PRE-activation diff bounds. First Linear: M = W1*(T-I) (each (T-I) column piped through the net's
-# Flatten so rows align with post-Flatten neurons); exact box min/max over v_in∈[0,1]; interval-propagate deeper;
-# ReLU clip. FC nets only.
-function geometric_interval_diff_bounds(nn, TmI, input_shape)
-    relu_up = Array{Float64}[]; relu_dn = Array{Float64}[]
-    diff_up = Float64[]; diff_dn = Float64[]; diff_active = false; flat = nothing
-    for l in nn.layers
+# Push one (T-I) column through the affine prefix (the layers before the first ReLU) WITHOUT biases:
+# biases cancel in the difference N(x') - N(x), so the diff map is the prefix's linear part alone.
+# Conv2d reuses interval_conv2d_bounds with a degenerate interval (low == high == col), which is an
+# exact convolution; Linear is a bias-free matvec; Flatten is the layer's own numeric forward.
+function _geometric_prefix_linear_part(prefix, col)
+    x = col
+    for l in prefix
         t = string(typeof(l))
         if occursin("Flatten", t)
-            flat = l
+            x = x |> l
+        elseif occursin("Linear", t)
+            x = Float64.(transpose(l.matrix)) * x
+        elseif occursin("Conv", t)
+            F = Float64.(l.filter)
+            zero_bias = zeros(Float64, length(l.bias))
+            x4 = ndims(x) == 4 ? x : reshape(x, 1, :, 1, 1)
+            lo, _ = interval_conv2d_bounds(F, F, x4, x4, zero_bias, l.stride, l.padding)
+            x = lo
+        else
+            error("geometric_interval_diff_bounds: unsupported prefix layer $(t) (Flatten/Linear/Conv2d only)")
+        end
+    end
+    return x
+end
+
+# Per-ReLU PRE-activation diff bounds for a geometric (T-I) move. Up to the first ReLU the diff is an
+# exact linear map of the shared input, M = A*(T-I) with A the net's affine prefix; each (T-I) column
+# streams through the prefix and the exact box min/max over v_in ∈ [0,1] accumulates per output neuron
+# (positive/negative parts of M's rows). Past the first ReLU the diff is no longer linear, so the
+# bounds interval-propagate through the remaining layers (bias-free: biases cancel in a difference)
+# with the standard ReLU diff clip. Supports Flatten/Linear/Conv2d nets, FC and conv alike.
+function geometric_interval_diff_bounds(nn, TmI, input_shape)
+    relu_up = Array{Float64}[]; relu_dn = Array{Float64}[]
+    first_relu = findfirst(l -> occursin("ReLU", string(typeof(l))), nn.layers)
+    first_relu === nothing && return relu_up, relu_dn
+    prefix = nn.layers[1:first_relu-1]
+
+    diff_up = nothing; diff_dn = nothing
+    for i in 1:size(TmI, 2)
+        out = _geometric_prefix_linear_part(prefix, reshape(Float64.(TmI[:, i]), input_shape))
+        if diff_up === nothing
+            diff_up = max.(0.0, out); diff_dn = min.(0.0, out)
+        else
+            diff_up .+= max.(0.0, out); diff_dn .+= min.(0.0, out)
+        end
+    end
+
+    # First ReLU: record the PRE-activation diff bounds, then clip for propagation.
+    push!(relu_up, copy(diff_up)); push!(relu_dn, copy(diff_dn))
+    diff_up = max.(0.0, diff_up); diff_dn = .- max.(0.0, .- diff_dn)
+
+    for l in nn.layers[first_relu+1:end]
+        t = string(typeof(l))
+        if occursin("Flatten", t)
+            if ndims(diff_up) > 1
+                diff_up = diff_up |> l; diff_dn = diff_dn |> l
+            end
         elseif occursin("Linear", t)
             W = Float64.(transpose(l.matrix))
-            if !diff_active
-                cols = [W * (flat === nothing ? TmI[:, i] :
-                              vec(reshape(TmI[:, i], input_shape) |> flat)) for i in 1:size(TmI, 2)]
-                M = hcat(cols...)
-                diff_dn = vec(sum(min.(0.0, M), dims=2)); diff_up = vec(sum(max.(0.0, M), dims=2))
-                diff_active = true
-            else
-                diff_dn, diff_up = interval_matrix_vector_multiplication(W, W, diff_dn, diff_up)
-            end
+            diff_dn, diff_up = interval_matrix_vector_multiplication(W, W, diff_dn, diff_up)
+        elseif occursin("Conv", t)
+            F = Float64.(l.filter)
+            zero_bias = zeros(Float64, length(l.bias))
+            up4 = ndims(diff_up) == 4 ? diff_up : reshape(diff_up, 1, :, 1, 1)
+            dn4 = ndims(diff_dn) == 4 ? diff_dn : reshape(diff_dn, 1, :, 1, 1)
+            diff_dn, diff_up = interval_conv2d_bounds(F, F, dn4, up4, zero_bias, l.stride, l.padding)
         elseif occursin("ReLU", t)
             push!(relu_up, copy(diff_up)); push!(relu_dn, copy(diff_dn))
             diff_up = max.(0.0, diff_up); diff_dn = .- max.(0.0, .- diff_dn)
         else
-            error("geometric_interval_diff_bounds: unsupported layer $(t) (FC Flatten/Linear/ReLU nets only)")
+            error("geometric_interval_diff_bounds: unsupported layer $(t) (Flatten/Linear/Conv2d/ReLU only)")
         end
     end
     return relu_up, relu_dn

@@ -424,7 +424,7 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
     elif model_arch == "cnn0":
         model = CNN0()
     elif model_arch == "cnn1":
-        model = CNN1()
+        model = CNN1(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "cnn2":
         model = CNN2(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "cnn3":
