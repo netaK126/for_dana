@@ -170,16 +170,17 @@ def _timeout_row_is_stale_rerun(status, runtime):
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
     
-    # ("patch(1,14,14,3)",  "patch:1,14,14,3"),
+    ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("trans(1,1)",        "translation:1,1"),
-    # ("occ(14,14,9)",        "occ:14,14,9"),
+    # ("trans(1,1)",        "translation:1,1"),
+    ("occ(14,14,9)",        "occ:14,14,9"),
     # ("contrast(1.5)",      "contrast:1.5"),
     ("rotation(10)",      "rotation:10"),
     # ("linf(0.1)",         "linf:0.1"), 
     # ("brightness(0.25)",  "brightness:0.25"), 
     
     # ("trans(1,3)",        "translation:1,3"),
-    ("trans(3,1)",        "translation:3,1"),
+    # ("trans(3,1)",        "translation:3,1"),
     # ("trans(3,3)",        "translation:3,3"),
     # ("occ(5,5,5)",        "occ:5,5,5"),
     # ("occ(3,3,5)",        "occ:3,3,5"),
@@ -3063,6 +3064,32 @@ def _ensure_full_results_section(path, updater, marker_suffix=""):
         print(f"[full-results] could not prepare {path}: {exc}")
 
 
+def _ensure_auto_marker_pair(path, begin, end):
+    """Append a BEGIN/END AUTO marker pair to an EXISTING `path` if absent, so
+    the updater -- which raises SystemExit when its markers are missing -- can
+    write this dataset's block instead of bailing. Unlike
+    _ensure_full_results_section this adds no file header, so it is safe for
+    files that ARE \\input by main.tex (sec_evaluation.tex charts,
+    sec_appendix_percell.tex). Without this, a NEW dataset (e.g. HAR) has no
+    per-dataset marker in those files, so its charts cells are dropped from the
+    combined figure and its rows never reach the main-paper appendix -- while
+    sec_full_results_tables.tex (which IS ensured) still shows them.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return
+    if begin in text:
+        return
+    text = text.rstrip("\n") + f"\n\n{begin}\n{end}\n"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        print(f"[paper-tables] could not add AUTO markers to {path}: {exc}")
+
+
 def _parse_ablation_expected(entries):
     """Parse --ablation_expected into
     {(dataset_or_None, arch): (ct0s, css, tau_or_None)}.
@@ -3517,6 +3544,13 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     # caller can pool BOTH across datasets into one combined figure each.
     time_cells, bd_groups = [], []
     body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    # Ensure this dataset's chart marker exists, else regenerate_aaai_n2_charts_
+    # section raises (SystemExit) on the missing marker and its time/bd cells are
+    # lost -- so a new dataset (HAR) never reaches the combined figures.
+    if os.path.exists(body_tex) and hasattr(updater, "AAAI_N2_CHARTS_BEGIN_MARK"):
+        _ensure_auto_marker_pair(
+            body_tex, updater.AAAI_N2_CHARTS_BEGIN_MARK + _mslug,
+            updater.AAAI_N2_CHARTS_END_MARK + _mslug)
     if os.path.exists(body_tex) and hasattr(
             updater, "regenerate_aaai_n2_charts_section"):
         try:
@@ -3541,6 +3575,12 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     full_tex = os.path.join(cwd, "neta-s-paper", "sections",
                             "sec_full_results_tables.tex")
     _ensure_full_results_section(full_tex, updater, _mslug)
+    # The main-paper appendix needs the same per-dataset marker (the ensure
+    # above only covers sec_full_results_tables.tex); without it this dataset's
+    # rows are dropped from main.pdf's appendix.
+    _ensure_auto_marker_pair(
+        percell_tex, updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
+        updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug)
     _drop_supported = hasattr(updater, "set_aaai_wide_drop_partial_rows")
     for _target, _drop in ((full_tex, False), (percell_tex, True)):
         if not os.path.exists(_target):
@@ -4953,12 +4993,11 @@ def main():
             for dataset, arch, model_path in arch_runs:
                 n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                 arch_prefix = _aprefix(dataset, arch)
-                for role, role_tag, role_model_p in (("N1", n1_tag, n1_model_p),
-                                                     ("N2", n2_tag, n2_model_p)):
-                    # --n2_tables_only: N1's delta_max only feeds the source-network
-                    # (N1) tables; the N2 rows use N2's own delta_max. Skip it.
-                    if args.n2_tables_only and role == "N1":
-                        continue
+                # delta_max is computed for N2 (the target network) only: the
+                # bound-gap normalization in the target-network tables uses N2's
+                # own delta_max, so the source network N1's delta_max is not
+                # needed and is never queued.
+                for role, role_tag, role_model_p in (("N2", n2_tag, n2_model_p),):
                     dm_out_dir = os.path.join(
                         cwd, "paper_experiments", dataset, f"{arch}_exp",
                         "delta_max", f"delta_max_{arch}_{role}_{role_tag}")

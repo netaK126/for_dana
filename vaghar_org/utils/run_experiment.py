@@ -36,7 +36,7 @@ from models import (
     FNN_2_10, FNN_3_10, FNN_3_50, FNN_3_100,
     FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_6_100,
     FNN_9_200, FNN_10_10,
-    CNN0, CNN1, CNN2, CNN3, CNN5,
+    CNN0, CNN1, CNN2, CNN3, CNN4, CNN5,
     FNN_ACAS, FNN_HAR,
 )
 
@@ -58,6 +58,7 @@ ARCH_REGISTRY = {
     'cnn1':  (CNN1,      'cnn1'),
     'cnn2':  (CNN2,      'cnn2'),
     'cnn3':  (CNN3,      'cnn3'),
+    'cnn4':  (CNN4,      'cnn4'),
     'cnn5':  (CNN5,      'cnn5'),
     # Pretrained tabular benchmark nets (only under --internet_nets_benchmarks).
     'acas':  (FNN_ACAS,  'acas'),

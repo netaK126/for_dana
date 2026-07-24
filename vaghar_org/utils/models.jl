@@ -271,6 +271,31 @@ function get_nn(model_path, model_name, w, h, k, c, dataset)
         fc2 = get_matrix_params(dict1, "fc2", (10, 10))
         fc3 = get_matrix_params(dict1, "fc3", (10, c))
         nn = Sequential( [ conv1,ReLU(),conv2,ReLU(),conv3,ReLU(),conv4,ReLU(),conv5,ReLU(), Flatten([1, 2, 3, 4]), fc1, ReLU(), fc2, ReLU(), fc3, ],"nn", )
+    elseif model_name == "cnn4"
+        is_conv = true
+        stride_to_use_1 = 1
+        stride_to_use_2 = 3
+        conv_filters = 8
+        conv_filters2 = 8
+        # Wider sibling of cnn2 (8 conv channels instead of 3), 2 CONV + 2 FC.
+        # Flattened conv-output size derived from the input geometry (valid
+        # padding: out = div(in - kernel, stride) + 1), so cnn4 adapts across
+        # datasets: 28x28 -> 512 (MNIST/Fashion-MNIST), 32x32 -> 648 (CIFAR-10).
+        w1 = div(w - 4, stride_to_use_1) + 1
+        h1 = div(h - 4, stride_to_use_1) + 1
+        w2 = div(w1 - 3, stride_to_use_2) + 1
+        h2 = div(h1 - 3, stride_to_use_2) + 1
+        flatten_num = conv_filters2 * w2 * h2
+        model_pth = myunpickle(model_path)
+        dict1 = Dict{String,Any}("conv1/weight"=>model_pth[1], "conv1/bias" => reshape(model_pth[2],(1,length(model_pth[2]))),
+        "conv2/weight"=>model_pth[3], "conv2/bias" => reshape(model_pth[4],(1,length(model_pth[4]))),
+        "fc1/weight"=>model_pth[5],"fc1/bias" => reshape(model_pth[6],(1,length(model_pth[6]))),
+        "fc2/weight"=>model_pth[7], "fc2/bias" => reshape(model_pth[8],(1,length(model_pth[8]))))
+        conv1 = get_conv_params(dict1, "conv1", (4, 4, k, conv_filters), expected_stride = stride_to_use_1)
+        conv2 = get_conv_params(dict1, "conv2", (3, 3, conv_filters, conv_filters2), expected_stride = stride_to_use_2)
+        fc1 = get_matrix_params(dict1, "fc1", (flatten_num, 10))
+        fc2 = get_matrix_params(dict1, "fc2", (10, c))
+        nn = Sequential( [ conv1,ReLU(),conv2,ReLU(), Flatten([1, 2, 3, 4]), fc1, ReLU(), fc2, ],"nn", )
     elseif model_name == "cnn5"
         is_conv = true
         stride_to_use_1 = 1
