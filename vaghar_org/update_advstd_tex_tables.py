@@ -4202,6 +4202,22 @@ _FASHION_DATASET_ALIASES = frozenset(
 _CIFAR_DATASET_ALIASES = frozenset({"cifar", "cifar10", "cifar-10"})
 
 
+# Output-class count per dataset, for the "expected c_target" set behind the
+# red partial-row "*". The image datasets all have 10; the pretrained tabular
+# benchmark nets do not (ACAS Xu has 5 advisories, HAR 6 activities), and a
+# missing key used to fall back to 10 -- which marked every acas/har row
+# partial and, under _AAAI_WIDE_DROP_PARTIAL_ROWS, dropped it from the
+# appendix entirely. Mirrors _num_classes_for in run_relaxation_sweep.py.
+_DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10, "cifar": 10,
+                        "fashion_mnist": 10, "fashion-mnist": 10,
+                        "acas": 5, "har": 6}
+
+
+def _num_classes_for_dataset(dataset):
+    """Output-class count for `dataset`, defaulting to 10 for image datasets."""
+    return _DATASET_NUM_CLASSES.get(dataset, 10)
+
+
 def _dataset_display_name(dataset):
     """Human-readable dataset name for captions, tolerant of the
     hyphen/underscore spellings used across this repo."""
@@ -4260,6 +4276,51 @@ def _find_mnist_data_root(cwd, dataset="mnist"):
     return None
 
 
+def _compute_delta_d_har_tabular(model_pth_path, c_srcs, cwd):
+    """delta_d for the HAR tabular benchmark net. HAR is not a torchvision image
+    dataset -- it is the UCI "Human Activity Recognition Using Smartphones" set
+    (Anguita 2013), 561 numeric features already scaled to [-1,1] -- so it has
+    its own forward pass over data/UCI HAR Dataset/{train,test}/X_*.txt instead
+    of the ToTensor/image-DataLoader path. Returns
+        {c_src_0indexed: max_x (f(x)[c_src] - max_{k!=c_src} f(x)[k])}
+    over train+test, or None if torch / the data / the model is unavailable.
+    The net is fc1(561->500) -> ReLU -> fc2(500->6), reconstructed straight from
+    the state_dict (no model class needed)."""
+    try:
+        import numpy as np
+        import torch
+    except ImportError:
+        return None
+    data_dir = os.path.join(cwd, "data", "UCI HAR Dataset")
+    x_parts = []
+    for rel in ("train/X_train.txt", "test/X_test.txt"):
+        p = os.path.join(data_dir, rel)
+        if os.path.isfile(p):
+            try:
+                x_parts.append(np.loadtxt(p))
+            except ValueError:
+                return None
+    if not x_parts:
+        return None
+    x = np.vstack(x_parts)
+    try:
+        sd = torch.load(model_pth_path, map_location="cpu")
+        w1, b1 = sd["fc1.weight"].cpu().numpy(), sd["fc1.bias"].cpu().numpy()
+        w2, b2 = sd["fc2.weight"].cpu().numpy(), sd["fc2.bias"].cpu().numpy()
+    except Exception:
+        return None
+    if x.shape[1] != w1.shape[1]:
+        return None
+    out = np.maximum(0.0, x @ w1.T + b1) @ w2.T + b2   # (N, n_classes)
+    n_cls = out.shape[1]
+    deltas = {}
+    for c in c_srcs:
+        if 0 <= c < n_cls:
+            other_max = np.delete(out, c, axis=1).max(axis=1)
+            deltas[c] = float((out[:, c] - other_max).max())
+    return deltas
+
+
 def _compute_delta_d_for_arch_role(arch, model_pth_path, c_srcs, cwd,
                                    dataset="mnist"):
     """Forward-pass the dataset's train+test through the .pth model and return
@@ -4267,13 +4328,17 @@ def _compute_delta_d_for_arch_role(arch, model_pth_path, c_srcs, cwd,
     over both dataset splits. Returns None if PyTorch/the data/the model
     file isn't available — caller treats that as 'unknown' and renders '?'.
     """
+    if not os.path.isfile(model_pth_path):
+        return None
+    # HAR is a tabular benchmark net (UCI HAR 561-feature vectors), not a
+    # torchvision image dataset, so it takes the tabular forward-pass path.
+    if dataset == "har" or arch == "har":
+        return _compute_delta_d_har_tabular(model_pth_path, c_srcs, cwd)
     try:
         import torch
         import torchvision.datasets as dsets
         import torchvision.transforms as transforms
     except ImportError:
-        return None
-    if not os.path.isfile(model_pth_path):
         return None
     cls_name = _ARCH_TO_MODEL_CLASS_NAME.get(arch)
     if cls_name is None:
@@ -8332,8 +8397,7 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
             # When restricted via --ct (requested_c_targets, 0-indexed), the
             # expected set is exactly that request minus the self-pair, so the
             # "*" flags a requested c_target with no data.
-            n_classes = {"mnist": 10, "cifar10": 10,
-                         "fashion_mnist": 10}.get(dataset, 10)
+            n_classes = _num_classes_for_dataset(dataset)
             _req_cts = _ct_for(requested_c_targets, arch)
             if _req_cts is not None:
                 expected_cts = {ct for ct in _req_cts
@@ -9001,6 +9065,237 @@ def regenerate_aaai_time_combined_section(
               f"{exc}")
 
 
+HAR_CONFIDENCE_BEGIN_MARK = "% BEGIN AUTO: har_confidence_figures"
+HAR_CONFIDENCE_END_MARK   = "% END AUTO: har_confidence_figures"
+
+
+def _parse_har_bound_rows(path):
+    """[(c_source, lower_bound, upper_bound), ...] from a HAR result .txt.
+    Each line is 'key=val,key=val,...'; rows without finite bounds are dropped."""
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or "lower_bound" not in line:
+                    continue
+                kv = {}
+                for tok in line.split(","):
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        kv[k.strip()] = v.strip()
+                try:
+                    cs = int(float(kv["c_source"]))
+                    lo = float(kv["lower_bound"])
+                    up = float(kv["upper_bound"])
+                except (KeyError, ValueError):
+                    continue
+                if math.isfinite(lo) and math.isfinite(up):
+                    rows.append((cs, lo, up))
+    except OSError:
+        return []
+    return rows
+
+
+def _har_method_bounds(cwd):
+    """{method: {c_src: (delta_l, delta_u)}} for HAR, method in
+    'vaghar' / 'ours' / 'transfer'. delta_l / delta_u are the MAX over the
+    target classes of the verified lower / upper bounds (the source class's
+    global-robustness delta). Method buckets mirror the paper tables:
+      * 'vaghar'   -- the NO-perturbed-intervals baseline: vagharNoPerturbed_*
+                      dirs, or an all-off N2stdBoost cell (no zono / no SibGate
+                      / no PerturbedIntervals). HAR currently has neither.
+      * 'ours'     -- any other N2stdBoost cell (zono / SibGate / PI on).
+      * 'transfer' -- advStd_* dirs. HAR currently has none.
+    vagharWithPerturbed_* is the separate 'PI' variant, NOT \\baseline, so it is
+    deliberately excluded (see _wide_combo_of_dir). Returns {} if no HAR data."""
+    import glob  # module convention: glob is imported locally
+    root = os.path.join(cwd, "paper_experiments", "har", "har_exp")
+    if not os.path.isdir(root):
+        return {}
+    acc = {}   # method -> c_src -> ([lowers], [uppers])
+    for eps_dir in glob.glob(os.path.join(root, "*", "eps_*")):
+        for d in sorted(glob.glob(os.path.join(eps_dir, "*"))):
+            if not os.path.isdir(d):
+                continue
+            base = os.path.basename(d)
+            if base.startswith("advStd_"):
+                fixed_method = "transfer"
+            elif base.startswith("vagharNoPerturbed_"):
+                fixed_method = "vaghar"
+            elif base.startswith("N2stdBoost_"):
+                fixed_method = None   # classified per file below
+            else:
+                continue               # vagharWithPerturbed (PI), n1_state, model_*
+            for tf in glob.glob(os.path.join(d, "*.txt")):
+                method = fixed_method
+                if method is None:
+                    fname = os.path.basename(tf)
+                    is_all_off = ("zono" not in fname
+                                  and "SibGate" not in fname
+                                  and "PertruebedIntervals" not in fname
+                                  and "PerturbedIntervals" not in fname)
+                    method = "vaghar" if is_all_off else "ours"
+                for cs, lo, up in _parse_har_bound_rows(tf):
+                    los, ups = acc.setdefault(method, {}).setdefault(
+                        cs, ([], []))
+                    los.append(lo)
+                    ups.append(up)
+    out = {}
+    for method, per in acc.items():
+        for cs, (los, ups) in per.items():
+            if los and ups:
+                out.setdefault(method, {})[cs] = (max(los), max(ups))
+    return out
+
+
+def _har_forward_margins(cwd, c_srcs, n_samples=1000, seed=0):
+    """{c_src: numpy array (n_samples,)} of the HAR target net N2's clean-input
+    class margin  f(x)[c_src] - max_{k != c_src} f(x)[k]  for x drawn uniformly
+    from the verification box [-1,1]^561. Returns None if torch / the model is
+    unavailable. The int8 N2 is 'Linear(561->500) -> ReLU -> Linear(500->6)', so
+    the forward pass is reconstructed straight from the state_dict."""
+    try:
+        import numpy as np
+        import torch
+    except ImportError:
+        return None
+    cand = [
+        os.path.join(cwd, "paper_experiments", "har", "har_exp",
+                     "model_har_int8", "model.pth"),
+        os.path.join(cwd, "models", "har", "model.pth"),
+    ]
+    sd_path = next((p for p in cand if os.path.isfile(p)), None)
+    if sd_path is None:
+        return None
+    try:
+        sd = torch.load(sd_path, map_location="cpu")
+        w1 = sd["fc1.weight"].cpu().numpy()
+        b1 = sd["fc1.bias"].cpu().numpy()
+        w2 = sd["fc2.weight"].cpu().numpy()
+        b2 = sd["fc2.bias"].cpu().numpy()
+    except Exception:
+        return None
+    n_in = w1.shape[1]
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-1.0, 1.0, size=(n_samples, n_in))
+    h = np.maximum(0.0, x @ w1.T + b1)
+    out = h @ w2.T + b2               # (n_samples, n_classes)
+    n_cls = out.shape[1]
+    margins = {}
+    for c in c_srcs:
+        if 0 <= c < n_cls:
+            mask = np.ones(n_cls, dtype=bool)
+            mask[c] = False
+            margins[c] = out[:, c] - out[:, mask].max(axis=1)
+    return margins
+
+
+def render_har_confidence_figures(cwd, n_samples=50000, seed=0):
+    """Auto-generate, for HAR only, one figure per source class c_tag: the
+    network's clean-input class margin over `n_samples` inputs sampled uniformly
+    from the verification box [-1,1]^561 (a sampling stand-in for the
+    dataset-empirical delta_d, which HAR has no dataset for), with horizontal
+    delta_l / delta_u lines per method (ours / vaghar / transfer) that has HAR
+    results. Renders the PDFs under neta-s-paper/figures/ and returns the LaTeX
+    figure floats (empty string if HAR data / torch / matplotlib is missing)."""
+    try:
+        import numpy as np  # noqa: F401  (used indirectly via margins arrays)
+        import matplotlib
+        try:
+            matplotlib.use("Agg")
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return ""
+    bounds = _har_method_bounds(cwd)
+    # Source classes = whatever the HAR results cover; fall back to {0, 1}.
+    c_srcs = sorted({cs for per in bounds.values() for cs in per} or {0, 1})
+    margins = _har_forward_margins(cwd, c_srcs, n_samples=n_samples, seed=seed)
+    if margins is None:
+        print("[full-results] HAR confidence figures skipped "
+              "(torch / model unavailable)")
+        return ""
+    fig_dir = os.path.join(cwd, "neta-s-paper", "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+    # Canonical three methods, drawn in this order. 'ours' is red so the
+    # single method HAR has data for reads as the requested red bound lines.
+    method_order = ["ours", "vaghar", "transfer"]
+    method_color = {"ours": "#d62728", "vaghar": "#1f77b4",
+                    "transfer": "#2ca02c"}
+    parts = [HAR_CONFIDENCE_BEGIN_MARK,
+             r"\section*{HAR --- random-input confidence "
+             r"($\delta_d$ stand-in)}"]
+    # The figure is a full-width figure* (\includegraphics[width=\textwidth]),
+    # so a 7in-wide canvas is displayed ~1:1 and 10pt matplotlib text prints at
+    # ~10pt -- the paper's body size. Fonts are set here (not shrunk by an
+    # includegraphics downscale) so the in-figure text matches the running text.
+    rc = {"font.size": 10, "axes.titlesize": 10, "axes.labelsize": 10,
+          "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 10}
+    for c in c_srcs:
+        y = margins.get(c)
+        if y is None:
+            continue
+        with plt.rc_context(rc):
+            fig, ax = plt.subplots(figsize=(7.0, 3.9))
+            # Small, semi-transparent dots so 50k points read as a density
+            # band rather than one solid block.
+            ax.scatter(range(len(y)), y, s=2, color="0.4", alpha=0.35,
+                       linewidths=0, zorder=2,
+                       label="class margin (random inputs)")
+            drawn, absent = [], []
+            for m in method_order:
+                b = bounds.get(m, {}).get(c)
+                if b is None:
+                    # Keep the label in the legend with no line drawn.
+                    ax.plot([], [], ls="none", marker="",
+                            label=f"{m}: no HAR data")
+                    absent.append(m)
+                    continue
+                dl, du = b
+                col = method_color[m]
+                ax.axhline(dl, ls="--", lw=1.8, color=col, zorder=3,
+                           label=rf"{m} $\delta_l$")
+                ax.axhline(du, ls="-", lw=1.8, color=col, zorder=3,
+                           label=rf"{m} $\delta_u$")
+                drawn.append(m)
+            ax.set_xlabel("random input index")
+            ax.set_ylabel(
+                r"$f(x)_{c_\mathrm{tag}}-\max_{k\neq c_\mathrm{tag}}f(x)_k$")
+            ax.set_title(rf"HAR, $c_\mathrm{{tag}}={c + 1}$")
+            ax.legend(loc="best", framealpha=0.9, ncol=2)
+            fig.tight_layout()
+            pdf = os.path.join(fig_dir, f"har_confidence_ctag{c + 1}.pdf")
+            fig.savefig(pdf)
+            plt.close(fig)
+        drawn_txt = (", ".join(drawn) if drawn else "no method")
+        absent_txt = (r" \emph{" + "}, \\emph{".join(absent) + "} have no "
+                      "HAR runs, so they carry no line." if absent else "")
+        parts.append("\n".join([
+            r"\begin{figure*}[t]",
+            r"\centering",
+            rf"\includegraphics[width=\textwidth]"
+            rf"{{figures/har_confidence_ctag{c + 1}}}",
+            r"\caption{HAR, source class $c_\mathrm{tag}=" + str(c + 1)
+            + r"$: the target network $N$'s clean-input class margin "
+            r"$f(x)_{c_\mathrm{tag}}-\max_{k\neq c_\mathrm{tag}}f(x)_k$ over "
+            + f"{n_samples:,}" + r" inputs drawn uniformly from the verification "
+            r"box $[-1,1]^{561}$. This samples the box as a stand-in for the "
+            r"dataset-empirical $\delta_d$ (HAR ships with no public dataset), "
+            r"so its peak under-estimates the true $\delta_d$. Horizontal lines "
+            r"mark the verified $\delta_l$ (dashed) and $\delta_u$ (solid), "
+            r"taken as the max over target classes, for " + drawn_txt + "."
+            + absent_txt + r"}",
+            rf"\label{{fig:har-confidence-ctag{c + 1}}}",
+            r"\end{figure*}",
+        ]))
+    parts.append(HAR_CONFIDENCE_END_MARK)
+    if len(parts) <= 3:   # markers + section header only, no figure emitted
+        return ""
+    return "\n".join(parts)
+
+
 AAAI_N2_BOUNDDIFF_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_bounddiff"
 AAAI_N2_BOUNDDIFF_END_MARK   = "% END AUTO: aaai_n2_bounddiff"
 
@@ -9212,6 +9507,9 @@ _TAB1_ARCH_ORDER = [
     "3x10", "3x50", "3x100", "6x100", "9x200",
     "cnn0", "cnn1", "cnn2", "cnn3", "cnn4", "cnn5",
     "6x50", "fc",
+    # The benchmark nets close Table 1, in the order the evaluation text
+    # introduces them (ACAS Xu, then HAR).
+    "acas", "har",
 ]
 
 
@@ -9224,7 +9522,7 @@ def _tab1_arch_sort_key(arch):
         return (1, arch)
 
 
-_AAAI_SUMMARY_NUM_CLASSES = {"mnist": 10, "cifar10": 10, "fashion_mnist": 10}
+_AAAI_SUMMARY_NUM_CLASSES = dict(_DATASET_NUM_CLASSES)
 
 
 def _aaai_summary_stats(rows, archs, dataset="mnist", force_timeout=None,

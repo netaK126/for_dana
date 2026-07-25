@@ -170,16 +170,17 @@ def _timeout_row_is_stale_rerun(status, runtime):
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
     
-    # ("patch(1,14,14,3)",  "patch:1,14,14,3"),
+    ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("trans(1,1)",        "translation:1,1"),
-    # ("occ(14,14,9)",        "occ:14,14,9"),
+    # ("trans(1,1)",        "translation:1,1"),
+    ("occ(14,14,9)",        "occ:14,14,9"),
     # ("contrast(1.5)",      "contrast:1.5"),
     ("rotation(10)",      "rotation:10"),
     # ("linf(0.1)",         "linf:0.1"), 
     # ("brightness(0.25)",  "brightness:0.25"), 
     
     # ("trans(1,3)",        "translation:1,3"),
-    ("trans(3,1)",        "translation:3,1"),
+    # ("trans(3,1)",        "translation:3,1"),
     # ("trans(3,3)",        "translation:3,3"),
     # ("occ(5,5,5)",        "occ:5,5,5"),
     # ("occ(3,3,5)",        "occ:3,3,5"),
@@ -205,6 +206,13 @@ BENCHMARK_PERTURBATIONS = [
     ("linf(0.01)", "linf:0.01"),
 ]
 
+# Per-dataset linf radius for the benchmark nets, overriding the eps baked into
+# BENCHMARK_PERTURBATIONS. The two nets live on different input domains -- ACAS
+# on the .nnet header normalization (coordinate ranges well under 1) and HAR on
+# [-1,1]^561 -- so one shared eps does not mean the same thing for both. Set
+# from --benchmark_eps; an absent key falls back to BENCHMARK_PERTURBATIONS.
+_BENCHMARK_EPS = {}
+
 
 # Set from --perturbations in main(); applied inside perturbations_for so the
 # filter reaches the per-dataset list rather than only the image constant.
@@ -221,11 +229,35 @@ def _num_classes_for(dataset):
     return 10
 
 
+def _benchmark_perturbations_for(julia_dataset):
+    """BENCHMARK_PERTURBATIONS with this dataset's --benchmark_eps applied.
+
+    Returns BENCHMARK_PERTURBATIONS unchanged when no override was given, so
+    the ACAS command lines are byte-identical to before unless asked otherwise.
+    """
+    eps_str = _BENCHMARK_EPS.get(julia_dataset)
+    if eps_str is None:
+        return BENCHMARK_PERTURBATIONS
+    # Kept as the literal CLI string, never a float: eps_str is spliced
+    # straight into the "eps_{eps_str}" results-directory name, so any
+    # reformatting here (0.001 -> 1e-03) would silently orphan the results.
+    return [(f"linf({eps_str})", f"linf:{eps_str}")]
+
+
+def all_perturbations_for(dataset):
+    """Every perturbation valid for `dataset`, IGNORING the --perturbations
+    filter. The analysis paths scan all perturbation types on purpose, but they
+    still must not scan the image list for a benchmark net: patch/occ/
+    translation/rotation index a 2D pixel grid a flat input vector does not
+    have, so those cells can never exist and the scan finds nothing at all."""
+    _jd = _julia_dataset_name(dataset)
+    return (_benchmark_perturbations_for(_jd) if _jd in ("acas", "har")
+            else PERTURBATIONS)
+
+
 def perturbations_for(dataset):
     """Perturbation list valid for `dataset`, after any --perturbations filter."""
-    base = (BENCHMARK_PERTURBATIONS
-            if _julia_dataset_name(dataset) in ("acas", "har")
-            else PERTURBATIONS)
+    base = all_perturbations_for(dataset)
     if _PERT_NAME_FILTER:
         base = [p for p in base
                 if any(p[0].lower().startswith(pf) for pf in _PERT_NAME_FILTER)]
@@ -242,6 +274,42 @@ CORES_PER_JOB = 32
 # concurrent sweeps can claim disjoint core windows and not fight each other.
 CORE_START = int(os.environ.get("SWEEP_CORE_START", "8"))
 TOTAL_CORES = 255
+
+# Optional explicit per-slot CPU ranges, e.g. SWEEP_CORE_LIST="32-63,96-127".
+# Each comma-separated entry is ONE concurrency slot's `taskset -c` spec, letting
+# the sweep pin to a NON-CONTIGUOUS CPU set that the CORE_START/--max_cores
+# window (a single contiguous block) cannot express. When set, it OVERRIDES that
+# slotting: max_slots = number of entries and --max_cores is ignored for the
+# slot count. Each entry should be `cores_per_job` (32) wide to give one job a
+# full slot; it is passed to `taskset -c` verbatim.
+CORE_SLOTS = [p.strip() for p in os.environ.get("SWEEP_CORE_LIST", "").split(",")
+              if p.strip()]
+
+
+def _max_slots_for(total_cores, cores_per_job):
+    """Concurrency-slot count: one slot per SWEEP_CORE_LIST entry when that
+    override is set, else the contiguous CORE_START..total_cores window divided
+    into cores_per_job-wide slots."""
+    if CORE_SLOTS:
+        return len(CORE_SLOTS)
+    return (total_cores - CORE_START) // cores_per_job
+
+
+def _slot_core_spec(slot_idx, cores_per_job):
+    """`taskset -c` CPU spec for a concurrency slot: the explicit SWEEP_CORE_LIST
+    range when set, else the contiguous window at CORE_START + slot_idx*width."""
+    if CORE_SLOTS:
+        return CORE_SLOTS[slot_idx]
+    core_lo = CORE_START + slot_idx * cores_per_job
+    return f"{core_lo}-{core_lo + cores_per_job - 1}"
+
+
+def _cores_desc(cores_per_job):
+    """Human-readable description of the CPU set the slots cover, for banners."""
+    if CORE_SLOTS:
+        return "cores " + ",".join(CORE_SLOTS)
+    n = _max_slots_for(TOTAL_CORES, cores_per_job)
+    return f"cores {CORE_START}-{CORE_START + n * cores_per_job - 1}"
 
 
 def standard_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist"):
@@ -905,7 +973,7 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
     print(f"{phase_name}: {total_jobs} jobs total  "
           f"({len(ready_jobs)} ready now, {total_jobs - len(ready_jobs)} waiting on deps)  "
           f"{max_slots} concurrent slots  "
-          f"({cores_per_job} cores/job, cores {CORE_START}-{CORE_START + max_slots * cores_per_job - 1})")
+          f"({cores_per_job} cores/job, {_cores_desc(cores_per_job)})")
     if grouped:
         from collections import Counter as _Counter
         split = ", ".join(f"{g}:{n}" for g, n in _Counter(group_slots).items())
@@ -920,10 +988,9 @@ def run_pool(ready_jobs, max_slots, cwd, cores_per_job, phase_name="",
     os.makedirs(log_dir, exist_ok=True)
 
     def launch_in_slot(slot_idx, label, cmd):
-        core_lo = CORE_START + slot_idx * cores_per_job
-        core_hi = core_lo + cores_per_job - 1
-        full_cmd = ["taskset", "-c", f"{core_lo}-{core_hi}"] + cmd
-        print(f"  [{label:<50s}] cores {core_lo}-{core_hi}  "
+        core_spec = _slot_core_spec(slot_idx, cores_per_job)
+        full_cmd = ["taskset", "-c", core_spec] + cmd
+        print(f"  [{label:<50s}] cores {core_spec}  "
               f"({finished}/{total_jobs} done, {len(job_queue)} queued, "
               f"{sum(len(v) for v in locked_jobs.values())} locked)")
         safe_label = label.replace("/", "_").replace(" ", "_")
@@ -2382,7 +2449,7 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
     --advstd_safe_combos_only. Returns the path of the combo-ranking CSV.
     """
     import csv as _csv
-    all_perts = PERTURBATIONS
+    all_perts = all_perturbations_for(dataset)
     combined_base = os.path.join(cwd, "paper_experiments", dataset)
     os.makedirs(combined_base, exist_ok=True)
     suffix = "_vs_withPerturbed" if compare_to_with_perturbed else ""
@@ -3193,6 +3260,32 @@ def _ensure_full_results_section(path, updater, marker_suffix=""):
         print(f"[full-results] could not prepare {path}: {exc}")
 
 
+def _ensure_auto_marker_pair(path, begin, end):
+    """Append a BEGIN/END AUTO marker pair to an EXISTING `path` if absent, so
+    the updater -- which raises SystemExit when its markers are missing -- can
+    write this dataset's block instead of bailing. Unlike
+    _ensure_full_results_section this adds no file header, so it is safe for
+    files that ARE \\input by main.tex (sec_evaluation.tex charts,
+    sec_appendix_percell.tex). Without this, a NEW dataset (e.g. HAR) has no
+    per-dataset marker in those files, so its charts cells are dropped from the
+    combined figure and its rows never reach the main-paper appendix -- while
+    sec_full_results_tables.tex (which IS ensured) still shows them.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return
+    if begin in text:
+        return
+    text = text.rstrip("\n") + f"\n\n{begin}\n{end}\n"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        print(f"[paper-tables] could not add AUTO markers to {path}: {exc}")
+
+
 def _parse_ablation_expected(entries):
     """Parse --ablation_expected into
     {(dataset_or_None, arch): (ct0s, css, tau_or_None)}.
@@ -3274,6 +3367,22 @@ def _build_full_results_tex(cwd):
                       f"{float_tex}")
         n_blocks += 1
 
+    # HAR-only random-input confidence figures: a delta_d stand-in (HAR has no
+    # dataset). Computed once here, then placed RIGHT AFTER the HAR tables in
+    # the loop below. Appended to this standalone document ONLY, not the paper's
+    # own appendix. No-op when HAR has no results or torch/matplotlib is absent.
+    har_fig_chunk = ""
+    try:
+        sys.path.insert(0, cwd)
+        import update_advstd_tex_tables as _har_updater
+        _har_fig_tex = _har_updater.render_har_confidence_figures(cwd)
+        if _har_fig_tex:
+            har_fig_chunk = ("%% ---- har_confidence_figures (auto-generated) "
+                             "----\n" + _har_fig_tex)
+    except Exception as exc:
+        print(f"[full-results] HAR confidence figures skipped ({exc})")
+    har_fig_emitted = False
+
     for fname, marker in _FULL_RESULTS_BLOCKS:
         src = os.path.join(paper_dir, "sections", fname)
         if not os.path.exists(src):
@@ -3286,6 +3395,20 @@ def _build_full_results_tex(cwd):
                           f"sections/{fname}) ----\n"
                           f"\\section*{{{ds}}}\n{block}")
             n_blocks += 1
+            # The confidence figures sit immediately after the HAR tables, and
+            # ONLY when a HAR table was actually rendered (i.e. `har` was in
+            # --dataset). Without this coupling the figure would draw from the
+            # on-disk HAR results even on runs that produced no HAR table,
+            # leaving a data-less table beside a data-full figure.
+            if ds == "har" and har_fig_chunk and not har_fig_emitted:
+                chunks.append(har_fig_chunk)
+                n_blocks += 1
+                har_fig_emitted = True
+
+    if har_fig_chunk and not har_fig_emitted:
+        print("[full-results] HAR figures suppressed: no HAR table in this run "
+              "(add 'har' to --dataset to generate the HAR tables + figures)")
+
     if not chunks:
         print("[full-results] no AUTO table blocks found; "
               "table_full_results.tex not written")
@@ -3655,6 +3778,13 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     # caller can pool BOTH across datasets into one combined figure each.
     time_cells, bd_groups = [], []
     body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    # Ensure this dataset's chart marker exists, else regenerate_aaai_n2_charts_
+    # section raises (SystemExit) on the missing marker and its time/bd cells are
+    # lost -- so a new dataset (HAR) never reaches the combined figures.
+    if os.path.exists(body_tex) and hasattr(updater, "AAAI_N2_CHARTS_BEGIN_MARK"):
+        _ensure_auto_marker_pair(
+            body_tex, updater.AAAI_N2_CHARTS_BEGIN_MARK + _mslug,
+            updater.AAAI_N2_CHARTS_END_MARK + _mslug)
     if os.path.exists(body_tex) and hasattr(
             updater, "regenerate_aaai_n2_charts_section"):
         try:
@@ -3679,6 +3809,12 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     full_tex = os.path.join(cwd, "neta-s-paper", "sections",
                             "sec_full_results_tables.tex")
     _ensure_full_results_section(full_tex, updater, _mslug)
+    # The main-paper appendix needs the same per-dataset marker (the ensure
+    # above only covers sec_full_results_tables.tex); without it this dataset's
+    # rows are dropped from main.pdf's appendix.
+    _ensure_auto_marker_pair(
+        percell_tex, updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
+        updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug)
     _drop_supported = hasattr(updater, "set_aaai_wide_drop_partial_rows")
     for _target, _drop in ((full_tex, False), (percell_tex, True)):
         if not os.path.exists(_target):
@@ -3810,6 +3946,15 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--perturbations", nargs="*", default=None,
                         help="Filter perturbations by name prefix (e.g. 'patch' 'occ' 'trans' 'rotation')")
+    parser.add_argument("--benchmark_eps", nargs="*", default=None,
+                        help="Per-dataset linf radius for the pretrained benchmark nets, as "
+                             "<dataset>=<eps> (e.g. 'har=0.01'). Only linf is encodable for "
+                             "acas/har, and the two live on different input domains (ACAS on the "
+                             ".nnet header normalization, HAR on [-1,1]^561), so one shared eps "
+                             "does not mean the same thing for both. The value is used verbatim "
+                             "in the eps_<value> results directory, so pass it exactly as it "
+                             "should appear on disk. Without this the built-in "
+                             "BENCHMARK_PERTURBATIONS radius is used.")
     parser.add_argument("--max_cores", type=int, default=TOTAL_CORES,
                         help=f"Total cores available (default: {TOTAL_CORES})")
     parser.add_argument("--timeout", type=int, default=1800,
@@ -4053,7 +4198,7 @@ def main():
     parser.add_argument("--sweep_adv_std_branch_priorities", nargs="*", type=str, default=None,
                         help="Values for adv_std_branch_priorities: off | rank | decay "
                              "(legacy true/false accepted; legacy 'bounds'/'pseudocost' map to 'rank' with a warning). "
-                             "Default: ['rank'].")
+                             "Default: ['off'].")
     parser.add_argument("--sweep_adv_std_lp_basis", nargs="*", type=str, default=None,
                         help="Values for adv_std_lp_basis (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_bound_tightening", nargs="*", type=str, default=None,
@@ -4343,6 +4488,29 @@ def main():
     effective_force_timeout = (arch_force_timeout if arch_force_timeout is not None
                                else args.force_timeout)
 
+    # Per-dataset linf radius for the benchmark nets (acas/har). Applied before
+    # perturbations_for so every eps_* directory built below sees the override.
+    if args.benchmark_eps:
+        global _BENCHMARK_EPS
+        for entry in args.benchmark_eps:
+            if "=" not in entry:
+                print(f"ERROR: --benchmark_eps entry '{entry}' must be "
+                      f"<dataset>=<eps>, e.g. har=0.01")
+                sys.exit(1)
+            ds_key, eps_str = entry.split("=", 1)
+            ds_key = _julia_dataset_name(ds_key.strip())
+            eps_str = eps_str.strip()
+            if ds_key not in ("acas", "har"):
+                print(f"ERROR: --benchmark_eps only applies to the pretrained "
+                      f"benchmark nets (acas/har); got '{ds_key}'.")
+                sys.exit(1)
+            try:
+                float(eps_str)
+            except ValueError:
+                print(f"ERROR: --benchmark_eps radius '{eps_str}' is not a number.")
+                sys.exit(1)
+            _BENCHMARK_EPS[ds_key] = eps_str
+
     # Filter perturbations if requested
     if args.perturbations:
         global _PERT_NAME_FILTER
@@ -4372,7 +4540,7 @@ def main():
         #     ("trans(3,3)",        "translation:3,3"),
         #     ("rotation(10)",      "rotation:10"),
         # ]
-        all_perts = PERTURBATIONS
+        all_perts = all_perturbations_for(args.dataset)
         # Write combined CSVs to the dataset-level directory (not per-arch)
         dblchk = args.double_check_standard
         suffix = "_double_check_standard" if dblchk else ""
@@ -4621,14 +4789,14 @@ def main():
         return
 
     cores_per_job = CORES_PER_JOB
-    max_slots = (total_cores - CORE_START) // cores_per_job
+    max_slots = _max_slots_for(total_cores, cores_per_job)
 
     # ── Advanced-standard mode (two-phase: N1 once, then N2 sweep) ──────
     if args.advanced_standard:
         try:
             Threads_num = 32
             cores_per_job = Threads_num
-            max_slots = (total_cores - CORE_START) // cores_per_job
+            max_slots = _max_slots_for(total_cores, cores_per_job)
 
             # ── Multi-dataset grouping ──────────────────────────────────
             # By default the sweep runs a single dataset (args.dataset) over
@@ -4717,8 +4885,8 @@ def main():
                         sys.exit(1)
                     if sum(slot_counts) > max_slots:
                         print(f"ERROR: --dataset_slots sums to {sum(slot_counts)} but only "
-                              f"{max_slots} slots are available (cores {CORE_START}-"
-                              f"{CORE_START + max_slots * cores_per_job - 1}, {cores_per_job}/job)")
+                              f"{max_slots} slots are available "
+                              f"({_cores_desc(cores_per_job)}, {cores_per_job}/job)")
                         sys.exit(1)
                 else:
                     base = max_slots // n_groups
@@ -4759,7 +4927,7 @@ def main():
                     print("WARNING: --sweep_adv_std_branch_priorities=pseudocost is retired; using 'rank' instead.")
                     return "rank"
                 return v
-            branch_pri_vals = [_norm_bp(v) for v in args.sweep_adv_std_branch_priorities] if args.sweep_adv_std_branch_priorities else ["rank"]
+            branch_pri_vals = [_norm_bp(v) for v in args.sweep_adv_std_branch_priorities] if args.sweep_adv_std_branch_priorities else ["off"]
             for v in branch_pri_vals:
                 if v not in ("off", "rank", "decay"):
                     print(f"ERROR: unknown --sweep_adv_std_branch_priorities value '{v}' "
@@ -5113,12 +5281,11 @@ def main():
             for dataset, arch, model_path in arch_runs:
                 n1_tag, n2_tag, n1_model_p, n2_model_p, model_name, julia_dataset = arch_meta[(dataset, arch)]
                 arch_prefix = _aprefix(dataset, arch)
-                for role, role_tag, role_model_p in (("N1", n1_tag, n1_model_p),
-                                                     ("N2", n2_tag, n2_model_p)):
-                    # --n2_tables_only: N1's delta_max only feeds the source-network
-                    # (N1) tables; the N2 rows use N2's own delta_max. Skip it.
-                    if args.n2_tables_only and role == "N1":
-                        continue
+                # delta_max is computed for N2 (the target network) only: the
+                # bound-gap normalization in the target-network tables uses N2's
+                # own delta_max, so the source network N1's delta_max is not
+                # needed and is never queued.
+                for role, role_tag, role_model_p in (("N2", n2_tag, n2_model_p),):
                     dm_out_dir = os.path.join(
                         cwd, "paper_experiments", dataset, f"{arch}_exp",
                         "delta_max", f"delta_max_{arch}_{role}_{role_tag}")
@@ -5962,7 +6129,7 @@ def main():
         # ── Build job lists across all arch runs ──────────────────────
         Threads_num = 32
         cores_per_job = Threads_num
-        max_slots = (total_cores - CORE_START) // cores_per_job
+        max_slots = _max_slots_for(total_cores, cores_per_job)
 
         standard_jobs = []   # (pert_name, label, cmd) — pert_name used as dep key
         transfer_by_pert = {}  # pert_name -> [(label, cmd)]

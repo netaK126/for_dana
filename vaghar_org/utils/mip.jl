@@ -703,4 +703,7 @@ function mip_set_attr_transfer(m, timout, suboptimal_solution=0)
     if model_name == "cnn5"
         set_optimizer_attribute(m, "StartNodeLimit", 70)
     end
+    if model_name == "cnn4"
+        set_optimizer_attribute(m, "StartNodeLimit", 70)
+    end
 end
