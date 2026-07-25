@@ -4209,7 +4209,7 @@ def _dataset_display_name(dataset):
             "fashion_mnist": "Fashion-MNIST", "fashion-mnist": "Fashion-MNIST",
             "fashion": "Fashion-MNIST", "fmnist": "Fashion-MNIST",
             "cifar10": "CIFAR-10", "cifar": "CIFAR-10",
-            "acas": "ACAS Xu"}.get(dataset, dataset)
+            "acas": "ACAS Xu", "har": "HAR"}.get(dataset, dataset)
 
 
 def _torchvision_dataset_for(dataset):
@@ -4610,8 +4610,12 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
             # dataset except c_src. The sweep is supposed to fan out
             # over every other class, so anything missing is a gap
             # worth surfacing. Class counts are dataset-specific.
+            # The benchmark nets are not 10-class: HAR classifies 6 activities
+            # and ACAS Xu 5 advisories, so assuming 10 would call a complete
+            # sweep partial.
             _DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10,
-                                     "fashion_mnist": 10}
+                                     "fashion_mnist": 10,
+                                     "har": 6, "acas": 5}
             n_classes = _DATASET_NUM_CLASSES.get(dataset, 10)
 
             prev_pert_key = None  # re-emit pert on (pert,p_size) change
@@ -5050,22 +5054,35 @@ def _ft_for(force_timeout, arch):
     return force_timeout
 
 
-def _acas_provenance_clause(dataset):
-    """A caption sentence naming the ACAS Xu source network and how the target
-    network was derived from it. Empty string for the image datasets, so their
-    captions are unchanged.
+def _benchmark_provenance_clause(dataset):
+    """A caption sentence naming a benchmark dataset's source network, the work
+    it was taken from, the dataset it was trained on, and how the target network
+    was derived from it. Empty string for the image datasets, so their captions
+    are unchanged.
 
     Mirrors the phrasing the evaluation section already uses for the image
     models ("$\\Npre$ is trained using Adam, and $N$ is obtained by fine-tuning
-    $\\Npre$"), since ACAS has no training data and its pair is built by
-    quantization instead.
+    $\\Npre$"), since neither benchmark net has training data and both pairs are
+    built by quantization instead.
+
+    Callers pass either the raw dataset key or its display name, so "ACAS Xu"
+    and "acas" both have to resolve.
     """
     key = str(dataset).strip().lower().replace(" ", "")
-    if key not in ("acas", "acasxu"):
-        return ""
-    return (r" $\Npre$ is the ACAS Xu network \texttt{ACASXU\_run2a\_1\_1} "
-            r"of \citet{katz2017reluplex}, and $N$ is obtained by quantizing its "
-            r"weights to 8-bit integers, one scale per output channel.")
+    if key in ("acas", "acasxu"):
+        return (r" $\Npre$ is the ACAS Xu network \texttt{ACASXU\_run2a\_1\_1} "
+                r"of \citet{katz2017reluplex}, and $N$ is obtained by quantizing its "
+                r"weights to 8-bit integers, one scale per output channel.")
+    if key == "har":
+        # Same wording as the Table 1 caption, so the two agree on where the
+        # network and its data come from.
+        return (r" $\Npre$ is the network \texttt{HAR.nnet} of "
+                r"ReluDiff~\cite{paulsen2020reludiff}, originally trained on "
+                r"the UCI \emph{Human Activity Recognition Using Smartphones} "
+                r"dataset~\cite{anguita2013har}, and $N$ is obtained by "
+                r"quantizing its weights to 8-bit integers, one scale per "
+                r"output channel.")
+    return ""
 
 
 def _timeout_caption_clause(force_timeout, arch):
@@ -5370,8 +5387,12 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
             # 0-indexed), the "expected" set is exactly that request (minus
             # the self-pair c_src), so the "*" flags a requested c_target
             # with no data rather than every unrun class.
+            # The benchmark nets are not 10-class: HAR classifies 6 activities
+            # and ACAS Xu 5 advisories, so assuming 10 would call a complete
+            # sweep partial.
             _DATASET_NUM_CLASSES = {"mnist": 10, "cifar10": 10,
-                                     "fashion_mnist": 10}
+                                     "fashion_mnist": 10,
+                                     "har": 6, "acas": 5}
             n_classes = _DATASET_NUM_CLASSES.get(dataset, 10)
             _req_cts = _ct_for(requested_c_targets, arch)
             if _req_cts is not None:
@@ -5863,7 +5884,7 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                             r"finishes before the solver timeout (or was not "
                             r"run).")
             cap += _timeout_caption_clause(force_timeout, arch)
-            cap += _acas_provenance_clause(dataset)
+            cap += _benchmark_provenance_clause(dataset)
             lines.append(f"\\caption{{{cap}}}")
             if not bare_emitted:
                 lines.append(f"\\label{{{base_label}}}")
@@ -6178,8 +6199,7 @@ def _render_aaai_relax_precision_body(model_rows):
     # AAAI puts the caption UNDER the table, so it follows the tabular.
     lines.append(
         r"\caption{The binaries the relaxation drops (\#relaxed) and the "
-        r"precision it costs (loss). "
-        r"All columns are averaged over all experiments.}"
+        r"precision it costs (loss) averaged over all experiments.}"
 )
     lines.append(r"\label{tab:relax-precision}")
     lines.append(r"\end{table}")
@@ -6619,11 +6639,34 @@ _AAAI_YAXIS_POWER = 1.0
 # squash the bars).
 _AAAI_TIMEOUT_LINE_SLACK_MIN = 20.0
 
-# A (c_s, c_t) pair the BASELINE already solves within this many MINUTES is
-# left out of the solve-time charts (user request): such easy pairs carry no
-# acceleration story and only crowd the panels. They stay in the appendix
-# per-cell tables, and the chart captions state the cut.
-_AAAI_TIME_CHART_MIN_BASELINE_MIN = 15.0
+# A pooled solve-time row draws its dashed timeout level once its tallest bar
+# passes this many MINUTES (user request). Below it no run is near the cap and
+# the line would only squash the bars.
+_AAAI_TIME_LINE_MIN = 150.0
+
+# A bounds-difference panel draws its dashed 100 line once its tallest bar comes
+# within this many percentage points of delta_max, the level the gap cannot
+# pass.
+_AAAI_BD_CEIL_SLACK = 10.0
+
+# Width a row reserves on its RIGHT for the shared bound-difference axis: its
+# tick numbers plus the rotated "bounds diff" label. Only the row's last panel
+# draws them, so the row pays this once.
+_AAAI_RIGHT_DECO_PT = 34.0
+
+# Width a LATER panel of a row reserves on its left. It keeps its own time
+# scale and so prints its own tick numbers, but NOT the rotated unit name
+# (written once per row), which is all that _AAAI_PANEL_DECO_NEXT_PT budgets
+# for. Three digits at \small plus the tick and a little air.
+_AAAI_PANEL_TICKS_PT = 22.0
+
+# A (c_s, c_t) pair EVERY method solves within this many MINUTES is left out of
+# the solve-time charts (user request): such easy pairs carry no acceleration
+# story and only crowd the panels. The cut is on the whole cluster, not on the
+# baseline alone, so a pair where any one of \baseline, ours, or ours with
+# transfer needs longer stays on the chart, whichever method that is. They stay
+# in the appendix per-cell tables, and the chart captions state the cut.
+_AAAI_TIME_CHART_MIN_SOLVE_MIN = 15.0
 
 
 def _aaai_yaxis(vmax):
@@ -6706,7 +6749,8 @@ def _aaai_bar_data_w(span, plotbox_pt):
     return min(_AAAI_BAR_PT * span / plotbox_pt, 0.98 / 3.0)
 
 
-def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
+def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0,
+                          group_gap_extra=None):
     """Position one panel's clusters for the SIZE-RUN layout: clusters sit at
     a 1.0-slot pitch (the tight hard-coded 27pt) carrying only their
     "$c_t{=}N$" line; within a source group, same-size clusters are sorted
@@ -6723,6 +6767,12 @@ def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
     import re as _re
     from collections import OrderedDict
     slot = _AAAI_SLOT_PT
+    # Air at a GROUP boundary, when it differs from the air between two runs
+    # of one group. The solve-time figures group by MODEL and run by
+    # perturbation size, so only the model boundary earns the wide gap; None
+    # keeps both the same, which is what the bounds-difference figure wants.
+    if group_gap_extra is None:
+        group_gap_extra = run_gap_extra
 
     def _mean(bars):
         vs = [pair[0] for pair in bars.values()]
@@ -6739,9 +6789,11 @@ def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
         size = parts[1] if len(parts) > 1 else ""
         by_src.setdefault(src, []).append((size, _mean(bars), ct_line, bars))
     items, runs, srcs, subruns = [], [], [], []
+    runs_raw = []     # (x_first, x_last, label) per run, merged below
     x = 0.0           # last placed cluster (0 = none yet; first lands at 1.0)
     prev_c = None     # previous run's centre (data units)
     prev_w = 0.0      # previous run's size-label width (pt)
+    prev_lbl = None   # previous run's label, to spot a repeat
     for gi, (src, its) in enumerate(by_src.items()):
         # sort_by_label orders clusters inside a run by their tick-label line
         # (e.g. the bounds-difference "$c_s{=}N$" ascending) instead of by
@@ -6761,13 +6813,13 @@ def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
             # want visibly bigger air, user request), the source extra at a
             # group boundary, none before the very first run.
             if i == 0 and gi > 0:
-                base = max(_AAAI_TYPE_GAP, run_gap_extra)
+                base = max(_AAAI_TYPE_GAP, group_gap_extra)
             elif i > 0:
                 base = run_gap_extra
             else:
                 base = 0.0
             extra = base
-            if prev_c is not None:
+            if prev_c is not None and its[i][0] != prev_lbl:
                 # Keep this run's size label clear of the previous run's:
                 # centre distance (in pt) must cover both half-widths plus
                 # the (halved) run-label air -- within a "c=" group this is
@@ -6786,8 +6838,7 @@ def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
                     gfirst = xc
             x = x0 + k - 1
             centre = (x0 + x) / 2.0
-            if its[i][0]:
-                runs.append((centre, its[i][0]))
+            runs_raw.append((x0, x, its[i][0]))
             # SUB-RUNS: consecutive clusters of this run sharing the same
             # tick-label line (e.g. the bounds-difference "$c_s{=}N$"), so a
             # repeated c_s can be written once under its stretch.
@@ -6797,18 +6848,32 @@ def _aaai_size_run_layout(groups, sort_by_label=False, run_gap_extra=0.0):
                     subruns.append(((x0 + t0 + x0 + t - 1) / 2.0,
                                     its[i + t0][2]))
                     t0 = t
-            prev_c, prev_w = centre, w
+            prev_c, prev_w, prev_lbl = centre, w, its[i][0]
             i = j
         srcs.append(((gfirst + x) / 2.0, src))
+    # One size label per STRETCH of adjacent runs carrying it, not one per run
+    # (user request): consecutive models whose clusters share a perturbation
+    # size get the size written once, centred over the whole stretch. Runs
+    # inside one group are maximal same-size stretches already, so this only
+    # ever joins runs across a group boundary.
+    for (a, b, lbl) in runs_raw:
+        if runs and runs[-1][1] == lbl and lbl:
+            runs[-1] = (runs[-1][0], lbl, runs[-1][2], b)
+        else:
+            runs.append((a, lbl, a, b))
+    runs = [((first + last) / 2.0, lbl) for (_a, lbl, first, last) in runs
+            if lbl]
     return items, runs, srcs, (x if items else 1.0), subruns
 
 
-def _aaai_panel_span(groups, sort_by_label=False, run_gap_extra=0.0):
+def _aaai_panel_span(groups, sort_by_label=False, run_gap_extra=0.0,
+                     group_gap_extra=None):
     """x-extent (data units) of one CLUSTERED panel under the size-run
     layout -- the last cluster's position from _aaai_size_run_layout, so the
     packing and the axes sized from this exactly fit their content."""
     return _aaai_size_run_layout(groups, sort_by_label=sort_by_label,
-                                 run_gap_extra=run_gap_extra)[3]
+                                 run_gap_extra=run_gap_extra,
+                                 group_gap_extra=group_gap_extra)[3]
 
 
 # Packed-row solve-time layout: horizontal room reserved LEFT of a panel's
@@ -7092,12 +7157,17 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                       cluster_value_key=None, stagger_labels=False,
                       size_runs=False, run_tick_labels=False,
                       runs_above=False, run_sort_by_label=False,
-                      run_gap_extra=0.0, cs_subrun_labels=False):
+                      run_gap_extra=0.0, cs_subrun_labels=False,
+                      group_gap_extra=None, line_out=None):
     """Build the in-axis drawing commands for one plot. `groups` is a list of
-    (type_disp, item_label, {sk:(value, partial[, ci_half])}). An optional third
-    element `ci_half` (the solve-time bars supply it) is the confidence-interval
-    half-width in the bar's units and draws a black I-beam centred on the bar
-    top; when absent or None no I-beam is drawn. `series` is the per-method
+    (type_disp, item_label, {sk:(value, partial[, ci_half[, gap_pp]])}). An
+    optional third element `ci_half` (the solve-time bars supply it) is the
+    confidence-interval half-width in the bar's units and draws a black I-beam
+    centred on the bar top; when absent or None no I-beam is drawn. An optional
+    FOURTH element `gap_pp` is that bar's remaining bound gap
+    delta_u - delta_l in percentage points of delta_max. Nothing draws it at
+    present; it is carried so a chosen encoding of the remaining gap has the
+    number to hand. `series` is the per-method
     style table (_AAAI_CHART_SERIES for the solve-time figures,
     _AAAI_CHART_SERIES_GAP for the bounds-difference figures) and fixes the
     per-bar fill/draw colour, fill pattern, and left-to-right order.
@@ -7161,6 +7231,11 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
         stride = bar_w
         center0 = x - (k - 1) * stride / 2.0
         group_top = 0.0  # tallest decoration (bar/I-beam) of this cluster
+        # Points for the overlaid line graph: this cluster's per-method bound
+        # gap at each bar's x. Collected here because the x positions are only
+        # known inside this closure; the caller draws them in a SECOND axis
+        # carrying its own right-hand scale.
+        cluster_pts = []
         for bi, (sk, pair) in enumerate(items):
             v, p = pair[0], pair[1]
             ci = pair[2] if len(pair) > 2 else None
@@ -7219,7 +7294,12 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                     r"\node[font=\small\bfseries, text=red,"
                     r" anchor=south, inner sep=1pt] at "
                     f"(axis cs:{xc:.4g},{h:.4g}) {{*}};")
+            gap_pp = pair[3] if len(pair) > 3 else None
+            if line_out is not None and gap_pp is not None:
+                cluster_pts.append((xc, float(gap_pp)))
             group_top = max(group_top, deco_top)
+        if line_out is not None and len(cluster_pts) > 1:
+            line_out.append(cluster_pts)
         # One value per CLUSTER (user request): the named series' value --
         # \baseline, the reference every other bar is judged against --
         # centred above the cluster's tallest decoration, at \small (the
@@ -7242,7 +7322,8 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
         # sets xticklabels=\empty.
         items, run_lbls, srcs, xmax_pos, subruns = _aaai_size_run_layout(
             groups, sort_by_label=run_sort_by_label,
-            run_gap_extra=run_gap_extra)
+            run_gap_extra=run_gap_extra,
+            group_gap_extra=group_gap_extra)
         for (xc, ct_line, bars) in items:
             # run_tick_labels: print the per-cluster line on every cluster;
             # cs_subrun_labels supersedes it (the line is written once per
@@ -7254,6 +7335,10 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
             _draw_group(xc, bars)
         if cs_subrun_labels:
             for (xc, lbl) in subruns:
+                if not lbl:
+                    # No per-cluster line on this figure (e.g. the solve-time
+                    # figures name only c_s, once per block); skip the node.
+                    continue
                 lines.append(
                     f"\\node[anchor=north, font=\\small, inner sep=1pt,"
                     f" yshift=-2pt] at (axis cs:{xc:.4g},0) {{{lbl}}};")
@@ -7269,12 +7354,17 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
             run_y, src_y = ((-14.0, -27.0) if has_row0
                             else (-2.0, -15.0))
         for (xc, size) in run_lbls:
+            if not size:
+                # A figure with a single model writes no per-block model line
+                # (it names the model in its caption instead); skip the node
+                # rather than emit an empty one.
+                continue
             if runs_above:
                 # `(A |- B)` is plain tikz (no `calc` needed): x of the data
                 # coordinate, y of the axis top.
                 lines.append(
-                    f"\\node[anchor=south, font=\\small, inner sep=1pt,"
-                    f" yshift=2pt] at "
+                    f"\\node[anchor=south, font=\\small, align=center,"
+                    f" inner sep=1pt, yshift=2pt] at "
                     f"({{axis cs:{xc:.4g},0}}|-{{rel axis cs:0,1}}) "
                     f"{{{size}}};")
             else:
@@ -7283,8 +7373,12 @@ def _aaai_bar_content(groups, power, cluster=False, x_offset=0.0,
                     f" yshift={run_y:.4g}pt] at (axis cs:{xc:.4g},0) "
                     f"{{{size}}};")
         for (xc, src) in srcs:
+            if not src:
+                # Single-model figures name the model in the caption instead.
+                continue
             lines.append(
-                f"\\node[anchor=north, font=\\small\\bfseries, inner sep=1pt,"
+                f"\\node[anchor=north, font=\\small\\bfseries,"
+                f" align=center, inner sep=1pt,"
                 f" yshift={src_y:.4g}pt] at (axis cs:{xc:.4g},0) {{{src}}};")
         xtick = ",".join(f"{xp:.4g}" for xp, _l in xticks)
         if run_tick_labels and not cs_subrun_labels:
@@ -7387,6 +7481,13 @@ def _aaai_bar_figure(title, label, ylabel, caption, groups, wide=False):
     allvals = [pair[0] for _t, _l, bars in groups for pair in bars.values()]
     vmax = max(allvals) if allvals else 1.0
     ymax, ytick_clause = _aaai_yaxis(vmax)
+    # A bar within _AAAI_BD_CEIL_SLACK of 100 is effectively at the ceiling:
+    # delta_u - delta_l cannot exceed delta_max, so a run that close has
+    # learnt almost nothing. Mark the level so the reader sees the bar is
+    # pinned rather than merely tall (user request).
+    ceil_line = (100.0 - vmax) < _AAAI_BD_CEIL_SLACK
+    if ceil_line:
+        ymax = max(ymax, 100.0 ** power * 1.05)
     content, n, xtick, xticklabels = _aaai_bar_content(groups, power)
     fig_env = "figure*" if wide else "figure"
     plot_width = r"\textwidth" if wide else r"\columnwidth"
@@ -7446,6 +7547,13 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
                for _t, _l, bars in groups for pair in bars.values()]
     vmax = max(allvals) if allvals else 1.0
     ymax, ytick_clause = _aaai_yaxis(vmax)
+    # A bar within _AAAI_BD_CEIL_SLACK of 100 is effectively at the ceiling:
+    # delta_u - delta_l cannot exceed delta_max, so a run that close has
+    # learnt almost nothing. Mark the level so the reader sees the bar is
+    # pinned rather than merely tall (user request).
+    ceil_line = (100.0 - vmax) < _AAAI_BD_CEIL_SLACK
+    if ceil_line:
+        ymax = max(ymax, 100.0 ** power * 1.05)
     # Per-bar value labels removed (user request): bars carry no text above
     # them; heights read off the y-axis alone.
     # The plot box is pinned explicitly (`scale only axis`, \textwidth minus a
@@ -7475,23 +7583,26 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
         run_gap_extra=model_extra, cs_subrun_labels=True,
         group_order="given",
         series=_AAAI_CHART_SERIES_GAP, bar_w=_AAAI_BAR_PT / slot)
+    if ceil_line:
+        y100 = 100.0 ** power
+        content.append(
+            f"\\draw[dashed, gray, line width=0.6pt] "
+            f"(axis cs:0.5,{y100:.4g}) -- (axis cs:{n + 0.5:.4g},{y100:.4g});")
     # As in _aaai_combined_time_figure: the pgfplots graphic is pre-rendered to
     # a PDF (AAAI bans pgfplots in the paper source) while the caption/label stay
     # in the paper so the AAAI style typesets them.
     graphic = []
-    if dataset_disp:
-        graphic.append(r"{\small\textbf{" + dataset_disp + r"}}\par\smallskip")
-    graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
-    graphic.append(r"\par\smallskip")
     graphic.append(r"\begin{tikzpicture}")
     graphic.append(
         r"\begin{axis}[" "\n"
         r"  scale only axis, "
         f"width={w:.2f}pt, "
-        r"height=6cm, clip=false," "\n"
+        # Same plot-box height as the solve-time combination chart (user
+        # request), so a bar reads at the same scale in both figure families.
+        r"height=2.2cm, clip=false," "\n"
         f"  ymin=0, ymax={ymax:.4g}, xmin=0.5, xmax={n + 0.5:.4g}, "
         f"{ytick_clause}" "\n"
-        r"  ylabel={bound diff.\ (\% $\delta_{\max}$)}," "\n"
+        r"  ylabel={$\delta_u-\delta_l$ (\%$\delta_{\max}$)}," "\n"
         r"  ylabel style={font=\small}," "\n"
         + (f"  xtick={{{xtick}}}, xticklabels={{{xticklabels}}},\n"
            if xticklabels else
@@ -7507,29 +7618,10 @@ def _aaai_bd_single_figure(groups, force_timeout=None,
     graphic += content
     graphic.append(r"\end{axis}")
     graphic.append(r"\end{tikzpicture}")
-    out = []
-    out.append(r"\begin{figure*}[tp]")
-    out.append(r"\centering")
-    out.append(_aaai_render_chart_pdf(graphic, basename, tex_dir))
-    on_phrase = (r" on " + ds_phrase if ds_phrase else
-                 (r" on " + dataset_disp if dataset_disp else ""))
-    cap = (r"Remaining bound difference $\delta_u-\delta_l$ (as a percentage of "
-           r"$\delta_{\max}$; shorter is tighter) of \tool compared to "
-           r"\baseline (baseline)" + on_phrase + r", for every source-target "
-           r"class pair on which all three methods reach the timeout. Each "
-           r"cluster is one such pair, labelled by its source class $c_s$ "
-           r"(different clusters of the same $c_s$ are different target "
-           r"classes); the architecture and dataset are written above each "
-           r"block of adjacent clusters sharing them, and the perturbation "
-           r"type and size once under each such block.")
-    out.append(f"\\caption{{{cap}}}")
-    out.append(f"\\label{{{label_base}}}")
-    for lb in extra_labels:
-        out.append(f"\\label{{{lb}}}")
-    out.append(r"\end{figure*}")
-    out.append("")
-    return out
-
+    # Just this chunk's picture: the caller stacks EVERY chunk into ONE
+    # figure (user request), adds the legend once, and renders the lot to a
+    # single PDF.
+    return graphic
 
 def _aaai_standalone_legend(series=None):
     """A centred, self-contained legend -- one box + label per method, drawn
@@ -8006,7 +8098,7 @@ def _aaai_group_grid_figure(arch_rows, ylabel, dataset_disp, label_base,
                    r"marked on its label. Clusters where all three methods reach "
                    r"the timeout are moved to the bounds-difference figure.")
         cap += _timeout_caption_clause(force_timeout, arch)
-        cap += _acas_provenance_clause(dataset_disp)
+        cap += _benchmark_provenance_clause(dataset_disp)
         out.append(f"\\caption{{{cap}}}")
         if ri == 0:
             out.append(f"\\label{{{label_base}}}")
@@ -8368,16 +8460,31 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                                           size_disp, arch_disp,
                                           int(c_src), bd_bars))
                         continue
-                    # Pairs the baseline already solves quickly say
-                    # nothing about acceleration -- drop them from the
-                    # chart (they remain in the appendix tables; the
-                    # caption states the cut).
-                    if (pair_times.get("vaghar") is not None
-                            and pair_times["vaghar"]
-                            <= _AAAI_TIME_CHART_MIN_BASELINE_MIN):
+                    # Pairs EVERY method already solves quickly say nothing
+                    # about acceleration -- drop them from the chart (they
+                    # remain in the appendix tables; the caption states the
+                    # cut). Cutting on the baseline alone also hid the pairs
+                    # where \baseline is quick but a method is not, which is
+                    # exactly where the comparison has something to say, so
+                    # the whole cluster has to clear the cut. A missing time
+                    # keeps the pair, since it cannot be shown to be quick.
+                    if all(pair_times.get(sk) is not None
+                           and pair_times[sk] <= _AAAI_TIME_CHART_MIN_SOLVE_MIN
+                           for sk in series_keys):
                         continue
-                    pair_bars = {sk: (pair_times[sk], False)
-                                 for sk in series_keys}
+                    # Every bar also carries its remaining bound gap
+                    # (delta_u - delta_l, in pp of delta_max, the number the
+                    # appendix tables report) as a 4th slot. It is not drawn on
+                    # the time bar: it becomes the companion GAP ROW under this
+                    # panel, so both quantities are bar lengths on their own
+                    # axis and any two clusters compare directly. Carried for
+                    # solved bars too, where it is ~0 and draws a flat bar --
+                    # which is the honest reading, nothing left open.
+                    pair_bars = {}
+                    for sk in series_keys:
+                        _g = (cbars[sk][6].get(ct)
+                              if len(cbars[sk]) > 6 else None)
+                        pair_bars[sk] = (pair_times[sk], False, None, _g)
                     # Cluster x label, HORIZONTAL, two lines: the target
                     # class ($c_t{=}N$, matching the paper's notation) on
                     # top, the perturbation size below. The source class
@@ -8478,95 +8585,411 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
 AAAI_N2_TIME_COMBINED_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_time_combined"
 AAAI_N2_TIME_COMBINED_END_MARK   = "% END AUTO: aaai_n2_time_combined"
 
+AAAI_N2_TIME_APPENDIX_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_time_appendix"
+AAAI_N2_TIME_APPENDIX_END_MARK   = "% END AUTO: aaai_n2_time_appendix"
+
+# The perturbations whose solve-time figures go in the EVALUATION body, one
+# pooled figure each; every other perturbation goes to the appendix. Matched
+# against the normalised perturbation key, so the display form ($\ell_\infty$)
+# and the raw name (linf) both resolve.
+_AAAI_BODY_PERT_KEYS = ("patch", "rotation", "linf", "translation")
+
+
+def _time_in_body(cell):
+    """True for the solve-time cells the EVALUATION charts: patch, rotation and
+    linf in full, plus translation at size (3,1) only (user request). The rest
+    go to the appendix, so one perturbation can be split by SIZE between the
+    two -- which is why this is a per-cell predicate rather than a set of
+    perturbation names."""
+    key = _aaai_pert_key(cell[3])
+    if key in ("patch", "rotation", "linf"):
+        return True
+    size = (cell[5].split(r"\\")[-1].strip().strip("()").replace(" ", "")
+            if len(cell) > 5 else "")
+    return key == "translation" and size == "3,1"
+
+
+def _aaai_pert_key(type_disp):
+    """Normalise a perturbation's DISPLAY string back to its plain name, so a
+    figure can be routed by perturbation whatever the label looks like.
+    '$\\ell_\\infty$' -> 'linf'; 'occ' -> 'occ'."""
+    t = str(type_disp)
+    if "ell_" in t or "infty" in t:
+        return "linf"
+    return re.sub(r"[^a-z0-9]+", "", t.lower())
+
+
+def _aaai_time_gap_ymax(time_cells):
+    """The single right-hand (bound-difference) scale shared by EVERY solve-time
+    row of the paper (user request). Computed over ALL cells, so the body and
+    the appendix figures agree and a line's height means the same thing
+    wherever it is read."""
+    gmax = 0.0
+    for cell in time_cells or []:
+        for pair in cell[6].values():
+            if len(pair) > 3 and pair[3] is not None:
+                gmax = max(gmax, float(pair[3]))
+    return max(gmax * 1.15, 1.0)
+
+
+def _aaai_time_pooled_rows(entries, force_timeout=None, gap_ymax=None):
+    """The solve-time ROWS for ONE perturbation, pooling EVERY model onto a
+    single axis (user request: "all patch results on the same slot, just
+    create bigger gaps between groups of clusters of different models").
+
+    Returns (panels, one_model): `panels` is a list of PANEL DESCRIPTORS, one
+    per chunk (content lines plus the geometry the row packer needs), NOT
+    finished pictures -- the caller stacks the rows
+    of every perturbation into ONE figure per section (user request: one
+    figure in the Evaluation, one in the appendix) and adds the legend once. A
+    perturbation too wide for \\textwidth yields several rows, split only at a
+    (model, size, c_s) boundary so no shared label line is torn in half.
+
+    Same layout machinery as the bounds-difference figure: clusters at the
+    hard-coded pitch, `_AAAI_MODEL_GAP_PT` of air where the model changes, the
+    perturbation and size above each block, the source class under it, and the
+    model under that.
+
+    `entries` are the (dataset_disp, arch, arch_disp, type_disp, c_src,
+    item_label, bars) tuples collected per dataset, already filtered to this
+    one perturbation.
+    """
+    power = _AAAI_YAXIS_POWER
+    # Bars carry a 3rd (CI) and 4th (bound gap) slot that this figure does not
+    # draw; strip to (value, partial) so the axis top clears the bars alone.
+    # A perturbation evaluated on ONE model repeats that model's name over
+    # every block for no information; name it in the caption instead and leave
+    # the line off the plot.
+    models = {(e[2], e[0]) for e in entries}
+    one_model = models.pop() if len(models) == 1 else None
+
+    def _groups3(chunk):
+        # Three-level structure for the size-run layout, ordered MODEL-major
+        # (user request: every cluster of one model sits together whatever its
+        # c_s, and within a model the clusters of one perturbation size sit
+        # together):
+        #   group key    -- the model, "arch over dataset" on TWO lines. It is
+        #                   the layout's OUTER key, so a model's clusters are
+        #                   contiguous and only a model boundary earns the wide
+        #                   gap. Printed once under each block (empty, hence
+        #                   skipped, on a single-model figure).
+        #   label line 2 -- the perturbation as "<type>(<size>)", the RUN
+        #                   inside a model, so same-size clusters are
+        #                   adjacent. Printed above; the type rides on the
+        #                   label rather than being named in the caption
+        #                   (user request), and size_disp already carries its
+        #                   own parentheses.
+        #   label line 1 -- "$c_s{=}N$", once per adjacent stretch, below.
+        out = []
+        for (ds, _arch, arch_disp, type_disp, c_src, item_label,
+             bars) in chunk:
+            size_disp = (item_label.split(r"\\", 1)[1]
+                         if r"\\" in item_label else "")
+            # EVERY block names its model, even when the whole figure has
+            # only one (user request). The old shortcut dropped the line for a
+            # single-model row and left the caption to name it, which stopped
+            # working once the caption was shortened: rotation, linf and
+            # translation are each evaluated on one network, so their rows
+            # ended up naming the model nowhere.
+            model_key = arch_disp + r"\\" + ds
+            out.append((
+                model_key,
+                r"$c_s{=}" + str(c_src) + r"$\\" + type_disp + size_disp,
+                # slot 3 stays None (no CI marker); slot 4 is the bound gap,
+                # which feeds the overlaid line graph.
+                {sk: (pair[0], pair[1], None,
+                      pair[3] if len(pair) > 3 else None)
+                 for sk, pair in bars.items()}))
+        return out
+
+    # MODEL-major: one model's clusters are contiguous, then its clusters of
+    # one perturbation size, then its source classes. The layout re-sorts
+    # inside a model group on the same key, so the two agree.
+    pooled = sorted(entries, key=lambda g: (g[2], g[0], g[3],
+                                            g[5].split("\\\\")[-1],
+                                            g[4], g[5]))
+    plotbox = max(_AAAI_TEXTWIDTH_PT - 1.5 * _AAAI_PT_PER_CM, 1.0)
+    model_extra = ((_AAAI_MODEL_GAP_PT - _AAAI_CLUSTER_GAP_PT)
+                   / _AAAI_SLOT_PT)
+    # Indivisible packing units: a (size, model, dataset, c_s) block never
+    # straddles two figures, or its shared label lines would be torn in half.
+    blocks, prev_key = [], None
+    for g in pooled:
+        key = (g[2], g[0], g[3], g[5].split("\\\\")[-1], g[4])
+        if key != prev_key:
+            blocks.append([])
+            prev_key = key
+        blocks[-1].append(g)
+    chunks, cur = [], []
+    for blk in blocks:
+        cand = cur + blk
+        w = _aaai_panel_span(_groups3(cand), sort_by_label=True,
+                             run_gap_extra=0.0,
+                             group_gap_extra=model_extra) * _AAAI_SLOT_PT
+        if cur and w > plotbox:
+            chunks.append(cur)
+            cur = list(blk)
+        else:
+            cur = cand
+    if cur:
+        chunks.append(cur)
+
+    panels = []
+    for fi, chunk in enumerate(chunks):
+        groups = _groups3(chunk)
+        vmax = max((pair[0] for _t, _l, bars in groups
+                    for pair in bars.values()), default=1.0)
+        ymax, ytick_clause = _aaai_yaxis(vmax)
+        # Dashed timeout level, drawn once this row's tallest bar passes
+        # _AAAI_TIME_LINE_MIN. ONE line per distinct cap among the row's
+        # models: a pooled row may hold models given different caps (3x100
+        # runs five hours, the rest three), so a single level would be wrong
+        # for some of its bars.
+        caps = []
+        if vmax > _AAAI_TIME_LINE_MIN:
+            caps = sorted({_ft_for(force_timeout, e[1]) for e in chunk
+                           if _ft_for(force_timeout, e[1]) is not None})
+            for ft_secs in caps:
+                ymax = max(ymax, (ft_secs / 60.0) ** power * 1.05)
+        span = _aaai_panel_span(groups, sort_by_label=True,
+                                run_gap_extra=0.0,
+                                group_gap_extra=model_extra)
+        slot = _AAAI_SLOT_PT
+        w = span * slot
+        if w > plotbox:
+            slot, w = plotbox / span, plotbox
+        line_pts = []
+        content, n, xtick, xticklabels = _aaai_bar_content(
+            groups, power, cluster=True, size_runs=True,
+            runs_above=True, run_sort_by_label=True,
+            run_gap_extra=0.0, group_gap_extra=model_extra,
+            cs_subrun_labels=True, group_order="given",
+            series=_AAAI_CHART_SERIES, bar_w=_AAAI_BAR_PT / slot,
+            line_out=line_pts)
+        for ft_secs in caps:
+            y = (ft_secs / 60.0) ** power
+            content.append(
+                f"\\draw[dashed, darkgray, line width=0.6pt] "
+                f"(axis cs:0.5,{y:.4g}) -- "
+                f"(axis cs:{n + 0.5:.4g},{y:.4g});")
+
+        panels.append({
+            "content": content, "w": w, "n": n, "ymax": ymax,
+            "ytick": ytick_clause, "xtick": xtick,
+            "xticklabels": xticklabels, "line_pts": line_pts,
+        })
+    return panels, one_model
+
+
+def _aaai_time_single_figure(by_pert, order, force_timeout=None,
+                             tex_dir=None, basename="n2_time",
+                             label_base="fig:n2-time", extra_labels=(),
+                             gap_ymax=None, float_spec="tp"):
+    """ONE figure holding the solve-time rows of EVERY perturbation given
+    (user request: a single figure in the Evaluation and a single one in the
+    appendix, rather than one per perturbation).
+
+    Each perturbation contributes one or more rows from _aaai_time_pooled_rows;
+    the rows are stacked in `order`, the legend is drawn once at the top, and
+    the whole stack renders to a single PDF that one figure* imports. The
+    perturbation is named on each block's label (\"<type>(<size>)\"), so the
+    caption does not have to enumerate them.
+    """
+    graphic = []
+    graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
+    # ONE packing pass PER PERTURBATION (user request): a panel never mixes
+    # perturbation types. Several such panels then SHARE a row when they fit
+    # \textwidth together, which is what keeps the figure short without ever
+    # putting two perturbations on one slot.
+    panels = []
+    for key in order:
+        if key not in by_pert:
+            continue
+        _disp, cells = by_pert[key]
+        pans, _one_model = _aaai_time_pooled_rows(
+            cells, force_timeout=force_timeout, gap_ymax=gap_ymax)
+        panels += pans
+    # First-fit into rows. A row pays the left decoration once (the rotated
+    # "time (minutes)" label and its tick numbers), the right decoration once
+    # (the shared bound-difference axis), and the separation between panels.
+    rows, row_w = [], []
+    for pan in panels:
+        # A later panel in a row keeps its OWN time scale, so it must also
+        # carry its own tick numbers: reserve their width in the budget.
+        joined = _AAAI_PANEL_HSEP_PT + _AAAI_PANEL_TICKS_PT + pan["w"]
+        for ri in range(len(rows)):
+            if (row_w[ri] + joined + _AAAI_RIGHT_DECO_PT
+                    <= _AAAI_TEXTWIDTH_PT):
+                rows[ri].append(pan)
+                row_w[ri] += joined
+                break
+        else:
+            rows.append([pan])
+            row_w.append(_AAAI_PANEL_DECO_PT + pan["w"])
+    n_rows = len(rows)
+    for ri, row in enumerate(rows):
+        graphic.append(r"\par\smallskip")
+        graphic.append(r"\begin{tikzpicture}")
+        for ci, pan in enumerate(row):
+            first, last = (ci == 0), (ci == len(row) - 1)
+            opt = (f"name=bax{ri}x{ci}, scale only axis, "
+                   f"width={pan['w']:.2f}pt, height=2.2cm, clip=false,\n"
+                   f"  ymin=0, ymax={pan['ymax']:.4g}, xmin=0.5, "
+                   f"xmax={pan['n'] + 0.5:.4g}, {pan['ytick']}\n"
+                   r"  x tick label style={align=center, font=\small},"  "\n"
+                   r"  y tick label style={font=\small}," "\n"
+                   r"  axis background/.style={fill=black!4}," "\n"
+                   r"  ymajorgrids, major grid style={gray!25}")
+            if pan["xtick"] and pan["xticklabels"]:
+                opt += (f", xtick={{{pan['xtick']}}}, "
+                        f"xticklabels={{{pan['xticklabels']}}}")
+            elif pan["xtick"]:
+                opt += f", xtick={{{pan['xtick']}}}, xticklabels=\\empty"
+            else:
+                opt += r", xtick=\empty"
+            if first:
+                opt += r", ylabel={time (minutes)}, ylabel style={font=\small}"
+            else:
+                # Every panel keeps its OWN time scale (user request), so it
+                # prints its own tick numbers. Only the unit NAME is written
+                # once, on the row's first panel.
+                anc = f"anc{ri}x{ci}"
+                graphic.append(
+                    f"\\path (bax{ri}x{ci - 1}.south east) "
+                    f"++({_AAAI_PANEL_HSEP_PT:.2f}pt,0pt) coordinate ({anc});")
+                opt += f", at={{({anc})}}, anchor=south west"
+            graphic.append(f"\\begin{{axis}}[{opt}]")
+            graphic += pan["content"]
+            graphic.append(r"\end{axis}")
+            # The overlaid line axis. Its scale is figure-wide, so only the
+            # row's LAST panel draws the axis line, its ticks and its label;
+            # the others place their lines against the same scale silently.
+            if pan["line_pts"]:
+                gopt = (f"name=lax{ri}x{ci}, "
+                        f"at={{(bax{ri}x{ci}.south west)}}, "
+                        r"anchor=south west," "\n"
+                        f"  scale only axis, width={pan['w']:.2f}pt, "
+                        r"height=2.2cm, clip=false," "\n"
+                        f"  ymin=0, ymax={gap_ymax or 100.0:.4g}, xmin=0.5, "
+                        f"xmax={pan['n'] + 0.5:.4g}," "\n"
+                        r"  axis x line=none, ")
+                if last:
+                    gopt += (r"axis y line*=right," "\n"
+                             r"  ylabel={$\delta_u-\delta_l$ (\%$\delta_{\max}$)},"
+                "\n"
+                             r"  ylabel style={font=\small}," "\n"
+                             r"  y tick label style={font=\small}]")
+                else:
+                    gopt += (r"axis y line=none, yticklabels=\empty]")
+                graphic.append(f"\\begin{{axis}}[{gopt}")
+                for pts in pan["line_pts"]:
+                    pts = sorted(pts)
+                    path = " -- ".join(f"(axis cs:{px:.4g},{pg:.4g})"
+                                       for px, pg in pts)
+                    graphic.append(
+                        f"\\draw[black, line width=0.6pt] {path};")
+                    for px, pg in pts:
+                        graphic.append(
+                            f"\\node[circle, fill=black, inner sep=0pt,"
+                            f" minimum size=2.2pt] at "
+                            f"(axis cs:{px:.4g},{pg:.4g}) {{}};")
+                graphic.append(r"\end{axis}")
+        graphic.append(r"\end{tikzpicture}")
+    if not n_rows:
+        return []
+    out = [r"\begin{figure*}[" + float_spec + "]", r"\centering",
+           _aaai_render_chart_pdf(graphic, basename, tex_dir)]
+    cap = (r"Solve time of \tool compared to \baseline (baseline)")
+    out.append(f"\\caption{{{cap}}}")
+    out.append(f"\\label{{{label_base}}}")
+    for lb in extra_labels:
+        out.append(f"\\label{{{lb}}}")
+    out.append(r"\end{figure*}")
+    out.append("")
+    return out
+
+
+def _aaai_ct_of_label(item_label):
+    """The target class out of a cluster's '$c_t{=}N$\\\\<size>' label."""
+    m = re.search(r"c_t\{=\}(\d+)", str(item_label))
+    return m.group(1) if m else "?"
+
+
+def _aaai_time_cells_by_pert(time_cells):
+    """Split the solve-time cells into the BODY perturbations (one pooled
+    figure each, in _AAAI_BODY_PERT_KEYS order) and everything else, which goes
+    to the appendix. Returns (body, rest): both {pert_key: (display, cells)}."""
+    def _group(cells):
+        by = {}
+        for cell in cells:
+            by.setdefault(_aaai_pert_key(cell[3]), (cell[3], []))[1].append(cell)
+        return by
+    cells = time_cells or []
+    return (_group([c for c in cells if _time_in_body(c)]),
+            _group([c for c in cells if not _time_in_body(c)]))
+
+
+def regenerate_aaai_time_appendix_section(
+        tex_path, time_cells, force_timeout=None,
+        begin_mark=AAAI_N2_TIME_APPENDIX_BEGIN_MARK,
+        end_mark=AAAI_N2_TIME_APPENDIX_END_MARK):
+    """The solve-time figures for every perturbation the body does NOT show
+    (user request: patch, rotation and linf in the Evaluation, anything else
+    here), one pooled figure per perturbation, same layout as the body's."""
+    try:
+        _body, rest = _aaai_time_cells_by_pert(time_cells)
+        if rest:
+            tex_dir = os.path.dirname(os.path.dirname(os.path.abspath(tex_path)))
+            figs = _aaai_time_single_figure(
+                rest, sorted(rest), force_timeout=force_timeout,
+                tex_dir=tex_dir, basename="n2_time_app",
+                label_base="fig:n2-time-app",
+                gap_ymax=_aaai_time_gap_ymax(time_cells))
+            body_tex = "\n".join(figs)
+        else:
+            body_tex = r"% (every perturbation is shown in the body)"
+        update_aaai_wide_perarch_tex(tex_path, body_tex,
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark, label_suffix="")
+    except SystemExit as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_time_appendix block "
+              f"skipped: {exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_time_appendix block error: "
+              f"{exc}")
+
 
 def regenerate_aaai_time_combined_section(
         tex_path, time_cells, force_timeout=None,
         begin_mark=AAAI_N2_TIME_COMBINED_BEGIN_MARK,
         end_mark=AAAI_N2_TIME_COMBINED_END_MARK):
-    """Emit the solve-time panels as ONE pooled figure set across ALL
-    datasets (user request: panels of different datasets may share a row when
-    that saves space; each panel's two-line title names its architecture and,
-    in gray, its dataset). The row packing and the split across `figure*`
-    floats happen in _aaai_combined_time_figure; all floats share the one
-    AUTO block. `time_cells` is a list of
-    (dataset_disp, arch, arch_disp, type_disp, c_src, item_label, bars)."""
-    import re
+    """Emit the body's solve-time figures: ONE pooled figure per perturbation
+    in _AAAI_BODY_PERT_KEYS (patch, rotation, linf), each carrying EVERY model
+    on one axis with a wider gap between models. Every other perturbation is
+    emitted by regenerate_aaai_time_appendix_section instead. `time_cells` is a
+    list of (dataset_disp, arch, arch_disp, type_disp, c_src, item_label,
+    bars)."""
     try:
-        if time_cells:
-            # Each bar already carries its own per-bar CI (3rd tuple element),
-            # computed in _render_aaai_n2_charts from that bar's own
-            # experiments; nothing to pool here.
+        body, _rest = _aaai_time_cells_by_pert(time_cells)
+        if body:
             # Charts are pre-rendered to PDFs next to the paper (AAAI bans
             # pgfplots in the source); tex_path is <paper>/sections/<file>.tex.
             tex_dir = os.path.dirname(os.path.dirname(os.path.abspath(tex_path)))
-            cell_map = {}    # (type_disp, (ds, arch)) -> [(src, label, bars)]
-            col_titles = {}  # (ds, arch) -> 2-line title (arch over dataset)
-            col_order = []   # (ds, arch) panel-column order (encounter order)
-            type_means = {}  # type_disp -> [values]  (row order)
-            ds_order = []    # datasets in encounter order (caption + labels)
-            # The clusters of one panel sit GROUPED by their source class:
-            # the group's first tuple slot is the "source = <num>" label the
-            # cluster branch of _aaai_bar_content prints once under each
-            # group, and appending cs-ascending (cells arrive sorted by c_src
-            # per panel) fixes the left-to-right group order
-            # (group_order="given" downstream).
-            for (ds, arch, arch_disp, type_disp, c_src,
-                 item_label, bars) in time_cells:
-                key = (ds, arch)
-                cell_map.setdefault((type_disp, key), []).append(
-                    (r"$c{=}" + str(c_src) + r"$", item_label, bars))
-                type_means.setdefault(type_disp, []).extend(
-                    pair[0] for pair in bars.values())
-                if key not in col_titles:
-                    # Kept as an (arch_disp, dataset) PAIR; the final two-line
-                    # title string is built per panel in
-                    # _aaai_combined_time_figure, where a panel-wide repeated
-                    # perturbation size may join the dataset line.
-                    col_titles[key] = (arch_disp, ds)
-                    col_order.append(key)
-                if ds not in ds_order:
-                    ds_order.append(ds)
-            # Source groups ascending left-to-right, whatever order the sizes
-            # contributed their clusters in (stable, so the within-group
-            # cluster order is untouched). The class number is the digits of
-            # the "$c{=}N$" group label.
-            for v in cell_map.values():
-                v.sort(key=lambda g: int(re.sub(r"\D", "", g[0])))
-            types_order = sorted(
-                type_means,
-                key=lambda t: sum(type_means[t]) / len(type_means[t]))
-            ds_phrase = (ds_order[0] if len(ds_order) == 1 else
-                         ", ".join(ds_order[:-1]) + " and " + ds_order[-1])
-            caption = (
-                r"\tool compared to \baseline (baseline) on " + ds_phrase
-                + r" (each plot is titled by its architecture and dataset)"
-                r" through different perturbation types and sizes, "
-                r"across different source classes and target classes. "
-                r"Each bar cluster is for a different $c_t$. "
-                r"pair is shown only when \baseline solveing process is "
-                r"over $15$ minutes.")
-            # Labels: the bare fig:n2-time plus per-dataset and (deduped)
-            # per-arch aliases, all on the FIRST float so older \refs
-            # resolve.
-            labels = ["fig:n2-time"]
-            for ds in ds_order:
-                dslug = re.sub(r"[^a-z0-9]+", "-", ds.lower()).strip("-")
-                labels.append(f"fig:n2-time-{dslug}")
-            seen_arch = set()
-            for (_ds, arch) in col_order:
-                a = arch.replace("_", "")
-                if a not in seen_arch:
-                    seen_arch.add(a)
-                    labels.append(f"fig:n2-time-{a}")
-            parts = _aaai_combined_time_figure(
-                col_order, col_titles, types_order, cell_map,
-                caption, labels, tex_dir=tex_dir,
-                basename="n2_time_1",
-                force_timeout=force_timeout)
-            body = "\n".join(parts)
+            # ONE figure for the body (user request), stacking the rows of
+            # every body perturbation. The per-perturbation aliases stay as
+            # extra \labels on it so the section's existing \refs resolve.
+            figs = _aaai_time_single_figure(
+                body, [k for k in _AAAI_BODY_PERT_KEYS if k in body],
+                force_timeout=force_timeout, tex_dir=tex_dir,
+                basename="n2_time", label_base="fig:n2-time",
+                extra_labels=[f"fig:n2-time-{k}"
+                              for k in _AAAI_BODY_PERT_KEYS if k in body],
+                gap_ymax=_aaai_time_gap_ymax(time_cells),
+                float_spec="t")
+            body_out = "\n".join(figs)
         else:
-            body = r"% (no solve-time clusters)"
-        update_aaai_wide_perarch_tex(tex_path, body,
+            body_out = r"% (no solve-time clusters)"
+        update_aaai_wide_perarch_tex(tex_path, body_out,
                                      begin_mark=begin_mark,
                                      end_mark=end_mark,
                                      label_suffix="")
@@ -8581,10 +9004,71 @@ def regenerate_aaai_time_combined_section(
 AAAI_N2_BOUNDDIFF_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_bounddiff"
 AAAI_N2_BOUNDDIFF_END_MARK   = "% END AUTO: aaai_n2_bounddiff"
 
+AAAI_N2_BOUNDDIFF_APP_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_bounddiff_appendix"
+AAAI_N2_BOUNDDIFF_APP_END_MARK   = "% END AUTO: aaai_n2_bounddiff_appendix"
+
+
+def _bd_in_body(entry):
+    """True for the bounds-difference clusters the EVALUATION shows (user
+    request): every HAR cluster, every conv4 cluster, contrast at 1.2, occ at
+    (3,3,5) outside c_s 0 and 4, and brightness 0.25 on conv1/MNIST outside
+    c_s 2. Everything else -- translation, contrast 1.5, and the excluded
+    source classes -- goes to the appendix.
+
+    `entry` is (dataset_disp, type_disp, size_disp, arch_disp, c_src, bars);
+    size_disp arrives parenthesised, e.g. "(3,3,5)"."""
+    ds, type_disp, size_disp = entry[0], entry[1], entry[2]
+    arch_disp = entry[3] if len(entry) > 3 else ""
+    try:
+        c_src = int(entry[4])
+    except (IndexError, TypeError, ValueError):
+        c_src = None
+    if str(ds).strip().lower() == "har":
+        return True
+    if "conv4" in str(arch_disp):
+        return True
+    key = _aaai_pert_key(type_disp)
+    size = str(size_disp).strip().strip("()").replace(" ", "")
+    if key == "contrast" and size == "1.2":
+        return True
+    # occ (3,3,5) except the c_s the appendix takes.
+    if key == "occ" and size == "3,3,5" and c_src not in (0, 4):
+        return True
+    # brightness 0.25 on conv1/MNIST, except c_s=2.
+    if (key == "brightness" and size == "0.25"
+            and "conv1" in str(arch_disp)
+            and str(ds).strip() == "MNIST" and c_src != 2):
+        return True
+    return False
+
+
+def _bd_split(bd_groups):
+    """(body, appendix) partition of the bounds-difference clusters."""
+    body = [g for g in (bd_groups or []) if _bd_in_body(g)]
+    rest = [g for g in (bd_groups or []) if not _bd_in_body(g)]
+    return body, rest
+
+
+def regenerate_aaai_bounddiff_appendix_section(
+        tex_path, bd_groups, force_timeout=None,
+        begin_mark=AAAI_N2_BOUNDDIFF_APP_BEGIN_MARK,
+        end_mark=AAAI_N2_BOUNDDIFF_APP_END_MARK):
+    """The bounds-difference figures for every cluster the body does NOT show
+    (see _bd_in_body). Same renderer as the body's, different AUTO block."""
+    _body, rest = _bd_split(bd_groups)
+    return regenerate_aaai_bounddiff_section(
+        tex_path, rest, force_timeout=force_timeout,
+        begin_mark=begin_mark, end_mark=end_mark,
+        label_stem="fig:n2-bounddiff-app", basename_stem="n2_bounddiff_app",
+        preselected=True)
+
 
 def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                                       begin_mark=AAAI_N2_BOUNDDIFF_BEGIN_MARK,
-                                      end_mark=AAAI_N2_BOUNDDIFF_END_MARK):
+                                      end_mark=AAAI_N2_BOUNDDIFF_END_MARK,
+                                      label_stem="fig:n2-bounddiff",
+                                      basename_stem="n2_bounddiff",
+                                      preselected=False, float_spec="tp"):
     """Emit EXACTLY TWO bounds-difference figures (user request: no
     per-dataset split anymore). `bd_groups` is the pooled list of
     (dataset_disp, type_disp, size_disp, x_label, bars) clusters from every
@@ -8593,6 +9077,10 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
     order is preserved), then split in half across the two `figure*`s. The
     x labels carry the dataset ("arch, dataset" line), so no figure belongs
     to a dataset. Both figures live in the one AUTO block."""
+    if not preselected:
+        # The EVALUATION shows only the selected clusters; the rest are
+        # emitted by regenerate_aaai_bounddiff_appendix_section.
+        bd_groups, _rest = _bd_split(bd_groups)
     try:
         if bd_groups:
             # Same perturbation type+size adjacent (then arch, then dataset,
@@ -8640,33 +9128,35 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                     cur = cand
             if cur:
                 chunks.append(cur)
-            figs = []
-            # See regenerate_aaai_time_combined_section: charts are pre-rendered
-            # to PDFs next to the paper, so derive the paper root from tex_path.
+            # ONE figure holding EVERY chunk (user request): the chunks
+            # become stacked rows of a single graphic, the legend is drawn
+            # once, and the lot renders to one PDF under one caption.
             tex_dir = os.path.dirname(os.path.dirname(os.path.abspath(tex_path)))
-            for fi, chunk in enumerate(chunks):
-                ds_in = []
+            graphic = []
+            graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
+            ds_all = []
+            for chunk in chunks:
                 for g in chunk:
-                    if g[0] not in ds_in:
-                        ds_in.append(g[0])
-                ds_phrase = (ds_in[0] if len(ds_in) == 1 else
-                             ", ".join(ds_in[:-1]) + " and " + ds_in[-1])
-                # The bare fig:n2-bounddiff (+ per-dataset aliases for older
-                # \refs) on the first figure; later ones get their own label.
-                if fi == 0:
-                    label_base = "fig:n2-bounddiff"
-                    extra = ["fig:n2-bounddiff-"
-                             + re.sub(r"[^a-z0-9]+", "-", d.lower()).strip("-")
-                             for d in ds_in]
-                else:
-                    label_base = f"fig:n2-bounddiff-cont{fi}"
-                    extra = []
-                figs += _aaai_bd_single_figure(
-                    _groups3(chunk),
-                    force_timeout=force_timeout,
-                    label_base=label_base, ds_phrase=ds_phrase,
-                    extra_labels=extra,
-                    tex_dir=tex_dir, basename=f"n2_bounddiff_{fi + 1}")
+                    if g[0] not in ds_all:
+                        ds_all.append(g[0])
+                graphic.append(r"\par\smallskip")
+                graphic += _aaai_bd_single_figure(
+                    _groups3(chunk), force_timeout=force_timeout,
+                    tex_dir=tex_dir)
+            figs = [r"\begin{figure*}[" + float_spec + "]", r"\centering",
+                    _aaai_render_chart_pdf(graphic, f"{basename_stem}_1",
+                                           tex_dir)]
+            cap = (r"Bound difference $\delta_u-\delta_l$ of \tool compared "
+                   r"to \baseline (baseline) when reached timeout")
+            figs.append(f"\\caption{{{cap}}}")
+            figs.append(f"\\label{{{label_stem}}}")
+            if label_stem == "fig:n2-bounddiff":
+                for d in ds_all:
+                    figs.append(
+                        "\\label{" + label_stem + "-"
+                        + re.sub(r"[^a-z0-9]+", "-", d.lower()).strip("-")
+                        + "}")
+            figs.append(r"\end{figure*}")
             body = "\n".join(figs)
         else:
             body = (r"% (no cluster has all three methods at the timeout -- "
@@ -8704,6 +9194,10 @@ _AAAI_ARCH_DISPLAY = {
     "3x50": r"3$\times$50",
     "3x10": r"3$\times$10",
     "3x100": r"3$\times$100",
+    # HAR ships one pretrained net, so its arch key IS the dataset name. The
+    # rendering must match the Network cell of Table 1 verbatim, since
+    # _filter_tab_networks pairs the two to decide which rows Table 1 keeps.
+    "har": r"1$\times$500",
 }
 
 
@@ -9232,19 +9726,19 @@ ABLATION_END_MARK = "% END AUTO: ablation_tables"
 _ABLATION_COLUMNS = ("full", "zono", "triangle", "zono_triangle",
                      "pert_intervals", "var_hint")
 _ABLATION_COL_HEADERS = {
-    "full": r"as is",
-    "zono": r"w/o zono",
-    "triangle": r"w/o triangle",
+    "full": r"\tool",
+    "zono": r"w/o zonotope",
+    "triangle": r"w/o relaxation",
     # Both bound-tightening techniques removed together: zono and triangle
     # tighten the same ReLU bounds, so either alone can be masked by the
     # other still doing the work.
-    "zono_triangle": r"w/o zono \& triangle",
-    "pert_intervals": r"w/o pert.\ int.",
+    "zono_triangle": r"w/o zonotope \& relaxation",
+    "pert_intervals": r"w/o perturbation difference",
     # var_hint drops only the N1-derived variable hints (the PGD warm start
     # still runs, so those files keep the _HyperAttackHints tag). The
     # warm_start variant (drops both; no _HyperAttackHints tag) is still
     # classified from disk but has no column here (removed per user).
-    "var_hint": r"w/o \texttt{prev\_pgd}",
+    "var_hint": r"w/o warm start",
 }
 _ABLATION_ROW_LABELS = {"ours": r"\emph{ours}",
                         "transfer": r"\emph{ours with transfer}"}
@@ -9417,9 +9911,15 @@ def _collect_ablation_baseline(cwd, dataset, arch, perts, parse_result_file,
     exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
     out = {}
     for _pname, pert_spec in perts:
-        pert_type, eps_str = pert_spec.split(":", 1)
+        pert_type = pert_spec.split(":", 1)[0]
         eps_glob = os.path.join(exp_base, pert_type, "eps_*")
         for eps_dir in sorted(glob.glob(eps_glob)):
+            # Key on the eps of the directory being read, NOT on the one in
+            # the spec: this loop walks every eps_* dir of the perturbation,
+            # so keying on the spec collapses all of them onto one key and
+            # the keys stop matching the ablation cells (which carry the real
+            # eps).
+            eps_str = os.path.basename(eps_dir).replace("eps_", "")
             dir_globs = sorted(set(
                 glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*"))
                 + glob.glob(os.path.join(eps_dir, "N2stdBoost_*"))))
@@ -9490,12 +9990,77 @@ def _ablation_mean_gap(cells, keys, delta_max_by_key=None, arch=None):
     return sum(gaps) / len(gaps)
 
 
+def _ablation_mean_loss(cells, keys, baseline, delta_max_by_key=None,
+                        arch=None):
+    """Mean PRECISION LOSS of an ablation variant over `keys`: how far its
+    bound interval provably sits from the exact delta, as a percentage of
+    delta_max. Higher means further from the true bound; 0 means the variant
+    is consistent with the same delta as \baseline.
+
+    Per cell this is the distance between the variant's [dl, du] and
+    \baseline's, the same measure Table 2 uses (_relax_gap_loss):
+
+        100 * max(0, max(dl_m, dl_b) - min(du_m, du_b)) / delta_max
+
+    \baseline relaxes no binary, so its interval soundly contains the exact
+    delta whether or not it proved optimality; a variant interval disjoint
+    from it therefore differs from the exact delta by AT LEAST this much.
+    Cells with no baseline run, no bounds, or no delta_max are skipped rather
+    than counted as 0, so the mean never credits a variant for a cell it
+    cannot be judged on. Returns None when no cell can be judged."""
+    losses = []
+    for k in keys:
+        m = (cells or {}).get(k)
+        b = (baseline or {}).get(k)
+        if not m or not b or len(m) < 4 or len(b) < 4:
+            continue
+        ml, mu, bl, bu = m[2], m[3], b[2], b[3]
+        if any(v is None or v != v for v in (ml, mu, bl, bu)):
+            continue
+        dm = None
+        if delta_max_by_key is not None and arch is not None:
+            entry = delta_max_by_key.get((arch, "N2", k[2]))
+            if entry:
+                dm = entry.get("upper")
+        if not dm:
+            continue
+        losses.append(100.0 * max(0.0, max(ml, bl) - min(mu, bu)) / dm)
+    if not losses:
+        return None
+    return sum(losses) / len(losses)
+
+
 def _fmt_ablation_time(sec):
     return f"{sec:.0f}" if sec >= 100 else f"{sec:.1f}"
 
 
+def _ablation_pert_phrase(cells):
+    """The perturbations this ablation table covers, as "type (size)" joined
+    for a caption. Read off the cell keys of the ABLATED variants only: the
+    "full" row is the ordinary run and carries every perturbation on disk, so
+    including it would list perturbations the ablation never touched."""
+    seen = []
+    for (_row, variant), grid in (cells or {}).items():
+        if variant == "full":
+            continue
+        for key in (grid or {}):
+            if len(key) < 2:
+                continue
+            pert, eps = key[0], key[1]
+            disp = (str(pert).replace("_", r"\_")
+                    .replace("linf", r"$\ell_\infty$")) + r" (" + str(eps) + r")"
+            if disp not in seen:
+                seen.append(disp)
+    if not seen:
+        return ""
+    if len(seen) == 1:
+        return seen[0]
+    return ", ".join(seen[:-1]) + " and " + seen[-1]
+
+
 def _render_ablation_table(dataset, arch, cells, label_suffix="",
-                           expected=None, unified_tau=None):
+                           expected=None, unified_tau=None,
+                           delta_max_by_key=None, baseline=None):
     """One booktabs table for (dataset, arch), or None when no ablation
     variant has data. Cells: each variant's mean total solve time in seconds
     over the grid cells it completed.
@@ -9511,28 +10076,34 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
                    for v in _ABLATION_COLUMNS)
     if not have_abl:
         return None
+    # TRANSPOSED (techniques as ROWS, the two modes as the only two data
+    # columns) so the table fits ONE text column at full size. The untransposed
+    # form needs six technique columns, which only fit via \resizebox-style
+    # shrinking -- banned by AAAI, and it would drop the in-table text under
+    # the 9pt floor. \small is GROUPED around the body so the caption stays
+    # 10pt.
     lines = [
-        # table* (full page width): in this paper's two-column style a
-        # single-column `table` leaves \textwidth = the whole page, so the
-        # adjustbox below never shrinks 7 technique columns to the column
-        # width and the table runs into the margin. Same convention as the
-        # per-cell appendix tables.
-        r"\begin{table*}[!tbp]",
+        r"\begin{table}[t]",
         r"\centering",
-        r"\small",
+        r"{\small",
         r"\setlength{\tabcolsep}{4pt}",
-        # 7 technique columns + 2 label columns overflow a single text column;
-        # shrink to fit the same way the per-cell appendix tables do.
-        r"\begin{adjustbox}{max width=\textwidth,center}%",
-        r"\begin{tabular}{l" + "c" * len(_ABLATION_COLUMNS) + "}",
+        r"\begin{tabular}{@{}lrrrr@{}}",
         r"\toprule",
-        " & " + " & ".join(_ABLATION_COL_HEADERS[c]
-                           for c in _ABLATION_COLUMNS) + r" \\",
+        # Each mode carries a time column and a precision column (user
+        # request); precision is the mean remaining bound difference
+        # delta_u - delta_l, the same quantity the figures and the per-cell
+        # tables report, in percentage points of delta_max.
+        " & " + " & ".join(r"\multicolumn{2}{c}{" + _ABLATION_ROW_LABELS[r_]
+                           + "}" for r_ in ("ours", "transfer")) + r" \\",
+        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}",
+        r" & $t$ (s) & loss & $t$ (s) & loss \\",
         r"\midrule",
     ]
     STAR = r"\textcolor{red}{$^*$}"  # same partial-coverage mark as the
     #                                   per-cell appendix tables
     any_star = False
+    grid = {}   # (mode, technique) -> solve-time cell, emitted transposed below
+    prec = {}   # (mode, technique) -> mean bound difference
     for row in ("ours", "transfer"):
         variants = {v: cells.get((row, v)) for v in _ABLATION_COLUMNS}
         if row == "ours":
@@ -9578,13 +10149,13 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
         # given, otherwise the union of observed cells (relative rule).
         if exp_keys is None:
             exp_keys = union
-        # Single label column: the time unit lives in the caption ("mean
-        # solve time (s)"), so no dedicated "$t$ (s)" sub-label column.
-        rendered = [_ABLATION_ROW_LABELS[row]]
+        # Values are collected per (mode, technique) here and emitted BELOW,
+        # one line per technique, since the table is transposed.
         for v in _ABLATION_COLUMNS:
             c = variants.get(v)
             if not c:
-                rendered.append("---")
+                grid[(row, v)] = "---"
+                prec[(row, v)] = "---"
                 continue
             # Each variant averages over ALL the grid cells it completed
             # (its own set, not the row-wide intersection): the command line
@@ -9599,24 +10170,37 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
             if exp_keys - keys_v:
                 cell += STAR
                 any_star = True
-            rendered.append(cell)
-        lines.append(" & ".join(rendered) + r" \\")
-        if row == "ours":
-            lines.append(r"\midrule")
+            grid[(row, v)] = cell
+            loss = _ablation_mean_loss(c, keys_v, baseline,
+                                       delta_max_by_key=delta_max_by_key,
+                                       arch=arch)
+            prec[(row, v)] = ("---" if loss is None
+                              else (r"%.2f\%%" % loss))
+    for v in _ABLATION_COLUMNS:
+        cells_out = []
+        for r_ in ("ours", "transfer"):
+            cells_out.append(grid.get((r_, v), "---"))
+            cells_out.append(prec.get((r_, v), "---"))
+        lines.append(_ABLATION_COL_HEADERS[v] + " & "
+                     + " & ".join(cells_out) + r" \\")
     lines += [
         r"\bottomrule",
-        r"\end{tabular}%",
-        r"\end{adjustbox}",
-        r"\caption{The mean solve time (s) of \tool{} "
-        r"on \textsf{" + arch + r"} (" + dataset + r") with one component "
-        + r"removed at a time"
+        r"\end{tabular}}%",
+        r"\caption{Ablation experiments over "
+        + _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
+        + r" (" + _dataset_display_name(dataset) + r")"
+        + (r" for " + _ablation_pert_phrase(cells) if _ablation_pert_phrase(cells)
+           else "")
+        + r": the mean solve time and the mean precision loss (how far the "
+        r"bound provably sits from the exact one, as a percentage of "
+        r"$\delta_{\max}$) with one component removed at a time"
         + ((r", for $\tau{=}%g$" % unified_tau)
            if unified_tau is not None else "")
         + (r"; a red $^*$ marks a variant with incomplete cells"
            if any_star else "")
         + r".}",
         r"\label{tab:ablation-" + dataset + label_suffix + "-" + arch + r"}",
-        r"\end{table*}",
+        r"\end{table}",
     ]
     return "\n".join(lines)
 
@@ -9663,10 +10247,21 @@ def regenerate_ablation_appendix_section(tex_path, cwd, dataset, arch_runs,
             if chosen_tau is not None and cells:
                 print(f"[update_advstd_tex_tables] ablation table "
                       f"{dataset}/{arch}: unified tau = {chosen_tau:g}")
-            tab = _render_ablation_table(dataset, arch, cells,
-                                         label_suffix=ds_label_suffix,
-                                         expected=expected,
-                                         unified_tau=chosen_tau)
+            # The precision column measures each variant against \baseline's
+            # sound interval on the SAME cell, normalised by delta_max --
+            # the same construction Table 2 uses.
+            tab = _render_ablation_table(
+                dataset, arch, cells,
+                label_suffix=ds_label_suffix,
+                expected=expected, unified_tau=chosen_tau,
+                delta_max_by_key=_load_delta_max_values(cwd, dataset, [arch]),
+                baseline=_collect_ablation_baseline(
+                    # (name, "type:eps") pairs, the shape this collector
+                    # parses; the eps half is unused (it globs eps_*), so
+                    # every perturbation dir on disk is covered.
+                    cwd, dataset, arch,
+                    [(p_, p_ + ":") for p_ in _WIDE_PERT_SUBDIRS],
+                    parse_result_file, seeds_filter=seeds_filter))
         except Exception as exc:
             print(f"[update_advstd_tex_tables] ablation table {dataset}/{arch} "
                   f"error: {exc}")
