@@ -4566,6 +4566,9 @@ def _render_wide_perarch_body(rows, archs, dataset, delta_max_by_key=None,
         if ub is not None and math.isfinite(ub):
             cell["ub"].append(ub)
         cell["status"].append(str(r.get("solve_status", "") or ""))
+        _ro, _rp = r.get("relaxed_org"), r.get("relaxed_pert")
+        if _ro is not None or _rp is not None:
+            cell["relaxed"].append((_ro or 0) + (_rp or 0))
         ct = r.get("c_target")
         if ct is not None:
             try:
@@ -4999,6 +5002,13 @@ _AAAI_WIDE_COLUMN_HEADERS = (
     r"ours with transfer",
 )
 
+
+def _wide_group_width(hdr):
+    """Sub-columns a method group spans in the per-cell tables: 4 for the two
+    \tool modes (delta_l, delta_u, t, #relaxed) and 3 for \baseline, which
+    relaxes no binary and would only ever print 0."""
+    return 3 if hdr.strip() == r"\baseline" else 4
+
 # Tau values the per-cell tables render, in row order. This is the DEFAULT;
 # --paper_taus overrides it via set_aaai_wide_taus() so an extra threshold
 # (e.g. 0.25) can be pulled into the tables without editing the source.
@@ -5291,6 +5301,10 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
     buckets = defaultdict(lambda: defaultdict(
         lambda: {"t_base": [], "t_geom": [], "lb_base": [], "lb_geom": [],
                   "ub_base": [], "ub_geom": [], "status": [],
+                  # Binaries the relaxation dropped, summed over the two MIP
+                  # copies (clean N(x) and perturbed N(x')) -- the same
+                  # convention the relaxation/precision table uses.
+                  "relaxed": [],
                   "c_targets": set(), "c_targets_geom": set()}))
     for r in rows:
         key = (r["arch"], r["role"], r["perturbation"],
@@ -5322,6 +5336,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         if is_geom:
             continue
         cell["status"].append(str(r.get("solve_status", "") or ""))
+        _ro, _rp = r.get("relaxed_org"), r.get("relaxed_pert")
+        if _ro is not None or _rp is not None:
+            cell["relaxed"].append((_ro or 0) + (_rp or 0))
 
     columns = [col for col, _hdr in _AAAI_WIDE_COLUMNS]
 
@@ -5338,11 +5355,14 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         top = ["\\multirow{2}{*}{model}", "\\multirow{2}{*}{pert (size)}",
                "\\multirow{2}{*}{$\\tau$}"]
         for hdr in _AAAI_WIDE_COLUMN_HEADERS:
-            top.append("\\multicolumn{3}{c|}{" + hdr + "}")
+            top.append("\\multicolumn{%d}{c|}{%s}"
+                       % (_wide_group_width(hdr), hdr))
         top += trailing_top
         sub = ["", "", ""]
-        for _ in _AAAI_WIDE_COLUMN_HEADERS:
+        for hdr in _AAAI_WIDE_COLUMN_HEADERS:
             sub += [r"$\delta_l$\%", r"$\delta_u$\%", r"$t$"]
+            if _wide_group_width(hdr) == 4:
+                sub += [r"\#rel"]
         sub += ["", ""]  # the two trailing columns span both header rows
         return [f"\\providecommand{{\\{name}}}{{%",
                 " & ".join(top) + r" \\",
@@ -5384,7 +5404,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         _eps_min = rerun_timeout_eps / 60.0
         # l l l = model, pert (size), tau; then one "r r r" group per method.
         col_spec = ("@{}l l l | "
-                    + " | ".join(["r r r"] * len(_AAAI_WIDE_COLUMN_HEADERS))
+                    + " | ".join("r r r" if _wide_group_width(h) == 3
+                                 else "r r r r"
+                                 for h in _AAAI_WIDE_COLUMN_HEADERS)
                     + " | r r@{}")
         # Collect every (role, c_src) block's rows, each tagged with all_timeout,
         # so this architecture can be split into TWO tables below: one for cells
@@ -5537,6 +5559,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         if cell["ub_geom"]:
                             s["ub_raw_geom"] = (sum(cell["ub_geom"])
                                 / len(cell["ub_geom"]))
+                    if cell["relaxed"]:
+                        s["relaxed"] = (sum(cell["relaxed"])
+                                        / len(cell["relaxed"]))
                     stats[c] = s
                     # A side is partial iff at least one expected c_target
                     # wasn't run on that side. Don't penalise extra c_targets
@@ -5558,10 +5583,13 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                 # delta_max was unavailable, distinct from the red "*" (partial
                 # c_target coverage). See the raw-bound fallback above.
                 BLUESTAR = r"\textcolor{blue!60!cyan}{$^*$}"
-                for c in columns:
+                for _ci, c in enumerate(columns):
+                    _w = _wide_group_width(
+                        _AAAI_WIDE_COLUMN_HEADERS[_ci]
+                        if _ci < len(_AAAI_WIDE_COLUMN_HEADERS) else "")
                     s = stats.get(c)
                     if s is None:
-                        data_cells += ["---", "---", "---"]
+                        data_cells += ["---"] * _w
                         continue
                     # Each sub-column renders a SINGLE value, preferring the
                     # geometric-range (--geometric_intervals, "geom") run and
@@ -5621,6 +5649,12 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                                      else partial.get(c))
                         data_cells.append(_fmt_trim(t_v)
                                           + (STAR if t_partial else ""))
+                    # #relaxed: mean binaries the relaxation dropped over the
+                    # two copies of N. Only the two \tool groups carry it.
+                    if _w == 4:
+                        _rv = s.get("relaxed")
+                        data_cells.append("---" if _rv is None
+                                          else f"{_rv:.0f}")
 
                 # Trailing diff column. The compared method is the transfer
                 # column on N2 rows and the standard ("ours") column on N1 rows
@@ -6203,9 +6237,45 @@ def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
 _AAAI_RELAX_DATASET_ORDER = ["mnist", "fashion-mnist", "cifar"]
 
 
-def _render_aaai_relax_precision_body(model_rows):
+def _tab1_neuron_counts(sections_dir):
+    """{(dataset_display, network_display): neurons} parsed from the frozen
+    full Table 1 master (tab_networks_full.tex), the paper's own statement of
+    each network's ReLU count. The relaxed-share denominator of the
+    relaxation/precision table is derived from these, so the two tables can
+    never disagree about a network's size; a hard-coded dict here could.
+
+    A data row is '<Dataset> & <Network> & <Architecture> & <#Neurons> & ...';
+    the header (\textbf) and rule lines don't match the shape and fall
+    through."""
+    out = {}
+    path = os.path.join(sections_dir, "tab_networks_full.tex")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if not line.rstrip().endswith(r"\\") or "textbf" in line:
+            continue
+        cells = [c.strip() for c in line.split("&")]
+        if len(cells) < 4:
+            continue
+        digits = re.sub(r"\D", "", cells[3])
+        if digits:
+            out[(cells[0], cells[1])] = int(digits)
+    return out
+
+
+def _render_aaai_relax_precision_body(model_rows, neuron_counts=None):
     """Render the single Evaluation relaxation/precision table from the pooled
-    per-network rows of collect_aaai_relax_precision_rows (all datasets)."""
+    per-network rows of collect_aaai_relax_precision_rows (all datasets).
+
+    `neuron_counts` ({(dataset_display, network_display): neurons}, from
+    _tab1_neuron_counts) turns the relaxed columns into SHARES: dropped
+    binaries over the total binaries in \baseline's encoding, which has one
+    binary per ReLU neuron in each of the TWO copies of $N$ it encodes, i.e.
+    2 * #Neurons of Table 1. A network absent from the counts falls back to
+    the absolute number (and says so on the console) rather than guessing."""
     if not model_rows:
         return "% auto-generated: aaai_relax_precision -- no data"
 
@@ -6218,10 +6288,15 @@ def _render_aaai_relax_precision_body(model_rows):
     rows = sorted(model_rows,
                   key=lambda r: (_ds_key(r), _tab1_arch_sort_key(r["arch"])))
 
-    def _relaxed(v):
-        # Counts, so render whole binaries; the mean over runs is fractional only
-        # because a few cells relax a different number.
-        return "---" if v is None else f"{int(round(v))}"
+    def _relaxed(v, denom):
+        # Share of the encoding's binaries (user request): the dropped count,
+        # summed over the two copies of $N$, over 2 * #Neurons. One decimal,
+        # so 0 reads as exactly none relaxed and small shares keep a digit.
+        if v is None:
+            return "---"
+        if denom:
+            return f"{100.0 * v / denom:.1f}\\%"
+        return f"{int(round(v))}"
 
     def _loss(v):
         if v is None:
@@ -6246,26 +6321,36 @@ def _render_aaai_relax_precision_body(model_rows):
                  r"\multicolumn{2}{c}{\textbf{\emph{ours}}} & "
                  r"\multicolumn{2}{c}{\textbf{\emph{transfer}}} \\")
     lines.append(r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}")
-    lines.append(r" & \textbf{\#relaxed} & \textbf{loss} & "
-                 r"\textbf{\#relaxed} & \textbf{loss} \\")
+    lines.append(r" & \textbf{relaxed} & \textbf{loss} & "
+                 r"\textbf{relaxed} & \textbf{loss} \\")
     lines.append(r"\midrule")
     for r in rows:
-        model = (_dataset_display_name(r["dataset"]) + " "
-                 + _AAAI_ARCH_DISPLAY.get(r["arch"],
-                                          r["arch"].replace("_", r"\_")))
+        ds_disp = _dataset_display_name(r["dataset"])
+        arch_disp = _AAAI_ARCH_DISPLAY.get(r["arch"],
+                                           r["arch"].replace("_", r"\_"))
+        model = ds_disp + " " + arch_disp
+        neurons = (neuron_counts or {}).get((ds_disp, arch_disp))
+        denom = 2 * neurons if neurons else None
+        if denom is None:
+            print(f"[relax-precision] {model}: not in Table 1's master; "
+                  f"relaxed shown as an absolute count, not a share")
         lines.append(" & ".join([
             model,
-            _relaxed(r["relaxed_ours"]), _loss(r["loss_ours"]),
-            _relaxed(r["relaxed_transfer"]), _loss(r["loss_transfer"]),
+            _relaxed(r["relaxed_ours"], denom), _loss(r["loss_ours"]),
+            _relaxed(r["relaxed_transfer"], denom), _loss(r["loss_transfer"]),
         ]) + r" \\")
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}%")
     lines.append(r"\end{adjustbox}")
     # AAAI puts the caption UNDER the table, so it follows the tabular.
     lines.append(
-        r"\caption{The binaries the relaxation drops (\#relaxed) and the "
-        r"precision it costs (loss) averaged over all experiments.}"
-)
+        r"\caption{The share of ReLU binaries the relaxation drops (relaxed) "
+        r"and the precision it costs (loss), averaged over all experiments. "
+        r"A run's relaxed share is the number of binaries the relaxation "
+        r"drops, summed over the two copies of $N$ that \baseline's MIP "
+        r"encodes, divided by the total number of binaries in that encoding: "
+        r"one binary per ReLU neuron in each of the two copies, that is, "
+        r"twice the \#Neurons column of Table~\ref{tab:networks}.}")
     lines.append(r"\label{tab:relax-precision}")
     lines.append(r"\end{table}")
     return "\n".join(lines)
@@ -6276,7 +6361,11 @@ def regenerate_aaai_relax_precision_section(tex_path, model_rows):
     table pooled over every dataset. Run once, after the per-dataset
     collect_aaai_relax_precision_rows calls."""
     try:
-        body = _render_aaai_relax_precision_body(model_rows)
+        # tab_networks_full.tex sits beside tex_path (both under sections/).
+        body = _render_aaai_relax_precision_body(
+            model_rows,
+            neuron_counts=_tab1_neuron_counts(
+                os.path.dirname(os.path.abspath(tex_path))))
         update_aaai_wide_perarch_tex(tex_path, body,
                                      begin_mark=AAAI_RELAX_PREC_BEGIN_MARK,
                                      end_mark=AAAI_RELAX_PREC_END_MARK)
@@ -10038,6 +10127,12 @@ _ABLATION_COL_HEADERS = {
     # classified from disk but has no column here (removed per user).
     "var_hint": r"w/o warm start",
 }
+#: A technique whose ablation means something different per mode. "ours" is
+#: single-network and has no N_pre, so its zonotope row can only be the whole
+#: technique off; "transfer" instead ablates only the zonotope's N_pre input
+#: (user request), which is the claim the paper actually makes about transfer.
+_ABLATION_MODE_COMPONENT = {("transfer", "zono"): "zono_npre"}
+
 _ABLATION_ROW_LABELS = {"ours": r"\emph{ours}",
                         "transfer": r"\emph{ours with transfer}"}
 
@@ -10045,11 +10140,47 @@ _ABL_SEED_RE = re.compile(r"_seed(\d+)(?=_)(?!_itr)")
 _ABL_BTPR_RE = re.compile(r"_(?:BTPR|BoundTightPertRelax)(\d+(?:\.\d+)?)")
 
 
+#: Cache of {result dir -> {short name: full name}} read from the
+#: _filename_legend.txt that safe_filepath writes beside truncated results.
+_LEGEND_CACHE = {}
+
+
+def _resolve_truncated_name(dirpath, fname):
+    """The FULL result filename for `fname`, which may be hash-truncated.
+
+    Julia's safe_filepath caps a name at the 255-byte Linux limit by cutting it
+    and appending a 16-hex hash, writing `<short> => <full>` into
+    _filename_legend.txt beside it. The cut lands on the TAIL, which is exactly
+    where the semantically load-bearing tags live (_depGuardFix, _cTagN,
+    _PerturbedIntervals), so parsing the on-disk name silently misreads such a
+    file -- most damagingly as pre-fix/stale, which drops it entirely. Resolve
+    through the legend before any tag is inspected; names that were never
+    truncated pass straight through."""
+    if not re.search(r"_[0-9a-f]{16}\.txt$", fname):
+        return fname
+    leg = _LEGEND_CACHE.get(dirpath)
+    if leg is None:
+        leg = {}
+        lp = os.path.join(dirpath, "_filename_legend.txt")
+        if os.path.exists(lp):
+            try:
+                with open(lp) as fh:
+                    for line in fh:
+                        if " => " in line:
+                            short, full = line.strip().split(" => ", 1)
+                            leg[short] = full
+            except OSError:
+                pass
+        _LEGEND_CACHE[dirpath] = leg
+    return leg.get(fname, fname)
+
+
 def _classify_ablation_filename(fname):
     """Map a result filename to ('ours'|'transfer', variant) or None.
 
     variant is 'full' for the un-ablated control combo and the removed
-    component ('zono' | 'triangle' | 'zono_triangle' | 'pert_intervals' |
+    component ('zono' | 'zono_npre' | 'triangle' | 'zono_triangle' |
+    'pert_intervals' |
     'var_hint') for the `_ablation`-tagged runs -- leave-one-out except
     'zono_triangle', which removes both bound-tightening techniques at once.
     Non-control non-ablation files (grid combos, τ=0 rows, ...) return None.
@@ -10073,6 +10204,11 @@ def _classify_ablation_filename(fname):
             # Combined removal first: it is the only variant missing BOTH
             # tags, so testing it after the single-component checks would
             # let it be swallowed by the 'zono' branch.
+            # zono_npre keeps the _zonoBounds tag and adds _noNpreZono, so it
+            # must be tested BEFORE the tag-absence checks below, which would
+            # otherwise class it as the untouched control.
+            if "_noNpreZono" in fname:
+                return ("transfer", "zono_npre")
             if "_zonoBounds" not in fname and "_SibGate" not in fname:
                 return ("transfer", "zono_triangle")
             if "_zonoBounds" not in fname:
@@ -10082,7 +10218,8 @@ def _classify_ablation_filename(fname):
             return None
         # control: the full paper combo at τ > 0 (τ=0 wide-grid rows and
         # partial combos are not the ablation reference).
-        if ("_noPI" not in fname and "_varHintPrevPGD" in fname
+        if ("_noPI" not in fname and "_noNpreZono" not in fname
+                and "_varHintPrevPGD" in fname
                 and "_zonoBounds" in fname and "_SibGate" in fname
                 and tau > 0.0):
             return ("transfer", "full")
@@ -10109,6 +10246,7 @@ def _collect_ablation_cells(cwd, dataset, arch, parse_result_file,
                             seeds_filter=None, stale_fn=None,
                             unify_taus=None):
     """({(row, variant): {(pert, eps, cs, ct): (total_time, solve_status,
+    lower_bound, upper_bound, relaxed_binaries),
                                                 lower_bound, upper_bound)}},
         chosen_tau_or_None).
 
@@ -10143,7 +10281,8 @@ def _collect_ablation_cells(cwd, dataset, arch, parse_result_file,
                          + glob.glob(os.path.join(eps_dir, "N2stdBoost_*")))
             for d in sorted(dir_globs):
                 for tf in sorted(glob.glob(os.path.join(d, "*.txt"))):
-                    fname = os.path.basename(tf)
+                    fname = _resolve_truncated_name(os.path.dirname(tf),
+                                                    os.path.basename(tf))
                     cls = _classify_ablation_filename(fname)
                     if cls is None:
                         continue
@@ -10171,10 +10310,24 @@ def _collect_ablation_cells(cwd, dataset, arch, parse_result_file,
                                 .upper().replace(" ", "_")
                             if status == "INTERRUPTED":
                                 continue
+                            # 5th slot: binaries the relaxation dropped,
+                            # summed over BOTH MIP copies (clean N(x) and
+                            # perturbed N(x')), the same convention Table 2
+                            # uses. None when the run recorded neither count.
+                            def _int_or_none(x):
+                                try:
+                                    return int(str(x).strip())
+                                except (TypeError, ValueError):
+                                    return None
+                            _ro = _int_or_none(info.get("n2_org_relaxed_binaries"))
+                            _rp = _int_or_none(info.get("n2_pert_relaxed_binaries"))
+                            _rel = None if (_ro is None and _rp is None) else \
+                                ((_ro or 0) + (_rp or 0))
                             cells[(pert_type, eps_str, cs, ct)] = (
                                 t, status,
                                 info.get("lower_bound"),
-                                info.get("upper_bound"))
+                                info.get("upper_bound"),
+                                _rel)
     if candidates is None:
         return outs[None], None
     chosen = max(candidates,
@@ -10401,9 +10554,15 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
     #                                   per-cell appendix tables
     any_star = False
     grid = {}   # (mode, technique) -> solve-time cell, emitted transposed below
-    prec = {}   # (mode, technique) -> mean bound difference
+    prec = {}   # (mode, technique) -> mean precision loss
     for row in ("ours", "transfer"):
-        variants = {v: cells.get((row, v)) for v in _ABLATION_COLUMNS}
+        # Fetch the MODE-MAPPED component, not the column name: for
+        # ("transfer", "zono") the data lives under "zono_npre", which is not
+        # in _ABLATION_COLUMNS. Keying this dict on the column name alone left
+        # that cell permanently "---".
+        variants = {_ABLATION_MODE_COMPONENT.get((row, v), v):
+                    cells.get((row, _ABLATION_MODE_COMPONENT.get((row, v), v)))
+                    for v in _ABLATION_COLUMNS}
         if row == "ours":
             # The warm-start ablation is not produced for standard mode:
             # var_hint needs N1, which standard mode has no notion of.
@@ -10450,7 +10609,7 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
         # Values are collected per (mode, technique) here and emitted BELOW,
         # one line per technique, since the table is transposed.
         for v in _ABLATION_COLUMNS:
-            c = variants.get(v)
+            c = variants.get(_ABLATION_MODE_COMPONENT.get((row, v), v))
             if not c:
                 grid[(row, v)] = "---"
                 prec[(row, v)] = "---"
@@ -10501,6 +10660,146 @@ def _render_ablation_table(dataset, arch, cells, label_suffix="",
         r"\end{table}",
     ]
     return "\n".join(lines)
+
+
+ABLATION_FULL_BEGIN_MARK = "% BEGIN AUTO: ablation_full_tables"
+ABLATION_FULL_END_MARK = "% END AUTO: ablation_full_tables"
+
+
+def _ablation_full_tables(dataset, arch, cells, baseline=None,
+                          delta_max_by_key=None, label_suffix=""):
+    """PER-EXPERIMENT ablation tables (user request): one table per
+    (perturbation, size, c_s), rows = technique, columns = c_t. Every cell is
+    exactly ONE run -- no averaging anywhere -- and carries both modes, each
+    with its solve time and its precision loss.
+
+    This is the un-aggregated companion to _render_ablation_table, which means
+    the same numbers over the whole grid. It lives in table_full_results.tex,
+    where a wide table is fine.
+    """
+    # Which (pert, eps, c_s) blocks exist, from the ABLATED variants only:
+    # the 'full' row is an ordinary run covering the whole sweep and would
+    # invent blocks the ablation never touched.
+    blocks = {}
+    for (row, variant), grid in (cells or {}).items():
+        if variant == "full":
+            continue
+        for (pert, eps, cs, ct) in (grid or {}):
+            blocks.setdefault((pert, eps, cs), set()).add(ct)
+    out = []
+    for (pert, eps, cs) in sorted(blocks, key=lambda b: (b[0], b[1], b[2])):
+        cts = sorted(blocks[(pert, eps, cs)])
+        if not cts:
+            continue
+        head1 = " & ".join(r"\multicolumn{4}{c}{$c_t{=}%d$}" % ct for ct in cts)
+        head2 = " & ".join(r"\multicolumn{2}{c}{\emph{ours}} & "
+                           r"\multicolumn{2}{c}{\emph{ours with transfer}}"
+                           for _ in cts)
+        head3 = " & ".join(r"$t$ (s) & loss & $t$ (s) & loss" for _ in cts)
+        rules = " ".join(r"\cmidrule(lr){%d-%d}" % (2 + 4 * i, 5 + 4 * i)
+                         for i in range(len(cts)))
+        lines = [r"\begin{table*}[!tbp]", r"\centering", r"\small",
+                 r"\setlength{\tabcolsep}{4pt}",
+                 r"\begin{adjustbox}{max width=\textwidth,center}%",
+                 r"\begin{tabular}{@{}l" + "rr rr" * len(cts) + "@{}}",
+                 r"\toprule",
+                 " & " + head1 + r" \\", rules,
+                 " & " + head2 + r" \\",
+                 " & " + head3 + r" \\", r"\midrule"]
+        for v in _ABLATION_COLUMNS:
+            cells_out = []
+            for ct in cts:
+                for row in ("ours", "transfer"):
+                    _v = _ABLATION_MODE_COMPONENT.get((row, v), v)
+                    got = ((cells or {}).get((row, _v)) or {}).get(
+                        (pert, eps, cs, ct))
+                    if not got:
+                        cells_out += ["---", "---"]
+                        continue
+                    cells_out.append(_fmt_ablation_time(got[0]))
+                    loss = _ablation_mean_loss(
+                        {(pert, eps, cs, ct): got},
+                        [(pert, eps, cs, ct)], baseline,
+                        delta_max_by_key=delta_max_by_key, arch=arch)
+                    cells_out.append("---" if loss is None
+                                     else (r"%.2f\%%" % loss))
+            lines.append(_ABLATION_COL_HEADERS[v] + " & "
+                         + " & ".join(cells_out) + r" \\")
+        pert_disp = (str(pert).replace("_", r"\_")
+                     .replace("linf", r"$\ell_\infty$"))
+        lines += [
+            r"\bottomrule", r"\end{tabular}%", r"\end{adjustbox}",
+            r"\caption{Ablation experiments over "
+            + _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
+            + r" (" + _dataset_display_name(dataset) + r") for "
+            + pert_disp + r" (" + str(eps) + r"), source class $c_s{=}"
+            + str(cs) + r"$. Every cell is a single run: its solve time and "
+            r"its precision loss against \baseline.}",
+            r"\label{tab:ablation-full-" + dataset + label_suffix + "-" + arch
+            + "-" + re.sub(r"[^a-z0-9]+", "", str(pert).lower())
+            + "-" + re.sub(r"[^0-9]+", "", str(eps)) + "-cs" + str(cs) + r"}",
+            r"\end{table*}", ""]
+        out.append("\n".join(lines))
+    return out
+
+
+def regenerate_ablation_full_section(tex_path, cwd, dataset, arch_runs,
+                                     parse_result_file, seeds_filter=None,
+                                     stale_fn=None,
+                                     begin_mark=ABLATION_FULL_BEGIN_MARK,
+                                     end_mark=ABLATION_FULL_END_MARK,
+                                     ds_label_suffix="", expected_map=None,
+                                     taus=None):
+    """Write the PER-EXPERIMENT ablation tables into `tex_path`'s AUTO block.
+
+    Same collection path as regenerate_ablation_appendix_section (so both
+    describe the same runs), but rendered un-aggregated by
+    _ablation_full_tables. `expected_map` selects which (dataset, arch) pairs
+    render, exactly as it does for the aggregated table."""
+    bodies = []
+    for arch, _mp in arch_runs:
+        pinned_tau = None
+        if expected_map:
+            hit = (expected_map.get((dataset, arch))
+                   or expected_map.get((None, arch)))
+            if not hit:
+                continue
+            if len(hit) > 2 and hit[2] is not None:
+                pinned_tau = hit[2]
+        try:
+            cells, _chosen = _collect_ablation_cells(
+                cwd, dataset, arch, parse_result_file,
+                seeds_filter=seeds_filter, stale_fn=stale_fn,
+                unify_taus=([pinned_tau] if pinned_tau is not None else taus))
+            bodies += _ablation_full_tables(
+                dataset, arch, cells,
+                baseline=_collect_ablation_baseline(
+                    cwd, dataset, arch,
+                    [(p_, p_ + ":") for p_ in _WIDE_PERT_SUBDIRS],
+                    parse_result_file, seeds_filter=seeds_filter),
+                delta_max_by_key=_load_delta_max_values(cwd, dataset, [arch]),
+                label_suffix=ds_label_suffix)
+        except Exception as exc:
+            print(f"[update_advstd_tex_tables] ablation full tables "
+                  f"{dataset}/{arch} error: {exc}")
+            continue
+    body = ("\n\n".join(bodies) if bodies
+            else "% (no _ablation result files found for this dataset)")
+    with open(tex_path) as f:
+        text = f.read()
+    if begin_mark not in text or end_mark not in text:
+        raise SystemExit(f"ablation_full_tables markers not found in {tex_path}")
+    pre, rest = text.split(begin_mark, 1)
+    _old, post = rest.split(end_mark, 1)
+    updated = f"{pre}{begin_mark}\n{body}\n{end_mark}{post}"
+    if updated == text:
+        print(f"[update_advstd_tex_tables] no changes to ablation_full_tables "
+              f"block ({dataset})")
+        return
+    with open(tex_path, "w") as f:
+        f.write(updated)
+    print(f"[update_advstd_tex_tables] wrote ablation_full_tables block "
+          f"({dataset}, {len(bodies)} table(s)) in {tex_path}")
 
 
 def regenerate_ablation_appendix_section(tex_path, cwd, dataset, arch_runs,

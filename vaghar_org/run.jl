@@ -363,6 +363,16 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
+        "--adv_std_zono_npre"
+        help = "advanced_standard: let the zonotope use N_pre. Default true. Set false to ablate " *
+               "ONLY the N_pre contribution: the absolute N2 zonotope is still propagated, but it " *
+               "is NOT intersected with N_pre's pre-activation bounds or the N_pre->N difference " *
+               "zonotope (Source A). The perturbation-difference technique, which reads the same " *
+               "diff bounds, is unaffected. Only meaningful with --adv_std_zono_bounds true; " *
+               "filename tag _noNpreZono."
+        arg_type = Bool
+        required = false
+        default = true
         "--adv_std_n1_probe"
         help = "advanced_standard: run post-Phase-1 LP probing against a joint N1+N2 LP " *
                "relaxation (triangle ReLU relaxations) to derive tighter per-neuron N2 " *
@@ -926,6 +936,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     use_lp_basis = args["adv_std_lp_basis"]
     use_bound_tightening = args["adv_std_bound_tightening"]
     use_zono_bounds = args["adv_std_zono_bounds"]
+    zono_use_npre   = args["adv_std_zono_npre"]
     # Technique 6: N1-gated N2/N2p triangle LP relaxation. Propagated to the
     # core_ops.jl::relu() consumer via the `adv_std_n2_relax_threshold` global.
     global adv_std_n2_relax_threshold = args["adv_std_n2_relax_threshold"]
@@ -1005,6 +1016,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Technique 3 (LP Basis):            $(use_lp_basis)")
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
+    println("  Zono uses N_pre (Source A):        $(zono_use_npre)")
     println("  Technique 4+ (N1 Probe):           $(args["adv_std_n1_probe"])")
     println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
@@ -1031,6 +1043,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         end
         if args["adv_std_n2_sibling_gate"]; n2_check = n2_check * "_SibGate"; end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
+        if use_zono_bounds && !zono_use_npre; n2_check = n2_check * "_noNpreZono"; end
         if args["adv_std_n1_probe"] == "lp"; n2_check = n2_check * "_n1ProbeLP"; end
         # Mode-specific varHint filename tag. Keep the legacy "_varHintFixed"
         # token for VH_PREV (so historical result files keep comparing cleanly);
@@ -1116,7 +1129,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # warning if those globals are empty, e.g. legacy n1_state_dir load.
             if use_zono_bounds
                 println("Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...")
-                compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init)
+                compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
+                                                           use_n1_tighten=zono_use_npre)
             end
 
             # Source C: joint N1+N2 LP probe via OBBT (--adv_std_n1_probe=lp).
@@ -1317,6 +1331,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 end
                 if args["adv_std_n2_sibling_gate"]; n2_name = n2_name * "_SibGate"; end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
+                if use_zono_bounds && !zono_use_npre; n2_name = n2_name * "_noNpreZono"; end
                 if args["adv_std_n1_probe"] == "lp"; n2_name = n2_name * "_n1ProbeLP"; end
                 # See n2_check builder above: VH_PREV keeps the legacy tag,
                 # VH_DIRECT emits "_varHintDirect", VH_DIRECT_PGD emits "_varHintDirectPGD",

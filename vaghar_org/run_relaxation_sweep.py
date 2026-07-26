@@ -183,7 +183,7 @@ PERTURBATIONS = [
     # ("trans(3,1)",        "translation:3,1"),
     # ("trans(3,3)",        "translation:3,3"),
     # ("occ(5,5,5)",        "occ:5,5,5"),
-    # ("occ(3,3,5)",        "occ:3,3,5"),
+    ("occ(3,3,5)",        "occ:3,3,5"),
     # ("occ(1,1,9)",        "occ:1,1,9"),
     # ("contrast(1.2)",      "contrast:1.2"),
     # ("rotation(5)",      "rotation:5"),
@@ -2790,6 +2790,10 @@ def _recompile_neta_s_paper(cwd):
 #: dataset-scoped variant (":<ds>") of the marker is picked up automatically.
 _FULL_RESULTS_BLOCKS = [
     ("sec_full_results_tables.tex", "aaai_safe_wide_n2_appendix_tables"),
+    # Per-experiment ablation tables: one per (perturbation, size, c_s), every
+    # cell a single run. Only in the full-results document, where a wide table
+    # is fine; the Evaluation keeps the aggregated Table 3.
+    ("sec_full_results_tables.tex", "ablation_full_tables"),
 ]
 
 #: Hand-written floats copied verbatim into table_full_results.tex, ahead of
@@ -3857,6 +3861,17 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                     taus=_taus)
             except Exception as exc:
                 print(f"[ablation-tables] block error: {exc}")
+            if hasattr(updater, "regenerate_ablation_full_section"):
+                try:
+                    updater.regenerate_ablation_full_section(
+                        full_tex, cwd, dataset, arch_runs,
+                        parse_result_file=parse_result_file,
+                        seeds_filter=combo_ranking_seeds,
+                        stale_fn=_is_pre_fix_dropped,
+                        expected_map=ablation_expected,
+                        taus=_taus)
+                except Exception as exc:
+                    print(f"[ablation-full] block error: {exc}")
 
     # Per-network relaxation + precision-cost rows for the single Evaluation
     # table. Pooled across datasets by the caller and emitted once, like the
@@ -4299,6 +4314,11 @@ def main():
                              "warm start at all; its files carry no _HyperAttackHints tag, which "
                              "is what separates them from var_hint) | "
                              "zono (adv_std_zono_bounds=false) | "
+                             "zono_npre (adv_std_zono_npre=false: the zonotope is KEPT but its "
+                             "N_pre input is removed -- the absolute N2 zonotope still "
+                             "propagates, it is just not intersected with N_pre's pre-activation "
+                             "bounds or the N_pre->N difference zonotope; needs the base "
+                             "zono_bounds=true; filename tag _noNpreZono) | "
                              "triangle (adv_std_n2_relax_threshold=0, sibling_gate=false — whole "
                              "technique off) | "
                              "zono_triangle (BOTH bound-tightening techniques off: "
@@ -5052,6 +5072,20 @@ def main():
                             print(f"WARNING: --advstd_ablations zono_triangle — base zono "
                                   f"and triangle are already off; combo equals the base.")
                         zb, rt, sg = "false", 0.0, "false"
+                    elif _tok == "zono_npre":
+                        # Keep the zonotope, ablate ONLY its N_pre input: the
+                        # absolute N2 zonotope is still propagated but is not
+                        # intersected with N_pre's pre-activation bounds or the
+                        # N_pre->N difference zonotope. Encoded as a distinct
+                        # zb VALUE rather than a 12th tuple slot, so the combo
+                        # arity (and every unpack of it) is untouched; the job
+                        # builder maps it to the two Julia flags.
+                        if zb != "true":
+                            print(f"ERROR: --advstd_ablations zono_npre needs the base "
+                                  f"zono_bounds=true (there is no zonotope to take N_pre "
+                                  f"out of); base has zono_bounds={zb}.")
+                            sys.exit(1)
+                        zb = "true_nonpre"
                     elif _tok == "pert_intervals":
                         # PI off ONLY — rt/SibGate kept (true leave-one-out).
                         # When rt > 0 the job builder adds
@@ -5061,12 +5095,12 @@ def main():
                     else:
                         print(f"ERROR: unknown --advstd_ablations component '{_tok_raw}' "
                               f"(expected none | var_hint | warm_start | zono | "
-                              f"triangle | zono_triangle | pert_intervals)")
+                              f"zono_npre | triangle | zono_triangle | pert_intervals)")
                         sys.exit(1)
                     combo = (ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp)
                     # A misconfigured base (not a mere no-op) is an error here —
                     # unlike the Cartesian path we don't silently prune.
-                    if (zb == "true" and bt == "false") or \
+                    if (zb.startswith("true") and bt == "false") or \
                        (np_ != "off" and bt == "false") or \
                        (rt >= 0.0 and bt == "false"):
                         print(f"ERROR: --advstd_ablations '{_tok}' yields combo {combo} that "
@@ -5570,6 +5604,7 @@ def main():
                                 else:                 tech_tag += "bt"
                             if sg == "true":          tech_tag += "sg"
                             if zb == "true":          tech_tag += "zb"
+                            elif zb == "true_nonpre": tech_tag += "zbNoNpre"
                             if np_ == "lp":           tech_tag += "npLP"
                             if vh == "true":          tech_tag += "vhFixed"
                             if pi == "false":         tech_tag += "noPI"
@@ -5592,7 +5627,8 @@ def main():
                                 else:
                                     base_name_to_save += "_boundTight"
                             if sg == "true":          base_name_to_save += "_SibGate"
-                            if zb == "true":          base_name_to_save += "_zonoBounds"
+                            if zb.startswith("true"): base_name_to_save += "_zonoBounds"
+                            if zb == "true_nonpre":   base_name_to_save += "_noNpreZono"
                             if np_ == "lp":           base_name_to_save += "_n1ProbeLP"
                             if vh == "prev":          base_name_to_save += "_varHintFixed"
                             elif vh == "direct":      base_name_to_save += "_varHintDirect"
@@ -5669,7 +5705,12 @@ def main():
                                     "--adv_std_branch_priorities", bp,
                                     "--adv_std_lp_basis", lb,
                                     "--adv_std_bound_tightening", bt,
-                                    "--adv_std_zono_bounds", zb,
+                                    # "true_nonpre" is the zono_npre ablation:
+                                    # zonotope ON, its N_pre input OFF.
+                                    "--adv_std_zono_bounds",
+                                    ("true" if zb == "true_nonpre" else zb),
+                                    "--adv_std_zono_npre",
+                                    ("false" if zb == "true_nonpre" else "true"),
                                     "--adv_std_n1_probe", np_,
                                     "--adv_std_n2_relax_threshold", str(rt),
                                     "--adv_std_n2_sibling_gate", sg,

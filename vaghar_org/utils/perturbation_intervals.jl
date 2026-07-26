@@ -1957,7 +1957,8 @@ end
 # tions of the same quantity, so the result over-approximates N2's true value
 # set. Adding these scalar bounds inside the MIP big-M encoding therefore
 # preserves N2's integer optimum.
-function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init)
+function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
+                                                    use_n1_tighten::Bool=true)
     global n2_abs_up_bounds, n2_abs_down_bounds
     global relu_diff_up_bounds, relu_diff_down_bounds
     global n1_preact_up_bounds, n1_preact_down_bounds
@@ -1972,7 +1973,18 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
     # ReLU loop already falls through to (u_hull, l_hull) when n1_preact /
     # relu_diff are empty (see the relu_layer_idx <= length(n1_preact_up_bounds)
     # guard below), so the zonotope-only output is sound.
-    source_a_available = !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+    # use_n1_tighten=false ablates ONLY the N_pre contribution to this
+    # zonotope (--adv_std_zono_npre=false): the absolute N2 zonotope below is
+    # still propagated, but it is not intersected with N_pre's stored
+    # pre-activation bounds or the N_pre->N difference zonotope. The globals
+    # are left untouched, so the perturbation-difference technique that also
+    # reads relu_diff_* is unaffected -- this ablates the zonotope's use of
+    # N_pre, not N_pre itself.
+    source_a_available = use_n1_tighten &&
+        !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
+    if !use_n1_tighten
+        println("compute_n2_bounds_zonotope_with_n1_tighten: N_pre tightening DISABLED (--adv_std_zono_npre=false); absolute N2 zonotope only")
+    end
     if source_a_available && length(n1_preact_up_bounds) != length(relu_diff_up_bounds)
         println("compute_n2_bounds_zonotope_with_n1_tighten: n1_preact and relu_diff layer counts differ ($(length(n1_preact_up_bounds)) vs $(length(relu_diff_up_bounds))), skipping Source A intersect (Source B = absolute zonotope only)")
         source_a_available = false

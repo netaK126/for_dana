@@ -893,9 +893,16 @@ function safe_filepath(dir::AbstractString, basename::AbstractString, ext::Abstr
         return dir * basename * ext
     end
     h = string(hash(basename), base=16)  # 16-char hex hash
-    # Keep a recognisable prefix (token + model + mode) then append the hash
-    trunc_len = max_name - length(h) - 1  # 1 for underscore separator
-    short_name = basename[1:trunc_len] * "_" * h
+    # Keep a recognisable PREFIX (token + model + mode) *and* the TAIL, with
+    # the hash between them. The tail carries the tags every consumer parses --
+    # _depGuardFix (soundness/staleness), _PerturbedIntervals, _cTagN -- so
+    # cutting it, as a prefix-only truncation does, makes the file read as a
+    # different (and typically stale) run and it is silently dropped from the
+    # tables. The legend below still recovers the full name either way.
+    tail_len = min(length(basename), 64)
+    tail = basename[end-tail_len+1:end]
+    head_len = max_name - length(h) - 2 - length(tail)  # 2 underscores
+    short_name = basename[1:head_len] * "_" * h * "_" * tail
     # Append to legend file so the full flag string is always recoverable
     mkpath(dir)
     legend_path = dir * "_filename_legend.txt"
