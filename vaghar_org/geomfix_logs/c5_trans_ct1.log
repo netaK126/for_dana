@@ -1,0 +1,32 @@
+
+Advanced-standard: 1 technique combinations × 1 seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):
+  mipStart=false  branchPri=off  lpBasis=false  boundTight/BTPR=BoundTightPertRelax0.25  zonoBounds=true  n1Probe=off  varHint=prev_pgd  sibGate=true
+  seeds: [4]
+  [n2_tables_only] N2 (target-network) tables only — skipping N1-only jobs (delta_max N1, N1stdBoost); the essential Phase 1 N1-solve state for advstd N2 is kept.
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [cnn5]
+============================================================
+
+  N2 already exists at /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/model_seed42_itr19_sgd_itr1, skipping training.
+  N1: /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/model_seed42_itr19
+  N2: /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/model_seed42_itr19_sgd_itr1
+  [cnn5] N2 delta_max already complete for c_srcs=[1] at /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/delta_max/delta_max_cnn5_N2_model_seed42_itr19_sgd_itr1 — skipping
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+c_tag = 1  (Julia 1-indexed; Julia writes ctag0 into filenames)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [cnn5] trans(1,1) c_tag=1 N1 state already complete for c_targets=[2, 4, 5] at /root/Downloads/for_dana/vaghar_org/paper_experiments/cifar/cnn5_exp/translation/eps_1,1/n1_state_cnn5_model_seed42_itr19 — skipping N1 solve
+
+── Phase 1+1.5+2 merged across c_tags=[1] [row-priority]: 0 N1 (0 ready, 0 chained) + 0 std-N2 + 2 advstd (2 ready, 0 waiting on N1) ──
+
+============================================================
+Phase 1+1.5+2 (all c_tags): 2 jobs total  (2 ready now, 0 waiting on deps)  1 concurrent slots  (32 cores/job, cores 200-231)
+============================================================
+
+  [[cnn5] trans(1,1) c_tag=1 N2stdBoost(zbbtpr0.25sgpi) seed4] cores 200-231  (0/2 done, 1 queued, 0 locked)
+  [[cnn5] trans(1,1) c_tag=1 N2stdBoost(zbbtpr0.25sgpi) seed4] finished (OK)  [1/2]
+  [[cnn5] trans(1,1) c_tag=1 N2(btpr0.25sgzb) seed4  ] cores 200-231  (1/2 done, 0 queued, 0 locked)
+  [[cnn5] trans(1,1) c_tag=1 N2(btpr0.25sgzb) seed4  ] finished (OK)  [2/2]
+
+Phase 1+1.5+2 (all c_tags): all 2 jobs done.
