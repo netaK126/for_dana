@@ -3409,7 +3409,7 @@ def _update_conclusion_sentence(cwd, vals):
     # The threshold is named because the averages cover the default rows only.
     tau_txt = f"{PAPER_DEFAULT_TAU:g}"
     sentence = (
-        f"For the default threshold $\\tau{{=}}{tau_txt}$, \\tool speeds up "
+        f"\\tool speeds up "
         f"\\baseline by ${g('speedup','ours'):.1f}\\times$ "
         f"on average, and by ${g('speedup','transfer'):.1f}\\times$ with "
         "transfer.\n"

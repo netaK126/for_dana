@@ -6513,7 +6513,7 @@ def _render_aaai_relax_precision_body(model_rows, neuron_counts=None):
     # copies of $N$, so a network of n ReLU neurons contributes 2n binaries.
     # The caption says binaries and the Evaluation text matches it.
     lines.append(
-        r"\caption{Percentage of relaxed binaries and the resulting precision "
+        r"\caption{Percentage of relaxed neurons and the resulting precision "
         r"loss, averaged over all experiments.}")
     lines.append(r"\label{tab:relax-precision}")
     lines.append(r"\end{table}")

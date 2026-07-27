@@ -1,1 +1,35 @@
 nohup: ignoring input
+
+Advanced-standard: 1 technique combinations × 1 seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):
+  mipStart=false  branchPri=off  lpBasis=false  boundTight/BTPR=BoundTightPertRelax0.5  zonoBounds=true  n1Probe=off  varHint=prev_pgd  sibGate=true
+  seeds: [4]
+  [n2_tables_only] N2 (target-network) tables only — skipping N1-only jobs (delta_max N1, N1stdBoost); the essential Phase 1 N1-solve state for advstd N2 is kept.
+
+============================================================
+Phase 0: Training N2 = N1 + 1 SGD epoch(s) [3x100]
+============================================================
+
+  N2 already exists at paper_experiments/mnist/3x100_exp/model_seed42_itr19_sgd_itr1, skipping training.
+  N1: paper_experiments/mnist/3x100_exp/model_seed42_itr19
+  N2: paper_experiments/mnist/3x100_exp/model_seed42_itr19_sgd_itr1
+  [3x100] N2 delta_max already complete for c_srcs=[2] at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x100_exp/delta_max/delta_max_3x100_N2_model_seed42_itr19_sgd_itr1 — skipping
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+c_tag = 2  (Julia 1-indexed; Julia writes ctag1 into filenames)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [3x100] occ(3,3,5) c_tag=2 N1 state already complete for c_targets=[3, 4, 6] at /root/Downloads/for_dana/vaghar_org/paper_experiments/mnist/3x100_exp/occ/eps_3,3,5/n1_state_3x100_model_seed42_itr19 — skipping N1 solve
+
+── Phase 1+1.5+2 merged across c_tags=[2]: 0 N1 (0 ready, 0 chained) + 0 std-N2 + 3 advstd (3 ready, 0 waiting on N1) ──
+
+============================================================
+Phase 1+1.5+2 (all c_tags): 3 jobs total  (3 ready now, 0 waiting on deps)  2 concurrent slots  (32 cores/job, cores 72-99,100-127)
+============================================================
+
+  [[3x100] occ(3,3,5) c_tag=2 N2(btpr0.5sgzb) seed4  ] cores 72-99  (0/3 done, 2 queued, 0 locked)
+  [[3x100] occ(3,3,5) c_tag=2 N2stdBoost(zbbtpr0.5sgpi) seed4] cores 100-127  (0/3 done, 1 queued, 0 locked)
+  [[3x100] occ(3,3,5) c_tag=2 N2stdBoost(zbbtpr0.5sgpi) seed4] finished (OK)  [1/3]
+  [[3x100] occ(3,3,5) c_tag=2 N2stdBoost(btpr0.0) seed4] cores 100-127  (1/3 done, 0 queued, 0 locked)
+  [[3x100] occ(3,3,5) c_tag=2 N2(btpr0.5sgzb) seed4  ] finished (OK)  [2/3]
+  [[3x100] occ(3,3,5) c_tag=2 N2stdBoost(btpr0.0) seed4] finished (OK)  [3/3]
+
+Phase 1+1.5+2 (all c_tags): all 3 jobs done.
