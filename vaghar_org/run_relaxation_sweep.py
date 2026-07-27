@@ -3691,6 +3691,42 @@ def _build_full_results_tex(cwd):
     print(f"[full-results] built {os.path.join(paper_dir, job + '.pdf')}")
 
 
+def _check_repeat_arch(arch, prev_path, prev_ct, prev_cs,
+                       path, group_ct, group_cs, where):
+    """Validate a SECOND --arch_timeouts group for an architecture already
+    listed, exiting with an explanation when the repeat is not a per-source-
+    class cap split.
+
+    Repeating an arch is only meaningful to give its source classes different
+    caps -- MNIST's 3x100 ran c_s 0 and 4 for five hours and c_s 1 for three,
+    and one group carries one cap. So each repeat must name a DISJOINT '#CS'
+    set, and everything else about the architecture (its model path and its
+    '@CT' grid) must agree, since those are per-arch and not per-source-class.
+    """
+    if not prev_cs or not group_cs:
+        print(f"ERROR: --arch_timeouts lists arch '{arch}' more than once"
+              f"{where} without a '#CS' list on every group. Repeating an arch "
+              f"is only allowed to give different source classes different "
+              f"caps, so each group must name the classes its cap applies to.")
+        sys.exit(1)
+    both = sorted(set(prev_cs) & set(group_cs))
+    if both:
+        print(f"ERROR: --arch_timeouts gives arch '{arch}'{where} two caps for "
+              f"source class(es) {both}; the '#CS' lists of repeated groups "
+              f"must be disjoint.")
+        sys.exit(1)
+    if prev_path != path:
+        print(f"ERROR: --arch_timeouts lists arch '{arch}'{where} with two "
+              f"model paths ({prev_path!r} and {path!r}); a repeated arch "
+              f"splits caps by source class, not by model.")
+        sys.exit(1)
+    if (prev_ct or set()) != (group_ct or set()):
+        print(f"ERROR: --arch_timeouts lists arch '{arch}'{where} with two "
+              f"'@CT' target-class grids; a repeated arch splits caps by "
+              f"source class and must keep one target grid.")
+        sys.exit(1)
+
+
 def _parse_arch_timeouts(spec):
     """Parse --arch_timeouts into (arch_runs, force_timeout_by_arch,
     c_targets_by_arch, c_sources_by_arch, dataset_scoped).
@@ -3715,9 +3751,18 @@ def _parse_arch_timeouts(spec):
       The '@...'/'#...' suffixes are stripped off the END of the group first
       (in any order) so they never collide with the arch=path ':'/'=' seps.
 
+    An architecture may be listed in SEVERAL groups, which is how its source
+    classes get different caps: MNIST's 3x100 ran c_s 0 and 4 for five hours and
+    c_s 1 for three, and one group carries one cap. Each repeat must then name a
+    disjoint '#CS' set and keep the same model path and '@CT' grid, see
+    _check_repeat_arch.
+
     Returns:
       * arch_runs           -- list of (arch, model_path) pairs in spec order.
-      * force_timeout_by_arch -- {arch: seconds}.
+      * force_timeout_by_arch -- {arch: seconds}, plus a {(arch, c_s): seconds}
+                               entry per source class whenever an arch was
+                               listed more than once. The bare arch key stays
+                               the fallback for classes no group named.
       * c_targets_by_arch   -- {arch: set_of_0indexed_targets | None}, or None
                                overall when NO group carried a '@CT' (so the
                                caller keeps using the global --ct unchanged). A
@@ -3808,21 +3853,34 @@ def _parse_arch_timeouts(spec):
                 ds_key, a = (p.strip() for p in a.split(":", 1))
                 ds_key = ds_key.lower()
             if ds_key is not None:
-                if a in ds_scoped.get(ds_key, {}):
-                    print(f"ERROR: --arch_timeouts lists arch '{a}' more than "
-                          f"once for dataset '{ds_key}'")
-                    sys.exit(1)
+                prev = ds_scoped.get(ds_key, {}).get(a)
+                if prev is not None:
+                    _check_repeat_arch(a, prev["path"], prev["ct"], prev["cs"],
+                                       mp.strip(), group_ct, group_cs,
+                                       f" for dataset '{ds_key}'")
+                    prev["cs"] = set(prev["cs"]) | set(group_cs)
+                    prev["secs_by_cs"].update({c: secs for c in group_cs})
+                    continue
                 ds_scoped.setdefault(ds_key, {})[a] = {
                     "path": mp.strip(), "secs": secs,
-                    "ct": group_ct, "cs": group_cs}
+                    "ct": group_ct, "cs": group_cs,
+                    "secs_by_cs": ({c: secs for c in group_cs}
+                                   if group_cs else {})}
                 continue
             if a in ft_by_arch:
-                print(f"ERROR: --arch_timeouts lists arch '{a}' more than once")
-                sys.exit(1)
+                _check_repeat_arch(a, dict(arch_runs).get(a), ct_by_arch[a],
+                                   cs_by_arch[a], mp.strip(), group_ct,
+                                   group_cs, "")
+                cs_by_arch[a] = set(cs_by_arch[a]) | set(group_cs)
+                for c in group_cs:
+                    ft_by_arch[(a, c)] = secs
+                continue
             arch_runs.append((a, mp.strip()))
             ft_by_arch[a] = secs
             ct_by_arch[a] = group_ct
             cs_by_arch[a] = group_cs
+            for c in (group_cs or ()):
+                ft_by_arch[(a, c)] = secs
     if not arch_runs and not ds_scoped:
         print("ERROR: --arch_timeouts listed no arch=model_path pairs")
         sys.exit(1)
@@ -3858,7 +3916,14 @@ def _arch_setup_for_dataset(dataset, arch_runs, ft_by_arch, ct_by_arch,
                 break
         else:
             runs.append((arch, cfg["path"]))
+        # A scoped entry replaces the unscoped one wholesale, per-source-class
+        # caps included, so the unscoped arch's (arch, c_s) keys go first.
+        for k in [k for k in ft
+                  if isinstance(k, tuple) and k and k[0] == arch]:
+            del ft[k]
         ft[arch] = cfg["secs"]
+        for c, c_secs in (cfg.get("secs_by_cs") or {}).items():
+            ft[(arch, c)] = c_secs
         if cfg["ct"] is not None:
             ct = dict(ct or {})
             ct[arch] = cfg["ct"]
@@ -4379,7 +4444,12 @@ def main():
                              "@CT groups, --ct). Honored by --paper_tables_from_txt "
                              "(per-model ct) and --find_advstd_faster_than_standard "
                              "(per-model cap): every model renders in one pass, each "
-                             "filtered/clamped to its own cap and target-class set.")
+                             "filtered/clamped to its own cap and target-class set. "
+                             "An arch may be listed in several groups to give its "
+                             "SOURCE classes different caps, e.g. "
+                             "'18000:3x100=.@3,4,6#0,4|10800:3x100=.@3,4,6#1'; each "
+                             "repeat must then carry a disjoint '#CS' list and keep "
+                             "the same model path and '@CT' grid.")
     parser.add_argument("--combination_table", type=str, default=None,
                         metavar="BT:VH[:TAU][,BT:VH[:TAU],...]",
                         help="Restrict the advstd tables in advstd_techniques.tex (overall "

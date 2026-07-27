@@ -5130,16 +5130,44 @@ _AAAI_TIMEOUT_STATUSES = frozenset({
 })
 
 
-def _ft_for(force_timeout, arch):
+def _ft_for(force_timeout, arch, c_src=None):
     """Resolve the effective wall-clock cap for one architecture.
 
     `force_timeout` is either a plain scalar in seconds (the same cap for every
-    arch, from --force_timeout) or a dict {arch: seconds} carrying a different
-    cap per architecture (from --arch_timeouts). None -- or an arch missing from
-    the dict -- disables the cap for that arch."""
+    arch, from --force_timeout) or a dict from --arch_timeouts. None -- or an
+    arch missing from the dict -- disables the cap for that arch.
+
+    The dict is keyed by arch, and additionally by (arch, c_source) when one
+    architecture was run under DIFFERENT caps per source class -- MNIST's 3x100
+    ran c_s 0 and 4 for five hours and c_s 1 for three. A (arch, c_src) key
+    wins over the bare arch key, which stays the fallback for the source classes
+    no group named."""
     if isinstance(force_timeout, dict):
+        if c_src is not None:
+            try:
+                keyed = force_timeout.get((arch, int(c_src)))
+            except (TypeError, ValueError):
+                keyed = None
+            if keyed is not None:
+                return keyed
         return force_timeout.get(arch)
     return force_timeout
+
+
+def _ft_all_for(force_timeout, arch):
+    """Every distinct cap this architecture ran under, as a sorted list: one
+    entry for the usual single-cap arch, several for an arch whose source
+    classes carry different caps. Used where a caption or a chart has to speak
+    about the arch as a whole and a single number would be wrong."""
+    if not isinstance(force_timeout, dict):
+        return [force_timeout] if force_timeout is not None else []
+    caps = set()
+    for k, v in force_timeout.items():
+        if v is None:
+            continue
+        if k == arch or (isinstance(k, tuple) and k and k[0] == arch):
+            caps.add(v)
+    return sorted(caps)
 
 
 def _benchmark_provenance_clause(dataset):
@@ -5176,15 +5204,23 @@ def _benchmark_provenance_clause(dataset):
 def _timeout_caption_clause(force_timeout, arch):
     """A caption sentence stating this architecture's solver timeout, always in
     hours. Empty string when no cap is set for the arch (so the caption is
-    unchanged). Example: ' Each run is given a solver timeout of $3$ hours.'"""
-    ft = _ft_for(force_timeout, arch)
-    if ft is None:
+    unchanged). Example: ' Each run is given a solver timeout of $3$ hours.'
+
+    An architecture whose source classes ran under different caps names them
+    all, since no single number describes its runs."""
+    caps = _ft_all_for(force_timeout, arch)
+    if not caps:
         return ""
-    hrs = ft / 3600.0
-    hrs_str = (f"{hrs:.0f}" if abs(hrs - round(hrs)) < 1e-9
-               else _fmt_trim(hrs))
-    unit = "hour" if hrs_str == "1" else "hours"
-    return f" Each run is given a solver timeout of ${hrs_str}$ {unit}."
+
+    def _hrs(ft):
+        h = ft / 3600.0
+        return f"{h:.0f}" if abs(h - round(h)) < 1e-9 else _fmt_trim(h)
+
+    strs = [f"${_hrs(c)}$" for c in caps]
+    unit = "hour" if strs == ["$1$"] else "hours"
+    joined = (strs[0] if len(strs) == 1
+              else " and ".join([", ".join(strs[:-1]), strs[-1]]))
+    return f" Each run is given a solver timeout of {joined} {unit}."
 
 
 def _ct_for(requested_c_targets, arch):
@@ -5218,8 +5254,10 @@ def _aaai_is_timeout_mismatch(row, force_timeout, eps):
     rows always return False (they're included regardless).
 
     `force_timeout` may be a per-arch dict, in which case this row's own arch
-    selects the cap; a scalar is applied to every arch."""
-    force_timeout = _ft_for(force_timeout, row.get("arch"))
+    -- and, for an arch capped per source class, its own c_source -- selects the
+    cap; a scalar is applied to every arch."""
+    force_timeout = _ft_for(force_timeout, row.get("arch"),
+                            row.get("c_source"))
     if force_timeout is None:
         return False
     status = str(row.get("solve_status", "") or "").upper().replace(" ", "_")
@@ -5454,8 +5492,6 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         # Displayed architecture name (conv1/conv3/3x50/...); the \label ids keep
         # the raw key via safe_arch so cross-refs stay stable.
         arch_disp = _AAAI_ARCH_DISPLAY.get(arch, arch.replace("_", r"\_"))
-        _ft = _ft_for(force_timeout, arch)
-        _cap_min = (_ft / 60.0) if _ft is not None else None
         _eps_min = rerun_timeout_eps / 60.0
         # l l l = model, pert (size), tau; then one "r r r" group per method.
         col_spec = ("@{}l l l | "
@@ -5473,6 +5509,10 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         from itertools import groupby
         for (role, c_src), gkeys in groupby(arch_keys,
                                              key=lambda k: (k[1], k[4])):
+            # The cap is read per source class: an arch whose classes ran under
+            # different caps has no single one.
+            _ft = _ft_for(force_timeout, arch, c_src)
+            _cap_min = (_ft / 60.0) if _ft is not None else None
             dm_entry = None
             if delta_max_by_key is not None:
                 dm_entry = delta_max_by_key.get((arch, role, c_src))
@@ -5698,7 +5738,6 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     if t_v is None:
                         data_cells.append("---")
                     else:
-                        _ft = _ft_for(force_timeout, arch)
                         if _ft is not None:
                             t_v = min(t_v, _ft / 60.0)
                         t_partial = (partial_geom.get(c) if t_is_geom
@@ -5745,7 +5784,6 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                         v = s2.get("t_base")
                     if v is None:
                         return None
-                    _ft = _ft_for(force_timeout, arch)
                     if _ft is not None:
                         v = min(v, _ft / 60.0)
                     return v
@@ -5973,8 +6011,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
     # One timeout figure for the whole dataset block: named only when every
     # architecture in it ran under the same cap, since a mixed block has no
     # single number to name.
-    _ds_caps = {_ft_for(force_timeout, a)
-                for (a, _s, _d) in (ds_archs[True] + ds_archs[False])}
+    _ds_caps = {c
+                for (a, _s, _d) in (ds_archs[True] + ds_archs[False])
+                for c in _ft_all_for(force_timeout, a)}
     _ds_caps = {c for c in _ds_caps if c is not None}
     if len(_ds_caps) == 1:
         _hrs = next(iter(_ds_caps)) / 3600.0
@@ -8871,7 +8910,7 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
             for k in pert_keys:
                 _, pert, p_size, _ = k
                 cells = buckets[k]
-                _ft = _ft_for(force_timeout, arch)
+                _ft = _ft_for(force_timeout, arch, c_src)
                 type_disp = (pert.replace("_", r"\_")
                              .replace("linf", r"$\ell_\infty$"))
                 size_disp = ("(" + p_size + ")").replace("_", r"\_")
@@ -8955,14 +8994,15 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
         # = mean remaining delta_u-delta_l gap); otherwise it stays in the
         # SOLVE-TIME grid (bar height = mean solve time). Any universe Cs absent
         # from a cluster is appended to its x label as "missing Cs=k" in both.
-        _ft = _ft_for(force_timeout, arch)
         # A merged bar "reached the timeout" when its mean solve time is pinned
         # at the wall-clock cap (all contributing Cs runs were clamped there);
-        # rerun_timeout_eps (seconds) is the same slack the sweep uses.
-        cap_min = (_ft / 60.0) if _ft is not None else None
+        # rerun_timeout_eps (seconds) is the same slack the sweep uses. The cap
+        # is read per source class, since one arch can carry several.
         eps_min = rerun_timeout_eps / 60.0
 
-        def _timed_out(v):
+        def _timed_out(v, c_src):
+            _ft = _ft_for(force_timeout, arch, c_src)
+            cap_min = (_ft / 60.0) if _ft is not None else None
             return cap_min is not None and v >= cap_min - eps_min
 
         for (type_disp, size_disp, _tau), bars_by_cs in merge_acc.items():
@@ -8984,7 +9024,7 @@ def _render_aaai_n2_charts(rows, archs, dataset, delta_max_by_key=None,
                 for ct in sorted(common_cts, key=int):
                     pair_times = {sk: cbars[sk][5][ct]
                                   for sk in series_keys}
-                    if all(_timed_out(pair_times[sk])
+                    if all(_timed_out(pair_times[sk], c_src)
                            for sk in series_keys):
                         # All three at the cap: no time signal. Chart the
                         # pair's own remaining delta_u-delta_l gap instead
@@ -9398,8 +9438,8 @@ def _aaai_time_pooled_rows(entries, force_timeout=None, gap_ymax=None):
         # for some of its bars.
         caps = []
         if vmax > _AAAI_TIME_LINE_MIN:
-            caps = sorted({_ft_for(force_timeout, e[1]) for e in chunk
-                           if _ft_for(force_timeout, e[1]) is not None})
+            caps = sorted({c for e in chunk
+                           for c in _ft_all_for(force_timeout, e[1])})
             for ft_secs in caps:
                 ymax = max(ymax, (ft_secs / 60.0) ** power * 1.05)
         span = _aaai_panel_span(groups, sort_by_label=True,
@@ -9986,6 +10026,26 @@ def _bd_in_body(entry):
     return False
 
 
+#: Bounds-difference blocks the BODY figure packs into its LAST row instead of
+#: the place its model-major sort would give them, as
+#: (dataset, arch, perturbation, size) (user request). They sort after every
+#: other block, so the greedy packer drops them into the trailing free space of
+#: the final row rather than opening the figure with them. Only the body figure
+#: honours this; the appendix keeps the plain model-major order.
+_AAAI_BD_PACK_LAST = (
+    ("MNIST", "3$\\times$100", "occ", "3,3,5"),
+)
+
+
+def _bd_pack_last(entry):
+    """1 for a cluster named in _AAAI_BD_PACK_LAST, 0 otherwise -- the leading
+    element of the body figure's sort key."""
+    size = str(entry[2]).strip().strip("()").replace(" ", "")
+    here = (str(entry[0]).strip(), str(entry[3]).strip(),
+            _aaai_pert_key(entry[1]), size)
+    return 1 if here in _AAAI_BD_PACK_LAST else 0
+
+
 def _bd_tau(g):
     """A bounds-difference cluster's threshold; the headline one for the older
     six-element tuples."""
@@ -10057,6 +10117,7 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
         # The EVALUATION shows only the selected clusters; the rest are
         # emitted by regenerate_aaai_bounddiff_appendix_section.
         bd_groups, _rest = _bd_split(bd_groups)
+    is_app = label_stem != "fig:n2-bounddiff"
     try:
         if bd_groups:
             # Same perturbation type+size adjacent (then arch, then dataset,
@@ -10066,8 +10127,12 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
             # Model-major, then perturbation, then the (c_s, c_t) pair, and
             # the threshold LAST: two clusters differing only in threshold are
             # therefore adjacent, with the headline one on the left.
+            # _AAAI_BD_PACK_LAST blocks lead the key with a 1, which parks them
+            # after every other block and so in the last packed row.
             pooled = sorted(bd_groups,
-                            key=lambda g: (g[3], g[0], g[1], g[2], g[4],
+                            key=lambda g: ((0 if is_app
+                                            else _bd_pack_last(g)),
+                                           g[3], g[0], g[1], g[2], g[4],
                                            (g[7] if len(g) > 7 else 0),
                                            _bd_tau_key(g)))
 
@@ -10133,7 +10198,7 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                 graphic += _aaai_bd_single_figure(
                     _groups3(chunk), force_timeout=force_timeout,
                     tex_dir=tex_dir)
-            _is_app = label_stem != "fig:n2-bounddiff"
+            _is_app = is_app
             figs = [r"\begin{figure*}[" + float_spec + "]", r"\centering",
                     _aaai_render_chart_pdf(
                         graphic, f"{basename_stem}_1", tex_dir,
