@@ -164,21 +164,6 @@ function parse_commandline()
         required = false
         default = 0
         # ── Advanced-standard mode flags ─────────────────────────────────
-        "--adv_std_branch_priorities"
-        help = "advanced_standard branch-priority mode: off | rank | decay. " *
-               "rank = order N2 binaries by N1 gap, map ranks to [1,100] (uniform spacing). " *
-               "decay = pri = max(1, round(100·exp(-g/g_med))) (magnitude-aware). " *
-               "Legacy true/false accepted (true → rank, false → off). " *
-               "Legacy values 'bounds' and 'pseudocost' are retired and produce a migration error."
-        arg_type = String
-        required = false
-        default = "rank"
-        # Legacy 'bounds' and 'pseudocost' are accepted here only so the friendly
-        # migration error in main_advanced_standard can fire; otherwise ArgParse
-        # would reject them with a generic message before the shim runs.
-        range_tester = x -> x in ("off", "rank", "decay",
-                                  "bounds", "pseudocost",
-                                  "true", "false")
         "--adv_std_var_hint"
         help = "advanced_standard variable-hint mode (Technique 5): " *
                "off | prev | direct | direct_pgd | prev_pgd. " *
@@ -191,8 +176,7 @@ function parse_commandline()
                "is silent, leave where PGD agrees, withdraw where PGD disagrees. VarHintVal/" *
                "VarHintPri are NOT set under this mode. " *
                "'prev_pgd' is the same Start-consensus routing applied to 'prev's p_i. " *
-               "Legacy 'true'/'false' still accepted (map to 'prev'/'off') with a deprecation warning. " *
-               "Orthogonal to --adv_std_branch_priorities."
+               "Legacy 'true'/'false' still accepted (map to 'prev'/'off') with a deprecation warning."
         arg_type = String
         required = false
         default = "off"
@@ -743,16 +727,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         error("advanced_standard mode requires --model_path2 pointing to N2 (different from N1)")
     end
 
-    bp_mode = args["adv_std_branch_priorities"]
-    # Backward compatibility: accept legacy true/false as rank/off
-    bp_mode = bp_mode == "true"  ? "rank" :
-              bp_mode == "false" ? "off"  : bp_mode
-    if bp_mode == "bounds"
-        error("--adv_std_branch_priorities=bounds is retired; use 'rank' (uniform-spacing) or 'decay' (magnitude-aware) instead.")
-    end
-    if bp_mode == "pseudocost"
-        error("--adv_std_branch_priorities=pseudocost is retired; use 'rank' or 'decay' instead.")
-    end
     # Technique 5: 5-valued mode (off/prev/direct/direct_pgd/prev_pgd); see parse_var_hint_mode.
     var_hint_mode = parse_var_hint_mode(args["adv_std_var_hint"])
     use_lp_basis = args["adv_std_lp_basis"]
@@ -833,7 +807,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     name_to_save_init = name_to_save
 
     println("Advanced-standard mode: techniques enabled:")
-    println("  Technique 2 (Branch Priorities):   $(bp_mode)")
     println("  Technique 3 (LP Basis):            $(use_lp_basis)")
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
@@ -848,8 +821,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         # already has technique flags
     else
         n2_check = n2_check * "_N2_advStd"
-        if bp_mode == "rank";         n2_check = n2_check * "_branchPriRank"; end
-        if bp_mode == "decay";        n2_check = n2_check * "_branchPriDecay"; end
         if use_lp_basis;              n2_check = n2_check * "_lpBasis"; end
         # Technique 6 (BoundTightPertRelax) subsumes bound-tightening — when
         # τ ≥ 0 we emit _BoundTightPertRelax{τ} instead of _boundTight since
@@ -1066,7 +1037,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:suboptimal_solution] = suboptimal_solution_n2
             d_n2[:suboptimal_time] = suboptimal_time_n2
             d_n2[:adv_std_flags] = (
-                adv_std_branch_priorities    = bp_mode,
                 adv_std_lp_basis             = args["adv_std_lp_basis"],
                 adv_std_bound_tightening     = args["adv_std_bound_tightening"],
                 adv_std_zono_bounds          = args["adv_std_zono_bounds"],
@@ -1131,8 +1101,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = name_to_save
             else
                 n2_name = name_to_save * "_N2_advStd"
-                if bp_mode == "rank";         n2_name = n2_name * "_branchPriRank"; end
-                if bp_mode == "decay";        n2_name = n2_name * "_branchPriDecay"; end
                 if use_lp_basis;              n2_name = n2_name * "_lpBasis"; end
                 # See n2_check builder above: _BoundTightPertRelax subsumes _boundTight.
                 if use_bound_tightening
@@ -1203,15 +1171,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             mip_set_delta_property(m_n2, perturbation, d_n2)
             set_optimizer(m_n2, optimizer)
             mip_set_attr(m_n2, perturbation, d_n2, timout)
-
             MOI.set(m_n2, Gurobi.CallbackFunction(), my_callback)
-            # Technique 2: Branching priorities (must be after mip_set_attr to bridge Gurobi backend)
-            if bp_mode == "rank"
-                apply_n1_branch_priorities_rank!(m_n2, n1_layers_info)
-            elseif bp_mode == "decay"
-                apply_n1_branch_priorities_decay!(m_n2, n1_layers_info)
-            end
-            # Technique 5: Variable hints (independent of bp_mode; both can be active).
+            # Technique 5: Variable hints.
             # Mode ∈ {off, prev, direct, direct_pgd, prev_pgd}; apply_n1_var_hints!
             # early-returns on VH_OFF. The *_PGD modes additionally consume PGD's
             # Start values (set by hyper_attack_hints above), so they must run
