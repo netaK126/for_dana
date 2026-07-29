@@ -93,14 +93,6 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     network_version = "org"
     v_in_output = v_in |> nn
 
-    # Pre-compute perturbation interval bounds for the conditional-triangle
-    # relaxation (used by core_ops.jl's relu() when use_relaxations=true).
-    # With nn1==nn2 (same network), diff=0 and composed=pert, so
-    # relu_comp_up/down_bounds will hold the perturbation interval bounds.
-    if use_relaxations
-        compute_diff_and_comp_bounds(nn, nn, I_pert_prev_up, I_pert_prev_down; optimizing_intervals=optimizing_intervals)
-    end
-
     layer_counter = 0
     nueron_counter = 0
     network_version = "perturbation"

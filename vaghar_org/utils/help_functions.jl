@@ -49,8 +49,11 @@ function input_domain_shaped(shape)
 end
 
 # ── Conditional-triangle relaxation globals ──────────────────────────────
-# Populated by compute_diff_and_comp_bounds() before encoding n2_org/n2_pert.
-# Each entry is a Float64 vector (one value per neuron), indexed by ReLU layer.
+# use_relaxations/relaxation_threshold/relaxation_condition_count/
+# relaxation_gap_area belong to the RETIRED legacy relaxation (its CLI flags
+# are gone); they stay defined because core_ops.jl consults them, permanently
+# at their off defaults. optimizing_intervals is LIVE: it feeds the
+# diff-bounds interval clipping.
 global use_relaxations::Bool = false
 global relaxation_threshold::Float64 = 0.5
 global relaxation_condition_count = 0
@@ -124,7 +127,8 @@ global n2_xp_derived_preact_down_bounds = []
 global n2_abs_up_bounds::Vector   = []
 global n2_abs_down_bounds::Vector = []
 
-# ── advstd Technique 4 + N1-probe LP bounds (--adv_std_n1_probe) ───────────
+# ── advstd retired N1-probe LP bounds (Source C; kept because core_ops.jl
+#    consults these globals — nothing populates them anymore) ────────────────
 # Per-ReLU-layer scalar bounds on N2's pre-activation, produced by
 # compute_n2_bounds_n1_probe_lp (Source C). Computed via OBBT on a joint
 # LP-relaxed (N1 + N2) model using N1's post-solve bounds for the triangle
@@ -378,63 +382,42 @@ function clear_n2_relax_decision!()
 end
 
 # ── Technique 5 (Variable Hints) mode ────────────────────────────────────
-# Four methods share the hint-value formula; they differ in how the transfer
-# probability p_i is computed and which Gurobi channel carries the result.
-#   VH_PREV       — shift N1's achieved pre-activation ẑ^N1 by the diff bound,
-#                   clip to [l_n2, u_n2], take p from that interval's lengths.
-#                   Output: VarHintVal + VarHintPri (soft hints).
-#   VH_DIRECT     — take p directly from how lopsided [l_n2, u_n2] is around 0.
-#                   Output: VarHintVal + VarHintPri (soft hints).
-#   VH_DIRECT_PGD — same p as VH_DIRECT, but the hint_val is routed into
-#                   set_start_value() (Gurobi Start), filtered by PGD consensus:
-#                   fill where PGD is silent, leave where PGD agrees, withdraw
-#                   where PGD disagrees. No VarHintVal / VarHintPri written.
-#   VH_PREV_PGD   — same p as VH_PREV (shift-and-clip from ẑ^N1), routed
-#                   through set_start_value() with the same PGD consensus
-#                   filter as VH_DIRECT_PGD. No VarHintVal / VarHintPri written.
-# See §4.3 of advstd_techniques.tex and compute_varhint{,_direct} below.
-@enum VarHintMode VH_OFF VH_PREV VH_DIRECT VH_DIRECT_PGD VH_PREV_PGD
+# One active method (the retired prev/direct/direct_pgd variants are gone):
+#   VH_PREV_PGD — shift N1's achieved pre-activation ẑ^N1 by the diff bound,
+#                 clip to [l_n2, u_n2], take p from that interval's lengths,
+#                 then route hint_val into set_start_value() (Gurobi Start)
+#                 filtered by PGD consensus: fill where PGD is silent, leave
+#                 where PGD agrees, withdraw where PGD disagrees.
+#                 No VarHintVal / VarHintPri written.
+# See §4.3 of advstd_techniques.tex and compute_varhint below.
+@enum VarHintMode VH_OFF VH_PREV_PGD
 
 """
     parse_var_hint_mode(s::AbstractString) -> VarHintMode
 
-Accepts `{"off", "prev", "direct", "direct_pgd", "prev_pgd"}` (case-insensitive).
-Legacy Boolean values `{"true", "false"}` are still accepted and map as
-`"true" → VH_PREV`, `"false" → VH_OFF` with a one-time deprecation warning.
-Any other value raises.
+Accepts `{"off", "prev_pgd"}` (case-insensitive). The retired modes
+(`prev`, `direct`, `direct_pgd`, legacy `true`/`false`) raise.
 """
 function parse_var_hint_mode(s::AbstractString)
     t = lowercase(strip(String(s)))
-    if t == "off" || t == "false"
-        t == "false" && @warn "adv_std_var_hint=false is deprecated; use adv_std_var_hint=off" maxlog=1
+    if t == "off"
         return VH_OFF
-    elseif t == "prev" || t == "true"
-        t == "true" && @warn "adv_std_var_hint=true is deprecated; use adv_std_var_hint=prev" maxlog=1
-        return VH_PREV
-    elseif t == "direct"
-        return VH_DIRECT
-    elseif t == "direct_pgd"
-        return VH_DIRECT_PGD
     elseif t == "prev_pgd"
         return VH_PREV_PGD
     else
-        error("Invalid --adv_std_var_hint value: '$(s)'. Expected one of {off, prev, direct, direct_pgd, prev_pgd} (true/false accepted for backward compatibility).")
+        error("Invalid --adv_std_var_hint value: '$(s)'. Expected one of {off, prev_pgd} (prev/direct/direct_pgd are retired).")
     end
 end
 
 """
     var_hint_mode_label(m::VarHintMode) -> String
 
-Lower-case label matching the CLI/sweep vocabulary (`"off"`, `"prev"`,
-`"direct"`, `"direct_pgd"`, `"prev_pgd"`). Used when serialising the mode back
-into result CSVs so the downstream pipeline sees the same tokens it accepted
-on the command line.
+Lower-case label matching the CLI/sweep vocabulary (`"off"`, `"prev_pgd"`).
+Used when serialising the mode back into result CSVs so the downstream
+pipeline sees the same tokens it accepted on the command line.
 """
 function var_hint_mode_label(m::VarHintMode)
     m == VH_OFF        && return "off"
-    m == VH_PREV       && return "prev"
-    m == VH_DIRECT     && return "direct"
-    m == VH_DIRECT_PGD && return "direct_pgd"
     m == VH_PREV_PGD   && return "prev_pgd"
     error("unknown VarHintMode: $m")
 end
@@ -442,11 +425,10 @@ end
 """
     hint_from_p(v1_bit::Int, p::Float64) -> (hint_val::Int, hint_pri::Int)
 
-Shared tail of the VarHint rule used by both VH_PREV and VH_DIRECT. Agrees
-with N1 when `p ≥ 0.5`, flips when `p < 0.5`; priority is a V-shape in `p`,
-maxing at 100 when `p ∈ {0, 1}` and floored at 1 (priority 0 is reserved by
-Gurobi for "ignore"). Factored out so the two branches cannot drift in how
-they translate a transfer probability into an advisory hint.
+Tail of the VarHint rule. Agrees with N1 when `p ≥ 0.5`, flips when
+`p < 0.5`; priority is a V-shape in `p`, maxing at 100 when `p ∈ {0, 1}`
+and floored at 1 (priority 0 is reserved by Gurobi for "ignore"). Under
+VH_PREV_PGD only `hint_val` is consumed (the Start channel has no priority).
 """
 function hint_from_p(v1_bit::Int, p::Float64)
     hint_val = (p >= 0.5) ? v1_bit : 1 - v1_bit
@@ -457,7 +439,7 @@ end
 """
     compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
 
-Mode **VH_PREV** — previous §4.3 rule. Shifts N1's achieved pre-activation
+The VH_PREV_PGD p-rule (§4.3). Shifts N1's achieved pre-activation
 `z1_preact` by the weight-drift diff bound `[d_lo, d_hi]` to form the
 predicted N2 pre-activation interval, clips to `[l_n2, u_n2]`, and takes
 `p` as the fraction of the clipped interval on N1's side of zero
@@ -485,72 +467,31 @@ function compute_varhint(z1_preact::Float64, v1_bit::Int, d_lo::Float64, d_hi::F
 end
 
 """
-    compute_varhint_direct(v1_bit, l_n2, u_n2)
-
-Mode **VH_DIRECT** — new rule. Derives the transfer probability `p` directly
-from Tech 2's tightened pre-activation range `[l_n2, u_n2]`, without
-constructing any shifted interval or using N1's pre-activation scalar:
-
-  `v1_bit = 0`:  `p = (-l_n2) / (u_n2 - l_n2)`  — fraction of `[l_n2, u_n2]` in `R⁻`
-  `v1_bit = 1`:  `p =   u_n2  / (u_n2 - l_n2)`  — fraction of `[l_n2, u_n2]` in `R⁺`
-
-Self-calibrates: a wider diff bound flows through Tech 2 to produce a wider
-`[l_n2, u_n2]`, pulling `p` toward 0.5 and automatically lowering the hint
-priority. No midpoint-proxy error, no diff-width false confidence.
-
-Precondition: `l_n2 < 0 < u_n2` (enforced upstream by Tech 2 elimination).
-Returns `(hint_val, hint_pri)` via `hint_from_p`.
-"""
-function compute_varhint_direct(v1_bit::Int, l_n2::Float64, u_n2::Float64)
-    @assert l_n2 < 0 && u_n2 > 0 "compute_varhint_direct expects a split neuron (l_n2 < 0 < u_n2), got [$l_n2, $u_n2]"
-    W = u_n2 - l_n2
-    side_len = (v1_bit == 0) ? -l_n2 : u_n2
-    p = side_len / W
-    return hint_from_p(v1_bit, p)
-end
-
-"""
     apply_n1_var_hints!(m_n2, mode, n1_var_names, n1_var_values, n1_layers_info)
 
 Set Gurobi hints on N2 binaries. `mode` is a `VarHintMode` enum:
 
   * `VH_OFF` — return without setting any hint.
-  * `VH_PREV` — use `compute_varhint` (shift ẑ^N1 by diff bound, clip, take p).
-    Output: `VarHintVal` + `VarHintPri`.
-  * `VH_DIRECT` — use `compute_varhint_direct` (p from [l_n2, u_n2] directly).
-    Output: `VarHintVal` + `VarHintPri`.
-  * `VH_DIRECT_PGD` — same p as `VH_DIRECT`, but route `hint_val` through
+  * `VH_PREV_PGD` — compute `p` via `compute_varhint` (shift ẑ^N1 by the
+    diff bound, clip to [l_n2, u_n2], take p), then route `hint_val` through
     `set_start_value` filtered by PGD consensus. For each surviving binary:
     if PGD is silent (no Start set yet), fill with `hint_val`; if PGD agrees
     with `hint_val`, leave PGD's value in place; if PGD disagrees, call
     `set_start_value(a_i, nothing)` to withdraw both. **No `VarHintVal`/
-    `VarHintPri` is written under this mode** — MIPStart is the sole channel.
-  * `VH_PREV_PGD` — same p as `VH_PREV` (shift-and-clip from ẑ^N1), routed
-    through the same Start-consensus filter as `VH_DIRECT_PGD`. No
-    `VarHintVal`/`VarHintPri` is written.
+    `VarHintPri` is written** — MIPStart is the sole channel.
 
 For each surviving N2 binary `a_i` (with `l^{N2}_i < 0 < u^{N2}_i`):
 
   1. Look up N1's binary value `v^{N1}_i` by matching variable name in
      `n1_var_values`.
-  2. Dispatch on `mode` to compute `(hint_val, hint_pri)` (hint_pri is
-     ignored under `VH_*_PGD`):
-       - `VH_PREV` / `VH_PREV_PGD`: also look up `z1_preact` (x_rect for
-         active neurons, `l^{N1}_i / 2` for inactive) and the diff bound
-         `[d_lo, d_hi]`.
-       - `VH_DIRECT` / `VH_DIRECT_PGD`: use only `v1_bit, l_n2, u_n2` — no N1
-         preact, no diff.
-  3. Emit:
-       - `VH_PREV` / `VH_DIRECT`: set `VarHintVal` and `VarHintPri`.
-       - `VH_DIRECT_PGD` / `VH_PREV_PGD`: run the Start-consensus update above.
+  2. Look up `z1_preact` (x_rect for active neurons, `l^{N1}_i / 2` for
+     inactive) and the diff bound `[d_lo, d_hi]`; compute `hint_val`.
+  3. Run the Start-consensus update above.
 
-`VH_PREV` and `VH_PREV_PGD` use globals `relu_diff_up_bounds`/
-`relu_diff_down_bounds` (populated by `load_n1_diff_bounds!` in Phase 2).
-`VH_DIRECT` and `VH_DIRECT_PGD` use only the current `layers_info_dict` (N2's
-final tightened bounds after Tech 2 integration). `VH_DIRECT_PGD` and
-`VH_PREV_PGD` additionally read `JuMP.start_value(v)` on each binary,
-expecting PGD's hints (set by `hyper_attack_hints()`) to have already run for
-this N2 MIP.
+Uses globals `relu_diff_up_bounds`/`relu_diff_down_bounds` (populated by
+`load_n1_diff_bounds!` in Phase 2) and reads `JuMP.start_value(v)` on each
+binary, expecting PGD's hints (set by `hyper_attack_hints()`) to have
+already run for this N2 MIP.
 
 **Soundness.** Under all modes the set attributes (`VarHintVal`, `VarHintPri`,
 `Start`) are advisory. No constraint, coefficient, or variable bound is
@@ -570,10 +511,8 @@ function apply_n1_var_hints!(m_n2, mode::VarHintMode,
         return
     end
     @assert length(n1_var_names) == length(n1_var_values) "n1_var_names and n1_var_values length mismatch ($(length(n1_var_names)) vs $(length(n1_var_values)))"
-    # PREV and PREV_PGD need diff bounds populated by load_n1_diff_bounds!;
-    # DIRECT variants do not.
-    if (mode == VH_PREV || mode == VH_PREV_PGD) &&
-       (isempty(relu_diff_up_bounds) || isempty(relu_diff_down_bounds))
+    # prev_pgd needs diff bounds populated by load_n1_diff_bounds!.
+    if isempty(relu_diff_up_bounds) || isempty(relu_diff_down_bounds)
         error("apply_n1_var_hints!: mode=$(var_hint_mode_label(mode)) requires relu_diff_*_bounds globals. " *
               "Ensure load_n1_diff_bounds! or compute_diff_bounds_* has run before Phase 2 MIP build.")
     end
@@ -584,14 +523,13 @@ function apply_n1_var_hints!(m_n2, mode::VarHintMode,
     end
     # Number of ReLU layers per network copy; layers 1..K are the org copy,
     # K+1..2K are the pert copy. Same diff bound applies to both copies.
-    # Only needed under VH_PREV / VH_PREV_PGD (the diff-bound lookup path).
-    K = (mode == VH_PREV || mode == VH_PREV_PGD) ? length(relu_diff_up_bounds) : 0
+    K = length(relu_diff_up_bounds)
     applied = 0
     flipped = 0
     n2_binary_count = 0
     n_tier1_skipped = 0
     n_no_match = 0
-    # PGD Start-consensus bucket counters (used by VH_DIRECT_PGD and VH_PREV_PGD).
+    # PGD Start-consensus bucket counters.
     n_pgd_silent_filled     = 0
     n_pgd_agreed_nop        = 0
     n_pgd_disagreed_withdrew = 0
@@ -624,77 +562,61 @@ function apply_n1_var_hints!(m_n2, mode::VarHintMode,
             n_tier1_skipped += 1
             continue
         end
-        # Dispatch by mode.
+        # Compute (hint_val, hint_pri) via the prev_pgd p-rule.
         local hint_val::Int
         local hint_pri::Int
-        if mode == VH_DIRECT || mode == VH_DIRECT_PGD
-            # DIRECT / DIRECT_PGD: p derived solely from [l_n2, u_n2]; no N1 preact or diff.
-            (hint_val, hint_pri) = compute_varhint_direct(v1_bit, l_n2, u_n2)
-        else  # VH_PREV or VH_PREV_PGD
-            # N1's bounds for this neuron — keys match because both networks share
-            # architecture; n1_layers_info was saved/loaded in Phase 1/2.
-            haskey(n1_layers_info, (layer, neuron)) || continue
-            (u_n1, l_n1, _) = n1_layers_info[(layer, neuron)]
-            # N1's pre-activation scalar. The big-M encoding only fixes hat_z
-            # exactly when the ReLU was active (then x_rect == hat_z). When
-            # inactive, hat_z is free in [l_n1, 0]; take the midpoint as a proxy.
-            if v1_bit == 1
-                # x_rect name differs from a name by one substring: "a_layerCount" → "x_rect_layerCount"
-                x_rect_name = replace(bin_name, "a_layerCount" => "x_rect_layerCount"; count=1)
-                z1_preact = get(value_by_name, x_rect_name, 0.0)
-            else
-                z1_preact = l_n1 / 2  # midpoint of the inactive range [l_n1, 0]
-            end
-            # Diff bound for this neuron. Layer 1..K → org copy (r = layer);
-            # layer K+1..2K → pert copy (r = layer - K). Same diff for both copies.
-            r = (layer <= K) ? layer : (layer - K)
-            if r < 1 || r > K
-                continue  # layer index out of diff-bound range; skip defensively
-            end
-            diff_up_vec   = vec(relu_diff_up_bounds[r])
-            diff_down_vec = vec(relu_diff_down_bounds[r])
-            if neuron < 1 || neuron > length(diff_up_vec)
-                continue
-            end
-            d_hi = diff_up_vec[neuron]
-            d_lo = diff_down_vec[neuron]
-            (hint_val, hint_pri) = compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
-        end
-        if hint_val != v1_bit; flipped += 1; end
-        if mode == VH_DIRECT_PGD || mode == VH_PREV_PGD
-            # Start-consensus: route hint_val through set_start_value, filtered
-            # by PGD. Expect hyper_attack_hints() to have run earlier in Phase 2;
-            # if PGD failed, JuMP.start_value is nothing on every binary and
-            # this mode degrades to "varHint fills every gap".
-            v_pgd_raw = JuMP.start_value(v)
-            if v_pgd_raw === nothing
-                JuMP.set_start_value(v, Float64(hint_val))
-                n_pgd_silent_filled += 1
-            else
-                v_pgd_bit = Int(round(v_pgd_raw))
-                if v_pgd_bit == hint_val
-                    n_pgd_agreed_nop += 1   # leave PGD's Start in place
-                else
-                    JuMP.set_start_value(v, nothing)
-                    n_pgd_disagreed_withdrew += 1
-                end
-            end
-            applied += 1
+        # N1's bounds for this neuron — keys match because both networks share
+        # architecture; n1_layers_info was saved/loaded in Phase 1/2.
+        haskey(n1_layers_info, (layer, neuron)) || continue
+        (u_n1, l_n1, _) = n1_layers_info[(layer, neuron)]
+        # N1's pre-activation scalar. The big-M encoding only fixes hat_z
+        # exactly when the ReLU was active (then x_rect == hat_z). When
+        # inactive, hat_z is free in [l_n1, 0]; take the midpoint as a proxy.
+        if v1_bit == 1
+            # x_rect name differs from a name by one substring: "a_layerCount" → "x_rect_layerCount"
+            x_rect_name = replace(bin_name, "a_layerCount" => "x_rect_layerCount"; count=1)
+            z1_preact = get(value_by_name, x_rect_name, 0.0)
         else
-            MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintVal"), JuMP.index(v), Float64(hint_val))
-            MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VarHintPri"), JuMP.index(v), hint_pri)
-            applied += 1
+            z1_preact = l_n1 / 2  # midpoint of the inactive range [l_n1, 0]
         end
+        # Diff bound for this neuron. Layer 1..K → org copy (r = layer);
+        # layer K+1..2K → pert copy (r = layer - K). Same diff for both copies.
+        r = (layer <= K) ? layer : (layer - K)
+        if r < 1 || r > K
+            continue  # layer index out of diff-bound range; skip defensively
+        end
+        diff_up_vec   = vec(relu_diff_up_bounds[r])
+        diff_down_vec = vec(relu_diff_down_bounds[r])
+        if neuron < 1 || neuron > length(diff_up_vec)
+            continue
+        end
+        d_hi = diff_up_vec[neuron]
+        d_lo = diff_down_vec[neuron]
+        (hint_val, hint_pri) = compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
+        if hint_val != v1_bit; flipped += 1; end
+        # Start-consensus: route hint_val through set_start_value, filtered
+        # by PGD. Expect hyper_attack_hints() to have run earlier in Phase 2;
+        # if PGD failed, JuMP.start_value is nothing on every binary and
+        # this mode degrades to "varHint fills every gap".
+        v_pgd_raw = JuMP.start_value(v)
+        if v_pgd_raw === nothing
+            JuMP.set_start_value(v, Float64(hint_val))
+            n_pgd_silent_filled += 1
+        else
+            v_pgd_bit = Int(round(v_pgd_raw))
+            if v_pgd_bit == hint_val
+                n_pgd_agreed_nop += 1   # leave PGD's Start in place
+            else
+                JuMP.set_start_value(v, nothing)
+                n_pgd_disagreed_withdrew += 1
+            end
+        end
+        applied += 1
     end
-    if mode == VH_DIRECT_PGD || mode == VH_PREV_PGD
-        println("apply_n1_var_hints!: mode=$(mode), Start-consensus on $applied of $n2_binary_count N2 binaries " *
-                "(pgd-silent-filled=$n_pgd_silent_filled, pgd-agreed-nop=$n_pgd_agreed_nop, " *
-                "pgd-disagreed-withdrew=$n_pgd_disagreed_withdrew, flipped=$flipped, " *
-                "no-N1-match=$n_no_match, Tech2-eliminated-but-survived=$n_tier1_skipped)")
-    else
-        println("apply_n1_var_hints!: mode=$(mode), set VarHintVal/VarHintPri on $applied of $n2_binary_count N2 binaries " *
-                "(flipped=$flipped, no-N1-match=$n_no_match, Tech2-eliminated-but-survived=$n_tier1_skipped)")
-    end
+    println("apply_n1_var_hints!: mode=$(mode), Start-consensus on $applied of $n2_binary_count N2 binaries " *
+            "(pgd-silent-filled=$n_pgd_silent_filled, pgd-agreed-nop=$n_pgd_agreed_nop, " *
+            "pgd-disagreed-withdrew=$n_pgd_disagreed_withdrew, flipped=$flipped, " *
+            "no-N1-match=$n_no_match, Tech2-eliminated-but-survived=$n_tier1_skipped)")
     if n2_binary_count > 0 && applied == 0
         error("apply_n1_var_hints!: 0 of $n2_binary_count N2 binaries received a hint (mode=$(mode)). " *
               "Aborting before optimize! so no mislabeled results are produced. " *

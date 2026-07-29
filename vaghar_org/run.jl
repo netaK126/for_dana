@@ -36,7 +36,6 @@ include("utils/datasets.jl")
 include("utils/models.jl")
 include("utils/mip.jl")
 include("utils/perturbation_intervals.jl")
-include("utils/n1_probe_lp.jl")
 include("utils/n2_relax_decision.jl")
 include("utils/sibgate_emit.jl")
 
@@ -128,26 +127,11 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
-        "--use_relaxations"
-        help = "activate conditional-triangle relaxation; in standard mode relaxes perturbation copy based on perturbed intervals, in transfer mode relaxes n2_org and n2_pert; eliminates binary variables for qualifying neurons"
-        arg_type = Bool
-        required = false
-        default = false
-        "--relaxation_threshold"
-        help = "interval-width threshold Trelax: relax neuron when width < Trelax (0.1=conservative, 0.5=default, 1.0=aggressive, Inf=all)"
-        arg_type = Float64
-        required = false
-        default = 0.5
         "--optimizing_intervals"
         help = "tighter per-neuron ReLU clipping in interval propagation (uses N1/N2 preact stability)"
         arg_type = Bool
         required = false
         default = true
-        "--relaxation_gap_area"
-        help = "use triangle relaxation-gap area scoring instead of interval width for relaxation threshold decision (Method 2)"
-        arg_type = Bool
-        required = false
-        default = false
         "--force_cpu"
         help = "force CPU-only mode for hyper attack (no GPU)"
         arg_type = Bool
@@ -165,23 +149,16 @@ function parse_commandline()
         default = 0
         # ── Advanced-standard mode flags ─────────────────────────────────
         "--adv_std_var_hint"
-        help = "advanced_standard variable-hint mode (Technique 5): " *
-               "off | prev | direct | direct_pgd | prev_pgd. " *
-               "'prev' uses the previous §4.3 rule (shift N1's pre-activation by the diff " *
-               "bound, clip to [l_n2, u_n2], take p from interval-length ratios). " *
-               "'direct' derives p directly from Tech 2's tightened [l_n2, u_n2], without " *
-               "re-introducing the ẑ^N1 midpoint proxy or diff-width noise. " *
-               "'direct_pgd' computes p the same way as 'direct', but routes hint_val into " *
+        help = "advanced_standard variable-hint mode (Technique 5): off | prev_pgd. " *
+               "'prev_pgd' shifts N1's pre-activation by the diff bound, clips to " *
+               "[l_n2, u_n2], takes p from interval-length ratios, and routes hint_val into " *
                "set_start_value() (Gurobi Start) with PGD consensus filtering: fill where PGD " *
                "is silent, leave where PGD agrees, withdraw where PGD disagrees. VarHintVal/" *
-               "VarHintPri are NOT set under this mode. " *
-               "'prev_pgd' is the same Start-consensus routing applied to 'prev's p_i. " *
-               "Legacy 'true'/'false' still accepted (map to 'prev'/'off') with a deprecation warning."
+               "VarHintPri are never set."
         arg_type = String
         required = false
         default = "off"
-        range_tester = x -> lowercase(strip(String(x))) in
-                             ("off", "prev", "direct", "direct_pgd", "prev_pgd", "true", "false")
+        range_tester = x -> lowercase(strip(String(x))) in ("off", "prev_pgd")
         "--adv_std_bound_tightening"
         help = "advanced_standard: tighten N2 bounds using N1 + compute_diff_and_comp_bounds (Technique 4)"
         arg_type = Bool
@@ -205,16 +182,6 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
-        "--adv_std_n1_probe"
-        help = "advanced_standard: run post-Phase-1 LP probing against a joint N1+N2 LP " *
-               "relaxation (triangle ReLU relaxations) to derive tighter per-neuron N2 " *
-               "pre-activation bounds, eliminating more N2 binaries via the existing stable-flip " *
-               "short-circuit. Values: off | lp. Requires --adv_std_bound_tightening true. " *
-               "linf perturbation only in the first implementation; other perturbations skip with a warning."
-        arg_type = String
-        required = false
-        default = "off"
-        range_tester = x -> x in ("off", "lp")
         "--adv_std_n2_relax_threshold"
         help = "advanced_standard (Technique 6): replace N2/N2p ReLU binaries with a " *
                "triangle LP relaxation (no binary) when the triangle-gap-area of N1's interval " *
@@ -353,10 +320,7 @@ end
 function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    global use_relaxations = args["use_relaxations"]
-    global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
-    global relaxation_gap_area = args["relaxation_gap_area"]
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -459,7 +423,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
 
         for c_target in c_targets
             name_to_save = name_to_save_init
-            global relaxation_condition_count = 0
             if c_tag==c_target
                 continue
             end
@@ -531,13 +494,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 println("Adding perturbed interval constraints...")
                 perturbed_interval_constraints(m, nn, "org", "perturbation")
             end
-            if args["use_relaxations"]
-                name_to_save = name_to_save*"_Relaxations"*string(args["relaxation_threshold"])
-                if args["relaxation_gap_area"]
-                    name_to_save = name_to_save*"_GapArea"
-                end
-                println("Applying conditional triangle relaxations with threshold $(args["relaxation_threshold"]) (gap_area=$(args["relaxation_gap_area"]))...")
-            end
 
             # ── Standard-mode boost filename tags (kept distinct from advstd
             # tags via the _stdBoost_ prefix; advstd uses _N2_advStd_…). ──────
@@ -563,9 +519,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             mip_reuse_bounds()
             results.str = update_results_str(results.str, c_tag, c_target, d)
             println(results_path)
-            if args["use_relaxations"]
-                name_to_save = name_to_save * "_RelaxCount" * string(relaxation_condition_count)
-            end
             # Append per-tier neuron counts at the very end, mirroring the
             # advstd _both/_orgDrop/_pertDrop convention so result-file
             # name matching can strip them with a single regex.
@@ -603,10 +556,10 @@ function advstd_results_complete(results_path::AbstractString, n2_name_suffix::A
         return true
     end
     # Search for any .txt file whose name contains the n2_name suffix and the cTag marker.
-    # Strip the probe's _elimOrg{N}_elimPert{N} counts before matching: when
-    # adv_std_n1_probe=lp those counts are injected between the tech flags and
-    # _HyperAttackHints, so the raw filename no longer contains n2_name_suffix
-    # as a contiguous substring. n2_name_suffix itself never has elim counts.
+    # Strip historical _elimOrg{N}_elimPert{N} counts before matching: the
+    # retired N1-probe (Source C) injected them between the tech flags and
+    # _HyperAttackHints in old result files, so those raw filenames do not
+    # contain n2_name_suffix as a contiguous substring.
     ctag_marker = "_cTag" * string(c_tag)
     elim_re = r"_elimOrg\d+_elimPert\d+"
     for fname in readdir(results_path)
@@ -720,7 +673,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         error("advanced_standard mode requires --model_path2 pointing to N2 (different from N1)")
     end
 
-    # Technique 5: 5-valued mode (off/prev/direct/direct_pgd/prev_pgd); see parse_var_hint_mode.
+    # Technique 5: off | prev_pgd; see parse_var_hint_mode.
     var_hint_mode = parse_var_hint_mode(args["adv_std_var_hint"])
     use_bound_tightening = args["adv_std_bound_tightening"]
     use_zono_bounds = args["adv_std_zono_bounds"]
@@ -782,10 +735,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
 
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    global use_relaxations = args["use_relaxations"]
-    global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
-    global relaxation_gap_area = args["relaxation_gap_area"]
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -802,7 +752,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
     println("  Zono uses N_pre (Source A):        $(zono_use_npre)")
-    println("  Technique 4+ (N1 Probe):           $(args["adv_std_n1_probe"])")
     println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
 
@@ -825,14 +774,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if args["adv_std_n2_sibling_gate"]; n2_check = n2_check * "_SibGate"; end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
         if use_zono_bounds && !zono_use_npre; n2_check = n2_check * "_noNpreZono"; end
-        if args["adv_std_n1_probe"] == "lp"; n2_check = n2_check * "_n1ProbeLP"; end
-        # Mode-specific varHint filename tag. Keep the legacy "_varHintFixed"
-        # token for VH_PREV (so historical result files keep comparing cleanly);
-        # VH_DIRECT emits "_varHintDirect"; VH_DIRECT_PGD emits "_varHintDirectPGD";
-        # VH_PREV_PGD emits "_varHintPrevPGD".
-        if var_hint_mode == VH_PREV;       n2_check = n2_check * "_varHintFixed";     end
-        if var_hint_mode == VH_DIRECT;     n2_check = n2_check * "_varHintDirect";    end
-        if var_hint_mode == VH_DIRECT_PGD; n2_check = n2_check * "_varHintDirectPGD"; end
         if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
     if use_hyper_attack; n2_check = n2_check * "_HyperAttackHints"; end
@@ -867,11 +808,9 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         token_signature = string(now().instant.periods.value)
 
         load_n1_from_disk = n1_state_dir != "" && isdir(n1_state_dir)
-        # nn1 is needed for Technique 4 diff-bound computation and for the
-        # N1-probe LP (Source C). In the state-dir load path we normally
-        # skip loading nn1 to save time, but if the probe is enabled we
-        # need nn1's weights to build the joint LP.
-        nn1_needed = !load_n1_from_disk || args["adv_std_n1_probe"] == "lp"
+        # nn1 is needed only for Technique 4 diff-bound computation; in the
+        # state-dir load path we skip loading it to save time.
+        nn1_needed = !load_n1_from_disk
         nn1 = nn1_needed ? get_nn(model_path, model_name, w, h, k, c, dataset) : nothing
         nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
 
@@ -914,33 +853,13 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                                                            use_n1_tighten=zono_use_npre)
             end
 
-            # Source C: joint N1+N2 LP probe via OBBT (--adv_std_n1_probe=lp).
-            # Builds a fresh LP-only model with triangle-relaxed ReLUs for
-            # both N1 and N2 sharing v_in/v_x0, runs per-neuron min/max on
-            # every N2 pre-activation. Output is strictly tighter than
-            # Source A/B because the LP polytope captures cross-neuron
-            # correlations that scalar/zonotope projections lose.
+            # The n2_probe_* globals stay defined (core_ops.jl consults them);
+            # nothing populates them anymore, so clearing keeps them empty.
             clear_n2_probe_bounds()
-            if args["adv_std_n1_probe"] == "lp"
-                println("Advanced-standard: running N1-probe LP (Source C) to tighten N2 bounds...")
-                probe_ran = compute_n2_bounds_n1_probe_lp(
-                    nn1, nn2, perturbation, perturbation_size,
-                    w, h, k, Gurobi.Optimizer)
-                if !probe_ran
-                    println("ERROR: --adv_std_n1_probe=lp was requested but Source C could not run " *
-                            "(see the compute_n2_bounds_n1_probe_lp message above). Aborting this " *
-                            "Phase 2 invocation without running any MIP solves — no result files " *
-                            "will be written. Re-run with compatible prerequisites (supported " *
-                            "perturbation + populated n1_preact/relu_diff bounds + matching ReLU " *
-                            "layer counts) or drop --adv_std_n1_probe.")
-                    return
-                end
-            end
         end
 
         for c_target in c_targets
             name_to_save = name_to_save_init
-            global relaxation_condition_count = 0
             if c_tag == c_target
                 continue
             end
@@ -1027,9 +946,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:adv_std_flags] = (
                 adv_std_bound_tightening     = args["adv_std_bound_tightening"],
                 adv_std_zono_bounds          = args["adv_std_zono_bounds"],
-                adv_std_n1_probe             = args["adv_std_n1_probe"],
                 adv_std_n2_relax_threshold   = args["adv_std_n2_relax_threshold"],
-                adv_std_var_hint             = var_hint_mode_label(var_hint_mode),   # "off" | "prev" | "direct"
+                adv_std_var_hint             = var_hint_mode_label(var_hint_mode),   # "off" | "prev_pgd"
                 gurobi_seed                  = args["gurobi_seed"],
             )
             optimizer = Gurobi.Optimizer
@@ -1099,22 +1017,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 if args["adv_std_n2_sibling_gate"]; n2_name = n2_name * "_SibGate"; end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
                 if use_zono_bounds && !zono_use_npre; n2_name = n2_name * "_noNpreZono"; end
-                if args["adv_std_n1_probe"] == "lp"; n2_name = n2_name * "_n1ProbeLP"; end
-                # See n2_check builder above: VH_PREV keeps the legacy tag,
-                # VH_DIRECT emits "_varHintDirect", VH_DIRECT_PGD emits "_varHintDirectPGD",
-                # VH_PREV_PGD emits "_varHintPrevPGD".
-                if var_hint_mode == VH_PREV;       n2_name = n2_name * "_varHintFixed";     end
-                if var_hint_mode == VH_DIRECT;     n2_name = n2_name * "_varHintDirect";    end
-                if var_hint_mode == VH_DIRECT_PGD; n2_name = n2_name * "_varHintDirectPGD"; end
                 if var_hint_mode == VH_PREV_PGD;   n2_name = n2_name * "_varHintPrevPGD";   end
-            end
-            # Append the probe's binary-elimination counts (org + pert split)
-            # as the LAST suffix so pre-flight substring matching (which uses
-            # n2_check without these counts) still finds already-completed files.
-            if args["adv_std_n1_probe"] == "lp"
-                n2_name = n2_name *
-                          "_elimOrg" * string(n_probe_eliminated_binaries_org) *
-                          "_elimPert" * string(n_probe_eliminated_binaries_pert)
             end
             # Technique 4 (SibGate): per-tier neuron counts so the filename
             # encodes how the relaxation actually played out:
@@ -1191,10 +1094,7 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
 
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    global use_relaxations = args["use_relaxations"]
-    global relaxation_threshold = args["relaxation_threshold"]
     global optimizing_intervals = args["optimizing_intervals"]
-    global relaxation_gap_area = args["relaxation_gap_area"]
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -1255,7 +1155,6 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
         end
 
         for c_target in c_targets
-            global relaxation_condition_count = 0
             if c_tag == c_target
                 continue
             end
