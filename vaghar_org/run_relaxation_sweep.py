@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-Run VHAGaR experiments in two phases:
-  Phase 1: Standard experiments — one job per perturbation type (all run in parallel).
-  Phase 2: Transfer experiments — one job per (perturbation, T, optimizing_intervals)
-            combination (run in parallel after all Phase 1 jobs finish).
-
-Two modes for obtaining N1/N2:
-  Default (dual-seed): Uses two independently trained models from different seeds.
-  --model_path MODE:   N1 = given model, N2 = N1 + extra SGD epoch(s).
+Run the advanced_standard (advstd) sweep:
+  Phase 0:   Train N2 = N1 + extra SGD epoch(s) (--model_path / --arch_models).
+  Phase 0.5: delta_max normalizer runs (--mode standard --perturbation max).
+  Phase 1:   N1 standard solve + state save (--mode advanced_standard_n1).
+  Phase 1.5: standard N2 baseline (--mode standard).
+  Phase 2:   advstd N2 solve per technique combo (--mode advanced_standard_n2).
+  Phase 2.5: stdBoost jobs on N1/N2 (--mode standard with --nn1_* flags).
 
 Maintains up to N concurrent jobs (based on available cores).
 When a job finishes, its core slot is immediately reused by the next job.
 
 Usage:
-    python3 run_relaxation_sweep.py                            # dual-seed mode (default)
-    python3 run_relaxation_sweep.py --model_path /path/to/model_dir  # +1 epoch mode
-    python3 run_relaxation_sweep.py --perturbations patch occ  # only these perturbations
-    python3 run_relaxation_sweep.py --max_cores 100            # limit core usage
-    python3 run_relaxation_sweep.py --skip_standard            # skip phase 1
-    python3 run_relaxation_sweep.py --skip_transfer            # skip phase 2
+    python3 run_relaxation_sweep.py --advanced_standard --model_path /path/to/model_dir
+    python3 run_relaxation_sweep.py --advanced_standard --perturbations patch occ
+    python3 run_relaxation_sweep.py --advanced_standard --max_cores 100
+
+Analysis modes (no jobs launched): --find_advstd_faster_than_standard,
+--paper_tables_from_txt, --ablation_tables, --combo_ranking_csv.
 
 Stop all with Ctrl+C.
 """
@@ -37,9 +36,8 @@ import shutil
 
 # ── Child-process lifecycle ──────────────────────────────────────────────
 # Goal: a Ctrl+C (SIGINT) or `kill <pid>` (SIGTERM) of this supervisor
-# tears down every descendant — including grand-children like julia spawned
-# from utils/run_experiment.py — rather than leaving them orphaned and
-# burning CPU for days.
+# tears down every descendant — including the julia jobs it spawns —
+# rather than leaving them orphaned and burning CPU for days.
 #
 # Two layers:
 #   1. Each child is started with start_new_session=True, putting it (and
@@ -49,8 +47,7 @@ import shutil
 #   2. preexec_fn sets PR_SET_PDEATHSIG so the kernel itself signals each
 #      direct child if the supervisor is SIGKILL'd (no chance to run a
 #      handler). The grandchildren survive that path — only the direct
-#      children get pdeathsig — but it at least prevents the python
-#      run_experiment.py layer from outliving us silently.
+#      children get pdeathsig.
 try:
     import ctypes
     import ctypes.util as _ctypes_util
@@ -265,8 +262,6 @@ def perturbations_for(dataset):
 
 
 # ── Transfer sweep parameters ────────────────────────────────────────────
-THRESHOLDS = [0]#[0, 0.05] # focused on best T_relax candidate
-OPT_INTERVALS = ["true"]#["true", "false"]
 
 # ── CPU pinning ──────────────────────────────────────────────────────────
 CORES_PER_JOB = 32
@@ -310,31 +305,6 @@ def _cores_desc(cores_per_job):
         return "cores " + ",".join(CORE_SLOTS)
     n = _max_slots_for(TOTAL_CORES, cores_per_job)
     return f"cores {CORE_START}-{CORE_START + n * cores_per_job - 1}"
-
-
-def standard_results_exist(pert_spec, cwd, arch="cnn1", dataset="mnist"):
-    """Check if standard N2 results (.txt files) already exist for this perturbation.
-
-    Returns True if at least one vagharNoPerturbed_*_sgd_itr* directory contains .txt
-    result files (these are the standard N2 results that transfer needs).
-    """
-    pert_type, eps_str = pert_spec.split(":", 1)
-    pert_dir_map = {
-        "patch": "patch", "occ": "occ", "translation": "translation",
-        "rotation": "rotation", "brightness": "brightness", "linf": "linf",
-    }
-    pert_dir = pert_dir_map.get(pert_type, pert_type)
-    eps_dir = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp",
-                           pert_dir, f"eps_{eps_str}")
-    if not os.path.isdir(eps_dir):
-        return False
-    # Look for vagharNoPerturbed_*_sgd_itr* dirs with .txt results
-    n2_dirs = [d for pat in n2_glob_patterns("vagharNoPerturbed")
-               for d in glob.glob(os.path.join(eps_dir, pat))]
-    for d in n2_dirs:
-        if glob.glob(os.path.join(d, "*.txt")):
-            return True
-    return False
 
 
 def _parse_c_source_target_pairs(filepath):
@@ -1507,324 +1477,6 @@ def parse_result_file(filepath):
                     continue
     return results
 
-
-def _extract_transfer_file_metadata(filename):
-    """Extract threads, relax_count, optimizing_intervals, and no_n1_bin from a transfer result filename."""
-    threads_match = re.search(r"Therads(\d+)", filename)
-    relax_count_match = re.search(r"RelaxCount(\d+)", filename)
-    opt_intervals = "yes" if "OptimizingIntervals" in filename else "no"
-    no_n1_bin = "yes" if "NoN1BinRelaxOnN2only" in filename else "no"
-    has_last_layer = "N1LastLayer" in filename
-    # New tag is _BoxScalarL; legacy tag is _NoBin. Match either.
-    has_no_bin = ("BoxScalarL" in filename) or ("NoBin" in filename)
-    has_n1xp = "N1xpConf" in filename
-    prune_tol_match = re.search(r"PruneTol([\d.]+)", filename)
-    has_zonotope = "Zonotope" in filename
-    # Legacy tags (pre-merge): now folded into --use_zonotope but still appear
-    # in historical filenames.
-    has_refined_relu_legacy = "RefinedReLU" in filename
-    has_zonotope_conv_legacy = "ZonoConv" in filename
-    has_sparse_zono_legacy = "SparseZono" in filename
-    gen_budget_match = re.search(r"GenBudget(\d+)", filename)
-    has_no_n2_xp = "NoN2xpEnc" in filename
-    # Combine no_n1_encoding and no_n2_xp_encoding into a single field:
-    #   "no" = all networks encoded, "no_n1_encoding+..." = N1(x) skipped,
-    #   "no_n2_xp_encoding+..." = N2(x') skipped
-    has_n1_lp_relax = "NoN1BinRelaxOnN2only" in filename
-    if has_no_n2_xp:
-        encoding_skip = "no_n2_xp_encoding"
-    elif has_n1_lp_relax:
-        encoding_skip = "n1_lp_relax"
-    elif has_last_layer and has_no_bin:
-        encoding_skip = "no_n1_encoding+last_layer_no_bin"
-    elif has_last_layer and has_n1xp:
-        encoding_skip = "no_n1_encoding+last_layer+n1xp"
-    elif has_last_layer:
-        encoding_skip = "no_n1_encoding+last_layer"
-    elif "NoN1Enc" in filename and has_n1xp:
-        encoding_skip = "no_n1_encoding+n1xp"
-    elif "NoN1Enc" in filename:
-        encoding_skip = "no_n1_encoding"
-    else:
-        encoding_skip = "no"
-    if prune_tol_match:
-        encoding_skip += "+pruneTol" + prune_tol_match.group(1)
-    adapt_prune_match = re.search(r"AdaptPrune([\d.]+)", filename)
-    if adapt_prune_match:
-        encoding_skip += "+adaptPrune" + adapt_prune_match.group(1)
-    n1_stab_match = re.search(r"N1StabRelax([\d.]+)", filename)
-    if n1_stab_match:
-        encoding_skip += "+n1StabRelax" + n1_stab_match.group(1)
-    if has_zonotope:
-        encoding_skip += "+zono"
-    zono_ord_match = re.search(r"ZonoOrd(\d+)", filename)
-    if zono_ord_match:
-        encoding_skip += "+zonoOrd" + zono_ord_match.group(1)
-    # Legacy tags — stop cluttering the label; they're implied by +zono now.
-    if has_refined_relu_legacy:
-        encoding_skip += "+refinedReLU"
-    if has_zonotope_conv_legacy:
-        encoding_skip += "+zonoConv"
-    if has_sparse_zono_legacy:
-        encoding_skip += "+sparseZono"
-    if gen_budget_match:
-        encoding_skip += "+genK" + gen_budget_match.group(1)
-    # Legacy --n2_xp_k_value / --bridge_at_split tags (flags removed).
-    n2_xp_k_match = re.search(r"N2xpK(\d+)", filename)
-    if n2_xp_k_match:
-        encoding_skip += "+n2xpK" + n2_xp_k_match.group(1)
-    if "SplitBridge" in filename:
-        encoding_skip += "+splitBridge"
-    if "BoundN2xpOut" in filename:
-        encoding_skip += "+boundN2xpOut"
-    if "BoundN2xpComp" in filename:
-        encoding_skip += "+boundN2xpComp"
-    if "N2xpViaN1Zono" in filename:
-        encoding_skip += "+n2xpViaN1Zono"
-    if "BranchPriN2x" in filename:
-        encoding_skip += "+branchPriN2x"
-    if "capDD" in filename:
-        encoding_skip += "+capDD"
-    # N2 bound tightening (current tags + legacy TightenN2 tag)
-    has_std_warmstart = "StdWarmstart" in filename
-    if has_std_warmstart:
-        encoding_skip += "+stdWarmstart"
-    has_bound_n2_relu = ("BoundN2ReLU" in filename) or ("TightenN2" in filename)
-    has_bound_n2_non_relu = "BoundN2NonReLU" in filename
-    return {
-        "threads": int(threads_match.group(1)) if threads_match else "",
-        "relax_count": int(relax_count_match.group(1)) if relax_count_match else "",
-        "optimizing_intervals": opt_intervals,
-        "encoding_skip": encoding_skip,
-        "bound_n2_relu_using_zonotope": "yes" if has_bound_n2_relu else "no",
-        "bound_n2_non_relu_using_zonotope": "yes" if has_bound_n2_non_relu else "no",
-    }
-
-
-def find_transfer_faster_than_standard(perts, exp_base, csv_transfer_faster, csv_standard_faster,
-                                       csv_transfer_tighter_at_timeout, csv_standard_tighter_at_timeout,
-                                       arch="cnn1", double_check_standard=False,
-                                       compare_to_with_perturbed=False,
-                                       transfer_opt_time_only=False):
-    """For each perturbation/eps, compare transfer vs standard N2 (NoPerturbed).
-
-    Returns four lists of row dicts (transfer_faster, standard_faster,
-    transfer_tighter, standard_tighter). If csv paths are provided,
-    also writes them to CSVs.
-    """
-    import csv
-
-    # Map perturbation name prefix to directory name
-    pert_dir_map = {
-        "patch": "patch",
-        "occ": "occ",
-        "trans": "translation",
-        "rotation": "rotation",
-        "brightness": "brightness",
-        "occ": "occ",
-    }
-
-    fieldnames = [
-        "arch",
-        "perturbation",
-        "perturbation_size",
-        "c_source",
-        "c_target",
-        "time_standard",
-        "time_transfer",
-        "delta_standard_lower_bound",
-        "delta_standard_upper_bound",
-        "delta_diff_transfer_lower_bound",
-        "delta_diff_transfer_upper_bound",
-        "transfer_threads",
-        "T_relax",
-        "relax_count",
-        "optimizing_intervals",
-        "encoding_skip",
-        "bound_n2_relu_using_zonotope",
-        "bound_n2_non_relu_using_zonotope",
-        "how_much_faster",
-    ]
-    if not compare_to_with_perturbed:
-        fieldnames += ["gap_standard", "gap_transfer"]
-    fieldnames += ["solve_status_standard", "solve_status_transfer"]
-
-    rows_transfer_faster = []
-    rows_standard_faster = []
-    rows_transfer_tighter = []
-    rows_standard_tighter = []
-
-    for pert_name, pert_spec in perts:
-        # e.g. pert_spec = "patch:1,14,14,3" -> dir = "patch", eps = "1,14,14,3"
-        pert_type, eps_str = pert_spec.split(":", 1)
-        pert_dir = pert_dir_map.get(pert_type, pert_type)
-        eps_dir = os.path.join(exp_base, pert_dir, f"eps_{eps_str}")
-
-        if not os.path.isdir(eps_dir):
-            print(f"  [{pert_name}] No results directory: {eps_dir}")
-            continue
-
-        # Find standard N2 directories
-        if double_check_standard:
-            std_prefix = "double_check_vhagarNoPertubed"
-        elif compare_to_with_perturbed:
-            std_prefix = "vagharWithPerturbed"
-        else:
-            std_prefix = "vagharNoPerturbed"
-        std_pattern = " or ".join(n2_glob_patterns(std_prefix))
-        standard_n2_dirs = glob_n2_dirs(eps_dir, std_prefix)
-        if not standard_n2_dirs:
-            print(f"  [{pert_name}] No standard N2 ({std_pattern}) found in {eps_dir}")
-            continue
-
-        # Load all standard N2 results: (c_source, c_target) -> result dict
-        standard_results = {}
-        for sd in standard_n2_dirs:
-            txt_files = glob.glob(os.path.join(sd, "*.txt"))
-            for tf in txt_files:
-                parsed = parse_result_file(tf)
-                standard_results.update(parsed)
-
-        if not standard_results:
-            print(f"  [{pert_name}] No results parsed from standard N2 directories")
-            continue
-
-        # Find transfer directories
-        transfer_dirs = sorted(glob.glob(os.path.join(eps_dir, "transfer_*")))
-        if not transfer_dirs:
-            print(f"  [{pert_name}] No transfer directories found")
-            continue
-
-        for td in transfer_dirs:
-            td_name = os.path.basename(td)
-            relax_match = re.search(r"relax([\d.]+|[Ii]nf)", td_name)
-            relax_val = relax_match.group(1) if relax_match else ""
-            if relax_val and "GapArea" in td_name:
-                relax_val = f"rga{relax_val}"
-
-            txt_files = sorted(glob.glob(os.path.join(td, "*.txt")))
-            for tf in txt_files:
-                tf_name = os.path.basename(tf)
-                meta = _extract_transfer_file_metadata(tf_name)
-                transfer_results = parse_result_file(tf)
-
-                for (cs, ct), t_info in sorted(transfer_results.items()):
-                    key = (cs, ct)
-                    if key not in standard_results:
-                        continue
-                    # Skip old-style optimizing_intervals runs (but allow NoN1Encoding and NoN2xpEncoding)
-                    if meta["optimizing_intervals"] == "yes" and meta["encoding_skip"] == "no":
-                        continue
-                    s_info = standard_results[key]
-                    if s_info.get("solve_status", "") == "INTERRUPTED":
-                        continue
-                    if t_info.get("solve_status", "") == "INTERRUPTED":
-                        continue
-
-                    t_time = t_info["optimization_time"] if transfer_opt_time_only else t_info["total_time"]
-                    s_time = s_info["total_time"]
-                    
-                    
-                    # #TODO NETA
-                    # if float(t_info['lower_bound']) > 5:
-                    #     continue
-                    # #TODO NETA
-
-                    row = {
-                        "arch": arch,
-                        "perturbation": pert_type,
-                        "perturbation_size": eps_str,
-                        "c_source": cs,
-                        "c_target": ct,
-                        "time_standard": f"{s_time:.2f}",
-                        "time_transfer": f"{t_time:.2f}",
-                        "delta_standard_lower_bound": f"{s_info['lower_bound']:.6f}",
-                        "delta_standard_upper_bound": f"{s_info['upper_bound']:.6f}",
-                        "delta_diff_transfer_lower_bound": f"{t_info['lower_bound']:.6f}",
-                        "delta_diff_transfer_upper_bound": f"{t_info['upper_bound']:.6f}",
-                        "transfer_threads": meta["threads"],
-                        "T_relax": relax_val,
-                        "relax_count": meta["relax_count"],
-                        "optimizing_intervals": meta["optimizing_intervals"],
-                        "encoding_skip": meta["encoding_skip"],
-                        "bound_n2_relu_using_zonotope": meta["bound_n2_relu_using_zonotope"],
-                        "bound_n2_non_relu_using_zonotope": meta["bound_n2_non_relu_using_zonotope"],
-                    }
-
-                    if not compare_to_with_perturbed:
-                        s_gap = s_info["upper_bound"] - s_info["lower_bound"]
-                        t_gap = t_info["upper_bound"] - t_info["lower_bound"]
-                        row["gap_standard"] = f"{s_gap:.6f}"
-                        row["gap_transfer"] = f"{t_gap:.6f}"
-                    row["solve_status_standard"] = s_info.get("solve_status", "")
-                    row["solve_status_transfer"] = t_info.get("solve_status", "")
-
-                    
-                    if t_time < s_time * 0.99:  # transfer is faster
-                        row["how_much_faster"] = f"{s_time / t_time:.2f}x"
-                        rows_transfer_faster.append(row)
-                    elif s_time < t_time * 0.99:  # standard is faster
-                        row["how_much_faster"] = f"{t_time / s_time:.2f}x"
-                        rows_standard_faster.append(row)
-                    else:  # both hit timeout (~same time)
-                        row["how_much_faster"] = ""
-                        if not compare_to_with_perturbed:
-                            if t_gap < s_gap * 0.99:  # transfer has tighter gap
-                                rows_transfer_tighter.append(row)
-                            elif s_gap < t_gap * 0.99:  # standard has tighter gap
-                                rows_standard_tighter.append(row)
-
-    # Sort helper: (perturbation, perturbation_size, c_source, c_target, numeric_key)
-    def _parse_speed(val):
-        """Parse '2.50x' -> 2.50, empty -> inf."""
-        if not val:
-            return float('inf')
-        return float(val.rstrip('x'))
-
-    def _sort_key_faster(row):
-        return (row["arch"], row["perturbation"], row["perturbation_size"],
-                int(row["c_source"]), int(row["c_target"]),
-                _parse_speed(row["how_much_faster"]))
-
-    def _sort_key_tighter(row):
-        return (row["arch"], row["perturbation"], row["perturbation_size"],
-                int(row["c_source"]), int(row["c_target"]),
-                float(row["gap_transfer"]))
-
-    rows_transfer_faster.sort(key=_sort_key_faster)
-    rows_standard_faster.sort(key=_sort_key_faster)
-    rows_transfer_tighter.sort(key=_sort_key_tighter)
-    rows_standard_tighter.sort(key=_sort_key_tighter)
-
-    def _group_key(row):
-        return (row["arch"], row["perturbation"], row["perturbation_size"],
-                row["c_source"], row["c_target"])
-
-    # Write sorted rows to CSVs, inserting a blank row between groups
-    empty_row = {fn: "" for fn in fieldnames}
-    for filepath, rows in [
-        (csv_transfer_faster, rows_transfer_faster),
-        (csv_standard_faster, rows_standard_faster),
-        (csv_transfer_tighter_at_timeout, rows_transfer_tighter),
-        (csv_standard_tighter_at_timeout, rows_standard_tighter),
-    ]:
-        with open(filepath, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            prev_key = None
-            for row in rows:
-                key = _group_key(row)
-                if prev_key is not None and key != prev_key:
-                    writer.writerow(empty_row)
-                writer.writerow(row)
-                prev_key = key
-
-    print(f"  Wrote {len(rows_transfer_faster)} rows to {csv_transfer_faster}")
-    print(f"  Wrote {len(rows_standard_faster)} rows to {csv_standard_faster}")
-    print(f"  Wrote {len(rows_transfer_tighter)} rows to {csv_transfer_tighter_at_timeout}")
-    print(f"  Wrote {len(rows_standard_tighter)} rows to {csv_standard_tighter_at_timeout}")
-
-    return rows_transfer_faster, rows_standard_faster, rows_transfer_tighter, rows_standard_tighter
 
 
 def _extract_advstd_file_metadata(filename):
@@ -4270,18 +3922,6 @@ def main():
                         help=f"Total cores available (default: {TOTAL_CORES})")
     parser.add_argument("--timeout", type=int, default=1800,
                         help="MIP timeout per class pair in seconds (default: 1800)")
-    parser.add_argument("--thresholds", nargs="*", type=float, default=None,
-                        help="Override relaxation thresholds for transfer phase (default: all)")
-    parser.add_argument("--opt_intervals", nargs="*", default=None,
-                        help="Override optimizing_intervals values for transfer phase (e.g. 'true' 'false')")
-    parser.add_argument("--relaxation_gap_area", type=str, default="true",
-                        help="Use triangle relaxation-gap area scoring instead of interval width (true/false)")
-    parser.add_argument("--skip_standard", action="store_true",
-                        help="Skip phase 1 (standard experiments)")
-    parser.add_argument("--skip_transfer", action="store_true",
-                        help="Skip phase 2 (transfer experiments)")
-    parser.add_argument("--double_check_standard", action="store_true",
-                        help="Also run double-check standard using /root/Downloads/for_dana/code/run.jl")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to existing model directory (containing model.pth). "
                              "N1 = this model, N2 = N1 + extra SGD epoch(s). Replaces dual-seed mode.")
@@ -4315,10 +3955,6 @@ def main():
                              "dataset guaranteed concurrency; idle slots SPILL OVER to the "
                              "other dataset's remaining jobs (work-conserving, no idle cores). "
                              "Default: split the available slots as evenly as possible.")
-    parser.add_argument("--find_transfer_faster_than_standard", action="store_true",
-                        help="Scan existing results and report transfer experiments that are "
-                             "faster than standard N2 (vagharNoPerturbed with sgd) for each "
-                             "perturbation and (c_source, c_target) pair.")
     parser.add_argument("--find_advstd_faster_than_standard", action="store_true",
                         help="Scan existing results and report advanced-standard N2 experiments "
                              "that are faster than regular standard N2 for each perturbation "
@@ -4344,72 +3980,6 @@ def main():
                              "per-experiment ablation tables in sec_full_results_tables.tex. "
                              "Use --ablation_expected to select which (dataset, arch) pairs "
                              "render and to pin the threshold.")
-    parser.add_argument("--skip_vaghar_no_perturbed", action="store_true",
-                        help="When running standard, skip vagharNoPerturbed (without perturbed intervals) "
-                             "and only run vagharWithPerturbed.")
-    parser.add_argument("--standard_only", action="store_true",
-                        help="Run standard verification only on the given model(s), without "
-                             "extra SGD training or creating N2. Implies --skip_transfer.")
-    parser.add_argument("--standard_relaxation_thresholds", type=str, default=None,
-                        help="Comma-separated relaxation thresholds for standard mode "
-                             "(use_perturbed_intervals=true + use_relaxations=true). "
-                             "e.g. '0.05,0.1,0.5'. Passed to run_experiment.py. "
-                             "If not set, standard relaxation step is skipped.")
-    parser.add_argument("--no_n1_binaries_and_relaxtions_only_on_n2", action="store_true",
-                        help="LP-relax all N1 binaries and relax N2(x_p) by conditioning on N2(x) "
-                             "instead of N1(x). Keeps N2(x) exact as anchor.")
-    parser.add_argument("--no_n1_encoding_at_all", action="store_true",
-                        help="Skip N1 encoding entirely; replace conf(N1,x,c)>=delta_1 with "
-                             "interval-bounded constraints on N2 outputs using weight diff bounds.")
-    parser.add_argument("--no_n2_xp_encoding", action="store_true",
-                        help="Skip N2(x') encoding entirely; replace conf(N2,x',c) with "
-                             "interval-bounded output variables using perturbation bounds through N2. "
-                             "Assumes no_n1_encoding_at_all=false.")
-    parser.add_argument("--encode_n1_last_layer", action="store_true",
-                        help="When no_n1_encoding_at_all is active, encode N1 last linear layer "
-                             "exactly using interval-bounded hidden variables; gives exact delta_diff.")
-    parser.add_argument("--cap_delta_diff", action="store_true",
-                        help="Add delta_diff <= max_k(d_hi[c]-d_lo[k]) as a valid upper bound "
-                             "constraint. Tightens LP relaxation for faster solving.")
-    parser.add_argument("--n1_last_layer_prune_tol", type=float, default=0.0,
-                        help="Drop h_n1 variables with interval width <= this and use "
-                             "worst-case constants. 0.0 = only exact singletons. "
-                             "Requires --encode_n1_last_layer.")
-    parser.add_argument("--sweep_n1_adaptive_prune_budget", nargs="*", type=float, default=None,
-                        help="Cross-product: sweep over adaptive pruning budget values. "
-                             "E.g. --sweep_n1_adaptive_prune_budget 0 0.1 0.5 1.0")
-    parser.add_argument("--sweep_n1_stability_relax_threshold", nargs="*", type=float, default=None,
-                        help="Cross-product: sweep over N1 stability relaxation threshold values. "
-                             "E.g. --sweep_n1_stability_relax_threshold -1 0 0.05 0.1")
-    parser.add_argument("--constrain_n1_xp", action="store_true",
-                        help="Add interval-based constraint that conf(N1,x',c_target)<=0; "
-                             "no extra variables, uses pre-computed pert bounds through N1.")
-    parser.add_argument("--use_zonotope", action="store_true",
-                        help="Use zonotope (affine arithmetic) for diff bound propagation; "
-                             "tighter bounds by tracking correlations between neurons.")
-    parser.add_argument("--sweep_zonotope_max_order", nargs="*", type=int, default=None,
-                        help="Cross-product: sweep over zonotope max order values. "
-                             "E.g. --sweep_zonotope_max_order 0 3 5 10. Requires --use_zonotope.")
-    parser.add_argument("--sweep_bound_n2_xp_output_using_composed", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--bound_n2_xp_output_using_composed true and once false.")
-    parser.add_argument("--sweep_bound_n2_xp_using_composed", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--bound_n2_xp_using_composed true and once false.")
-    parser.add_argument("--sweep_branch_priority_n2x_first", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--branch_priority_n2x_first true and once false.")
-    parser.add_argument("--sweep_constrain_n2_xp_via_n1_zonotope", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--constrain_n2_xp_via_n1_zonotope true and once false.")
-    parser.add_argument("--sweep_bound_n2_relu_using_zonotope", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--bound_n2_relu_using_zonotope true and once false. If omitted, runs once "
-                             "with the flag off.")
-    parser.add_argument("--sweep_bound_by_zonotope_n2_hidden_neurons_which_are_not_relu", action="store_true",
-                        help="Cross-product: run each transfer job twice, once with "
-                             "--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu true and once false. "
-                             "If omitted, runs once with the flag off.")
     parser.add_argument("--compare_to_with_perturbed", action="store_true",
                         help="Compare transfer results to vagharWithPerturbed (standard with perturbed "
                              "intervals) instead of vagharNoPerturbed.")
@@ -4490,27 +4060,11 @@ def main():
                              "grows another row: e.g. '0.25,0.5' gives 5 bars. The legend "
                              "names the tau only when more than one is drawn. Only affects "
                              "--paper_tables_from_txt.")
-    parser.add_argument("--transfer_opt_time_only", action="store_true",
-                        help="When comparing times, use only optimization_time for transfer "
-                             "(no hyper_attack_time) while standard still uses total_time.")
-    parser.add_argument("--skip_hyper_transfer_attack", action="store_true",
-                        help="Disable hyper attack (PGD warm-start) in transfer runs.")
-    parser.add_argument("--standard_warmstart", action="store_true",
-                        help="In transfer mode: first solve standard MIP for N1 per (c_tag,c_target) "
-                             "to get delta_1 and binary values, then use those binaries as warm-start "
-                             "hints for the transfer MIP. Transfer jobs become self-contained "
-                             "(no dependency on standard phase). Implies --skip_standard.")
-    parser.add_argument("--standard_warmstart_n1_only", action="store_true",
-                        help="Restrict --standard_warmstart so only N1(x) (n1_org) binaries are "
-                             "hinted in the transfer MIP — skip n1_pert, n2_org, and n2_pert. "
-                             "Only meaningful with the 'full' encoding mode (N1 encoded).")
     # ── Advanced-standard mode ───────────────────────────────────────────
     parser.add_argument("--advanced_standard", action="store_true",
                         help="Run advanced_standard mode: solve standard on N1, then accelerated "
                              "standard on N2 using N1's solver info. Replaces standard+transfer. "
                              "Sweeps over technique flag combinations (excluding all-false).")
-    parser.add_argument("--sweep_adv_std_mip_start", nargs="*", type=str, default=None,
-                        help="Values for adv_std_mip_start (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_branch_priorities", nargs="*", type=str, default=None,
                         help="Values for adv_std_branch_priorities: off | rank | decay "
                              "(legacy true/false accepted; legacy 'bounds'/'pseudocost' map to 'rank' with a warning). "
@@ -4766,14 +4320,8 @@ def main():
               f"(cells that already ran the full budget are kept as done)")
 
     total_cores = args.max_cores
-    thresholds = args.thresholds if args.thresholds else THRESHOLDS
-    opt_intervals = args.opt_intervals if args.opt_intervals else OPT_INTERVALS
     dataset = args.dataset
 
-    if args.standard_only:
-        args.skip_transfer = True
-    if args.standard_warmstart:
-        args.skip_standard = True  # standard is done inside each transfer Julia process
 
     # Build list of (arch, model_path|None) to run. --arch_timeouts folds
     # --arch_models together with a per-model --force_timeout; when given it
@@ -4844,115 +4392,6 @@ def main():
         sys.exit(1)
 
     cwd = os.path.dirname(os.path.abspath(__file__))
-
-    # ── Analysis mode: find transfer faster than standard ─────────
-    if args.find_transfer_faster_than_standard:
-        # Always scan all perturbation types (not just the ones enabled for running)
-        # all_perts = [
-        #     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
-        #     ("occ(14,14,9)",      "occ:14,14,9"),
-        #     ("occ(1,1,5)",        "occ:1,1,5"),
-        #     ("occ(5,5,5)",        "occ:5,5,5"),
-        #     ("brightness(0.25)",  "brightness:0.25"),
-        #     ("contrast(1.5)",     "contrast:1.5"),
-        #     ("trans(1,1)",        "translation:1,1"),
-        #     ("trans(1,3)",        "translation:1,3"),
-        #     ("trans(3,1)",        "translation:3,1"),
-        #     ("trans(3,3)",        "translation:3,3"),
-        #     ("rotation(10)",      "rotation:10"),
-        # ]
-        all_perts = all_perturbations_for(args.dataset)
-        # Write combined CSVs to the dataset-level directory (not per-arch)
-        dblchk = args.double_check_standard
-        suffix = "_double_check_standard" if dblchk else ""
-        if args.compare_to_with_perturbed:
-            suffix += "_vs_withPerturbed"
-        if args.transfer_opt_time_only:
-            suffix += "_transferOptOnly"
-        combined_base = os.path.join(cwd, "paper_experiments", dataset)
-        os.makedirs(combined_base, exist_ok=True)
-        csv_transfer_faster = os.path.join(combined_base, f"transfer_faster_than_standard{suffix}.csv")
-        csv_standard_faster = os.path.join(combined_base, f"standard_faster_than_transfer{suffix}.csv")
-        csv_transfer_tighter = os.path.join(combined_base, f"transfer_tighter_at_timeout{suffix}.csv")
-        csv_standard_tighter = os.path.join(combined_base, f"standard_tighter_at_timeout{suffix}.csv")
-
-        # Collect rows across all archs, write CSVs once with no per-arch files
-        all_tf, all_sf, all_tt, all_st = [], [], [], []
-        for arch, _ in arch_runs:
-            exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
-            print(f"\nScanning results for {arch} in: {exp_base}")
-            tf, sf, tt, st = find_transfer_faster_than_standard(
-                all_perts, exp_base, csv_transfer_faster, csv_standard_faster,
-                csv_transfer_tighter, csv_standard_tighter, arch=arch,
-                double_check_standard=dblchk,
-                compare_to_with_perturbed=args.compare_to_with_perturbed,
-                transfer_opt_time_only=args.transfer_opt_time_only)
-            all_tf.extend(tf)
-            all_sf.extend(sf)
-            all_tt.extend(tt)
-            all_st.extend(st)
-
-        # Re-write combined CSVs with all archs together
-        find_transfer_faster_than_standard.__doc__  # just to access fieldnames
-        import csv as _csv
-        _fieldnames = [
-            "arch", "perturbation", "perturbation_size", "c_source", "c_target",
-            "time_standard", "time_transfer", "delta_standard_lower_bound",
-            "delta_standard_upper_bound", "delta_diff_transfer_lower_bound",
-            "delta_diff_transfer_upper_bound", "transfer_threads", "T_relax",
-            "relax_count", "optimizing_intervals", "encoding_skip",
-            "bound_n2_relu_using_zonotope", "bound_n2_non_relu_using_zonotope", "how_much_faster",
-        ]
-        if not args.compare_to_with_perturbed:
-            _fieldnames += ["gap_standard", "gap_transfer"]
-        _fieldnames += ["solve_status_standard", "solve_status_transfer"]
-
-        def _parse_speed(val):
-            if not val:
-                return float('inf')
-            return float(val.rstrip('x'))
-
-        def _sort_faster(row):
-            return (row["arch"], row["perturbation"], row["perturbation_size"],
-                    int(row["c_source"]), int(row["c_target"]),
-                    _parse_speed(row["how_much_faster"]))
-
-        def _sort_tighter(row):
-            return (row["arch"], row["perturbation"], row["perturbation_size"],
-                    int(row["c_source"]), int(row["c_target"]),
-                    float(row["gap_transfer"]))
-
-        def _group_key(row):
-            return (row["arch"], row["perturbation"], row["perturbation_size"],
-                    row["c_source"], row["c_target"])
-
-        all_tf.sort(key=_sort_faster)
-        all_sf.sort(key=_sort_faster)
-        all_tt.sort(key=_sort_tighter)
-        all_st.sort(key=_sort_tighter)
-
-        empty_row = {fn: "" for fn in _fieldnames}
-        for filepath, rows in [
-            (csv_transfer_faster, all_tf), (csv_standard_faster, all_sf),
-            (csv_transfer_tighter, all_tt), (csv_standard_tighter, all_st),
-        ]:
-            with open(filepath, "w", newline="") as f:
-                writer = _csv.DictWriter(f, fieldnames=_fieldnames)
-                writer.writeheader()
-                prev_key = None
-                for row in rows:
-                    key = _group_key(row)
-                    if prev_key is not None and key != prev_key:
-                        writer.writerow(empty_row)
-                    writer.writerow(row)
-                    prev_key = key
-
-        print(f"\nCombined CSVs ({len(arch_runs)} arch(s)):")
-        print(f"  {len(all_tf)} rows -> {csv_transfer_faster}")
-        print(f"  {len(all_sf)} rows -> {csv_standard_faster}")
-        print(f"  {len(all_tt)} rows -> {csv_transfer_tighter}")
-        print(f"  {len(all_st)} rows -> {csv_standard_tighter}")
-        return
 
     # ── Paper-tables mode: regenerate neta-s-paper tables from advStd txt ──
     if args.paper_tables_from_txt:
@@ -5236,7 +4675,6 @@ def main():
                       + f"  of {max_slots} slots")
 
             # Resolve technique sweep values
-            mip_start_vals = [v.lower() for v in args.sweep_adv_std_mip_start] if args.sweep_adv_std_mip_start else ["true"]
             # Branch priorities: rank (uniform-spacing) / decay (magnitude-aware).
             # Legacy true/false → rank/off. Legacy 'bounds'/'pseudocost' map to 'rank'
             # with a deprecation warning (so old sweep configs still run, but won't
@@ -5299,8 +4737,8 @@ def main():
             # bound_tightening=false (gated on Technique 4's pre-compute block).
             # Note: var_hint_fix has been merged into var_hint (the "fix" is
             # always-on now), so the vhf dimension is gone.
-            # Combos are 10-tuples (ms, bp, lb, bt, zb, np_, rt, vh, sg, pi);
-            # the trailing pi (use_perturbed_intervals) is fixed to "true" in
+            # Combos are 10-tuples (bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp);
+            # the pi (use_perturbed_intervals) field is fixed to "true" in
             # the Cartesian path and only varies via --advstd_ablations.
             if args.advstd_ablations:
                 # ── Leave-one-out ablation path (bypasses the product) ──
@@ -5308,7 +4746,6 @@ def main():
                 # combo; each token spawns one combo with that component
                 # removed. See the --advstd_ablations help text.
                 _abl_lists = {
-                    "--sweep_adv_std_mip_start": mip_start_vals,
                     "--sweep_adv_std_branch_priorities": branch_pri_vals,
                     "--sweep_adv_std_lp_basis": lp_basis_vals,
                     "--sweep_adv_std_bound_tightening": bound_tight_vals,
@@ -5323,11 +4760,11 @@ def main():
                         print(f"ERROR: --advstd_ablations needs a unique base combo, but "
                               f"{_fname} has {len(_vals)} values: {_vals}")
                         sys.exit(1)
-                # 11th field `hyp` = use_hyper_attack. It is part of the combo
+                # Last field `hyp` = use_hyper_attack. It is part of the combo
                 # key (not a side set) because var_hint and warm_start differ
-                # ONLY by it: both set vh=off, so a 10-wide key would make them
-                # identical and the dedup below would silently drop the second.
-                _base = (mip_start_vals[0], branch_pri_vals[0], lp_basis_vals[0],
+                # ONLY by it: both set vh=off, so a key without it would make
+                # them identical and the dedup below would silently drop the second.
+                _base = (branch_pri_vals[0], lp_basis_vals[0],
                          bound_tight_vals[0], zono_bounds_vals[0], n1_probe_vals[0],
                          relax_t_vals[0], var_hint_vals[0], sg_vals[0], "true", "true")
                 technique_combos = []
@@ -5336,7 +4773,7 @@ def main():
                     _tok = _tok_raw.strip().lower()
                     if _tok == "pi":
                         _tok = "pert_intervals"
-                    ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp = _base
+                    bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp = _base
                     if _tok == "none":
                         pass
                     elif _tok == "var_hint":
@@ -5402,7 +4839,7 @@ def main():
                               f"(expected none | var_hint | warm_start | zono | "
                               f"zono_npre | triangle | zono_triangle | pert_intervals)")
                         sys.exit(1)
-                    combo = (ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp)
+                    combo = (bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp)
                     # A misconfigured base (not a mere no-op) is an error here —
                     # unlike the Cartesian path we don't silently prune.
                     if (zb.startswith("true") and bt == "false") or \
@@ -5436,11 +4873,11 @@ def main():
                 technique_combos = [
                     # pi="true", hyp="true": the Cartesian path never varies
                     # perturbed intervals or the hyper-attack warm start.
-                    (ms, bp, lb, bt, zb, np_, rt, vh, sg, "true", "true")
-                    for ms, bp, lb, bt, zb, np_, rt, vh, sg in itertools.product(
-                        mip_start_vals, branch_pri_vals, lp_basis_vals, bound_tight_vals,
+                    (bp, lb, bt, zb, np_, rt, vh, sg, "true", "true")
+                    for bp, lb, bt, zb, np_, rt, vh, sg in itertools.product(
+                        branch_pri_vals, lp_basis_vals, bound_tight_vals,
                         zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals, sg_vals)
-                    if not (ms == "false" and bp == "off" and lb == "false" and bt == "false"
+                    if not (bp == "off" and lb == "false" and bt == "false"
                             and zb == "false" and np_ == "off" and rt < 0.0 and vh == "off"
                             and sg == "false")
                     and not (zb == "true" and bt == "false")
@@ -5502,7 +4939,11 @@ def main():
                         _row = {k: (v.strip() if isinstance(v, str) else v) for k, v in _row.items()}
                         # CSV uses yes/no; sweep uses true/false for binary flags.
                         _yn = {"yes": "true", "no": "false"}
-                        _ms = _yn.get(_row["mip_start"], _row["mip_start"])
+                        # mip_start (Technique 1) is retired; historical CSV rows
+                        # with mip_start=yes describe combos that can no longer
+                        # be launched, so they must not match any current combo.
+                        if _row.get("mip_start", "no") == "yes":
+                            continue
                         _bp = _row["branch_priorities"]  # off / bounds — same in both
                         _lb = _yn.get(_row["lp_basis"], _row["lp_basis"])
                         _bt = _yn.get(_row["bound_tightening"], _row["bound_tightening"])
@@ -5528,7 +4969,7 @@ def main():
                         # describing the sg="false" combos. New CSV layouts can
                         # add a "sibling_gate" column to disambiguate.
                         _sg = _yn.get(_row.get("sibling_gate", "no"), _row.get("sibling_gate", "false"))
-                        _key = (_ms, _bp, _lb, _bt, _zb, _np, _rt, _vh, _sg)
+                        _key = (_bp, _lb, _bt, _zb, _np, _rt, _vh, _sg)
                         _match_value = _row.get(_match_column, "").lower()
                         if _match_value in _priority_rank:
                             safe_keys.add(_key)
@@ -5544,29 +4985,29 @@ def main():
                           "all BoundTightPertRelax combos will be treated as 'untested' "
                           "(permissive). Regenerate the ranking after sweeping to populate it.")
                 # Combos carry a trailing pi field the ranking CSV predates —
-                # match on the first 9 flag fields only.
+                # match on the first 8 flag fields only.
                 pre_filter = len(technique_combos)
-                blocked = [c for c in technique_combos if c[:9] in unsafe_keys]
-                technique_combos = [c for c in technique_combos if c[:9] not in unsafe_keys]
-                n_safe = sum(1 for c in technique_combos if c[:9] in safe_keys)
-                n_untested = sum(1 for c in technique_combos if c[:9] not in safe_keys)
+                blocked = [c for c in technique_combos if c[:8] in unsafe_keys]
+                technique_combos = [c for c in technique_combos if c[:8] not in unsafe_keys]
+                n_safe = sum(1 for c in technique_combos if c[:8] in safe_keys)
+                n_untested = sum(1 for c in technique_combos if c[:8] not in safe_keys)
                 # Preserve flag-product order as the tiebreaker inside each rank.
                 _orig_pos = {c: i for i, c in enumerate(technique_combos)}
                 technique_combos.sort(
-                    key=lambda c: (safe_key_rank.get(c[:9], _UNTESTED_RANK), _orig_pos[c])
+                    key=lambda c: (safe_key_rank.get(c[:8], _UNTESTED_RANK), _orig_pos[c])
                 )
                 print(f"\n--advstd_safe_combos_only: filtered {pre_filter} -> {len(technique_combos)} combos "
                       f"({n_safe} safe, {n_untested} untested, {len(blocked)} blocked) "
                       f"from {args.advstd_safe_combos_only}")
 
             print(f"\nAdvanced-standard: {len(technique_combos)} technique combinations × {len(seed_vals)} seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):")
-            for ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
+            for bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
                 # When bt=true and rt>=0, boundTight is subsumed by BoundTightPertRelax in the filename.
                 bt_desc = f"BoundTightPertRelax{rt}" if (bt == "true" and rt >= 0.0) else \
                           ("boundTight" if bt == "true" else "off")
                 pi_desc = "" if pi == "true" else "  pertIntervals=false(noPI)"
                 hyp_desc = "" if hyp == "true" else "  hyperAttack=false(noWarmStart)"
-                print(f"  mipStart={ms}  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}{pi_desc}{hyp_desc}")
+                print(f"  branchPri={bp}  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}{pi_desc}{hyp_desc}")
             print(f"  seeds: {seed_vals}")
             if args.n2_tables_only:
                 print("  [n2_tables_only] N2 (target-network) tables only — "
@@ -5654,7 +5095,6 @@ def main():
                             "--ct", str(dummy_ct),
                             "--timout", str(args.timeout),
                             "--output_dir", dm_out_dir + "/",
-                            "--c_tag_mode", "false",
                             # delta_max maximises the source-class margin over
                             # the input region. The PGD warm start supplies a
                             # feasible incumbent, and the absolute zonotope
@@ -5699,9 +5139,9 @@ def main():
             need_pseudocosts = False
             # Does any combo in this sweep need the N1 probe? If so, the
             # state dir must also contain n1_preact_bounds.bin. Derived from
-            # the final combo list (index 5 = n1_probe) so the
+            # the final combo list (index 4 = n1_probe) so the
             # --advstd_ablations path is covered too.
-            need_n1_preact = any(c[5] != "off" for c in technique_combos)
+            need_n1_preact = any(c[4] != "off" for c in technique_combos)
             if need_n1_preact:
                 print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
 
@@ -5876,7 +5316,6 @@ def main():
                             "--ct", std_ct_arg,
                             "--timout", str(args.timeout),
                             "--output_dir", std_output_dir + "/",
-                            "--c_tag_mode", "false",
                             "--use_hyper_attack", "true",
                             "--activate_vaghgar_deps", "true",
                             "--use_perturbed_intervals", "true",
@@ -5897,9 +5336,8 @@ def main():
                             pert_type, f"eps_{eps_str}",
                             f"n1_state_{arch}_{n1_tag}")
 
-                        for ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
+                        for bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
                             tech_tag = ""
-                            if ms == "true":          tech_tag += "ms"
                             if bp == "rank":          tech_tag += "bpRank"
                             elif bp == "decay":       tech_tag += "bpDecay"
                             if lb == "true":          tech_tag += "lb"
@@ -5922,7 +5360,6 @@ def main():
                                 f"advStd_{arch}_N1_{n1_tag}")
 
                             base_name_to_save = f"{n2_tag}_N2_advStd"
-                            if ms == "true":          base_name_to_save += "_mipStart"
                             if bp == "rank":          base_name_to_save += "_branchPriRank"
                             elif bp == "decay":       base_name_to_save += "_branchPriDecay"
                             if lb == "true":          base_name_to_save += "_lpBasis"
@@ -5945,7 +5382,7 @@ def main():
                             # skip-check glob, and run.jl's n2_check all stay
                             # consistent automatically. ('none' controls stay
                             # untagged — they are the paper combo's own rows.)
-                            if (ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp) in advstd_ablation_combos:
+                            if (bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp) in advstd_ablation_combos:
                                 base_name_to_save += "_ablation"
 
                             requested_c_targets = _parse_c_targets(
@@ -5978,7 +5415,7 @@ def main():
                                 # label — and therefore in the sweep_logs/
                                 # filename, which is built from the label.
                                 n2_kind = ("N2-ablation"
-                                           if (ms, bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp)
+                                           if (bp, lb, bt, zb, np_, rt, vh, sg, pi, hyp)
                                            in advstd_ablation_combos else "N2")
                                 label = f"{arch_prefix}{pert_name} c_tag={c_tag} {n2_kind}({tech_tag}){seed_suffix}{tag_suffix}"
 
@@ -6006,7 +5443,6 @@ def main():
                                     "--activate_vaghgar_deps", "true",
                                     "--use_perturbed_intervals", pi,
                                     "--Threads_num", str(Threads_num),
-                                    "--adv_std_mip_start", ms,
                                     "--adv_std_branch_priorities", bp,
                                     "--adv_std_lp_basis", lb,
                                     "--adv_std_bound_tightening", bt,
@@ -6286,7 +5722,6 @@ def main():
                                         "--timout", str(args.timeout),
                                         "--output_dir", nn_output_dir + "/",
                                         "--name_to_save", base_name_to_save_nn,
-                                        "--c_tag_mode", "false",
                                         "--use_hyper_attack", "true",
                                         "--activate_vaghgar_deps", "true",
                                         "--use_perturbed_intervals", pi,
@@ -6471,204 +5906,9 @@ def main():
             sys.exit(1)
         return
 
-    try:
-        # ── Build job lists across all arch runs ──────────────────────
-        Threads_num = 32
-        cores_per_job = Threads_num
-        max_slots = _max_slots_for(total_cores, cores_per_job)
-
-        standard_jobs = []   # (pert_name, label, cmd) — pert_name used as dep key
-        transfer_by_pert = {}  # pert_name -> [(label, cmd)]
-        skipped_standard = []  # pert_names where standard results already exist
-
-        for arch, model_path in arch_runs:
-            use_model_path = model_path is not None
-
-            # ── Phase 0: Train +epoch (only in --model_path mode, skipped in --standard_only) ─────
-            n1_dir, n2_dir = None, None
-            if use_model_path and not args.standard_only:
-                print(f"\n{'=' * 60}")
-                print(f"Phase 0: Training N2 = N1 + {args.sgd_epochs} SGD epoch(s) [{arch}]")
-                print(f"{'=' * 60}\n")
-                n1_dir, n2_dir = train_extra_epochs(
-                    model_path, arch, dataset,
-                    sgd_epochs=args.sgd_epochs, lr=args.lr)
-            elif use_model_path and args.standard_only:
-                # standard_only: use the given model as both N1 and N2 (no extra training)
-                n1_dir = os.path.normpath(model_path)
-                if os.path.isfile(n1_dir):
-                    n1_dir = os.path.dirname(n1_dir)
-                n2_dir = n1_dir
-
-            # Build the extra args for run_experiment.py depending on mode
-            if use_model_path:
-                _model_args = ["--model_n1_dir", n1_dir, "--model_n2_dir", n2_dir]
-            else:
-                _model_args = ["--dual_seed"]
-
-            arch_prefix = f"[{arch}] "
-
-            for pert_name, pert_spec in perturbations_for(dataset):
-                job_key = f"{arch}/{pert_name}"
-                std_exists = not args.skip_standard and standard_results_exist(pert_spec, cwd, arch, dataset)
-                if std_exists and not args.double_check_standard:
-                    print(f"  {arch_prefix}{pert_name} Standard results already exist — skipping, "
-                          f"transfer jobs will start immediately.")
-                    skipped_standard.append(job_key)
-                else:
-                    std_label = f"{arch_prefix}{pert_name}"
-                    std_cmd = [
-                        "python3", "utils/run_experiment.py",
-                        "--skip_training",
-                        "--skip_transfer",
-                        "--perturbations", pert_spec,
-                        "--timeout", str(args.timeout),
-                        "--dataset", dataset,
-                        "--arch", arch,
-                    ] + _model_args
-                    if args.double_check_standard:
-                        std_cmd.append("--double_check_standard")
-                    if args.skip_vaghar_no_perturbed:
-                        std_cmd.append("--skip_vaghar_no_perturbed")
-                    if args.standard_relaxation_thresholds is not None:
-                        std_cmd += ["--standard_relaxation_thresholds", args.standard_relaxation_thresholds]
-                    standard_jobs.append((job_key, std_label, std_cmd))
-
-                # Cross-product values for sweep flags.
-                # Default: run with the flag off. --sweep_* enables running multiple values.
-                bound_relu_values = [True] if args.sweep_bound_n2_relu_using_zonotope else [False]
-                bound_non_relu_values = [False, True] if args.sweep_bound_by_zonotope_n2_hidden_neurons_which_are_not_relu else [False]
-                bound_n2xp_out_values = [False, True] if args.sweep_bound_n2_xp_output_using_composed else [False]
-                bound_n2xp_comp_values = [False, True] if args.sweep_bound_n2_xp_using_composed else [False]
-                link_n2xp_values = [False, True] if args.sweep_constrain_n2_xp_via_n1_zonotope else [False]
-                branch_pri_values = [False, True] if args.sweep_branch_priority_n2x_first else [False]
-                adapt_prune_values = args.sweep_n1_adaptive_prune_budget if args.sweep_n1_adaptive_prune_budget else [0.0]
-                zono_order_values = args.sweep_zonotope_max_order if args.sweep_zonotope_max_order else [0]
-                n1_stab_values = args.sweep_n1_stability_relax_threshold if args.sweep_n1_stability_relax_threshold else [-1.0]
-
-                # ── Build encoding mode list ──────────────────────────────
-                # When multiple encoding flags are passed, generate separate
-                # job groups so they run in parallel (not combined into one cmd).
-                encoding_modes = []
-                if args.no_n2_xp_encoding:
-                    encoding_modes.append("no_n2_xp")
-                if args.no_n1_binaries_and_relaxtions_only_on_n2 and not args.no_n1_encoding_at_all:
-                    encoding_modes.append("n1_lp_relax")
-                if args.no_n1_encoding_at_all:
-                    encoding_modes.append("no_n1_enc")
-                if not encoding_modes:
-                    encoding_modes.append("full")
-                # --standard_warmstart: always include "full" so both
-                # with-N1 and without-N1 configs run in parallel
-                if args.standard_warmstart and "full" not in encoding_modes:
-                    encoding_modes.insert(0, "full")
-
-                t_jobs = []
-                for enc_mode in encoding_modes:
-                  for oi, t, b_relu, b_non_relu, b_n2xp_out, b_n2xp, lnk, bpri, ap_budget, zo, sr in itertools.product(
-                        opt_intervals, thresholds, bound_relu_values, bound_non_relu_values,
-                        bound_n2xp_out_values, bound_n2xp_comp_values, link_n2xp_values, branch_pri_values,
-                        adapt_prune_values, zono_order_values, n1_stab_values):
-                                rga_tag = "true" if args.relaxation_gap_area.lower() == "true" else "false"
-                                br_tag = "1" if b_relu else "0"
-                                bnr_tag = "1" if b_non_relu else "0"
-                                ap_tag = f"ap{ap_budget}" if ap_budget > 0 else ""
-                                zo_tag = f"zo{zo}" if zo > 0 else ""
-                                sr_tag = f"sr{sr}" if sr >= 0 else ""
-                                xpout_tag = "bN2xpOut" if b_n2xp_out else ""
-                                xp_tag = "bN2xp" if b_n2xp else ""
-                                lnk_tag = "n1zono" if lnk else ""
-                                bpri_tag = "bpri" if bpri else ""
-                                enc_tag = f" enc={enc_mode}" if enc_mode != "full" else ""
-                                extra = "".join(f" {x}" for x in [ap_tag, zo_tag, sr_tag, xpout_tag, xp_tag, lnk_tag, bpri_tag] if x)
-                                t_label = f"{arch_prefix}{pert_name} T={t} oi={oi} rga={rga_tag} bRelu={br_tag} bNonRelu={bnr_tag}{enc_tag}{extra}"
-                                t_cmd = [
-                                    "python3", "utils/run_experiment.py",
-                                    "--skip_training",
-                                    "--skip_standard",
-                                    "--perturbations", pert_spec,
-                                    "--timeout", str(args.timeout),
-                                    "--dataset", dataset,
-                                    "--arch", arch,
-                                    "--relaxation_thresholds", str(t),
-                                    "--optimizing_intervals", oi,
-                                    "--Threads_num", str(Threads_num),
-                                    "--relaxation_gap_area", args.relaxation_gap_area,
-                                ] + _model_args
-                                # ── Encoding mode flags (mutually exclusive per job) ──
-                                if enc_mode == "no_n2_xp":
-                                    t_cmd.append("--no_n2_xp_encoding")
-                                elif enc_mode == "n1_lp_relax":
-                                    t_cmd.append("--no_n1_binaries_and_relaxtions_only_on_n2")
-                                elif enc_mode == "no_n1_enc":
-                                    t_cmd.append("--no_n1_encoding_at_all")
-                                    if args.encode_n1_last_layer:
-                                        t_cmd.append("--encode_n1_last_layer")
-                                    if args.n1_last_layer_prune_tol > 0:
-                                        t_cmd += ["--n1_last_layer_prune_tol", str(args.n1_last_layer_prune_tol)]
-                                    if args.constrain_n1_xp:
-                                        t_cmd.append("--constrain_n1_xp")
-                                # ── Flags applicable to all modes ──
-                                if args.cap_delta_diff:
-                                    t_cmd.append("--cap_delta_diff")
-                                if args.use_zonotope:
-                                    t_cmd.append("--use_zonotope")
-                                if b_n2xp_out and enc_mode != "no_n2_xp":
-                                    t_cmd.append("--bound_n2_xp_output_using_composed")
-                                if b_n2xp and enc_mode != "no_n2_xp":
-                                    t_cmd.append("--bound_n2_xp_using_composed")
-                                if lnk and enc_mode != "no_n2_xp":
-                                    t_cmd.append("--constrain_n2_xp_via_n1_zonotope")
-                                if bpri:
-                                    t_cmd.append("--branch_priority_n2x_first")
-                                if b_relu:
-                                    t_cmd.append("--bound_n2_relu_using_zonotope")
-                                if b_non_relu:
-                                    t_cmd.append("--bound_by_zonotope_n2_hidden_neurons_which_are_not_relu")
-                                if ap_budget > 0:
-                                    t_cmd += ["--n1_adaptive_prune_budget", str(ap_budget)]
-                                if zo > 0:
-                                    t_cmd += ["--zonotope_max_order", str(zo)]
-                                if sr >= 0:
-                                    t_cmd += ["--n1_stability_relax_threshold", str(sr)]
-                                if args.skip_hyper_transfer_attack:
-                                    t_cmd.append("--skip_hyper_transfer_attack")
-                                if args.standard_warmstart:
-                                    t_cmd.append("--standard_warmstart")
-                                if args.standard_warmstart_n1_only:
-                                    t_cmd.append("--standard_warmstart_n1_only")
-                                t_jobs.append((t_label, t_cmd))
-                transfer_by_pert[job_key] = t_jobs
-
-        # Transfer jobs for skipped-standard perturbations are immediately ready
-        skipped_transfer_ready = [
-            (lbl, cmd)
-            for pn in skipped_standard
-            if pn in transfer_by_pert
-            for (lbl, cmd) in transfer_by_pert[pn]
-        ]
-
-        # ── Phase 1 only ───────────────────────────────────────────────
-        if not args.skip_standard and args.skip_transfer:
-            ready = [(lbl, cmd) for (_, lbl, cmd) in standard_jobs]
-            run_pool(ready, max_slots, cwd, cores_per_job, "Phase 1 (standard)")
-
-        # ── Phase 2 only (all transfer jobs are immediately ready) ─────
-        elif args.skip_standard and not args.skip_transfer:
-            ready = [(lbl, cmd) for jobs in transfer_by_pert.values() for (lbl, cmd) in jobs]
-            run_pool(ready, max_slots, cwd, cores_per_job, "Phase 2 (transfer)")
-
-        # ── Both phases: transfer jobs unlock as each standard job finishes
-        elif not args.skip_standard and not args.skip_transfer:
-            ready = [(lbl, cmd) for (_, lbl, cmd) in standard_jobs] + skipped_transfer_ready
-            # locked_jobs key = standard job label; value = its transfer jobs
-            locked = {lbl: transfer_by_pert[pn] for (pn, lbl, _) in standard_jobs}
-            run_pool(ready, max_slots, cwd, cores_per_job,
-                     "Sweep", locked_jobs=locked)
-
-    except KeyboardInterrupt:
-        print("\nCtrl+C received — terminating all running jobs...")
-        sys.exit(1)
+    print("This sweep now supports only --advanced_standard runs and the analysis modes "
+          "(the legacy standard+transfer pipeline was removed).")
+    sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -48,12 +48,6 @@ function input_domain_shaped(shape)
     return (zeros(Float64, shape), ones(Float64, shape))
 end
 
-# Verification-mode selector for the TwoSafe comparison (Def 2.10 / 3.1):
-# "none" ⇒ optimization (Max delta); "asymmetric"/"symmetric" ⇒ decision at
-# fixed (ε, τ). τ is the softmax-confidence threshold.
-global twosafe_property = "none"
-global tau = 0.0
-
 # ── Conditional-triangle relaxation globals ──────────────────────────────
 # Populated by compute_diff_and_comp_bounds() before encoding n2_org/n2_pert.
 # Each entry is a Float64 vector (one value per neuron), indexed by ReLU layer.
@@ -308,23 +302,6 @@ mutable struct FirstMIPSolution
     time::Float64
 end
 first_mip_solution = FirstMIPSolution(-1.0, 0.0)
-
-# ── Hybrid Solve state (lazy argmax for N1 confidence) ─────────────────
-# When hybrid_solve=true, the MIP starts with a scalar lower bound on
-# conf_n1 and no argmax binaries. The callback inspects integer-feasible
-# solutions: if the scalar bound is too loose (actual min-margin >> L),
-# it adds a lazy constraint tightening delta_diff.
-mutable struct HybridSolveState
-    active::Bool
-    v_margin::Vector{Any}       # per-class margin variables (JuMP)
-    delta_diff::Any             # JuMP variable
-    conf_n2_x::Any              # JuMP variable
-    c_tag::Int
-    n_classes::Int
-    L::Float64                  # scalar lower bound (delta_1 + 1e-3)
-    n_cuts_added::Int
-end
-hybrid_solve_state = HybridSolveState(false, [], nothing, nothing, 0, 0, 0.0, 0)
 
 layers_info_dict = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
 
@@ -950,30 +927,6 @@ function save_results(results_path, model_name, perturbation, perturbation_size,
    end
 end
 
-# TwoSafe decision-mode result: robust / counterexample / inconclusive + time
-# (instead of the (δ_l, δ_u, t) triple that save_results writes for the
-# optimization mode). Written when --twosafe_property is asymmetric/symmetric.
-function save_twosafe_result(results_path, model_name, perturbation, perturbation_size, d, ss, tt, name_to_save, token_signature, verdict, property, tau_val)
-    mkpath(results_path)
-    basename = token_signature*"_"*model_name*"_"*perturbation*"_"*create_perturbation_string(perturbation_size)*"_ctag"*string(ss)*"_twosafe_"*name_to_save
-    eps_val = perturbation_size[1]
-    solve_time = get(d, :solve_time, 0.0)
-    open(safe_filepath(results_path, basename), "w") do file
-        write(file, "source,target,property,tau,epsilon,verdict,solve_time\n")
-        write(file, string(ss, ",", tt, ",", property, ",", tau_val, ",", eps_val, ",", verdict, ",", solve_time, "\n"))
-        if verdict == "NOT_ROBUST"
-            try
-                write(file, "# counterexample x (original input): " * join(vec(d[:v_in]), ",") * "\n")
-                write(file, "# counterexample x' (perturbed input): " * join(vec(d[:v_in_p]), ",") * "\n")
-            catch e
-                write(file, "# counterexample inputs unavailable\n")
-            end
-        end
-    end
-    println("TwoSafe[", property, " tau=", tau_val, " eps=", eps_val, "] src=", ss, " tgt=", tt,
-            " => ", verdict, " (", round(solve_time, digits=2), "s)")
-end
-
 function create_perturbation_string(perturbation_size)
     perturbation_size_string = ""
     for i in eachindex(perturbation_size)
@@ -996,24 +949,6 @@ function get_default_tightening_options(optimizer)::Dict
     end
 end
 
-function set_branch_priority_n2x_first!(m)
-    n_org = 0
-    n_pert = 0
-    for v in JuMP.all_variables(m)
-        if JuMP.is_binary(v)
-            vname = JuMP.name(v)
-            if startswith(vname, "n2_orga")
-                MOI.set(m, Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), 10)
-                n_org += 1
-            elseif startswith(vname, "n2_perta")
-                MOI.set(m, Gurobi.VariableAttribute("BranchPriority"), JuMP.index(v), 1)
-                n_pert += 1
-            end
-        end
-    end
-    println("  branch_priority: N2(x) binaries=$n_org (priority=10), N2(x') binaries=$n_pert (priority=1)")
-end
-
 function my_callback(cb_data::Gurobi.CallbackData, where::Int32)
     if where == GRB_CB_MIPSOL
         resultP = Ref{Float64}()
@@ -1025,7 +960,7 @@ function my_callback(cb_data::Gurobi.CallbackData, where::Int32)
             first_mip_solution.time = run_time[]
         end
 
-        # (hybrid_solve tightening happens after optimize! in hybrid_solve_phase2!)
+
     end
 end
 
@@ -1074,49 +1009,3 @@ function update_results_str(results, c_tag, c_target, d)
     return results * row * "\n"
 end
 
-# Read delta_1 (upper_bound) from a VHAGaR results file for a given c_target.
-# Supports both formats:
-#   New: c_source=0,c_target=3,lower_bound=...,upper_bound=...,optimization_time=...,hyper_attack_time=...
-#   Old: source,target,incumbent_obj,best_bound,solve_time
-function get_delta1_vaghar(results_path, c_target_index)
-    open(results_path, "r") do io
-        requested_line = ""
-        while !eof(io)
-            line_content = readline(io)
-            if isempty(strip(line_content))
-                continue
-            end
-            # Detect format by checking for key=value pairs
-            if occursin("c_target=", line_content)
-                # New named format
-                kv = Dict(strip(k) => strip(v) for (k, v) in
-                    (Base.split(pair, '=') for pair in Base.split(line_content, ',') if occursin("=", pair)))
-                if haskey(kv, "c_target") && parse(Int, kv["c_target"]) == c_target_index - 1
-                    requested_line = line_content
-                end
-            else
-                # Old positional format
-                tokens = Base.split(line_content, ',')
-                if length(tokens) >= 4
-                    target_in_file = parse(Int, tokens[2])
-                    if target_in_file == c_target_index - 1
-                        requested_line = line_content
-                    end
-                end
-            end
-        end
-        if requested_line == ""
-            println("Warning: no delta_1 found for c_target=$c_target_index in $results_path")
-            return -1.0
-        end
-        # Parse the matched line
-        if occursin("upper_bound=", requested_line)
-            kv = Dict(strip(k) => strip(v) for (k, v) in
-                (Base.split(pair, '=') for pair in Base.split(requested_line, ',') if occursin("=", pair)))
-            return parse(Float64, kv["upper_bound"])
-        else
-            parsed_tokens = Base.split(requested_line, ',')
-            return parse(Float64, parsed_tokens[4])
-        end
-    end
-end
