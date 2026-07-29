@@ -76,73 +76,22 @@ function extract_all_variable_values(m)
     return names, values
 end
 
-"""
-    extract_vbasis(m)
-
-Extract LP basis status (VBasis) for all variables from a solved Gurobi model.
-Returns a Dict mapping variable name → basis status integer.
-"""
-function extract_vbasis(m)
-    vbasis = Dict{String, Int}()
-    first_err = nothing
-    for v in JuMP.all_variables(m)
-        try
-            status = MOI.get(m, Gurobi.VariableAttribute("VBasis"), v)
-            vbasis[JuMP.name(v)] = status
-        catch e
-            if first_err === nothing; first_err = e; end
-        end
-    end
-    if isempty(vbasis) && first_err !== nothing
-        open("/tmp/julia_extract_debug.log", "a") do io
-            println(io, "[", now(), "] extract_vbasis: all queries failed. First error:")
-            println(io, sprint(showerror, first_err))
-        end
-    end
-    println("extract_vbasis: extracted $(length(vbasis)) basis statuses")
-    return vbasis
-end
-
-"""
-    apply_vbasis!(m_n2, vbasis)
-
-Apply LP basis status from N1 to N2's model as warm start for the root LP.
-"""
-function apply_vbasis!(m_n2, vbasis::Dict{String, Int})
-    if isempty(vbasis)
-        println("apply_vbasis!: no basis to apply")
-        return
-    end
-    applied = 0
-    for v in JuMP.all_variables(m_n2)
-        name = JuMP.name(v)
-        if haskey(vbasis, name)
-            MOI.set(JuMP.backend(m_n2), Gurobi.VariableAttribute("VBasis"), JuMP.index(v), vbasis[name])
-            applied += 1
-        end
-    end
-    println("apply_vbasis!: applied $applied / $(length(vbasis)) basis statuses")
-end
-
 # ── N1 state persistence (advanced_standard_n1 → advanced_standard_n2) ──
 
 """
     save_n1_state(state_dir, c_tag, c_target, n1_var_names, n1_var_values,
-                  n1_layers_info, n1_vbasis)
+                  n1_layers_info)
 
 Save N1 solver state for one (c_tag, c_target) pair to disk.
-Files: n1_vars_{c_tag}_{c_target}.bin, n1_layers_{c_tag}_{c_target}.bin,
-       n1_vbasis_{c_tag}_{c_target}.bin.
+Files: n1_vars_{c_tag}_{c_target}.bin, n1_layers_{c_tag}_{c_target}.bin.
 """
 function save_n1_state(state_dir::String, c_tag::Int, c_target::Int,
                        n1_var_names::Vector{String}, n1_var_values::Vector{Float64},
-                       n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}},
-                       n1_vbasis::Dict{String, Int})
+                       n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
     mkpath(state_dir)
     tag = "$(c_tag)_$(c_target)"
     serialize(joinpath(state_dir, "n1_vars_$tag.bin"), (n1_var_names, n1_var_values))
     serialize(joinpath(state_dir, "n1_layers_$tag.bin"), n1_layers_info)
-    serialize(joinpath(state_dir, "n1_vbasis_$tag.bin"), n1_vbasis)
     println("save_n1_state: saved to $state_dir (c_tag=$c_tag, c_target=$c_target)")
 end
 
@@ -173,35 +122,20 @@ end
     load_n1_state(state_dir, c_tag, c_target)
 
 Load N1 solver state for one (c_tag, c_target) pair from disk.
-Returns (n1_var_names, n1_var_values, n1_layers_info, n1_vbasis).
+Returns (n1_var_names, n1_var_values, n1_layers_info).
 """
-function load_n1_state(state_dir::String, c_tag::Int, c_target::Int;
-                       require_vbasis::Bool=false)
+function load_n1_state(state_dir::String, c_tag::Int, c_target::Int)
     tag = "$(c_tag)_$(c_target)"
     vars_path   = joinpath(state_dir, "n1_vars_$tag.bin")
     layers_path = joinpath(state_dir, "n1_layers_$tag.bin")
-    vbasis_path = joinpath(state_dir, "n1_vbasis_$tag.bin")
-    # n1_vars and n1_layers are consumed by every advstd technique (Tech 2
-    # bound tightening, Tech 3 varHint, Tech 4 relax) — always mandatory.
-    # n1_vbasis is consumed only by LP Basis transfer (--adv_std_lp_basis=true);
-    # pass require_vbasis=use_lp_basis at the call site. When LP Basis is off,
-    # tolerate absence with an empty-dict fallback rather than killing a run
-    # that would never have read the file anyway.
+    # n1_vars and n1_layers are consumed by every advstd technique (bound
+    # tightening, varHint, relax) — always mandatory.
     isfile(vars_path)   || error("load_n1_state: mandatory file missing: $vars_path — re-run Phase 1 for c_tag=$c_tag, c_target=$c_target")
     isfile(layers_path) || error("load_n1_state: mandatory file missing: $layers_path — re-run Phase 1 for c_tag=$c_tag, c_target=$c_target")
     n1_var_names, n1_var_values = deserialize(vars_path)
     n1_layers_info = deserialize(layers_path)
-    if isfile(vbasis_path)
-        n1_vbasis = deserialize(vbasis_path)
-        vb_msg = "$(length(n1_vbasis)) basis"
-    elseif require_vbasis
-        error("load_n1_state: mandatory file missing: $vbasis_path — required when --adv_std_lp_basis=true. Re-run Phase 1 for c_tag=$c_tag, c_target=$c_target, or disable --adv_std_lp_basis.")
-    else
-        n1_vbasis = Dict{String, Int}()
-        vb_msg = "no vbasis file (LP Basis disabled, not required)"
-    end
-    println("load_n1_state: loaded from $state_dir (c_tag=$c_tag, c_target=$c_target, $(length(n1_var_names)) vars, $(length(n1_layers_info)) neurons, $vb_msg)")
-    return n1_var_names, n1_var_values, n1_layers_info, n1_vbasis
+    println("load_n1_state: loaded from $state_dir (c_tag=$c_tag, c_target=$c_target, $(length(n1_var_names)) vars, $(length(n1_layers_info)) neurons)")
+    return n1_var_names, n1_var_values, n1_layers_info
 end
 
 """

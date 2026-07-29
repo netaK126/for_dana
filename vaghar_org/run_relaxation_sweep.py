@@ -4065,8 +4065,6 @@ def main():
                         help="Run advanced_standard mode: solve standard on N1, then accelerated "
                              "standard on N2 using N1's solver info. Replaces standard+transfer. "
                              "Sweeps over technique flag combinations (excluding all-false).")
-    parser.add_argument("--sweep_adv_std_lp_basis", nargs="*", type=str, default=None,
-                        help="Values for adv_std_lp_basis (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_bound_tightening", nargs="*", type=str, default=None,
                         help="Values for adv_std_bound_tightening (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_zono_bounds", nargs="*", type=str, default=None,
@@ -4670,7 +4668,6 @@ def main():
                       + (f" +{_spill} shared" if _spill > 0 else "")
                       + f"  of {max_slots} slots")
 
-            lp_basis_vals = [v.lower() for v in args.sweep_adv_std_lp_basis] if args.sweep_adv_std_lp_basis else ["true"]
             bound_tight_vals = [v.lower() for v in args.sweep_adv_std_bound_tightening] if args.sweep_adv_std_bound_tightening else ["true"]
             zono_bounds_vals = [v.lower() for v in args.sweep_adv_std_zono_bounds] if args.sweep_adv_std_zono_bounds else ["false"]
             n1_probe_vals = [v.lower() for v in args.sweep_adv_std_n1_probe] if args.sweep_adv_std_n1_probe else ["off"]
@@ -4711,7 +4708,7 @@ def main():
             # bound_tightening=false (gated on Technique 4's pre-compute block).
             # Note: var_hint_fix has been merged into var_hint (the "fix" is
             # always-on now), so the vhf dimension is gone.
-            # Combos are 9-tuples (lb, bt, zb, np_, rt, vh, sg, pi, hyp);
+            # Combos are 8-tuples (bt, zb, np_, rt, vh, sg, pi, hyp);
             # the pi (use_perturbed_intervals) field is fixed to "true" in
             # the Cartesian path and only varies via --advstd_ablations.
             if args.advstd_ablations:
@@ -4720,7 +4717,6 @@ def main():
                 # combo; each token spawns one combo with that component
                 # removed. See the --advstd_ablations help text.
                 _abl_lists = {
-                    "--sweep_adv_std_lp_basis": lp_basis_vals,
                     "--sweep_adv_std_bound_tightening": bound_tight_vals,
                     "--sweep_adv_std_zono_bounds": zono_bounds_vals,
                     "--sweep_adv_std_n1_probe": n1_probe_vals,
@@ -4737,8 +4733,7 @@ def main():
                 # key (not a side set) because var_hint and warm_start differ
                 # ONLY by it: both set vh=off, so a key without it would make
                 # them identical and the dedup below would silently drop the second.
-                _base = (lp_basis_vals[0],
-                         bound_tight_vals[0], zono_bounds_vals[0], n1_probe_vals[0],
+                _base = (bound_tight_vals[0], zono_bounds_vals[0], n1_probe_vals[0],
                          relax_t_vals[0], var_hint_vals[0], sg_vals[0], "true", "true")
                 technique_combos = []
                 _abl_by_combo = {}  # combo -> token (for the banner)
@@ -4746,7 +4741,7 @@ def main():
                     _tok = _tok_raw.strip().lower()
                     if _tok == "pi":
                         _tok = "pert_intervals"
-                    lb, bt, zb, np_, rt, vh, sg, pi, hyp = _base
+                    bt, zb, np_, rt, vh, sg, pi, hyp = _base
                     if _tok == "none":
                         pass
                     elif _tok == "var_hint":
@@ -4812,7 +4807,7 @@ def main():
                               f"(expected none | var_hint | warm_start | zono | "
                               f"zono_npre | triangle | zono_triangle | pert_intervals)")
                         sys.exit(1)
-                    combo = (lb, bt, zb, np_, rt, vh, sg, pi, hyp)
+                    combo = (bt, zb, np_, rt, vh, sg, pi, hyp)
                     # A misconfigured base (not a mere no-op) is an error here —
                     # unlike the Cartesian path we don't silently prune.
                     if (zb.startswith("true") and bt == "false") or \
@@ -4846,11 +4841,11 @@ def main():
                 technique_combos = [
                     # pi="true", hyp="true": the Cartesian path never varies
                     # perturbed intervals or the hyper-attack warm start.
-                    (lb, bt, zb, np_, rt, vh, sg, "true", "true")
-                    for lb, bt, zb, np_, rt, vh, sg in itertools.product(
-                        lp_basis_vals, bound_tight_vals,
+                    (bt, zb, np_, rt, vh, sg, "true", "true")
+                    for bt, zb, np_, rt, vh, sg in itertools.product(
+                        bound_tight_vals,
                         zono_bounds_vals, n1_probe_vals, relax_t_vals, var_hint_vals, sg_vals)
-                    if not (lb == "false" and bt == "false"
+                    if not (bt == "false"
                             and zb == "false" and np_ == "off" and rt < 0.0 and vh == "off"
                             and sg == "false")
                     and not (zb == "true" and bt == "false")
@@ -4921,7 +4916,10 @@ def main():
                         # with a non-off value describe combos that can no longer run.
                         if _row.get("branch_priorities", "off") not in ("off", ""):
                             continue
-                        _lb = _yn.get(_row["lp_basis"], _row["lp_basis"])
+                        # lp_basis (Technique 3) is retired; historical rows with
+                        # lp_basis=yes describe combos that can no longer run.
+                        if _row.get("lp_basis", "no") == "yes":
+                            continue
                         _bt = _yn.get(_row["bound_tightening"], _row["bound_tightening"])
                         # var_hint is 5-valued (off/prev/direct/direct_pgd/prev_pgd) in the sweep. CSV
                         # rows may contain legacy "yes"/"no" (from pre-tri-valued extractor runs)
@@ -4945,7 +4943,7 @@ def main():
                         # describing the sg="false" combos. New CSV layouts can
                         # add a "sibling_gate" column to disambiguate.
                         _sg = _yn.get(_row.get("sibling_gate", "no"), _row.get("sibling_gate", "false"))
-                        _key = (_lb, _bt, _zb, _np, _rt, _vh, _sg)
+                        _key = (_bt, _zb, _np, _rt, _vh, _sg)
                         _match_value = _row.get(_match_column, "").lower()
                         if _match_value in _priority_rank:
                             safe_keys.add(_key)
@@ -4961,29 +4959,29 @@ def main():
                           "all BoundTightPertRelax combos will be treated as 'untested' "
                           "(permissive). Regenerate the ranking after sweeping to populate it.")
                 # Combos carry a trailing pi field the ranking CSV predates —
-                # match on the first 7 flag fields only.
+                # match on the first 6 flag fields only.
                 pre_filter = len(technique_combos)
-                blocked = [c for c in technique_combos if c[:7] in unsafe_keys]
-                technique_combos = [c for c in technique_combos if c[:7] not in unsafe_keys]
-                n_safe = sum(1 for c in technique_combos if c[:7] in safe_keys)
-                n_untested = sum(1 for c in technique_combos if c[:7] not in safe_keys)
+                blocked = [c for c in technique_combos if c[:6] in unsafe_keys]
+                technique_combos = [c for c in technique_combos if c[:6] not in unsafe_keys]
+                n_safe = sum(1 for c in technique_combos if c[:6] in safe_keys)
+                n_untested = sum(1 for c in technique_combos if c[:6] not in safe_keys)
                 # Preserve flag-product order as the tiebreaker inside each rank.
                 _orig_pos = {c: i for i, c in enumerate(technique_combos)}
                 technique_combos.sort(
-                    key=lambda c: (safe_key_rank.get(c[:7], _UNTESTED_RANK), _orig_pos[c])
+                    key=lambda c: (safe_key_rank.get(c[:6], _UNTESTED_RANK), _orig_pos[c])
                 )
                 print(f"\n--advstd_safe_combos_only: filtered {pre_filter} -> {len(technique_combos)} combos "
                       f"({n_safe} safe, {n_untested} untested, {len(blocked)} blocked) "
                       f"from {args.advstd_safe_combos_only}")
 
             print(f"\nAdvanced-standard: {len(technique_combos)} technique combinations × {len(seed_vals)} seed(s) (all-off + zono/probe/relax-without-boundTight + sibgate-without-relax excluded):")
-            for lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
+            for bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
                 # When bt=true and rt>=0, boundTight is subsumed by BoundTightPertRelax in the filename.
                 bt_desc = f"BoundTightPertRelax{rt}" if (bt == "true" and rt >= 0.0) else \
                           ("boundTight" if bt == "true" else "off")
                 pi_desc = "" if pi == "true" else "  pertIntervals=false(noPI)"
                 hyp_desc = "" if hyp == "true" else "  hyperAttack=false(noWarmStart)"
-                print(f"  lpBasis={lb}  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}{pi_desc}{hyp_desc}")
+                print(f"  boundTight/BTPR={bt_desc}  zonoBounds={zb}  n1Probe={np_}  varHint={vh}  sibGate={sg}{pi_desc}{hyp_desc}")
             print(f"  seeds: {seed_vals}")
             if args.n2_tables_only:
                 print("  [n2_tables_only] N2 (target-network) tables only — "
@@ -5115,9 +5113,9 @@ def main():
             need_pseudocosts = False
             # Does any combo in this sweep need the N1 probe? If so, the
             # state dir must also contain n1_preact_bounds.bin. Derived from
-            # the final combo list (index 4 = n1_probe) so the
+            # the final combo list (index 2 = n1_probe) so the
             # --advstd_ablations path is covered too.
-            need_n1_preact = any(c[3] != "off" for c in technique_combos)
+            need_n1_preact = any(c[2] != "off" for c in technique_combos)
             if need_n1_preact:
                 print("This sweep requires n1_preact_bounds.bin (adv_std_n1_probe != off).")
 
@@ -5312,9 +5310,8 @@ def main():
                             pert_type, f"eps_{eps_str}",
                             f"n1_state_{arch}_{n1_tag}")
 
-                        for lb, bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
+                        for bt, zb, np_, rt, vh, sg, pi, hyp in technique_combos:
                             tech_tag = ""
-                            if lb == "true":          tech_tag += "lb"
                             # _BoundTightPertRelax subsumes _boundTight (see run.jl).
                             if bt == "true":
                                 if rt >= 0.0:         tech_tag += f"btpr{rt}"
@@ -5334,7 +5331,6 @@ def main():
                                 f"advStd_{arch}_N1_{n1_tag}")
 
                             base_name_to_save = f"{n2_tag}_N2_advStd"
-                            if lb == "true":          base_name_to_save += "_lpBasis"
                             if bt == "true":
                                 if rt >= 0.0:
                                     base_name_to_save += f"_BoundTightPertRelax{rt}"
@@ -5354,7 +5350,7 @@ def main():
                             # skip-check glob, and run.jl's n2_check all stay
                             # consistent automatically. ('none' controls stay
                             # untagged — they are the paper combo's own rows.)
-                            if (lb, bt, zb, np_, rt, vh, sg, pi, hyp) in advstd_ablation_combos:
+                            if (bt, zb, np_, rt, vh, sg, pi, hyp) in advstd_ablation_combos:
                                 base_name_to_save += "_ablation"
 
                             requested_c_targets = _parse_c_targets(
@@ -5387,7 +5383,7 @@ def main():
                                 # label — and therefore in the sweep_logs/
                                 # filename, which is built from the label.
                                 n2_kind = ("N2-ablation"
-                                           if (lb, bt, zb, np_, rt, vh, sg, pi, hyp)
+                                           if (bt, zb, np_, rt, vh, sg, pi, hyp)
                                            in advstd_ablation_combos else "N2")
                                 label = f"{arch_prefix}{pert_name} c_tag={c_tag} {n2_kind}({tech_tag}){seed_suffix}{tag_suffix}"
 
@@ -5415,7 +5411,6 @@ def main():
                                     "--activate_vaghgar_deps", "true",
                                     "--use_perturbed_intervals", pi,
                                     "--Threads_num", str(Threads_num),
-                                    "--adv_std_lp_basis", lb,
                                     "--adv_std_bound_tightening", bt,
                                     # "true_nonpre" is the zono_npre ablation:
                                     # zonotope ON, its N_pre input OFF.

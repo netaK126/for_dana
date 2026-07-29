@@ -182,13 +182,6 @@ function parse_commandline()
         default = "off"
         range_tester = x -> lowercase(strip(String(x))) in
                              ("off", "prev", "direct", "direct_pgd", "prev_pgd", "true", "false")
-        "--adv_std_lp_basis"
-        help = "advanced_standard: transfer N1's LP basis to N2's root node (Technique 3). " *
-               "No effect when --adv_std_bound_tightening is true (guarded — basis is " *
-               "incompatible with eliminated binaries). Default false; opt in explicitly."
-        arg_type = Bool
-        required = false
-        default = false
         "--adv_std_bound_tightening"
         help = "advanced_standard: tighten N2 bounds using N1 + compute_diff_and_comp_bounds (Technique 4)"
         arg_type = Bool
@@ -729,7 +722,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
 
     # Technique 5: 5-valued mode (off/prev/direct/direct_pgd/prev_pgd); see parse_var_hint_mode.
     var_hint_mode = parse_var_hint_mode(args["adv_std_var_hint"])
-    use_lp_basis = args["adv_std_lp_basis"]
     use_bound_tightening = args["adv_std_bound_tightening"]
     use_zono_bounds = args["adv_std_zono_bounds"]
     zono_use_npre   = args["adv_std_zono_npre"]
@@ -807,7 +799,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     name_to_save_init = name_to_save
 
     println("Advanced-standard mode: techniques enabled:")
-    println("  Technique 3 (LP Basis):            $(use_lp_basis)")
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
     println("  Zono uses N_pre (Source A):        $(zono_use_npre)")
@@ -821,7 +812,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         # already has technique flags
     else
         n2_check = n2_check * "_N2_advStd"
-        if use_lp_basis;              n2_check = n2_check * "_lpBasis"; end
         # Technique 6 (BoundTightPertRelax) subsumes bound-tightening — when
         # τ ≥ 0 we emit _BoundTightPertRelax{τ} instead of _boundTight since
         # the relaxation logically depends on bound-tightening being active.
@@ -970,12 +960,11 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # ═══ PASS 1: Get N1 solver state (solve or load from disk) ═══
             n1_var_names, n1_var_values = String[], Float64[]
             n1_layers_info = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
-            n1_vbasis = Dict{String, Int}()
 
             if load_n1_from_disk
                 println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
-                n1_var_names, n1_var_values, n1_layers_info, n1_vbasis =
-                    load_n1_state(n1_state_dir, c_tag, c_target; require_vbasis=use_lp_basis)
+                n1_var_names, n1_var_values, n1_layers_info =
+                    load_n1_state(n1_state_dir, c_tag, c_target)
             else
                 println("\n══ Advanced-standard PASS 1: solving N1 (c_tag=$c_tag, c_target=$c_target) ══")
                 suboptimal_solution_n1, suboptimal_time_n1 = 0, 0
@@ -1017,7 +1006,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 # so the state is complete for any N2 job)
                 n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
                 n1_layers_info = deepcopy(layers_info_dict)
-                n1_vbasis = extract_vbasis(m_n1)
                 m_n1 = nothing
             end
 
@@ -1037,7 +1025,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:suboptimal_solution] = suboptimal_solution_n2
             d_n2[:suboptimal_time] = suboptimal_time_n2
             d_n2[:adv_std_flags] = (
-                adv_std_lp_basis             = args["adv_std_lp_basis"],
                 adv_std_bound_tightening     = args["adv_std_bound_tightening"],
                 adv_std_zono_bounds          = args["adv_std_zono_bounds"],
                 adv_std_n1_probe             = args["adv_std_n1_probe"],
@@ -1101,7 +1088,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = name_to_save
             else
                 n2_name = name_to_save * "_N2_advStd"
-                if use_lp_basis;              n2_name = n2_name * "_lpBasis"; end
                 # See n2_check builder above: _BoundTightPertRelax subsumes _boundTight.
                 if use_bound_tightening
                     if args["adv_std_n2_relax_threshold"] >= 0.0
@@ -1179,14 +1165,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # after the hyper_attack_hints call at line ~999.
             if var_hint_mode != VH_OFF
                 apply_n1_var_hints!(m_n2, var_hint_mode, n1_var_names, n1_var_values, n1_layers_info)
-            end
-            # Technique 3: LP Basis transfer from N1
-            # Skip when bound tightening is active — the model structure changes
-            # (eliminated binaries, different big-M) make N1's basis incompatible.
-            if use_lp_basis && !use_bound_tightening
-                apply_vbasis!(m_n2, n1_vbasis)
-            elseif use_lp_basis && use_bound_tightening
-                println("apply_vbasis!: skipped (incompatible with bound tightening)")
             end
             optimize!(m_n2)
             mip_log(m_n2, d_n2)
@@ -1321,8 +1299,7 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             # Extract ALL solver info and save to disk
             n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
             n1_layers_info = deepcopy(layers_info_dict)
-            n1_vbasis = extract_vbasis(m_n1)
-            save_n1_state(n1_state_dir, c_tag, c_target, n1_var_names, n1_var_values, n1_layers_info, n1_vbasis)
+            save_n1_state(n1_state_dir, c_tag, c_target, n1_var_names, n1_var_values, n1_layers_info)
 
             mip_reuse_bounds()
             m_n1 = nothing
