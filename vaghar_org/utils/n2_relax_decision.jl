@@ -30,7 +30,7 @@ function compute_n2_relax_decision!(threshold::Real)
 
     # Number of ReLU layers in one N2 pass (org or pert).
     # advstd path: relu_diff_up_bounds is populated by
-    # compute_diff_and_comp_bounds / compute_diff_bounds_zonotope /
+    # compute_diff_bounds_zonotope /
     # load_n1_diff_bounds! — always present when --adv_std_bound_tightening
     # is true, which is a precondition for --adv_std_n2_relax_threshold.
     # Standard-mode (nn1 boosting) path: no diff bounds exist; fall back on

@@ -117,11 +117,12 @@ function parse_commandline()
         default = true
         "--geometric_intervals"
         help = "Exploit pixel-relocation structure for translation/rotation in the perturbed-interval bounds " *
-               "(correct per-pixel envelope + first-layer composition of the move). Interval-only, no zonotope. " *
-               "Sound: delta unchanged. Default false = today's behavior."
+               "(exact (T-I) map composed through the first layer). Interval-only, no zonotope. " *
+               "Sound: delta unchanged. Default true; ignored (with a warning) for other perturbations " *
+               "and when --use_perturbed_intervals=false."
         arg_type = Bool
         required = false
-        default = false
+        default = true
         "--activate_vaghgar_deps"
         help = "activate  vaghgar depandencies"
         arg_type = Bool
@@ -160,7 +161,7 @@ function parse_commandline()
         default = "off"
         range_tester = x -> lowercase(strip(String(x))) in ("off", "prev_pgd")
         "--adv_std_bound_tightening"
-        help = "advanced_standard: tighten N2 bounds using N1 + compute_diff_and_comp_bounds (Technique 4)"
+        help = "advanced_standard: tighten N2 bounds using N1's bounds shifted by the zonotope diff bounds (Technique 4)"
         arg_type = Bool
         required = false
         default = true
@@ -291,8 +292,7 @@ function main()
                   "model_path=\"$model_path\" (expected a <model>_box.txt sidecar).")
         global input_box_lo = input_box[1]
         global input_box_hi = input_box[2]
-        # N2 gets encoded over N1's box. That is right only if the two nets share
-        # a normalization; assert it rather than silently reusing N1's.
+        # The encoders use N1's input box for both networks; error if N2's own box differs.
         _mp2 = get(args, "model_path2", "")
         if _mp2 !== nothing && _mp2 != ""
             box2 = get_input_box(dataset, _mp2, input_width, input_height, input_channels)
@@ -305,10 +305,18 @@ function main()
     end
 
     if mode == "standard"
+        # Single-network verification: the VHAGaR baseline as-is, or BLEND
+        # without transfer when the boost flags (zonotope / conditional
+        # triangle) are on. Also runs the delta_max normalizer (--perturbation max).
         main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     elseif mode == "advanced_standard_n1"
+        # Transfer, phase 1: verify N_pre and save what BLEND's incremental
+        # verification consumes — N_pre's verified per-neuron bounds, its
+        # optimal solution, and the N_pre->N difference-zonotope bounds.
         main_advanced_standard_n1(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     elseif mode == "advanced_standard_n2"
+        # Transfer, phase 2: BLEND with transfer — verify the revised network
+        # N, reusing N_pre's saved results (bound tightening + warm start).
         main_advanced_standard_n2(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     else
         error("unknown --mode \"$mode\"; expected standard | advanced_standard_n1 | advanced_standard_n2")
@@ -345,32 +353,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
     global adv_std_n2_relax_threshold = nn1_relax_threshold
     global adv_std_n2_sibling_gate    = nn1_use_sibling_gate
 
-    # Unsound-combination guard (mirrors run.jl:693 for advstd). The Per-Copy
-    # Triangle Drop relies on perturbed-interval coupling to keep the relaxed
-    # copy linked to its exact sibling; without it the LP can drift and
-    # δ_exact is not guaranteed. τ = 0.0 emits no triangle (gap > 0 for every
-    # split neuron), so the guard only fires for τ > 0.
-    if nn1_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
-        if args["allow_relax_without_pi"]
-            # Ablation mode: the emitted cuts are exact-point-valid on their own
-            # (chord uses the exact encoding's (l, u); SibGate's drift interval is
-            # a computed enclosure, not a model constraint), so δ_relaxed ≥ δ_exact
-            # still holds — only tightness/speed degrade. See --allow_relax_without_pi.
-            println("WARNING (--allow_relax_without_pi): running --nn1_relax_threshold > 0 " *
-                    "WITHOUT --use_perturbed_intervals. Sound (δ_relaxed ≥ δ_exact) but the " *
-                    "relaxed copy is only loosely tied to the exact one — expect a looser " *
-                    "bound and a slower solve. Perturbed-interval ablation runs only.")
-        else
-            println("UNSOUND COMBINATION: --nn1_relax_threshold > 0 (Per-Copy Triangle Drop, " *
-                    "standard-mode boost §3.3) requires --use_perturbed_intervals=true for soundness. " *
-                    "Without the perturbed-interval coupling constraints the relaxed and exact " *
-                    "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
-                    "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
-                    "the relaxation with --nn1_relax_threshold off (or use τ = 0), or pass " *
-                    "--allow_relax_without_pi true for a perturbed-interval ablation run.")
-            return
-        end
-    end
+
     if nn1_use_sibling_gate && nn1_relax_threshold < 0.0
         println("WARNING: --nn1_sibling_gate=true but --nn1_relax_threshold < 0; " *
                 "the sibling-gated emission rides on the per-copy decision dict. " *
@@ -399,10 +382,12 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
         token_signature = string(now().instant.periods.value)
         nn = get_nn(model_path, model_name, w, h, k, c, dataset)
 
-        # ── Source B (absolute zonotope on N1) precompute, once per c_tag ──
-        # n2_abs_*_bounds is the global the encoder's intersect_per_copy_bounds
-        # consumes (see core_ops.jl:222). In standard mode we leave Source A
-        # (n1_neuron_bounds / relu_diff_*) empty so only Source B intersects.
+        # ── Zonotope Bound Tightening (paper: System, "Zonotope Bound
+        # Tightening"), once per c_tag: propagate a zonotope over the input
+        # domain and perturbation space to tighten the per-neuron bounds
+        # [l,u] and [l^p,u^p]. relu() intersects them via n2_abs_*_bounds
+        # (core_ops.jl:222). Without transfer, the N_pre-derived bounds
+        # stay empty.
         clear_n2_abs_bounds()
         if nn1_use_zono_bounds
             input_dummy = zeros(Float64, 1, w, h, k)
@@ -436,11 +421,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             d[:suboptimal_time] = suboptimal_time
             mip_reset()
 
-            # ── SibGate prerequisite: org-pert pre-activation diff bounds through N1.
-            # compute_n2_pert_relaxation_bounds populates relu_n2pert_*_bounds
-            # and n2_preact_*_bounds. The encoder side of SibGate (sibgate_emit.jl)
-            # walks these arrays to build the conditional triangle / coupling line.
-            # In standard mode the "second network" passed to this routine is N1 itself.
+            # Conditional Triangle inputs: per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
             if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
                 input_dummy_s = zeros(Float64, 1, w, h, k)
                 p_size_s = perturbation_size[1]
@@ -451,16 +432,17 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 compute_n2_pert_relaxation_bounds(nn, I_pert_up_s, I_pert_down_s)
             end
 
-            # ── Per-Copy Triangle Drop decision dict (Tech 6 dispatch) ────────
-            # Populated from Source B alone in standard mode (Source A absent).
+            # Reset the per-pair relaxation counters (reported in the filename and result line).
             clear_n2_relaxed_counters!()
             clear_sibgate_tier_counters!()
+            # Conditional Triangle decision: per neuron, relax the copies whose triangle-gap area is <= tau.
             if nn1_relax_threshold >= 0.0
                 compute_n2_relax_decision!(nn1_relax_threshold)
             else
                 clear_n2_relax_decision!()
             end
 
+            # Encode the two network copies (on x and on x') as a MIP, computing each neuron's bounds [l,u] along the way.
             bounds_time = @elapsed begin
                 merge!(d, get_model(w, h, k, perturbation, perturbation_size, nn, zeros(Float64, 1, w, h, k), optimizer,
                 get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
@@ -468,10 +450,8 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             d[:bounds_time] = bounds_time
             m = d[:Model]
 
-            # ── SibGate emission (post-encoding pass) ────────────────────────
-            # apply_sibgate_constraints! walks n2_relax_decision + n2_relu_state
-            # cache and emits the conditional triangles / coupling lines.
-            # No-op when adv_std_n2_sibling_gate=false.
+            # Add the Conditional Triangle constraints: when one copy keeps its binary, its sibling's triangle is gated on it; when both are relaxed, the two copies are tied together by their perturbation-difference interval.
+
             apply_sibgate_constraints!(m)
 
             if use_hyper_attack
@@ -479,9 +459,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 name_to_save = name_to_save*"_HyperAttackHints"
             end
             if activate_vaghgar_deps
-                # _depGuardFix marks the fixed dep encoder (has_a_o && has_a_p
-                # guard); the paper-tables pipeline keeps binary-dropping runs
-                # only when this tag is present, so it MUST follow _VagharDeps.
                 name_to_save = name_to_save*"_VagharDeps_depGuardFix"
                 perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d[:Perturbation])
@@ -532,7 +509,7 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
 end
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Advanced Standard Mode
+# Advanced Standard Mode (transfer)
 # ═══════════════════════════════════════════════════════════════════════════
 """
     advstd_results_complete(results_path, n2_name_suffix, c_tag, c_targets) -> Bool
@@ -671,18 +648,17 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         error("advanced_standard mode requires --model_path2 pointing to N2 (different from N1)")
     end
 
-    # Technique 5: off | prev_pgd; see parse_var_hint_mode.
+    # Warm Start: hint each unstable neuron's phase from N_pre's solution, kept only where it agrees with the attack's hints (off | prev_pgd).
     var_hint_mode = parse_var_hint_mode(args["adv_std_var_hint"])
+    # Transfer bound tightening: intersect N's per-neuron bounds with N_pre's verified bounds shifted by the difference bounds.
     use_bound_tightening = args["adv_std_bound_tightening"]
+    # Zonotope Bound Tightening: propagate a zonotope through N to tighten the per-neuron bounds [l,u] and [l^p,u^p].
     use_zono_bounds = args["adv_std_zono_bounds"]
+    # Ablation flag (zono_npre).
     zono_use_npre   = args["adv_std_zono_npre"]
-    # Technique 6: N1-gated N2/N2p triangle LP relaxation. Propagated to the
-    # core_ops.jl::relu() consumer via the `adv_std_n2_relax_threshold` global.
+    # Conditional Triangle: relax a copy's ReLU when its triangle-gap area is <= tau (read by relu() via this global).
     global adv_std_n2_relax_threshold = args["adv_std_n2_relax_threshold"]
-    # Technique 4 (SibGate) — read by core_ops.jl::relu() to switch from
-    # the simple Wong-Kolter triangle (Technique 3) to the conditional
-    # triangle gated on the sibling binary (one-thin tier) and the
-    # pre-activation coupling line (both-thin tier).
+    # Conditional Triangle emission: gate the triangle on the sibling copy's binary / couple both relaxed copies.
     global adv_std_n2_sibling_gate = args["adv_std_n2_sibling_gate"]
     if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold < 0.0
         println("WARNING: --adv_std_n2_sibling_gate=true but --adv_std_n2_relax_threshold < 0; " *
@@ -694,46 +670,16 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 "false. The relaxation block needs n1_neuron_bounds to be populated, which only " *
                 "happens when bound_tightening is true — no neurons will be relaxed in this run.")
     end
-    # Unsound-combination guard: Technique 4 (BoundTightPertRelax) relies on the
-    # perturbed-interval coupling constraints to link a relaxed copy's post-ReLU
-    # value to the exact one (see §4.4 of advstd_techniques.tex). Without those
-    # constraints the two copies can drift apart in the joint feasible set and
-    # δ_exact is no longer guaranteed to be reached. Refuse to run rather than
-    # silently produce unsound results.
-    #
-    # τ == 0.0 is treated as "effectively disabled" and allowed through: the gap
-    # formula u·|l| / (2(u-l)) is strictly positive for every split neuron
-    # (l < 0 < u), so gap ≤ 0 is only reachable when the neuron is stable — in
-    # which case Tech 2 has already removed the binary and n2_relax_decision's
-    # stable-both short-circuit skips it. No actual triangle relaxation is
-    # emitted at τ = 0, so no coupling constraint is needed.
-    if adv_std_n2_relax_threshold > 0.0 && !args["use_perturbed_intervals"]
-        if args["allow_relax_without_pi"]
-            # Ablation mode: the emitted cuts are exact-point-valid on their own
-            # (chord uses the exact encoding's (l, u); SibGate's drift interval is
-            # a computed enclosure, not a model constraint), so δ_relaxed ≥ δ_exact
-            # still holds — only tightness/speed degrade. See --allow_relax_without_pi.
-            println("WARNING (--allow_relax_without_pi): running --adv_std_n2_relax_threshold > 0 " *
-                    "WITHOUT --use_perturbed_intervals. Sound (δ_relaxed ≥ δ_exact) but the " *
-                    "relaxed copy is only loosely tied to the exact one — expect a looser " *
-                    "bound and a slower solve. Perturbed-interval ablation runs only.")
-        else
-            println("UNSOUND COMBINATION: --adv_std_n2_relax_threshold > 0 (Technique 4, " *
-                    "BoundTightPertRelax) requires --use_perturbed_intervals=true for soundness. " *
-                    "Without the perturbed-interval coupling constraints the relaxed and exact " *
-                    "copies can drift apart and δ_exact is not guaranteed. Exiting without " *
-                    "encoding or optimizing. Set --use_perturbed_intervals true, or disable " *
-                    "Technique 4 with --adv_std_n2_relax_threshold off (or use τ = 0, which " *
-                    "emits no actual relaxations), or pass --allow_relax_without_pi true " *
-                    "for a perturbed-interval ablation run.")
-            return
-        end
-    end
+    
+    # Folder with N_pre's saved verification results (verified bounds, optimal solution, difference bounds) that transfer reuses.
     n1_state_dir = args["n1_state_dir"]
 
     c_tag_list = [args["ctag"]]
+    # VHAGaR's dependency constraints between the two copies (equal / monotonic / anti-monotonic neurons).
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
+    # Tighter ReLU clipping inside the perturbation-difference interval propagation (uses each copy's stability).
     global optimizing_intervals = args["optimizing_intervals"]
+    # Translation/rotation only: fold the exact (T-I) relocation map through the first layer instead of a per-pixel envelope.
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -753,7 +699,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
 
-    # ── Pre-flight: build n2_check suffix for skip detection ──
+    # Build the filename signature of this exact configuration (one tag per active technique); results whose
+    # filename carries this signature were produced by the same configuration, so they can be skipped below.
     n2_check = name_to_save
     if occursin("_N2_advStd", n2_check)
         # already has technique flags
@@ -778,11 +725,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     if activate_vaghgar_deps;              n2_check = n2_check * "_VagharDeps_depGuardFix"; end  # must mirror the saved name's tag (see line ~666)
     if args["use_perturbed_intervals"]
         n2_check = n2_check * "_PerturbedIntervals"
-    else
-        # Perturbed-interval ablation runs (--allow_relax_without_pi): stamp an
-        # explicit _noPI so these files never alias the PI runs of the same combo
-        # (the sweep's skip-check globs the tag tail with a wildcard).
-        n2_check = n2_check * "_noPI"
     end
     if geometric_intervals;                 n2_check = n2_check * "_geomInt"; end
 
@@ -811,36 +753,24 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             error("advanced_standard_n2 requires --n1_state_dir pointing to saved N1 state")
         nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
 
-        # ── Technique 4: precompute sound per-neuron diff bounds ──────────
+        # Transfer bound tightening: load N_pre's difference bounds [d_lo, d_hi] and intersect N's zonotope bounds with N_pre's bounds shifted by them.
         clear_n2_abs_bounds()
         if use_bound_tightening
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size = perturbation_size[1]
-            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
-            # inputs; the old size[4]>1 branch seeded a malformed (k,1) matrix that
-            # collapsed spatial dims and broke conv bound-propagation on multi-
-            # channel (e.g. CIFAR-10) nets.
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
 
-            # Phase-2 loads from disk. diff_bounds.bin is mandatory;
-            # n1_preact_bounds.bin is mandatory iff zono (Source B) is active.
-            # Both loads crash-on-miss rather than silently degrading.
+            # Load N_pre's saved difference bounds (and, when the zonotope is on, N_pre's pre-activation bounds); a missing file is an error, never a silent fallback.
             load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
 
-            # Source B: absolute N2 zonotope, intersected with Source A per layer.
-            # Needs nn2 (always available here) and Source A's globals
-            # (relu_diff_*_bounds, n1_preact_*_bounds). Skips internally with a
-            # warning if those globals are empty, e.g. legacy n1_state_dir load.
+            # Zonotope Bound Tightening: propagate a zonotope through N, intersecting its bounds at each layer with N_pre's bounds shifted by the difference bounds.
             if use_zono_bounds
                 println("Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...")
                 compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
                                                            use_n1_tighten=zono_use_npre)
             end
 
-            # The n2_probe_* globals stay defined (core_ops.jl consults them);
-            # nothing populates them anymore, so clearing keeps them empty.
-            clear_n2_probe_bounds()
         end
 
         for c_target in c_targets
@@ -902,13 +832,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # Technique 4 (SibGate) per-tier counters reset per c_target.
             clear_sibgate_tier_counters!()
 
-            # Technique 4 (SibGate): populate the org↔pert pre-activation
-            # diff bound through N2 alone (relu_n2pert_*_bounds) and N2's
-            # per-copy pre-activation bound (n2_preact_*_bounds). These are
-            # the "[l_int, u_int]" and "[l_pre, u_pre]" inputs of the
-            # conditional-triangle / pre-act-coupling derivation in
-            # advstd_techniques.tex §Tech 4. Reuses the existing routine
-            # also used by --no_n1_binaries_and_relaxtions_only_on_n2.
+            # Conditional Triangle inputs: per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
             if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
                 compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
             end
@@ -1063,14 +987,12 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             # channel (e.g. CIFAR-10) nets.
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-            if args["adv_std_zono_bounds"]
-                global use_zonotope = true
-                println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
-                compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
-            else
-                println("Advanced-standard-N1: computing diff bounds between N1 and N2...")
-                compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
-            end
+            # The diff bounds [d_lo, d_hi] are always computed with the
+            # DIFFERENCE ZONOTOPE (the paper's Source A); is retired. --adv_std_zono_bounds still
+            # gates Source B (the absolute N2 zonotope) in Phase 2.
+            global use_zonotope = true
+            println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
+            compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
             # Preserve existing on-disk diff_bounds when completing a partial
             # state dir: per-pair n1_vars/n1_layers/... files already on disk
             # were produced against those saved bounds, and overwriting with

@@ -100,13 +100,10 @@ global n1_last_layer_prune_tol::Float64 = 0.0  # threshold: drop h_n1 vars with 
 global n1_adaptive_prune_budget::Float64 = 0.0  # sensitivity-based pruning budget; 0 = disabled
 global hybrid_solve::Bool = false  # two-phase solve: start with scalar bound, lazily add argmax constraints
 global use_zonotope::Bool = false
-global refined_relu_zonotope::Bool = false
-global zonotope_conv::Bool = false   # activate zonotope propagation through conv layers
 # --geometric_intervals: relocation-aware interval bounds for translation/rotation (default OFF = no change).
 global geometric_intervals::Bool = false
 global geometric_diff_map = nothing          # the (T-I) matrix for the current build, or nothing
 global geometric_input_shape = nothing       # size(input) for the current build
-global zonotope_max_order::Int = 0   # max zonotope order (generators / neurons); 0 = unlimited
 global bound_n2_relu_using_zonotope::Bool = false  # tighten ReLU preact bounds of N2 by intersecting with N1 preact + zonotope diff
 global n1_stability_relax_threshold::Float64 = -1.0  # transfer-aware: replace N2 binary with triangle LP relaxation when N1 neuron is stable and gap <= threshold; <0 = disabled
 global bound_by_zonotope_n2_hidden_neurons_which_are_not_relu::Bool = false  # add constraints on N2 final-layer logits using N1 output + zonotope diff
@@ -329,17 +326,6 @@ end
 function clear_n2_abs_bounds()
     global n2_abs_up_bounds   = Array{Float64}[]
     global n2_abs_down_bounds = Array{Float64}[]
-end
-
-function clear_n2_probe_bounds()
-    global n2_probe_up_bounds_org   = Array{Float64}[]
-    global n2_probe_down_bounds_org = Array{Float64}[]
-    global n2_probe_up_bounds_pert  = Array{Float64}[]
-    global n2_probe_down_bounds_pert = Array{Float64}[]
-    global n_probe_eliminated_binaries_org  = 0
-    global n_probe_eliminated_binaries_pert = 0
-    global n_probe_eliminated_binaries      = 0
-    global n1_probe_lp_time                 = 0.0
 end
 
 function clear_n2_relaxed_counters!()
