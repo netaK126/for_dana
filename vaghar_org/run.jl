@@ -96,7 +96,7 @@ function parse_commandline()
         required = false
         default = ""#"itr18"
         "--mode"
-        help = "standard, advanced_standard, advanced_standard_n1, or advanced_standard_n2"
+        help = "standard, advanced_standard_n1, or advanced_standard_n2"
         arg_type = String
         required = false
         default = "standard"
@@ -306,14 +306,12 @@ function main()
 
     if mode == "standard"
         main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
-    elseif mode == "advanced_standard"
-        main_advanced_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     elseif mode == "advanced_standard_n1"
         main_advanced_standard_n1(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     elseif mode == "advanced_standard_n2"
         main_advanced_standard_n2(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save,use_hyper_attack)
     else
-        error("unknown --mode \"$mode\"; expected standard | advanced_standard | advanced_standard_n1 | advanced_standard_n2")
+        error("unknown --mode \"$mode\"; expected standard | advanced_standard_n1 | advanced_standard_n2")
     end
 end
 
@@ -807,11 +805,10 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         w, h, k, c = get_dataset_params(dataset)
         token_signature = string(now().instant.periods.value)
 
-        load_n1_from_disk = n1_state_dir != "" && isdir(n1_state_dir)
-        # nn1 is needed only for Technique 4 diff-bound computation; in the
-        # state-dir load path we skip loading it to save time.
-        nn1_needed = !load_n1_from_disk
-        nn1 = nn1_needed ? get_nn(model_path, model_name, w, h, k, c, dataset) : nothing
+        # Phase 2 always loads N1's state from disk; fail loudly if the state
+        # dir vanished between the _n2 wrapper's check and here.
+        (n1_state_dir != "" && isdir(n1_state_dir)) ||
+            error("advanced_standard_n2 requires --n1_state_dir pointing to saved N1 state")
         nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
 
         # ── Technique 4: precompute sound per-neuron diff bounds ──────────
@@ -826,22 +823,10 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
 
-            if load_n1_from_disk
-                # Phase-2 loads from disk. diff_bounds.bin is mandatory;
-                # n1_preact_bounds.bin is mandatory iff zono (Source B) is active.
-                # Both loads crash-on-miss rather than silently degrading.
-                load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
-            elseif use_zono_bounds
-                # No state dir — compute diff bounds on the fly (no Phase 1 to load from).
-                global use_zonotope = true
-                println("Advanced-standard: computing zonotope diff bounds (Source A) between N1 and N2...")
-                compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
-                println("  Source A diff bounds computed: $(length(relu_diff_up_bounds)) ReLU layers")
-            else
-                println("Advanced-standard: computing diff bounds between N1 and N2...")
-                compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
-                println("  diff bounds computed: $(length(relu_diff_up_bounds)) ReLU layers")
-            end
+            # Phase-2 loads from disk. diff_bounds.bin is mandatory;
+            # n1_preact_bounds.bin is mandatory iff zono (Source B) is active.
+            # Both loads crash-on-miss rather than silently degrading.
+            load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
 
             # Source B: absolute N2 zonotope, intersected with Source A per layer.
             # Needs nn2 (always available here) and Source A's globals
@@ -876,57 +861,10 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 continue
             end
 
-            # ═══ PASS 1: Get N1 solver state (solve or load from disk) ═══
-            n1_var_names, n1_var_values = String[], Float64[]
-            n1_layers_info = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
-
-            if load_n1_from_disk
-                println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
-                n1_var_names, n1_var_values, n1_layers_info =
-                    load_n1_state(n1_state_dir, c_tag, c_target)
-            else
-                println("\n══ Advanced-standard PASS 1: solving N1 (c_tag=$c_tag, c_target=$c_target) ══")
-                suboptimal_solution_n1, suboptimal_time_n1 = 0, 0
-                if use_hyper_attack
-                    suboptimal_solution_n1, suboptimal_time_n1 = hyper_attack(dataset, c_tag, c_target, token_signature, model_name, model_path, perturbation, perturbation_size; force_cpu=args["force_cpu"])
-                end
-                optimizer = Gurobi.Optimizer
-                d_n1 = Dict()
-                d_n1[:TargetIndex] = get_target_indexes(c_target, c)
-                d_n1[:SourceIndex] = get_target_indexes(c_tag, c)
-                d_n1[:suboptimal_solution] = suboptimal_solution_n1
-                d_n1[:suboptimal_time] = suboptimal_time_n1
-                mip_reset()
-                clear_n1_neuron_bounds()
-                bounds_time_n1 = @elapsed begin
-                    merge!(d_n1, get_model(w, h, k, perturbation, perturbation_size, nn1, zeros(Float64, 1, w, h, k), optimizer,
-                    get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
-                end
-                d_n1[:bounds_time] = bounds_time_n1
-                m_n1 = d_n1[:Model]
-                if use_hyper_attack
-                    hyper_attack_hints(m_n1, token_signature, c_tag, c_target)
-                end
-                if activate_vaghgar_deps
-                    perturbation_dependencies(m_n1, nn1, perturbation, perturbation_size, w, h, k;
-                                              perturbation_var=d_n1[:Perturbation])
-                end
-                if args["use_perturbed_intervals"]
-                    perturbed_interval_constraints(m_n1, nn1, "org", "perturbation")
-                end
-                mip_set_delta_property(m_n1, perturbation, d_n1)
-                set_optimizer(m_n1, optimizer)
-                mip_set_attr(m_n1, perturbation, d_n1, timout)
-                MOI.set(m_n1, Gurobi.CallbackFunction(), my_callback)
-                optimize!(m_n1)
-                mip_log(m_n1, d_n1)
-
-                # Extract ALL N1 solver info (regardless of which techniques are enabled,
-                # so the state is complete for any N2 job)
-                n1_var_names, n1_var_values = extract_all_variable_values(m_n1)
-                n1_layers_info = deepcopy(layers_info_dict)
-                m_n1 = nothing
-            end
+            # ═══ PASS 1: Load N1 solver state from disk ═══
+            println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
+            n1_var_names, n1_var_values, n1_layers_info =
+                load_n1_state(n1_state_dir, c_tag, c_target)
 
             # ═══ PASS 2: Solve N2 (accelerated standard) ═══════════════════
             println("\n══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=$c_tag, c_target=$c_target) ══")
