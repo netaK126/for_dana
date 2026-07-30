@@ -5,7 +5,7 @@
 #   all_bounds_of_original/perturbation
 #
 # compute_diff_bounds_zonotope() also populates the relaxation globals
-# (relu_diff_*_bounds, relu_comp_*_bounds, n1_preact_*_bounds) used by
+# (relu_diff_*_bounds, n1_preact_*_bounds) used by
 # the conditional-triangle relaxation in core_ops.jl.
 # - Initialized in get_perturbation_specific_keys_linf_transfer()
 # - Propagation (paper eq. 3): W2·(z_org - z_pre) + ΔW·z_pre, where ΔW = W2 - W1
@@ -401,14 +401,11 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     # Same globals as the retired interval pass
     global relu_diff_up_bounds, relu_diff_down_bounds
     global n1_preact_up_bounds, n1_preact_down_bounds
-    global relu_comp_up_bounds, relu_comp_down_bounds
 
     relu_diff_up_bounds   = Array{Float64}[]
     relu_diff_down_bounds = Array{Float64}[]
     n1_preact_up_bounds   = Array{Float64}[]
     n1_preact_down_bounds = Array{Float64}[]
-    relu_comp_up_bounds   = Array{Float64}[]
-    relu_comp_down_bounds = Array{Float64}[]
 
     # Interval state (used for conv layers, pert, n1_act)
     diff_up   = zeros(Float64, size(I_pert_up_init))
@@ -541,8 +538,6 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
             push!(relu_diff_down_bounds, copy(diff_down))
             push!(n1_preact_up_bounds,   copy(n1_pre_up_cur))
             push!(n1_preact_down_bounds, copy(n1_pre_down_cur))
-            push!(relu_comp_up_bounds,   diff_up   .+ pert_up)
-            push!(relu_comp_down_bounds, diff_down .+ pert_down)
 
             if zono_active
                 n = length(diff_center)

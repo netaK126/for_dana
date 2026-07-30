@@ -18,15 +18,7 @@ function get_dataset_params( dataset )
 end
 
 
-# Per-coordinate input box for the verification region, returned as two arrays
-# of shape (1, w_, h_, k_) so they index directly with the CartesianIndices
-# used by the perturbation encoders.
-#
-# The box is NOT hard-coded: it is read from the `<model>_box.txt` sidecar that
-# utils/nnet_to_pickle.py derives from the source .nnet (two comma-separated
-# lines: lo then hi). HAR uses [-1,1]^561 (Paulsen et al., ICSE'20 / TwoSafe).
-# Image models have no sidecar, so this returns `nothing` and callers keep the
-# historical [0,1] path.
+# The network's input domain — one [lo, hi] per input coordinate — read from the model_box.txt next to the weights (HAR: [-1,1]^561); image models have no such file, so callers keep [0,1].
 function get_input_box( dataset, model_path, w_, h_, k_ )
     box_path = splitext(model_path)[1] * "_box.txt"
     if !isfile(box_path)

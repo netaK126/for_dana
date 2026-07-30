@@ -7,27 +7,11 @@ global all_bounds_of_perturbation = []
 global I_pert_prev_up = []
 global I_pert_prev_down = []
 
-# ── ACAS/HAR benchmark support (behind --internet_nets_benchmarks) ────────
-# Master switch; when false every branch below is bypassed and behavior is
-# identical to the image pipeline. Set from run.jl.
+# HAR benchmark support: master switch (--internet_nets_benchmarks) plus the network's input box; off = the image pipeline, unchanged.
 global internet_nets_benchmarks = false
-# Per-coordinate input box for the perturbation encoders, each an array shaped
-# (1,w,h,k) or `nothing` (⇒ historical [0,1] box). Set from get_input_box.
+# The HAR model's input domain, [lo, hi] per input coordinate ([-1,1]^561); `nothing` for every other model, meaning the [0,1] image domain.
 global input_box_lo = nothing
 global input_box_hi = nothing
-# Input domain for the interval/zonotope seeds. The image pipeline reasons over
-# [0,1]^n; the ACAS box is NOT a subset of it (it spans negative coordinates),
-# so seeding those passes with zeros/ones would cut away feasible region while
-# the MIP variable bounds stayed correct -- an unsound tightening that would not
-# surface as an error. These helpers are the single place that decision is made:
-# with the master switch off, or no sidecar loaded, they return exactly the
-# historical zeros/ones, so every image caller is bit-identical to before.
-# Whether the PERTURBED input variable is confined to the clean input domain.
-# True for linf (x' carries the same box bounds as x); false for brightness,
-# where x' = x + e with e >= 0 may exceed the domain's upper bound. The interval
-# passes clip to the domain only when this holds -- clipping unconditionally
-# would assert x' <= hi while the MIP admits x' > hi, an unsound tightening.
-# Encoders set it; default true preserves the historical behaviour.
 global perturbed_input_in_domain = true
 
 function input_domain_flat(n::Int)
@@ -48,36 +32,23 @@ function input_domain_shaped(shape)
     return (zeros(Float64, shape), ones(Float64, shape))
 end
 
-# ── Conditional-triangle relaxation globals ──────────────────────────────
-# use_relaxations/relaxation_threshold/relaxation_condition_count/
-# relaxation_gap_area belong to the RETIRED legacy relaxation (its CLI flags
-# are gone); they stay defined because core_ops.jl consults them, permanently
-# at their off defaults. optimizing_intervals is LIVE: it feeds the
-# diff-bounds interval clipping.
+# Retired relaxation's on/off switch — permanently false; the encoder (core_ops.jl) still checks the name, so it must stay defined.
 global use_relaxations::Bool = false
+# Retired relaxation's tau threshold — unused while use_relaxations is false.
 global relaxation_threshold::Float64 = 0.5
+# Retired relaxation's relaxed-neuron counter — stays 0.
 global relaxation_condition_count = 0
+# LIVE: in the difference-bound propagation, handle a ReLU exactly when the neuron is stable in both networks (both active: the difference passes through; both inactive: it is zero).
 global optimizing_intervals::Bool = true
+# Retired relaxation's scoring choice (triangle area vs interval width) — unused.
 global relaxation_gap_area::Bool = false
 
-# ── Activation conditional-triangle relaxation (n2_org pass) ─────────────
-# BRIDGE paper Section 5 / eq. (4):
-#   Replace a_n2_org binary by conditioning on a_n1_org (Npre's binary).
-#   Threshold and conditional intervals use diff bounds + Npre preact bounds.
-#   diff bounds: z_n2_org - z_n1_org  (inter-network pre-activation difference)
+# The difference bounds [d_lo, d_hi]: per neuron, how far N's pre-activation can stray from N_pre's (computed by the difference zonotope).
 global relu_diff_up_bounds::Vector   = []
 global relu_diff_down_bounds::Vector = []
-# Npre pre-activation bounds (before ReLU clipping), used for both relaxations
+# N_pre's pre-activation bounds [l, u] per neuron; shifted by the difference bounds wherever N reuses them.
 global n1_preact_up_bounds::Vector   = []
 global n1_preact_down_bounds::Vector = []
-
-# ── Perturbation conditional-triangle relaxation (n2_pert pass) ──────────
-# BRIDGE paper Section 5 / eq. (6):
-#   Replace a_n2_pert binary by conditioning on a_n1_org (same Npre binary).
-#   Threshold and conditional intervals use COMPOSED bounds + Npre preact bounds.
-#   composed bounds: (z_n2_pert - z_n1_org) = diff + pert
-global relu_comp_up_bounds::Vector   = []
-global relu_comp_down_bounds::Vector = []
 
 # ── N2-only perturbation relaxation (--no_n1_binaries_and_relaxtions_only_on_n2) ─
 # Relax N2(x_p) by conditioning on N2(x) binary instead of N1(x).
@@ -206,84 +177,6 @@ global last_hidden_diff_up::Vector{Float64}     = Float64[]
 global last_hidden_diff_down::Vector{Float64}   = Float64[]
 
 # ── Diff-bounds cache (avoid recomputing zonotope/interval across class pairs) ──
-# The diff bounds depend only on (nn1, nn2, perturbation) — NOT on (c_tag, c_target).
-# Cache after first computation, restore on subsequent class pairs.
-mutable struct DiffBoundsCache
-    valid::Bool
-    relu_diff_up::Vector{Array{Float64}}
-    relu_diff_down::Vector{Array{Float64}}
-    n1_preact_up::Vector{Array{Float64}}
-    n1_preact_down::Vector{Array{Float64}}
-    relu_comp_up::Vector{Array{Float64}}
-    relu_comp_down::Vector{Array{Float64}}
-    output_diff_up::Vector{Float64}
-    output_diff_down::Vector{Float64}
-    output_n2_pert_up::Vector{Float64}
-    output_n2_pert_down::Vector{Float64}
-    output_n1_pert_up::Vector{Float64}
-    output_n1_pert_down::Vector{Float64}
-    n1_last_hidden_up::Vector{Float64}
-    n1_last_hidden_down::Vector{Float64}
-    last_hidden_diff_up::Vector{Float64}
-    last_hidden_diff_down::Vector{Float64}
-end
-global diff_bounds_cache = DiffBoundsCache(false,
-    Array{Float64}[], Array{Float64}[], Array{Float64}[], Array{Float64}[],
-    Array{Float64}[], Array{Float64}[],
-    Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
-    Float64[], Float64[], Float64[], Float64[])
-
-function save_diff_bounds_to_cache!()
-    global diff_bounds_cache
-    diff_bounds_cache.relu_diff_up        = [copy(v) for v in relu_diff_up_bounds]
-    diff_bounds_cache.relu_diff_down      = [copy(v) for v in relu_diff_down_bounds]
-    diff_bounds_cache.n1_preact_up        = [copy(v) for v in n1_preact_up_bounds]
-    diff_bounds_cache.n1_preact_down      = [copy(v) for v in n1_preact_down_bounds]
-    diff_bounds_cache.relu_comp_up        = [copy(v) for v in relu_comp_up_bounds]
-    diff_bounds_cache.relu_comp_down      = [copy(v) for v in relu_comp_down_bounds]
-    diff_bounds_cache.output_diff_up      = copy(output_diff_up_bounds)
-    diff_bounds_cache.output_diff_down    = copy(output_diff_down_bounds)
-    diff_bounds_cache.output_n2_pert_up   = copy(output_n2_pert_up)
-    diff_bounds_cache.output_n2_pert_down = copy(output_n2_pert_down)
-    diff_bounds_cache.output_n1_pert_up   = copy(output_n1_pert_up)
-    diff_bounds_cache.output_n1_pert_down = copy(output_n1_pert_down)
-    diff_bounds_cache.n1_last_hidden_up   = copy(n1_last_hidden_up)
-    diff_bounds_cache.n1_last_hidden_down = copy(n1_last_hidden_down)
-    diff_bounds_cache.last_hidden_diff_up   = copy(last_hidden_diff_up)
-    diff_bounds_cache.last_hidden_diff_down = copy(last_hidden_diff_down)
-    diff_bounds_cache.valid = true
-    println("diff_bounds_cache: saved ($(length(diff_bounds_cache.relu_diff_up)) ReLU layers)")
-end
-
-function restore_diff_bounds_from_cache!()
-    global diff_bounds_cache
-    global relu_diff_up_bounds, relu_diff_down_bounds
-    global n1_preact_up_bounds, n1_preact_down_bounds
-    global relu_comp_up_bounds, relu_comp_down_bounds
-    global output_diff_up_bounds, output_diff_down_bounds
-    global output_n2_pert_up, output_n2_pert_down
-    global output_n1_pert_up, output_n1_pert_down
-    global n1_last_hidden_up, n1_last_hidden_down
-    global last_hidden_diff_up, last_hidden_diff_down
-    relu_diff_up_bounds   = [copy(v) for v in diff_bounds_cache.relu_diff_up]
-    relu_diff_down_bounds = [copy(v) for v in diff_bounds_cache.relu_diff_down]
-    n1_preact_up_bounds   = [copy(v) for v in diff_bounds_cache.n1_preact_up]
-    n1_preact_down_bounds = [copy(v) for v in diff_bounds_cache.n1_preact_down]
-    relu_comp_up_bounds   = [copy(v) for v in diff_bounds_cache.relu_comp_up]
-    relu_comp_down_bounds = [copy(v) for v in diff_bounds_cache.relu_comp_down]
-    output_diff_up_bounds   = copy(diff_bounds_cache.output_diff_up)
-    output_diff_down_bounds = copy(diff_bounds_cache.output_diff_down)
-    output_n2_pert_up       = copy(diff_bounds_cache.output_n2_pert_up)
-    output_n2_pert_down     = copy(diff_bounds_cache.output_n2_pert_down)
-    output_n1_pert_up       = copy(diff_bounds_cache.output_n1_pert_up)
-    output_n1_pert_down     = copy(diff_bounds_cache.output_n1_pert_down)
-    n1_last_hidden_up       = copy(diff_bounds_cache.n1_last_hidden_up)
-    n1_last_hidden_down     = copy(diff_bounds_cache.n1_last_hidden_down)
-    last_hidden_diff_up     = copy(diff_bounds_cache.last_hidden_diff_up)
-    last_hidden_diff_down   = copy(diff_bounds_cache.last_hidden_diff_down)
-    println("diff_bounds_cache: restored from cache ($(length(relu_diff_up_bounds)) ReLU layers)")
-end
-
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
     reusable_indexes::Int

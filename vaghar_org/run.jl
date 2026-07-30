@@ -761,7 +761,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
 
-            # Load N_pre's saved difference bounds (and, when the zonotope is on, N_pre's pre-activation bounds); a missing file is an error, never a silent fallback.
+            # Load the drift information — how far N can stray from N_pre ([d_lo, d_hi] + N_pre's pre-activation bounds); shared by all class pairs, shifts every reused N_pre quantity below.
             load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
 
             # Zonotope Bound Tightening: propagate a zonotope through N, intersecting its bounds at each layer with N_pre's bounds shifted by the difference bounds.
@@ -791,7 +791,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 continue
             end
 
-            # ═══ PASS 1: Load N1 solver state from disk ═══
+            # Load what N_pre proved and chose on this class pair — its verified per-neuron bounds (for bound tightening) and its optimal solution (for the warm-start hints).
             println("\n══ Advanced-standard: loading N1 state from $n1_state_dir (c_tag=$c_tag, c_target=$c_target) ══")
             n1_var_names, n1_var_values, n1_layers_info =
                 load_n1_state(n1_state_dir, c_tag, c_target)
@@ -821,26 +821,21 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             optimizer = Gurobi.Optimizer
             mip_reset()
 
-            # Technique 4: set N1 neuron bounds (consumed by relu() during get_model)
+            # Transfer bound tightening: expose N_pre's verified per-neuron bounds so the encoder intersects each of N's bounds with them, shifted by the difference bounds.
             if use_bound_tightening
                 set_n1_neuron_bounds(n1_layers_info)
             end
 
-            # Technique 6: reset the relaxed-binary counters per c_target so
-            # the filename reflects the counts for *this specific* MIP build.
+            # Reset the per-pair relaxation counters (reported in the filename and result line).
             clear_n2_relaxed_counters!()
-            # Technique 4 (SibGate) per-tier counters reset per c_target.
             clear_sibgate_tier_counters!()
 
-            # Conditional Triangle inputs: per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
+            # Conditional Triangle inputs: (compute) per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
             if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
                 compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
             end
 
-            # Technique 6 (BoundTightPertRelax): precompute the per-copy
-            # relaxation decision using N2's own tightened bounds (Sources
-            # A/B/C, now populated above). relu() consults the resulting
-            # n2_relax_decision dict instead of re-scoring from N1's bounds.
+            # Conditional Triangle decision: per neuron, relax the copies whose triangle-gap area (on the tightened bounds) is <= tau.
             if adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
                 compute_n2_relax_decision!(adv_std_n2_relax_threshold)
             else
@@ -854,12 +849,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:bounds_time] = bounds_time_n2
             m_n2 = d_n2[:Model]
 
-            # Technique 4 (SibGate): both org and pert copies are now
-            # encoded inside m_n2. Walk n2_relax_decision and emit:
-            #   • coupling lines for both-thin neurons
-            #   • conditional triangles (gated on the sibling binary)
-            #     for one-thin neurons
-            # No-op when --adv_std_n2_sibling_gate=false.
+            # Add the Conditional Triangle constraints: when one copy keeps its binary, its sibling's triangle is gated on it; when both are relaxed, the two copies are tied by their pre-activation difference interval.
             apply_sibgate_constraints!(m_n2)
 
             # Build N2 result filename with active technique flags
@@ -881,17 +871,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 if use_zono_bounds && !zono_use_npre; n2_name = n2_name * "_noNpreZono"; end
                 if var_hint_mode == VH_PREV_PGD;   n2_name = n2_name * "_varHintPrevPGD";   end
             end
-            # Technique 4 (SibGate): per-tier neuron counts so the filename
-            # encodes how the relaxation actually played out:
-            #   _both<N>     : neurons with BOTH binaries dropped (Tier 1).
-            #   _orgDrop<N>  : neurons with only org binary dropped (Tier 2,
-            #                  pert binary survives → conditional triangle on org
-            #                  gated on a^pert).
-            #   _pertDrop<N> : neurons with only pert binary dropped (Tier 2,
-            #                  org binary survives → conditional triangle on pert
-            #                  gated on a^org).
-            # Counters set by compute_n2_relax_decision!; pre-flight skip uses
-            # n2_check (without these counts), so historical files still match.
+            # Record in the filename how many neurons the Conditional Triangle relaxed: both copies (_both), only the clean copy (_orgDrop), only the perturbed copy (_pertDrop).
             if args["adv_std_n2_sibling_gate"]
                 n2_name = n2_name *
                           "_both"     * string(n_sibgate_both_thin) *
@@ -904,8 +884,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name * "_HyperAttackHints"
             end
             if activate_vaghgar_deps
-                # _depGuardFix marks the fixed dep encoder; must follow
-                # _VagharDeps so paper-tables keeps this binary-dropping run.
                 n2_name = n2_name * "_VagharDeps_depGuardFix"
                 perturbation_dependencies(m_n2, nn2, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d_n2[:Perturbation])
@@ -914,20 +892,12 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 n2_name = n2_name * "_PerturbedIntervals"
                 if geometric_intervals; n2_name = n2_name * "_geomInt"; end
                 perturbed_interval_constraints(m_n2, nn2, "org", "perturbation")
-            else
-                # Mirror the n2_check pre-flight tag: mark PI-ablation results
-                # so they stay distinguishable from same-combo PI runs.
-                n2_name = n2_name * "_noPI"
             end
             mip_set_delta_property(m_n2, perturbation, d_n2)
             set_optimizer(m_n2, optimizer)
             mip_set_attr(m_n2, perturbation, d_n2, timout)
             MOI.set(m_n2, Gurobi.CallbackFunction(), my_callback)
-            # Technique 5: Variable hints.
-            # Mode ∈ {off, prev, direct, direct_pgd, prev_pgd}; apply_n1_var_hints!
-            # early-returns on VH_OFF. The *_PGD modes additionally consume PGD's
-            # Start values (set by hyper_attack_hints above), so they must run
-            # after the hyper_attack_hints call at line ~999.
+            # Warm Start: hint each unstable neuron's phase from N_pre's solution shifted by the difference bounds, kept only where it agrees with the attack's hints (which must already be set — hence after hyper_attack_hints).
             if var_hint_mode != VH_OFF
                 apply_n1_var_hints!(m_n2, var_hint_mode, n1_var_names, n1_var_values, n1_layers_info)
             end
@@ -942,11 +912,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     end
 end
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Advanced Standard N1: solve N1 only and save solver state to disk.
-# Run once; then run advanced_standard_n2 (or advanced_standard --n1_state_dir)
-# multiple times in parallel with different technique flags.
-# ═══════════════════════════════════════════════════════════════════════════
+# Transfer, phase 1: verify N_pre once and save its results (verified bounds, optimal solution, difference bounds); advanced_standard_n2 runs then reuse them.
 function main_advanced_standard_n1(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
     model_path2 = args["model_path2"]
     n1_state_dir = args["n1_state_dir"]
@@ -981,32 +947,20 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size = perturbation_size[1]
-            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
-            # inputs; the old size[4]>1 branch seeded a malformed (k,1) matrix that
-            # collapsed spatial dims and broke conv bound-propagation on multi-
-            # channel (e.g. CIFAR-10) nets.
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-            # The diff bounds [d_lo, d_hi] are always computed with the
-            # DIFFERENCE ZONOTOPE (the paper's Source A); is retired. --adv_std_zono_bounds still
-            # gates Source B (the absolute N2 zonotope) in Phase 2.
+            # Difference zonotope: bound, per neuron, how far N's pre-activation can stray from N_pre's ([d_lo, d_hi]).
             global use_zonotope = true
             println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
             compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
-            # Preserve existing on-disk diff_bounds when completing a partial
-            # state dir: per-pair n1_vars/n1_layers/... files already on disk
-            # were produced against those saved bounds, and overwriting with
-            # freshly-recomputed bounds (which can differ in the last ULPs due
-            # to Gurobi LP threading) would desync old vs new pair files.
-            # In-memory globals are still populated above so this c_tag's
-            # per-c_target N1 MIPs get the comp-bound tightening.
+            # If this folder already has saved difference bounds (from an earlier, interrupted run), keep them:
+            # recomputing gives the same numbers, and all class pairs in one folder must use the same bounds.
             diff_bounds_path = joinpath(n1_state_dir, "diff_bounds.bin")
             preact_path = joinpath(n1_state_dir, "n1_preact_bounds.bin")
             if !isfile(diff_bounds_path)
                 save_n1_diff_bounds(n1_state_dir)
             elseif !isfile(preact_path) && !isempty(n1_preact_up_bounds)
-                # Diff bounds on disk, but n1_preact upgrade available.
-                # Write only the new preact file; leave diff_bounds.bin alone.
+                # Old folder from before N_pre's pre-activation bounds were saved: add just that missing file, keep the existing difference bounds.
                 serialize(preact_path, (n1_preact_up_bounds, n1_preact_down_bounds))
                 println("Advanced-standard-N1: preserved existing diff_bounds.bin; wrote new n1_preact_bounds.bin to $n1_state_dir")
             else
