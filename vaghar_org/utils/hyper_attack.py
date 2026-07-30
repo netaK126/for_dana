@@ -78,16 +78,8 @@ def create_attacked(X, eps, perturbation_type,size_,dims):
             lo_t = torch.as_tensor(lo, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
             hi_t = torch.as_tensor(hi, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
             Xout = torch.max(torch.min(X + eps, hi_t), lo_t)
-    elif perturbation_type == "filterv":
-        f_coeff = [size_[1], size_[2], size_[3]]
-        filter = torch.tensor(f_coeff).reshape(1, 1, len(f_coeff), 1).to(DEVICE)
-        Xout = torch.nn.functional.conv2d(X, filter.view(1, 1, len(f_coeff), 1), padding=(1, 0))
     elif perturbation_type == "contrast":
         Xout = X*(1+eps)
-    elif perturbation_type == "filterh":
-        f_coeff = [size_[1], size_[2], size_[3]]
-        filter = torch.tensor(f_coeff).reshape(1, 1, 1, len(f_coeff)).to(DEVICE)
-        Xout = torch.nn.functional.conv2d(X, filter.view(1, 1, 1, len(f_coeff)), padding=(0, 1))
     return Xout
 
 

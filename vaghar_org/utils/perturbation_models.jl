@@ -34,18 +34,10 @@ function get_model(w_, h_, k_,
         return merge(d_common, get_perturbation_specific_keys_occ(w_, h_, k_, perturbation_size,nn, input, m))
     elseif perturbation == "patch"
         return merge(d_common, get_perturbation_specific_keys_patch(w_, h_, k_, perturbation_size,nn, input, m))
-    elseif perturbation == "patchM"
-        return merge(d_common, get_perturbation_specific_keys_patchM(w_, h_, k_, perturbation_size,nn, input, m))
-    elseif perturbation == "occM"
-        return merge(d_common, get_perturbation_specific_keys_occM(w_, h_, k_, perturbation_size,nn, input, m))
     elseif perturbation == "translation"
         return merge(d_common, get_perturbation_specific_keys_translation(w_, h_, k_, perturbation_size,nn, input, m))
     elseif perturbation == "rotation"
         return merge(d_common, get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size,nn, input, m))
-    elseif perturbation == "filterv"
-        return merge(d_common, get_perturbation_specific_keys_filter_v(perturbation_size,nn, input, m))
-     elseif perturbation == "Privacy"
-        return merge(d_common, get_perturbation_specific_keys_privacy(w_, h_, k_, perturbation_size, nn, nn_second, input, m))
     else
         return merge(d_common, get_perturbation_specific_keys(perturbation_size,nn, input, m))
     end
@@ -98,14 +90,6 @@ function get_perturbation_specific_keys_linf(perturbation_size, nn::NeuralNet, i
     network_version = "perturbation"
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => v_e, :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
-end
-
-function get_perturbation_specific_keys_privacy(w_, h_, k_, perturbation_size, nn::NeuralNet, nn_hyper::NeuralNet,input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
-    input_range = CartesianIndices(size(input))
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-    v_in_output = v_in |> nn
-    v_output = v_in |> nn_hyper
-    return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
 
 function get_perturbation_specific_keys_brightness(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
@@ -310,14 +294,6 @@ function get_perturbation_specific_keys_patch(w_, h_, k_, perturbation_size, nn:
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
 
-function get_perturbation_specific_keys_patchM(w_, h_, k_, perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
-   #TPD
-end
-
-function get_perturbation_specific_keys_occM(w_, h_, k_, perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
-    #TPD
-end
-
 function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
     input_range = CartesianIndices(size(input))
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
@@ -405,64 +381,6 @@ function get_perturbation_specific_keys_translation(w_, h_, k_,perturbation_size
     v_output = v_x0 |> nn
     return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
 end
-
-function get_perturbation_specific_keys_filter_v(perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
-    input_range = CartesianIndices(size(input))
-    v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-    for j=1:27
-        @constraint(m,[i=28*j+1:28*(j+1)-1],v_x0[i]==0.01*v_in[i-1]+0.99*v_in[i]+0.01*v_in[i+1])
-    end
-    @constraint(m,[i=28:28:784],v_x0[i]== 0.1*v_in[i-1]+0.8*v_in[i])
-    @constraint(m,[i=1:28:756],v_x0[i]== 0.8*v_in[i]+0.1*v_in[i+1])
-
-    # Per-pixel perturbation intervals (filter_v is deterministic given v_in,
-    # hard-coded for 28x28 MNIST). With every v_in[·] ∈ [0,1]:
-    #   Interior i ∈ 28j+1..28j+27 (j=1..27):
-    #       Δ = 0.01·v[i-1] − 0.01·v[i] + 0.01·v[i+1] ∈ [-0.01, +0.02]
-    #   Right edge i ∈ 28:28:784:
-    #       Δ = 0.1·v[i-1] − 0.2·v[i] ∈ [-0.2, +0.1]
-    #   Left edge i ∈ 1:28:756:
-    #       Δ = −0.2·v[i] + 0.1·v[i+1] ∈ [-0.2, +0.1]
-    #   Uncovered (i ∈ 2..27, pre-existing): v_x0 free in [0,1] ⟹ Δ ∈ [-1, +1].
-    # Overlap: i ∈ {29, 57, …, 729} appears in both the interior and the
-    # left-edge @constraint blocks; both hold simultaneously in every
-    # feasible solution, so the tighter interior bound is sound — we apply
-    # interior LAST so it overrides the left-edge bound at those indices.
-    global I_pert_prev_up, I_pert_prev_down
-    N = prod(size(input))
-    flat_up   =  ones(Float64, N)
-    flat_down = -ones(Float64, N)
-    for i in 1:28:756            # left edge
-        flat_up[i]   =  0.1
-        flat_down[i] = -0.2
-    end
-    for i in 28:28:784           # right edge (no overlap with interior)
-        flat_up[i]   =  0.1
-        flat_down[i] = -0.2
-    end
-    for j = 1:27                 # interior (overrides left-edge on overlap)
-        for i in (28*j+1):(28*(j+1)-1)
-            flat_up[i]   =  0.02
-            flat_down[i] = -0.01
-        end
-    end
-    I_pert_prev_up   = reshape(flat_up,   size(input))
-    I_pert_prev_down = reshape(flat_down, size(input))
-
-    global layer_counter, nueron_counter, network_version
-    layer_counter = 0
-    nueron_counter = 0
-    network_version = "org"
-    v_in_output = v_in |> nn
-    layer_counter = 0
-    nueron_counter = 0
-    network_version = "perturbation"
-    v_output = v_x0 |> nn
-    return Dict(:v_in_p => v_x0, :Perturbation => "None", :v_out_p => v_output, :v_in => v_in, :v_out => v_in_output)
-end
-
 
 
 function get_perturbation_specific_keys_rotate(w_, h_, k_, perturbation_size, nn::NeuralNet, input::Array{<:Real}, m::Model,)::Dict{Symbol,Any}
