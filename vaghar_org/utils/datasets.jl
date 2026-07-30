@@ -8,11 +8,6 @@ function get_dataset_params( dataset )
     elseif dataset == "cifar10"
         w_,h_,k_=32,32,3
         c_ = 10
-    elseif dataset == "acas"
-        # ACAS Xu (Julian et al.): 5 tabular inputs, 5 advisory outputs.
-        # Only reachable under --internet_nets_benchmarks (guarded in run.jl).
-        w_,h_,k_=5,1,1
-        c_ = 5
     elseif dataset == "har"
         # Human Activity Recognition (Anguita et al. 2013): 561 sensor
         # features, 6 activity classes.
@@ -29,9 +24,9 @@ end
 #
 # The box is NOT hard-coded: it is read from the `<model>_box.txt` sidecar that
 # utils/nnet_to_pickle.py derives from the source .nnet (two comma-separated
-# lines: lo then hi). ACAS uses the .nnet header normalization; HAR uses
-# [-1,1]^561 (Paulsen et al., ICSE'20 / TwoSafe). Image models have no sidecar,
-# so this returns `nothing` and callers keep the historical [0,1] path.
+# lines: lo then hi). HAR uses [-1,1]^561 (Paulsen et al., ICSE'20 / TwoSafe).
+# Image models have no sidecar, so this returns `nothing` and callers keep the
+# historical [0,1] path.
 function get_input_box( dataset, model_path, w_, h_, k_ )
     box_path = splitext(model_path)[1] * "_box.txt"
     if !isfile(box_path)

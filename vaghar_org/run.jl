@@ -43,7 +43,7 @@ function parse_commandline()
     s = ArgParseSettings()
     @add_arg_table! s begin
         "--dataset", "-d"
-        help = "mnist, fmnist, cifar10, or (with --internet_nets_benchmarks) acas, har"
+        help = "mnist, fmnist, cifar10, or (with --internet_nets_benchmarks) har"
         arg_type = String
         required = false
         default = "mnist"
@@ -249,11 +249,11 @@ function parse_commandline()
         required = false
         default = false
 
-        # ── ACAS/HAR benchmark support (pretrained tabular nets) ──
+        # ── HAR benchmark support (pretrained tabular net) ──
         "--internet_nets_benchmarks"
-        help = "Master switch for the ACAS Xu / HAR benchmark nets (pretrained tabular FC nets " *
-               "from the TwoSafe paper). Off ⇒ behavior identical to today. On ⇒ enables the acas/har " *
-               "datasets, their per-coordinate input box, and the new archs; required to run acas/har."
+        help = "Master switch for the HAR benchmark net (pretrained tabular FC net). " *
+               "Off ⇒ behavior identical to today. On ⇒ enables the har dataset, its " *
+               "per-coordinate input box, and the har arch; required to run har."
         arg_type = Bool
         required = false
         default = false
@@ -278,9 +278,9 @@ function main()
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
 
-    # ── ACAS/HAR benchmark support (behind --internet_nets_benchmarks) ──
+    # ── HAR benchmark support (behind --internet_nets_benchmarks) ──
     global internet_nets_benchmarks = args["internet_nets_benchmarks"]
-    if dataset in ("acas", "har") && !internet_nets_benchmarks
+    if dataset == "har" && !internet_nets_benchmarks
         error("dataset \"$dataset\" requires --internet_nets_benchmarks true")
     end
     if internet_nets_benchmarks

@@ -71,10 +71,10 @@ def create_attacked(X, eps, perturbation_type,size_,dims):
         # "attacked" copy is the clean input itself.
         Xout = X + 0.0
     elif perturbation_type == "linf":
-        if ACAS_BOX is None:
+        if BENCH_BOX is None:
             Xout = torch.clamp(X+eps, 0, 1)
         else:
-            lo, hi = ACAS_BOX
+            lo, hi = BENCH_BOX
             lo_t = torch.as_tensor(lo, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
             hi_t = torch.as_tensor(hi, dtype=X.dtype, device=X.device).view(1, *X.shape[1:])
             Xout = torch.max(torch.min(X + eps, hi_t), lo_t)
@@ -174,13 +174,13 @@ def attack(model, X, source_, target_, device, token_signature,\
             break
         with torch.no_grad():
             X_pgd += alpha * X_pgd.grad.sign()
-            if ACAS_BOX is None:
+            if BENCH_BOX is None:
                 X_pgd = torch.clamp(X_pgd, 0, 1)
             else:
-                # Project into the verified box, not [0,1]: for ACAS the latter
+                # Project into the verified box, not [0,1]: the latter
                 # is mostly outside the region, so every iterate would be an
                 # infeasible warm start.
-                _lo, _hi = ACAS_BOX
+                _lo, _hi = BENCH_BOX
                 _lo_t = torch.as_tensor(_lo, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
                 _hi_t = torch.as_tensor(_hi, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
                 X_pgd = torch.max(torch.min(X_pgd, _hi_t), _lo_t)
@@ -299,7 +299,7 @@ def attack(model, X, source_, target_, device, token_signature,\
         elif "2x" in model_name:
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1(images_to.reshape(-1, 784))))), dim=0))
             layers_outputs.append(torch.mean(torch.sign((F.relu(model.fc1((create_attacked(images_to, eps_to, type_, size_, dims)).reshape(-1, 784))))), dim=0))
-        elif model_name in ("acas", "har"):
+        elif model_name == "har":
             # Pretrained tabular FC nets: every fc except the last is a ReLU
             # layer. Clean pass first, then the attacked pass, matching the
             # order the other branches use (num_relu_layers = len//2).
@@ -354,23 +354,23 @@ def attack(model, X, source_, target_, device, token_signature,\
 # Per-coordinate input box for the benchmark nets, set by load_dataset and read
 # by the sampling/clamping helpers. None for the image datasets, which keep the
 # historical [0,1] domain.
-ACAS_BOX = None
+BENCH_BOX = None
 # Sample count for the benchmark nets' hyper-input pool. Large because rare
 # advisories are very rare inside the verified region.
-ACAS_N_SAMPLES = 1000000
+BENCH_N_SAMPLES = 1000000
 
 
 def load_dataset( dataset, model_path=None ):
-    if dataset in ("acas", "har"):
+    if dataset == "har":
         # No dataset exists for these pretrained nets, and none is needed: the
         # attack seeds itself from random points in the verified input region
         # (see create_hyper_input), exactly as random_images already does for
         # the image datasets. Return empty splits and record the box.
-        global ACAS_BOX
+        global BENCH_BOX
         from acas_box import verification_box
         model_dir = os.path.dirname(model_path) if model_path and os.path.isfile(model_path) else model_path
         lo, hi = verification_box(model_dir)
-        ACAS_BOX = (lo, hi)
+        BENCH_BOX = (lo, hi)
         return [], [], (1, int(lo.size), 1)
     if dataset == "mnist":
         h_dim, w_dim, k_dim = 28, 28, 1
@@ -433,8 +433,6 @@ def load_model( model_arch, model_path, dims=(1, 28, 28)):
         model = CNN4(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "cnn5":
         model = CNN5(k=k_dim, w=w_dim, h=h_dim)
-    elif model_arch == "acas":
-        model = FNN_ACAS(k=k_dim, w=w_dim, h=h_dim)
     elif model_arch == "har":
         model = FNN_HAR(k=k_dim, w=w_dim, h=h_dim)
     else:
@@ -449,20 +447,19 @@ def create_hyper_input(source, trainset, testset, M, dims, perturbation_type=Non
 
     train_images = [image for image, _ in trainset]
     test_images = [image for image, _ in testset]
-    if ACAS_BOX is None:
+    if BENCH_BOX is None:
         random_images = torch.rand(len(trainset)+len(testset), dims[0], dims[1], dims[2])
     else:
         # The benchmark nets have no train/test split, so every sample is drawn
         # from the verified input region; torch.rand's [0,1) would fall outside
         # it entirely.
         import numpy as _np
-        lo, hi = ACAS_BOX
+        lo, hi = BENCH_BOX
         # Far more samples than the image path uses. The verified box is
-        # dominated by one advisory (in the ACAS phi1/phi2 region roughly
-        # 99.997% of points are COC), so a source class can otherwise end up
+        # dominated by a few classes, so a source class can otherwise end up
         # with only a handful of points -- or one, which used to crash below.
         random_images = torch.from_numpy(
-            _np.random.default_rng(1).uniform(lo, hi, size=(ACAS_N_SAMPLES, lo.size)).astype(_np.float32)
+            _np.random.default_rng(1).uniform(lo, hi, size=(BENCH_N_SAMPLES, lo.size)).astype(_np.float32)
         ).view(-1, dims[0], dims[1], dims[2])
     parts = [random_images]
     if train_images:
@@ -484,7 +481,7 @@ def create_hyper_input(source, trainset, testset, M, dims, perturbation_type=Non
         raise SystemExit(
             f"hyper_attack: no sampled input is classified as source class {source} "
             f"within the input region; cannot build a warm start. Widen the region "
-            f"or raise ACAS_N_SAMPLES.")
+            f"or raise BENCH_N_SAMPLES.")
     if indices_of_s.numel() < M:
         print(f"  WARNING: only {indices_of_s.numel()} of {len(all_samples)} samples "
               f"are class {source} (wanted {M}); the warm start will be weak.")

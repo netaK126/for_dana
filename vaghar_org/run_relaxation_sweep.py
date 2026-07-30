@@ -189,25 +189,19 @@ PERTURBATIONS = [
     # ("brightness(0.1)",  "brightness:0.1")
 ]
 
-# Perturbations for the pretrained benchmark nets (acas/har). Only linf is
+# Perturbations for the pretrained benchmark net (har). Only linf is
 # usable: every other encoder in perturbation_models.jl hard-codes the [0,1]
 # domain and ignores the input box, and the geometric ones (patch/occ/
-# translation/rotation) index a 2D pixel grid, which a 5-input vector does not
-# have -- patch:1,14,14,3 would index element 79 of 5. eps = 1e-3 matches the
-# ACAS row of the TwoSafe paper (arXiv 2606.21282, Table 1).
+# translation/rotation) index a 2D pixel grid, which a flat feature vector
+# does not have.
 BENCHMARK_PERTURBATIONS = [
-    # linf only. Every other encoder either indexes a 2D pixel grid (patch/occ/
-    # translation/rotation -- a 5-vector has no such grid) or hardcodes the
-    # [0,1] domain. eps = 1e-3 matches the ACAS row of the TwoSafe paper
-    # (arXiv 2606.21282, Table 1).
     ("linf(0.01)", "linf:0.01"),
 ]
 
-# Per-dataset linf radius for the benchmark nets, overriding the eps baked into
-# BENCHMARK_PERTURBATIONS. The two nets live on different input domains -- ACAS
-# on the .nnet header normalization (coordinate ranges well under 1) and HAR on
-# [-1,1]^561 -- so one shared eps does not mean the same thing for both. Set
-# from --benchmark_eps; an absent key falls back to BENCHMARK_PERTURBATIONS.
+# Per-dataset linf radius for the benchmark net, overriding the eps baked into
+# BENCHMARK_PERTURBATIONS (HAR lives on [-1,1]^561, so eps means something
+# different than on [0,1] images). Set from --benchmark_eps; an absent key
+# falls back to BENCHMARK_PERTURBATIONS.
 _BENCHMARK_EPS = {}
 
 
@@ -219,8 +213,6 @@ _PERT_NAME_FILTER = None
 def _num_classes_for(dataset):
     """Output-class count, so c_target/dummy_ct never exceed the net's outputs."""
     jd = _julia_dataset_name(dataset)
-    if jd == "acas":
-        return 5
     if jd == "har":
         return 6
     return 10
@@ -229,8 +221,7 @@ def _num_classes_for(dataset):
 def _benchmark_perturbations_for(julia_dataset):
     """BENCHMARK_PERTURBATIONS with this dataset's --benchmark_eps applied.
 
-    Returns BENCHMARK_PERTURBATIONS unchanged when no override was given, so
-    the ACAS command lines are byte-identical to before unless asked otherwise.
+    Returns BENCHMARK_PERTURBATIONS unchanged when no override was given.
     """
     eps_str = _BENCHMARK_EPS.get(julia_dataset)
     if eps_str is None:
@@ -248,7 +239,7 @@ def all_perturbations_for(dataset):
     translation/rotation index a 2D pixel grid a flat input vector does not
     have, so those cells can never exist and the scan finds nothing at all."""
     _jd = _julia_dataset_name(dataset)
-    return (_benchmark_perturbations_for(_jd) if _jd in ("acas", "har")
+    return (_benchmark_perturbations_for(_jd) if _jd == "har"
             else PERTURBATIONS)
 
 
@@ -1093,8 +1084,8 @@ def _julia_dataset_name(name):
 
 
 # N2 directory suffixes. The image pipeline derives N2 by extra SGD epochs and
-# tags it _sgd_itr{n}; the pretrained benchmark nets (acas/har) have no training
-# data, so their N2 comes from reducing weight precision and is tagged for that
+# tags it _sgd_itr{n}; the pretrained benchmark net (har) has no training
+# data, so its N2 comes from reducing weight precision and is tagged for that
 # instead. Several tools read the suffix to tell N1 from N2, so both spellings
 # have to be recognised anywhere that inference is made.
 N2_BENCHMARK_SUFFIX = "_int8"
@@ -1123,13 +1114,13 @@ def _delta_max_boost_args(julia_dataset):
     timeout would now reach optimality and change the normaliser behind every
     published image table cell. Widen this only with a before/after check.
     """
-    if julia_dataset not in ("acas", "har"):
+    if julia_dataset != "har":
         return ["--use_hyper_attack", "false"]
     return ["--use_hyper_attack", "true", "--nn1_zono_bounds", "true"]
 
 
 def _benchmark_args(julia_dataset):
-    """--internet_nets_benchmarks for the pretrained tabular nets (acas/har).
+    """--internet_nets_benchmarks for the pretrained tabular net (har).
 
     run.jl hard-errors for these datasets without it -- it is the master switch
     that also loads the per-coordinate input box from the <model>_box.txt
@@ -1137,7 +1128,7 @@ def _benchmark_args(julia_dataset):
     byte-identical to before.
     """
     return (["--internet_nets_benchmarks", "true"]
-            if julia_dataset in ("acas", "har") else [])
+            if julia_dataset == "har" else [])
 
 
 # The wall-clock cap the benchmark sweeps were run at, used when
@@ -1153,15 +1144,15 @@ BENCHMARK_FORCE_TIMEOUT = 10800
 def _benchmark_arch_for(dataset):
     """The architecture key of a pretrained benchmark dataset, or None.
 
-    ACAS Xu and HAR ship one pretrained network each, so their arch key IS the
-    dataset name (their results live under paper_experiments/<ds>/<ds>_exp) and
+    HAR ships one pretrained network, so its arch key IS the dataset
+    name (its results live under paper_experiments/<ds>/<ds>_exp) and
     naming the dataset already names the architecture. --arch_timeouts lists
     the image architectures, none of which exist under these datasets, so
     without this the loaders would scan only missing '<arch>_exp' dirs and the
     dataset would render "No data available" even with results on disk.
     """
     jd = _julia_dataset_name(str(dataset).strip().lower())
-    return jd if jd in ("acas", "har") else None
+    return jd if jd == "har" else None
 
 
 def _benchmark_class_grid(cwd, dataset, arch):
@@ -1213,8 +1204,7 @@ def _save_truncated_n2(model, n1_dir, n2_dir, device):
     ReluDiff produces its second network this way ("truncating each network's
     weights from 32-bit floats to 16-bit floats"); VeryDiff, which TwoSafe builds
     on, uses pruning for the same purpose. Either gives a tightly-coupled pair
-    without training data, which is what the ACAS nets need since their original
-    lookup-table data is not public.
+    without training data, which is what the pretrained benchmark net needs.
 
     Post-training int8 quantization rather than a reduced-precision float:
     float formats preserve RELATIVE precision, so shrinking the mantissa barely
@@ -1331,7 +1321,7 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
     # The benchmark nets get no SGD at all (see below), so their N2 is named for
     # what actually produced it (int8 quantization) rather than inheriting the
     # image pipeline's _sgd_itr tag. is_n2_model_name() knows both spellings.
-    n2_dir = (f"{n1_dir}{N2_BENCHMARK_SUFFIX}" if julia_ds in ('acas', 'har')
+    n2_dir = (f"{n1_dir}{N2_BENCHMARK_SUFFIX}" if julia_ds == 'har'
               else f"{n1_dir}_sgd_itr{sgd_epochs}")
 
     # Skip training if N2 already exists
@@ -1354,14 +1344,14 @@ def train_extra_epochs(model_path, arch, dataset, sgd_epochs=1, lr=1e-3, batch_s
     model.load_state_dict(torch.load(model_pth, map_location=device))
     print(f"  Loaded model from {model_pth}")
 
-    # The benchmark nets (acas/har) ship pretrained with no public training set,
+    # The benchmark net (har) ships pretrained with no public training set,
     # and extra SGD cannot produce an N2 for them: any oracle labelled by N1 is
     # fit exactly by N1 at step 0, so the gradient is zero and N2 == N1. Follow
     # the differential-verification literature instead and derive N2 by reducing
     # weight precision -- ReluDiff: "We produce f' by truncating each network's
     # weights from 32-bit floats to 16-bit floats." The truncated values are kept
     # in the original dtype so every downstream consumer is unchanged.
-    if julia_ds in ('acas', 'har'):
+    if julia_ds == 'har':
         _save_truncated_n2(model, n1_dir, n2_dir, device)
         print(f"  N1: {n1_dir}")
         print(f"  N2: {n2_dir}")
@@ -3553,7 +3543,7 @@ def _arch_setup_for_dataset(dataset, arch_runs, ft_by_arch, ct_by_arch,
     is otherwise absent. Datasets with no scoped entry get the unscoped setup
     unchanged.
 
-    The pretrained benchmark datasets (acas/har) are then given their own arch
+    The pretrained benchmark dataset (har) is then given its own arch
     for free, see _benchmark_arch_for.
     """
     scoped = (ds_scoped or {}).get(str(dataset).strip().lower(), {})
@@ -3910,13 +3900,12 @@ def main():
     parser.add_argument("--perturbations", nargs="*", default=None,
                         help="Filter perturbations by name prefix (e.g. 'patch' 'occ' 'trans' 'rotation')")
     parser.add_argument("--benchmark_eps", nargs="*", default=None,
-                        help="Per-dataset linf radius for the pretrained benchmark nets, as "
+                        help="Per-dataset linf radius for the pretrained benchmark net, as "
                              "<dataset>=<eps> (e.g. 'har=0.01'). Only linf is encodable for "
-                             "acas/har, and the two live on different input domains (ACAS on the "
-                             ".nnet header normalization, HAR on [-1,1]^561), so one shared eps "
-                             "does not mean the same thing for both. The value is used verbatim "
-                             "in the eps_<value> results directory, so pass it exactly as it "
-                             "should appear on disk. Without this the built-in "
+                             "har, which lives on [-1,1]^561 (not the [0,1] image domain), so "
+                             "eps does not mean the same thing as on images. The value is used "
+                             "verbatim in the eps_<value> results directory, so pass it exactly "
+                             "as it should appear on disk. Without this the built-in "
                              "BENCHMARK_PERTURBATIONS radius is used.")
     parser.add_argument("--max_cores", type=int, default=TOTAL_CORES,
                         help=f"Total cores available (default: {TOTAL_CORES})")
@@ -4340,7 +4329,7 @@ def main():
     effective_force_timeout = (arch_force_timeout if arch_force_timeout is not None
                                else args.force_timeout)
 
-    # Per-dataset linf radius for the benchmark nets (acas/har). Applied before
+    # Per-dataset linf radius for the benchmark net (har). Applied before
     # perturbations_for so every eps_* directory built below sees the override.
     if args.benchmark_eps:
         global _BENCHMARK_EPS
@@ -4352,9 +4341,9 @@ def main():
             ds_key, eps_str = entry.split("=", 1)
             ds_key = _julia_dataset_name(ds_key.strip())
             eps_str = eps_str.strip()
-            if ds_key not in ("acas", "har"):
+            if ds_key != "har":
                 print(f"ERROR: --benchmark_eps only applies to the pretrained "
-                      f"benchmark nets (acas/har); got '{ds_key}'.")
+                      f"benchmark net (har); got '{ds_key}'.")
                 sys.exit(1)
             try:
                 float(eps_str)

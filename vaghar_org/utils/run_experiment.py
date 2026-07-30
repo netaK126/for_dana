@@ -18,7 +18,7 @@ from models import (
     FNN_4_10, FNN_5_10, FNN_5_50, FNN_6_10, FNN_6_100,
     FNN_9_200, FNN_10_10,
     CNN0, CNN1, CNN2, CNN3, CNN4, CNN5,
-    FNN_ACAS, FNN_HAR,
+    FNN_HAR,
 )
 
 # ── architecture registry ────────────────────────────────────────────────
@@ -42,7 +42,6 @@ ARCH_REGISTRY = {
     'cnn4':  (CNN4,      'cnn4'),
     'cnn5':  (CNN5,      'cnn5'),
     # Pretrained tabular benchmark nets (only under --internet_nets_benchmarks).
-    'acas':  (FNN_ACAS,  'acas'),
     'har':   (FNN_HAR,   'har'),
 }
 
@@ -56,7 +55,6 @@ DATASET_CONFIG = {
     # channels/width/height encode the flat input dim (channels*w*h). Only the
     # julia-name and input-dim fields are used on the internet-nets path; the
     # torchvision slot must never be dereferenced for these.
-    'acas':          (None,               1, 5,   1,  'acas'),
     'har':           (None,               1, 561, 1,  'har'),
 }
 
