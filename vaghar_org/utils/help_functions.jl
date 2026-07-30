@@ -50,133 +50,56 @@ global relu_diff_down_bounds::Vector = []
 global n1_preact_up_bounds::Vector   = []
 global n1_preact_down_bounds::Vector = []
 
-# ── N2-only perturbation relaxation (--no_n1_binaries_and_relaxtions_only_on_n2) ─
-# Relax N2(x_p) by conditioning on N2(x) binary instead of N1(x).
-# Uses perturbation bounds through N2: z_n2_pert - z_n2_org
-# and N2 pre-activation bounds for conditional intervals.
+# Retired transfer switch — permanently false; kept because the encoder (core_ops.jl) checks it.
 global no_n1_binaries_and_relaxtions_only_on_n2::Bool = false
+# Per-neuron perturbation-difference intervals (perturbed copy vs clean copy) — the Conditional Triangle's coupling input.
 global relu_n2pert_up_bounds::Vector   = []
 global relu_n2pert_down_bounds::Vector = []
+# Each copy's pre-activation bounds [l, u] — the Conditional Triangle's gating input.
 global n2_preact_up_bounds::Vector     = []
 global n2_preact_down_bounds::Vector   = []
 
-# ── No-N1-encoding mode (--no_n1_encoding_at_all) ───────────────────────────
-# Output-layer diff bounds: N2(x)[k] - N1(x)[k] ∈ [output_diff_down[k], output_diff_up[k]]
-# Used to replace the entire N1 encoding with interval-bounded constraints on N2 outputs.
-global no_n1_encoding_at_all::Bool = false
-global no_n2_xp_encoding::Bool = false
-global encode_n1_last_layer::Bool = false
-global n1_last_layer_use_box_scalar::Bool = false
-global n1_last_layer_prune_tol::Float64 = 0.0  # threshold: drop h_n1 vars with interval width <= this; 0 = only exact singletons
-global n1_adaptive_prune_budget::Float64 = 0.0  # sensitivity-based pruning budget; 0 = disabled
-global hybrid_solve::Bool = false  # two-phase solve: start with scalar bound, lazily add argmax constraints
-global use_zonotope::Bool = false
-# --geometric_intervals: relocation-aware interval bounds for translation/rotation (default OFF = no change).
+# Translation/rotation: use the exact (T-I) relocation map, composed through the first layer, for the perturbation-difference intervals (run.jl sets it; default true).
 global geometric_intervals::Bool = false
-global geometric_diff_map = nothing          # the (T-I) matrix for the current build, or nothing
-global geometric_input_shape = nothing       # size(input) for the current build
-global bound_n2_relu_using_zonotope::Bool = false  # tighten ReLU preact bounds of N2 by intersecting with N1 preact + zonotope diff
-global n1_stability_relax_threshold::Float64 = -1.0  # transfer-aware: replace N2 binary with triangle LP relaxation when N1 neuron is stable and gap <= threshold; <0 = disabled
-global bound_by_zonotope_n2_hidden_neurons_which_are_not_relu::Bool = false  # add constraints on N2 final-layer logits using N1 output + zonotope diff
-global n2_derived_preact_up_bounds   = []
-global n2_derived_preact_down_bounds = []
-global bound_n2_xp_using_composed::Bool = false  # tighten N2(x') preact bounds using N1 preact + composed bounds to eliminate binaries
-global constrain_n2_xp_via_n1_zonotope::Bool = false  # add conditional constraints linking N2(x') post-ReLU to N2(x)'s binary using perturbation bounds via N1
-global branch_priority_n2x_first::Bool = false  # set Gurobi BranchPriority: N2(x) binaries high, N2(x') low → resolve N2(x) first
-global bound_n2_xp_output_using_composed::Bool = false  # bound N2(x') output logits using N1 output + composed (diff+pert) bounds
-global n2_xp_derived_preact_up_bounds   = []
-global n2_xp_derived_preact_down_bounds = []
+# The current build's (T-I) matrix; `nothing` for every non-relocation perturbation.
+global geometric_diff_map = nothing
+# The current build's input shape, for reshaping the (T-I) map.
+global geometric_input_shape = nothing
+# Retired transfer switch — permanently false; kept because the encoder (core_ops.jl) checks it.
+global bound_n2_relu_using_zonotope::Bool = false
+# Retired transfer threshold — permanently disabled (-1); kept because the encoder (core_ops.jl) checks it.
+global n1_stability_relax_threshold::Float64 = -1.0
+# Retired transfer switch — permanently false; kept because the encoder (core_ops.jl) checks it.
+global bound_n2_xp_using_composed::Bool = false
+# Retired transfer switch — permanently false; kept because the encoder (core_ops.jl) checks it.
+global constrain_n2_xp_via_n1_zonotope::Bool = false
 
-# ── advstd Technique 4 + zono bounds (--adv_std_zono_bounds) ───────────────
-# Per-ReLU-layer scalar bounds on N2's pre-activation, produced by
-# compute_n2_bounds_zonotope_with_n1_tighten (Source B). Independent of the
-# diff-zonotope path (Source A), intersected against the ReLU [l,u] inside
-# core_ops.jl::relu(). Empty when the --adv_std_zono_bounds flag is off.
+# Zonotope Bound Tightening's output: per-neuron pre-activation bounds from the zonotope propagated through the network, intersected into each ReLU's [l, u] by the encoder; empty when --adv_std_zono_bounds / --nn1_zono_bounds is off.
 global n2_abs_up_bounds::Vector   = []
 global n2_abs_down_bounds::Vector = []
 
-# ── advstd retired N1-probe LP bounds (Source C; kept because core_ops.jl
-#    consults these globals — nothing populates them anymore) ────────────────
-# Per-ReLU-layer scalar bounds on N2's pre-activation, produced by
-# compute_n2_bounds_n1_probe_lp (Source C). Computed via OBBT on a joint
-# LP-relaxed (N1 + N2) model using N1's post-solve bounds for the triangle
-# relaxation. Separate arrays for the "org" (clean-input) and "perturbation"
-# (perturbed-input) network_version passes, since the probe runs once per
-# pass with the appropriate input seed.
+# Retired technique's bound arrays — permanently empty; kept because the encoder (core_ops.jl) checks them for every neuron.
 global n2_probe_up_bounds_org::Vector   = []
 global n2_probe_down_bounds_org::Vector = []
 global n2_probe_up_bounds_pert::Vector  = []
 global n2_probe_down_bounds_pert::Vector = []
-# Count of N2 binaries eliminated *specifically by the N1-probe LP step*:
-# neurons that would still have been split after Technique 4 + Source A/B,
-# but whose probe-derived bound is single-signed. Tracked separately for
-# N2(x) ("org") and N2(x') ("pert") so the result file can report both
-# numbers. `n_probe_eliminated_binaries` is the sum of the two and is
-# retained for filename composition.
+# Retired technique's counters — always 0; kept only so old and new result lines share the same columns.
 global n_probe_eliminated_binaries_org::Int = 0
 global n_probe_eliminated_binaries_pert::Int = 0
-global n_probe_eliminated_binaries::Int = 0
 global n1_probe_lp_time::Float64 = 0.0
 
-# ── advstd Technique 6: N1-gated N2/N2p triangle LP relaxation ─────────────
-# When >= 0, core_ops.jl::relu() replaces the big-M binary encoding of an
-# N2/N2p ReLU with a three-inequality triangle LP whenever the
-# triangle-gap-area of N1's interval at the corresponding neuron is
-# <= this threshold. Sound over-approximation: delta_relaxed >= delta_exact.
-# -1 = disabled (default).
+# The Conditional Triangle's tau: relax a copy's ReLU (drop its binary for a triangle) when its triangle-gap area is <= tau; -1 disables.
 global adv_std_n2_relax_threshold = -1.0
-# Counters for the filename suffix / result-line columns — how many
-# N2(x) and N2(x') ReLU binaries were replaced by triangles this run.
-# NOTE: no `::Int` type annotation here because core_ops.jl (included
-# earlier via net_components.jl) already references these globals inside
-# relu() via `global n_n2_relaxed_binaries_* += 1`, which creates an
-# implicit untyped binding. Re-declaring with a type would raise
-# "cannot set type for global ... it already has a value" at include time.
+# How many clean-copy / perturbed-copy ReLUs the Conditional Triangle relaxed this run (reported in the filename and result line); must stay untyped — the encoder already binds these names before this file loads.
 global n_n2_relaxed_binaries_org  = 0
 global n_n2_relaxed_binaries_pert = 0
 
-# ── advstd Technique 4 (SibGate): sibling-gated conditional triangle ────────
-# When true, Technique-3's per-copy decision rule is unchanged but the
-# emission switches:
-#   • "both thin" tier: simple triangle on each copy + ONE pre-activation
-#     coupling line linking org and pert pre-acts.
-#   • "one thin" tier: conditional triangle on the relaxed copy, gated on
-#     the kept sibling's binary, with intervals intersected against
-#     Technique-1's unconditional per-copy bound.
-# Activation requires --adv_std_n2_relax_threshold >= 0 (Technique 4 inherits
-# Technique-3's tiered decision rule). Untyped for the same reason as the
-# n_n2_relaxed_binaries_* counters above.
+# Conditional Triangle emission switch: gate a lone relaxed copy's triangle on its sibling's binary, and couple two relaxed copies by their pre-activation difference interval; needs tau >= 0, untyped for the same load-order reason as above.
 global adv_std_n2_sibling_gate = false
-# Per-tier neuron counters, tracked at decision time and consumed by the
-# filename composer.
+# How many neurons landed in each Conditional Triangle case this run (both copies relaxed / only clean / only perturbed) — reported in the filename.
 global n_sibgate_both_thin             = 0
 global n_sibgate_one_thin_org_dropped  = 0
 global n_sibgate_one_thin_pert_dropped = 0
-global output_diff_up_bounds::Vector{Float64}   = Float64[]
-global output_diff_down_bounds::Vector{Float64} = Float64[]
-# N1 output-layer logit bounds (final linear layer of N1 over admissible inputs).
-# Used by --bound_by_zonotope_n2_hidden_neurons_which_are_not_relu to bound
-# N2's output logits as [n1_out_down + d_lo, n1_out_up + d_hi].
-global n1_output_up_bounds::Vector{Float64}   = Float64[]
-global n1_output_down_bounds::Vector{Float64} = Float64[]
-# Output-level perturbation bounds: N2(x')[k] - N2(x)[k] and N1(x')[k] - N1(x)[k]
-# Used by --constrain_n1_xp to add conf(N1,x',c_target)<=0 constraint.
-global output_n2_pert_up::Vector{Float64}   = Float64[]
-global output_n2_pert_down::Vector{Float64} = Float64[]
-global output_n1_pert_up::Vector{Float64}   = Float64[]
-global output_n1_pert_down::Vector{Float64} = Float64[]
-
-# ── N1 last-hidden-layer bounds (--encode_n1_last_layer) ────────────────────
-# Post-ReLU bounds on N1's last hidden layer activations: a_n1_last[i] ∈ [down, up]
-# Post-ReLU diff bounds at last hidden layer: a_n2_last[i] - a_n1_last[i] ∈ [down, up]
-# Used to create interval-bounded MIP variables for N1's last hidden layer,
-# then encode the final linear layer exactly → exact conf_n1_x and delta_diff.
-global n1_last_hidden_up::Vector{Float64}       = Float64[]
-global n1_last_hidden_down::Vector{Float64}     = Float64[]
-global last_hidden_diff_up::Vector{Float64}     = Float64[]
-global last_hidden_diff_down::Vector{Float64}   = Float64[]
-
-# ── Diff-bounds cache (avoid recomputing zonotope/interval across class pairs) ──
 mutable struct ReuseBoundAndDepsConfig
     is_reuse_bounds_and_deps::Bool
     reusable_indexes::Int

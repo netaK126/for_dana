@@ -398,7 +398,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             # negative output size on multi-channel (e.g. CIFAR-10) nets.
             I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy))
             I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy))
-            global use_zonotope = true
             println("Standard-mode boost: computing absolute zonotope bounds (Source B) on N1...")
             compute_n2_bounds_zonotope_with_n1_tighten(nn, I_pert_up_b, I_pert_down_b)
             println("  Source B bounds computed: $(length(n2_abs_up_bounds)) ReLU layers")
@@ -950,7 +949,6 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
             # Difference zonotope: bound, per neuron, how far N's pre-activation can stray from N_pre's ([d_lo, d_hi]).
-            global use_zonotope = true
             println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
             compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
             # If this folder already has saved difference bounds (from an earlier, interrupted run), keep them:

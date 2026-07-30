@@ -636,57 +636,10 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     end
 
     # Save all bounds (same globals as the retired interval pass)
-    global n1_last_hidden_up     = vec(copy(Float64.(n1_act_up)))
-    global n1_last_hidden_down   = vec(copy(Float64.(n1_act_down)))
-    global last_hidden_diff_up   = vec(copy(Float64.(last_relu_diff_up)))
-    global last_hidden_diff_down = vec(copy(Float64.(last_relu_diff_down)))
-    println("compute_diff_bounds_zonotope: last hidden layer size = $(length(n1_last_hidden_up)), " *
-            "diff width = $(maximum(last_hidden_diff_up .- last_hidden_diff_down))")
-
-    global output_diff_up_bounds   = vec(copy(Float64.(diff_up)))
-    global output_diff_down_bounds = vec(copy(Float64.(diff_down)))
-    println("compute_diff_bounds_zonotope: output-layer diff bounds width = $(maximum(output_diff_up_bounds .- output_diff_down_bounds))")
-    global n1_output_up_bounds   = vec(copy(Float64.(n1_pre_up_cur)))
-    global n1_output_down_bounds = vec(copy(Float64.(n1_pre_down_cur)))
-
+    println("compute_diff_bounds_zonotope: output-layer diff bounds width = $(maximum(vec(Float64.(diff_up)) .- vec(Float64.(diff_down))))")
     if zono_active
         println("  Final zonotope: $(size(diff_gens, 2)) generators")
     end
-
-    # Save N2 output pert bounds
-    global output_n2_pert_up   = vec(copy(Float64.(pert_up)))
-    global output_n2_pert_down = vec(copy(Float64.(pert_down)))
-
-    # Compute N1 output pert bounds (same as in the retired interval pass)
-    n1_pert_up   = copy(Float64.(I_pert_up_init))
-    n1_pert_down = copy(Float64.(I_pert_down_init))
-    for (layer_idx, l) in enumerate(nn1.layers)
-        if occursin("Flatten", string(typeof(l)))
-            if ndims(n1_pert_up) > 1
-                n1_pert_up   = vec(n1_pert_up |> l)
-                n1_pert_down = vec(n1_pert_down |> l)
-            end
-        elseif occursin("Linear", string(typeof(l)))
-            W1 = Float64.(transpose(l.matrix))
-            rp_min, rp_max = interval_matrix_vector_multiplication(W1, W1, n1_pert_down, n1_pert_up)
-            n1_pert_down = rp_min
-            n1_pert_up   = rp_max
-        elseif occursin("Conv", string(typeof(l)))
-            F1 = Float64.(l.filter)
-            zero_bias = zeros(Float64, length(l.bias))
-            n1_p_4d_down = ndims(n1_pert_down) == 4 ? n1_pert_down : reshape(n1_pert_down, 1, :, 1, 1)
-            n1_p_4d_up   = ndims(n1_pert_up)   == 4 ? n1_pert_up   : reshape(n1_pert_up,   1, :, 1, 1)
-            rp_min, rp_max = interval_conv2d_bounds(F1, F1, n1_p_4d_down, n1_p_4d_up, zero_bias, l.stride, l.padding)
-            n1_pert_down = rp_min
-            n1_pert_up   = rp_max
-        elseif occursin("ReLU", string(typeof(l)))
-            n1_pert_up   = max.(0.0, n1_pert_up)
-            n1_pert_down = .- max.(0.0, .- n1_pert_down)
-        end
-    end
-    global output_n1_pert_up   = vec(copy(Float64.(n1_pert_up)))
-    global output_n1_pert_down = vec(copy(Float64.(n1_pert_down)))
-    println("compute_diff_bounds_zonotope: N1 pert bounds width = $(maximum(output_n1_pert_up .- output_n1_pert_down))")
 
     println("compute_diff_bounds_zonotope: populated $(length(relu_diff_up_bounds)) ReLU layers")
 end
