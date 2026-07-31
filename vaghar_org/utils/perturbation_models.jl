@@ -100,8 +100,6 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 0, upper_bound = p_size)
-    # x' = x + e with e >= 0, so x' can exceed the clean domain's upper bound.
-    # perturbed_input_in_domain records that for the interval passes.
     global perturbed_input_in_domain = false
     if internet_nets_benchmarks
         (input_box_lo === nothing || input_box_hi === nothing) &&
