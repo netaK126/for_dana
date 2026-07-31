@@ -1,23 +1,7 @@
-# ────────────────────────────────────────────────────────────────────────────
-# advstd Technique 6 — BoundTightPertRelax (tiered per-copy N2 relaxation)
-#
-# compute_n2_relax_decision!(threshold) precomputes, for each N2 ReLU neuron,
-# whether the original-input copy and/or the perturbed-input copy should be
-# LP-relaxed (triangle) instead of big-M-encoded. Populates the global dict
-# `n2_relax_decision` that core_ops.jl::relu() consults.
-#
-# Decision rule (tiered):
-#   g_org  = tri_gap(l_org,  u_org)
-#   g_pert = tri_gap(l_pert, u_pert)
-#   if max(g_org, g_pert) ≤ τ  → relax BOTH copies
-#   elif min(g_org, g_pert) ≤ τ → relax ONLY the smaller-gap copy
-#   else                        → keep both exact
-#
-# The (l, u) bounds come from intersect_per_copy_bounds (defined in
-# core_ops.jl), which mirrors exactly what relu() will intersect at emission
-# time. This is the load-bearing invariant for the soundness of Technique 6:
-# every (ẑ, z⁺) feasible under the exact big-M ReLU on [l, u] is inside the
-# triangle on [l, u], so F_exact ⊆ F_BTPR and δ_BTPR ≥ δ_exact.
+# The Conditional Triangle's decision: for every neuron, score each copy's triangle-gap area on its tightened bounds and
+# record which copies to relax — both when both areas are <= tau, only the smaller-area copy when just it is, neither otherwise.
+# The scoring uses exactly the bounds the encoder will use when emitting the triangle, so the triangle always contains the
+# exact ReLU on the same [l, u] — which is why delta_relaxed >= delta_exact. Fills n2_relax_decision, consulted by relu().
 # ────────────────────────────────────────────────────────────────────────────
 
 function compute_n2_relax_decision!(threshold::Real)
@@ -28,16 +12,7 @@ function compute_n2_relax_decision!(threshold::Real)
         return
     end
 
-    # Number of ReLU layers in one N2 pass (org or pert).
-    # advstd path: relu_diff_up_bounds is populated by
-    # compute_diff_bounds_zonotope /
-    # load_n1_diff_bounds! — always present when --adv_std_bound_tightening
-    # is true, which is a precondition for --adv_std_n2_relax_threshold.
-    # Standard-mode (nn1 boosting) path: no diff bounds exist; fall back on
-    # n2_abs_up_bounds (Source B, absolute zonotope on nn1) for K/shape.
-    # When Source B was computed by the standard-mode boost wiring, its
-    # per-layer neuron counts match exactly the relu layout the encoder
-    # walks for the two copies, so the dual-key layout below still holds.
+    # Layer count and per-layer neuron counts, taken from whichever bound arrays this mode has: the difference bounds (transfer) or the zonotope bounds (no transfer).
     bounds_for_shape = !isempty(relu_diff_up_bounds) ? relu_diff_up_bounds :
                        (!isempty(n2_abs_up_bounds)   ? n2_abs_up_bounds   : nothing)
     if bounds_for_shape === nothing
@@ -53,11 +28,7 @@ function compute_n2_relax_decision!(threshold::Real)
         return
     end
 
-    # Starting (l, u) for the decision: use a wide outer envelope. The helper
-    # tightens via Sources A/B/C to the same interval relu() will use at
-    # emission. Starting looser than relu()'s upstream interval-arithmetic
-    # result only makes the decision more conservative (fewer relaxations) —
-    # still sound (see Technique 6 soundness proof in advstd_techniques.tex).
+    # Start each neuron from a wide envelope and tighten it exactly as the encoder will; starting looser only makes the tau test more conservative (fewer relaxed neurons), never unsound.
     l_init = -Inf
     u_init = +Inf
 
@@ -70,20 +41,18 @@ function compute_n2_relax_decision!(threshold::Real)
     for m_idx in 1:K
         n_neurons = length(bounds_for_shape[m_idx])
         for k_idx in 1:n_neurons
-            # Mirror relu()'s per-copy nn_layer keys. After mip_reset before
-            # the N2 build, neurons_names.layer increments 1..K during the
-            # org pass (v_in |> nn) then continues K+1..2K during the pert
-            # pass (v_x0 |> nn). n1_neuron_bounds (from N1's dual-copy MIP)
-            # has the same key structure, so Source A fires for both copies.
+            # Use the encoder's layer numbering: the clean copy is layers 1..K, the perturbed copy K+1..2K, matching N_pre's saved bounds so both copies get tightened.
             nn_layer_org  = m_idx
             nn_layer_pert = m_idx + K
 
+            # The clean copy's tightened bounds [l, u]: the envelope intersected with N_pre's shifted bounds and the zonotope bounds, exactly as the encoder will.
             (l_org,  u_org)  = intersect_per_copy_bounds(
                 l_init, u_init,
                 nn_layer_org, k_idx,
                 m_idx, k_idx,
                 "org",
             )
+            # The perturbed copy's tightened bounds, same intersections.
             (l_pert, u_pert) = intersect_per_copy_bounds(
                 l_init, u_init,
                 nn_layer_pert, k_idx,
@@ -123,14 +92,7 @@ function compute_n2_relax_decision!(threshold::Real)
             end
 
             if relax_org || relax_pert
-                # Dual-key layout: relu()'s lookup uses (neurons_names.layer,
-                # neurons_names.neuron), which differs between the org and
-                # pert passes. We store the FULL (relax_org, relax_pert) pair
-                # under each pass's key. Storing the same pair under both
-                # keys lets relu() see the joint tier when handling either
-                # copy — needed for Technique 4 (SibGate) to distinguish
-                # "both thin" (emit simple triangle + coupling line) from
-                # "one thin" (emit conditional triangle gated on sibling).
+                # Store the full (relax clean?, relax perturbed?) decision under BOTH copies' keys, so whichever copy the encoder is building, it can tell "both relaxed" (couple them) from "one relaxed" (gate on the sibling).
                 if relax_org
                     n2_relax_decision[(nn_layer_org, k_idx)]  = (relax_org, relax_pert)
                 end
@@ -141,8 +103,7 @@ function compute_n2_relax_decision!(threshold::Real)
         end
     end
 
-    # Technique 4 (SibGate) per-tier counters consumed by the filename
-    # composer. Stable neurons are excluded — they have no binary to drop.
+    # Count how many neurons landed in each Conditional Triangle case (reported in the filename); stable neurons are excluded — they have no binary to drop.
     global n_sibgate_both_thin             = n_both
     global n_sibgate_one_thin_org_dropped  = n_org_only
     global n_sibgate_one_thin_pert_dropped = n_pert_only

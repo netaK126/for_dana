@@ -4,10 +4,7 @@ function mip_reset()
     neurons_names.layer = 0
     first_mip_solution.solution = -1.0
     first_mip_solution.time = 0.0
-    # Technique 4 (SibGate): clear the per-neuron MIP-state cache so a
-    # stale (preact, l, u, x_rect) from the previous c_target build can't
-    # leak into the current one. apply_sibgate_constraints! reads from
-    # this cache, so it must be repopulated freshly for each MIP build.
+    # Each class pair gets its own fresh MIP: erase the per-neuron records (bounds and variables) saved during the previous build, so the Conditional Triangle's constraints are always built from the current MIP only.
     clear_n2_relu_state!()
 end
 
@@ -35,14 +32,6 @@ function mip_set_attr(m, perturbation, d, timout)
     set_optimizer_attribute(m, "MIPGap", 0.01)
     global gurobi_seed
     set_optimizer_attribute(m, "Seed", gurobi_seed)
-    # cnn2 only: the PGD partial warm-start triggers a completion sub-MIP whose
-    # default node budget explodes on this large model (~1h/target, no incumbent).
-    # Bound it so Gurobi stops repairing the start and gets to the real solve.
-    # Every other architecture is left exactly as before (no attribute set).
-    global model_name
-    if model_name == "cnn2"
-        set_optimizer_attribute(m, "StartNodeLimit", 100)
-    end
 end
 
 function mip_log(m, d)

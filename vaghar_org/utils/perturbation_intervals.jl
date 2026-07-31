@@ -1,16 +1,6 @@
-# Interval bound propagation for the transfer proof.
-#
-# Same approach as lucid_delta_diff_with_perturbation:
-# - Uses globals: I_z_prev_up/down, I_z_prev_up/down_perturbation,
-#   all_bounds_of_original/perturbation
-#
-# compute_diff_bounds_zonotope() also populates the relaxation globals
-# (relu_diff_*_bounds, n1_preact_*_bounds) used by
-# the conditional-triangle relaxation in core_ops.jl.
-# - Initialized in get_perturbation_specific_keys_linf_transfer()
-# - Propagation (paper eq. 3): W2·(z_org - z_pre) + ΔW·z_pre, where ΔW = W2 - W1
-# - Constraints: av[vec_n2] <= av[vec_n1] .+ I_z_prev_up_to_use
-#                av[vec_n2] >= av[vec_n1] .+ I_z_prev_down_to_use
+# The bound-propagation passes: the perturbation-difference interval constraints (including the exact (T-I)
+# treatment of translation/rotation), the difference zonotope between N_pre and N, the Zonotope Bound
+# Tightening pass, and the Conditional Triangle's input bounds.
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -36,16 +26,7 @@ function interval_matrix_vector_multiplication(w_h_low, w_h_high, I_z_prev_min, 
     return result_min, result_max
 end
 
-"""
-    interval_conv2d_bounds(F_low, F_high, x_low, x_high, bias, stride, padding)
-
-Interval arithmetic for Conv2d: computes [output_min, output_max] given
-filter interval [F_low, F_high] and input interval [x_low, x_high].
-
-Filter shape: (fh, fw, in_channels, out_channels)
-Input shape:  (batch, height, width, in_channels)
-Output shape: (batch, out_height, out_width, out_channels)
-"""
+# Interval arithmetic through a convolution layer: given per-entry ranges for the filter and the input, return per-entry ranges for the output.
 function interval_conv2d_bounds(F_low::Array{Float64,4}, F_high::Array{Float64,4},
                                 x_low::Array{Float64,4}, x_high::Array{Float64,4},
                                 bias::Vector{Float64}, stride::Int, padding)
@@ -100,30 +81,14 @@ function ensure_1d(x)
     ndims(x) > 1 ? vec(x) : x
 end
 
-"""
-    extract_neuron_index(var_name)
-
-Extract the structural neuron index (last integer) from a JuMP variable name.
-Variable names follow: {prefix}x_rect_layerCount{n}_neuronCount{n}_{layer}_{neuron}
-Returns the neuron index (1-based) used to index into interval bound arrays.
-"""
+# Read a neuron's index (the name's last number) out of its MIP variable name, for indexing into the bound arrays.
 function extract_neuron_index(var_name::String)
     # The neuron index is the last integer after the last underscore
     last_under = findlast('_', var_name)
     return parse(Int, var_name[last_under+1:end])
 end
 
-"""
-    add_matched_interval_constraints!(m, av, vec_a, vec_b, I_up_flat, I_down_flat)
-
-Add interval constraints only for neurons that have x_rect variables in BOTH
-network copies. Neurons are matched by their structural neuron index (extracted
-from JuMP variable names). This handles the case where bound tightening produces
-different split/fixed decisions for the two copies (common in CNN layers).
-
-Constraints added:  av[b_idx] <= av[a_idx] + I_up_flat[neuron]
-                    av[b_idx] >= av[a_idx] + I_down_flat[neuron]
-"""
+# Add the perturbation-difference interval constraints (perturbed copy within [clean copy + lo, clean copy + up]), only for neurons that have a variable in BOTH copies — the encoder may have fixed a neuron in one copy but not the other.
 function add_matched_interval_constraints!(m, av, vec_a, vec_b, I_up_flat, I_down_flat)
     # Build neuron_index → av_index maps for both copies
     map_a = Dict{Int,Int}()
@@ -150,12 +115,9 @@ end
 
 
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════
-# --geometric_intervals : relocation-aware INTERVAL bounds for translation/rotation (no zonotope).
-# All gated behind the geometric_intervals flag; geometric_diff_map !== nothing only for translation/rotation.
-# Supports Flatten/Linear/Conv2d nets (FC and conv alike) and both k==1 and k==3 (the encoders pin
-# every channel of mapped and zero-padded pixels). δ is unchanged — this is a sound bound tightening.
-# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Translation/rotation as an exact linear map: the perturbation moves pixels by a fixed map T, so x' - x = (T-I)x,
+# which is composed through the network's first layers and evaluated exactly over the input domain — tighter
+# perturbation-difference intervals than a per-pixel envelope, with delta unchanged.
 
 # (T-I) for translation: covered dst +1 at src, -1 at dst; padded dst -1 at dst. Exact transcription of the encoder.
 function geometric_diff_map_translation(sd, sr, w, h, k)
@@ -225,19 +187,17 @@ function _geometric_prefix_linear_part(prefix, col)
     return x
 end
 
-# Per-ReLU PRE-activation diff bounds for a geometric (T-I) move. Up to the first ReLU the diff is an
-# exact linear map of the shared input, M = A*(T-I) with A the net's affine prefix; each (T-I) column
-# streams through the prefix and the exact box min/max over v_in ∈ [0,1] accumulates per output neuron
-# (positive/negative parts of M's rows). Past the first ReLU the diff is no longer linear, so the
-# bounds interval-propagate through the remaining layers (bias-free: biases cancel in a difference)
-# with the standard ReLU diff clip. Supports Flatten/Linear/Conv2d nets, FC and conv alike.
+# Perturbation-difference intervals [d_down, d_up] at every ReLU layer, for translation/rotation.
 function geometric_interval_diff_bounds(nn, TmI, input_shape)
     relu_up = Array{Float64}[]; relu_dn = Array{Float64}[]
+    # Up to the first ReLU the difference N(x') - N(x) is the exact linear map A(T-I)x.
     first_relu = findfirst(l -> occursin("ReLU", string(typeof(l))), nn.layers)
     first_relu === nothing && return relu_up, relu_dn
+    # A = the network's layers before the first ReLU.
     prefix = nn.layers[1:first_relu-1]
 
     diff_up = nothing; diff_dn = nothing
+    # Bound A(T-I)x exactly over the [0,1] image domain: push each column of (T-I) through A; positive entries add to the upper bound, negative to the lower.
     for i in 1:size(TmI, 2)
         out = _geometric_prefix_linear_part(prefix, reshape(Float64.(TmI[:, i]), input_shape))
         if diff_up === nothing
@@ -251,6 +211,7 @@ function geometric_interval_diff_bounds(nn, TmI, input_shape)
     push!(relu_up, copy(diff_up)); push!(relu_dn, copy(diff_dn))
     diff_up = max.(0.0, diff_up); diff_dn = .- max.(0.0, .- diff_dn)
 
+    # Past the first ReLU the difference is no longer linear: propagate the intervals through the remaining layers (biases cancel in a difference).
     for l in nn.layers[first_relu+1:end]
         t = string(typeof(l))
         if occursin("Flatten", t)
@@ -644,29 +605,11 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     println("compute_diff_bounds_zonotope: populated $(length(relu_diff_up_bounds)) ReLU layers")
 end
 
-# ── advstd: absolute N2 zonotope bound propagation with N1 tightening ──
-# Source B for the --adv_std_zono_bounds feature. Propagates a zonotope for
-# N2's pre-activations directly (using N2's own weights W2) starting from an
-# input zonotope that covers [0-ε, 1+ε] per input pixel. At every ReLU layer
-# the zonotope hull is intersected with the "Source A" bound
-# [n1_preact + diff_down, n1_preact + diff_up] BEFORE the DeepZ relaxation is
-# applied, so every downstream layer's zonotope starts from a tighter box.
-#
-# Required populated globals (caller must have run compute_diff_bounds_zonotope
-# before invoking this function):
-#   relu_diff_up_bounds, relu_diff_down_bounds — per-ReLU-layer diff bounds
-#   n1_preact_up_bounds, n1_preact_down_bounds — per-ReLU-layer N1 preact bounds
-#
-# Populates:
-#   n2_abs_up_bounds, n2_abs_down_bounds — per-ReLU-layer N2 preact bounds,
-#     each entry a Float64 vector (layer-flat shape). Consumed in core_ops.jl
-#     inside the relu() bound-tightening block.
-#
-# Soundness: every step is an over-approximating abstract interpretation, and
-# the per-layer intersection is the intersection of two sound over-approxima-
-# tions of the same quantity, so the result over-approximates N2's true value
-# set. Adding these scalar bounds inside the MIP big-M encoding therefore
-# preserves N2's integer optimum.
+# Zonotope Bound Tightening: propagate a zonotope through the network over the full input domain and perturbation
+# space, and record each neuron's pre-activation bounds (into n2_abs_*_bounds, which the encoder intersects into
+# every ReLU's [l, u]). In transfer, at every ReLU layer the zonotope's bounds are first intersected with N_pre's
+# pre-activation bounds shifted by the difference bounds, so each downstream layer starts tighter. Both steps
+# over-approximate the network's true values, so adding these bounds to the MIP preserves the optimum.
 function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
                                                     use_n1_tighten::Bool=true)
     global n2_abs_up_bounds, n2_abs_down_bounds
@@ -676,19 +619,8 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
     n2_abs_up_bounds   = Array{Float64}[]
     n2_abs_down_bounds = Array{Float64}[]
 
-    # Standard-mode reuse: when Source A globals are empty (no N1→N2 diff to
-    # intersect against), still propagate the absolute zonotope through the
-    # network and store per-ReLU-layer bounds. The intersection step at the
-    # ReLU loop already falls through to (u_hull, l_hull) when n1_preact /
-    # relu_diff are empty (see the relu_layer_idx <= length(n1_preact_up_bounds)
-    # guard below), so the zonotope-only output is sound.
-    # use_n1_tighten=false ablates ONLY the N_pre contribution to this
-    # zonotope (--adv_std_zono_npre=false): the absolute N2 zonotope below is
-    # still propagated, but it is not intersected with N_pre's stored
-    # pre-activation bounds or the N_pre->N difference zonotope. The globals
-    # are left untouched, so the perturbation-difference technique that also
-    # reads relu_diff_* is unaffected -- this ablates the zonotope's use of
-    # N_pre, not N_pre itself.
+    # The N_pre intersection runs only when N_pre's bounds are actually loaded (transfer) AND use_n1_tighten allows it;
+    # otherwise — without transfer, or under the zono_npre ablation — the pass is the plain zonotope, which is sound on its own.
     source_a_available = use_n1_tighten &&
         !isempty(n1_preact_up_bounds) && !isempty(relu_diff_up_bounds)
     if !use_n1_tighten
@@ -798,8 +730,7 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
                 l_hull = vec(Float64.(abs_down))
             end
 
-            # 2. Intersect with the Source-A-derived bound at this ReLU layer:
-            #    [n1_preact + diff_down, n1_preact + diff_up]
+            # Intersect with N_pre's pre-activation bounds shifted by the difference bounds.
             if relu_layer_idx <= length(n1_preact_up_bounds)
                 n1_up   = vec(Float64.(n1_preact_up_bounds[relu_layer_idx]))
                 n1_dn   = vec(Float64.(n1_preact_down_bounds[relu_layer_idx]))
@@ -824,9 +755,7 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
             push!(n2_abs_up_bounds,   copy(u_tight))
             push!(n2_abs_down_bounds, copy(l_tight))
 
-            # 4. Update the running state through the ReLU, using the tightened
-            #    [l_tight, u_tight] as the per-neuron box the DeepZ relaxation
-            #    acts on.
+            # Push the zonotope through the ReLU, with the tightened [l, u] as each neuron's box for the ReLU transformer.
             if zono_active
                 n = length(center)
                 new_cols = Vector{Float64}[]

@@ -122,9 +122,7 @@ first_mip_solution = FirstMIPSolution(-1.0, 0.0)
 
 layers_info_dict = Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}}()
 
-# ── Advanced-standard mode: N1 neuron bounds for bound tightening ────
-# Populated after solving N1's standard MIP from layers_info_dict.
-# Consumed by relu() in core_ops.jl to tighten N2's big-M bounds.
+# N_pre's verified per-neuron bounds for this class pair; the encoder intersects each of N's bounds with them, shifted by the difference bounds.
 global n1_neuron_bounds = Dict{Tuple{Int,Int}, Tuple{Float64,Float64}}()
 
 function set_n1_neuron_bounds(n1_layers_info::Dict{Tuple{Int,Int}, Tuple{Float64,Float64,Int}})
@@ -155,13 +153,9 @@ function clear_sibgate_tier_counters!()
     global n_sibgate_one_thin_pert_dropped = 0
 end
 
-# ── advstd Technique 4 (SibGate): per-neuron MIP-state cache ───────────────
-# core_ops.jl::relu() records the pre-activation AffExpr `x`, the bounds
-# (l, u) the encoding uses, and the post-ReLU variable `x_rect` for every
-# split N2 neuron in the org/perturbation passes. After both copies are
-# encoded, apply_sibgate_constraints!(model, K) walks this cache + the
-# n2_relax_decision dict and adds the coupling line / conditional-triangle
-# upper bounds. Cleared per c_target by mip_reset (alongside layers_info_dict).
+# The Conditional Triangle must connect a neuron to its sibling in the OTHER copy — but the encoder builds one copy at a time,
+# so while encoding it saves each neuron's pieces here (input expression, bounds, output variable) and a second pass adds the
+# cross-copy constraints once both copies exist. Emptied for every class pair.
 global n2_relu_state = Dict{Tuple{Int,Int,String},
                             NamedTuple{(:preact, :l, :u, :x_rect),
                                        Tuple{Any, Float64, Float64, Any}}}()
@@ -172,26 +166,14 @@ function clear_n2_relu_state!()
                                            Tuple{Any, Float64, Float64, Any}}}()
 end
 
-# ── advstd Technique 6 (BoundTightPertRelax): per-copy relax decision ──────
-# Precomputed once per N2 build (after all bound-tightening sources have
-# populated their globals). Maps (layer, neuron) → (relax_org, relax_pert).
-# core_ops.jl::relu() consults this dict to decide whether to emit the
-# exact big-M encoding or a triangle LP relaxation for each copy.
+# The Conditional Triangle's decision map, filled once per build: (layer, neuron) -> (relax clean copy?, relax perturbed copy?); relu() reads it to choose the exact encoding or the triangle for each copy.
 global n2_relax_decision = Dict{Tuple{Int,Int}, Tuple{Bool,Bool}}()
 
 function clear_n2_relax_decision!()
     global n2_relax_decision = Dict{Tuple{Int,Int}, Tuple{Bool,Bool}}()
 end
 
-# ── Technique 5 (Variable Hints) mode ────────────────────────────────────
-# One active method (the retired prev/direct/direct_pgd variants are gone):
-#   VH_PREV_PGD — shift N1's achieved pre-activation ẑ^N1 by the diff bound,
-#                 clip to [l_n2, u_n2], take p from that interval's lengths,
-#                 then route hint_val into set_start_value() (Gurobi Start)
-#                 filtered by PGD consensus: fill where PGD is silent, leave
-#                 where PGD agrees, withdraw where PGD disagrees.
-#                 No VarHintVal / VarHintPri written.
-# See §4.3 of advstd_techniques.tex and compute_varhint below.
+# Warm Start mode: off, or prev_pgd — hint each unstable neuron's phase from N_pre's solution shifted by the difference bounds, kept only where it agrees with the attack's hints.
 @enum VarHintMode VH_OFF VH_PREV_PGD
 
 """
@@ -224,32 +206,14 @@ function var_hint_mode_label(m::VarHintMode)
     error("unknown VarHintMode: $m")
 end
 
-"""
-    hint_from_p(v1_bit::Int, p::Float64) -> (hint_val::Int, hint_pri::Int)
-
-Tail of the VarHint rule. Agrees with N1 when `p ≥ 0.5`, flips when
-`p < 0.5`; priority is a V-shape in `p`, maxing at 100 when `p ∈ {0, 1}`
-and floored at 1 (priority 0 is reserved by Gurobi for "ignore"). Under
-VH_PREV_PGD only `hint_val` is consumed (the Start channel has no priority).
-"""
+# Turn the probability p that N keeps N_pre's phase into the hint: N_pre's phase when p >= 0.5, the opposite otherwise (the returned priority is unused under prev_pgd).
 function hint_from_p(v1_bit::Int, p::Float64)
     hint_val = (p >= 0.5) ? v1_bit : 1 - v1_bit
     hint_pri = max(1, round(Int, 100 * abs(2 * p - 1)))
     return (hint_val, hint_pri)
 end
 
-"""
-    compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
-
-The VH_PREV_PGD p-rule (§4.3). Shifts N1's achieved pre-activation
-`z1_preact` by the weight-drift diff bound `[d_lo, d_hi]` to form the
-predicted N2 pre-activation interval, clips to `[l_n2, u_n2]`, and takes
-`p` as the fraction of the clipped interval on N1's side of zero
-(`v1_bit=0` → `(-inf, 0]`; `v1_bit=1` → `[0, +inf)`).
-
-Caller must only pass surviving binaries (`l_n2 < 0 < u_n2`). Returns
-`(hint_val, hint_pri)` via `hint_from_p`.
-"""
+# The Warm Start p-rule: shift N_pre's achieved pre-activation by the difference bounds (= where N's pre-activation can land), clip to N's bounds, and take p as the fraction of that interval on N_pre's side of zero.
 function compute_varhint(z1_preact::Float64, v1_bit::Int, d_lo::Float64, d_hi::Float64,
                          l_n2::Float64, u_n2::Float64)
     # Shifted interval I_i = [z1 + d_lo, z1 + d_hi], clipped to N2's sound bounds.
@@ -268,38 +232,9 @@ function compute_varhint(z1_preact::Float64, v1_bit::Int, d_lo::Float64, d_hi::F
     return hint_from_p(v1_bit, p)
 end
 
-"""
-    apply_n1_var_hints!(m_n2, mode, n1_var_names, n1_var_values, n1_layers_info)
-
-Set Gurobi hints on N2 binaries. `mode` is a `VarHintMode` enum:
-
-  * `VH_OFF` — return without setting any hint.
-  * `VH_PREV_PGD` — compute `p` via `compute_varhint` (shift ẑ^N1 by the
-    diff bound, clip to [l_n2, u_n2], take p), then route `hint_val` through
-    `set_start_value` filtered by PGD consensus. For each surviving binary:
-    if PGD is silent (no Start set yet), fill with `hint_val`; if PGD agrees
-    with `hint_val`, leave PGD's value in place; if PGD disagrees, call
-    `set_start_value(a_i, nothing)` to withdraw both. **No `VarHintVal`/
-    `VarHintPri` is written** — MIPStart is the sole channel.
-
-For each surviving N2 binary `a_i` (with `l^{N2}_i < 0 < u^{N2}_i`):
-
-  1. Look up N1's binary value `v^{N1}_i` by matching variable name in
-     `n1_var_values`.
-  2. Look up `z1_preact` (x_rect for active neurons, `l^{N1}_i / 2` for
-     inactive) and the diff bound `[d_lo, d_hi]`; compute `hint_val`.
-  3. Run the Start-consensus update above.
-
-Uses globals `relu_diff_up_bounds`/`relu_diff_down_bounds` (populated by
-`load_n1_diff_bounds!` in Phase 2) and reads `JuMP.start_value(v)` on each
-binary, expecting PGD's hints (set by `hyper_attack_hints()`) to have
-already run for this N2 MIP.
-
-**Soundness.** Under all modes the set attributes (`VarHintVal`, `VarHintPri`,
-`Start`) are advisory. No constraint, coefficient, or variable bound is
-modified. MIP feasible set is unchanged, so δ_exact is preserved whenever the
-solver terminates at OPTIMAL.
-"""
+# Warm Start: for each unstable neuron, compute the hint from N_pre's solution (the p-rule above) and reconcile it with the attack's
+# hint — fill where the attack is silent, keep where they agree, withdraw both where they disagree; the attack's hints must be set first.
+# Hints are advisory only: the feasible set is untouched, so the optimum is unchanged.
 function apply_n1_var_hints!(m_n2, mode::VarHintMode,
                              n1_var_names::Vector{String},
                              n1_var_values::Vector{Float64},
@@ -344,45 +279,35 @@ function apply_n1_var_hints!(m_n2, mode::VarHintMode,
             n_no_match += 1
             continue
         end
-        v1_bit = Int(round(v1_raw))  # N1's binary incumbent, rounded to {0,1}
-        # Parse (layer, neuron) from the binary's name. ReLU binaries are named
-        # "{nv}a_layerCount{lc}_neuronCount{nc}_{layer}_{neuron}" (see
-        # MIPVerify core_ops.jl). Other binaries live in the same MIP —
-        # conf_n1_bin_k, conf_n1_est_bin_k, max-anonymous (from maximum_ge) —
-        # and we must skip them, not parse. The regex matches only the ReLU shape.
+        # The phase N_pre's solution chose for this neuron (0 = inactive, 1 = active).
+        v1_bit = Int(round(v1_raw))
+        # Read (layer, neuron) out of the variable's name; the pattern matches only ReLU on/off binaries, so the MIP's other binaries (e.g. the argmax encoding's) are skipped.
         rgx_match = match(r"a_layerCount\d+_neuronCount\d+_(\d+)_(\d+)$", bin_name)
         rgx_match === nothing && continue
         layer = parse(Int, rgx_match.captures[1])
         neuron = parse(Int, rgx_match.captures[2])
-        # N2's tightened bounds (global layers_info_dict was rebuilt during N2's
-        # MIP construction with Tech 2's final integration).
+        # N's tightened bounds [l, u] for this neuron, from the encoding just built.
         haskey(layers_info_dict, (layer, neuron)) || continue
         (u_n2, l_n2, _var_idx) = layers_info_dict[(layer, neuron)]
-        # Tier 1: Tech 2 already eliminated this binary. Should be unreachable
-        # because relu() would not have created the binary — defensive skip.
+        # A stable neuron (always active or always inactive) has no binary to hint — skip (defensive; the encoder should not have created one).
         if l_n2 >= 0 || u_n2 <= 0
             n_tier1_skipped += 1
             continue
         end
-        # Compute (hint_val, hint_pri) via the prev_pgd p-rule.
+        # Compute the hint via the p-rule.
         local hint_val::Int
         local hint_pri::Int
-        # N1's bounds for this neuron — keys match because both networks share
-        # architecture; n1_layers_info was saved/loaded in Phase 1/2.
+        # N_pre's verified bounds for the same neuron (same architecture, same keys).
         haskey(n1_layers_info, (layer, neuron)) || continue
         (u_n1, l_n1, _) = n1_layers_info[(layer, neuron)]
-        # N1's pre-activation scalar. The big-M encoding only fixes hat_z
-        # exactly when the ReLU was active (then x_rect == hat_z). When
-        # inactive, hat_z is free in [l_n1, 0]; take the midpoint as a proxy.
+        # The pre-activation N_pre achieved at its optimum: read exactly when the neuron was active; when inactive the solution only says it is in [l, 0], so take the midpoint.
         if v1_bit == 1
-            # x_rect name differs from a name by one substring: "a_layerCount" → "x_rect_layerCount"
             x_rect_name = replace(bin_name, "a_layerCount" => "x_rect_layerCount"; count=1)
             z1_preact = get(value_by_name, x_rect_name, 0.0)
         else
-            z1_preact = l_n1 / 2  # midpoint of the inactive range [l_n1, 0]
+            z1_preact = l_n1 / 2
         end
-        # Diff bound for this neuron. Layer 1..K → org copy (r = layer);
-        # layer K+1..2K → pert copy (r = layer - K). Same diff for both copies.
+        # The difference bounds are per network layer; layers 1..K are the clean copy and K+1..2K the perturbed copy, with the same bounds for both.
         r = (layer <= K) ? layer : (layer - K)
         if r < 1 || r > K
             continue  # layer index out of diff-bound range; skip defensively
@@ -396,10 +321,7 @@ function apply_n1_var_hints!(m_n2, mode::VarHintMode,
         d_lo = diff_down_vec[neuron]
         (hint_val, hint_pri) = compute_varhint(z1_preact, v1_bit, d_lo, d_hi, l_n2, u_n2)
         if hint_val != v1_bit; flipped += 1; end
-        # Start-consensus: route hint_val through set_start_value, filtered
-        # by PGD. Expect hyper_attack_hints() to have run earlier in Phase 2;
-        # if PGD failed, JuMP.start_value is nothing on every binary and
-        # this mode degrades to "varHint fills every gap".
+        # Reconcile with the attack's hint: fill where the attack is silent, keep where they agree, withdraw both where they disagree (if the attack found nothing, N_pre's hints simply fill everything).
         v_pgd_raw = JuMP.start_value(v)
         if v_pgd_raw === nothing
             JuMP.set_start_value(v, Float64(hint_val))

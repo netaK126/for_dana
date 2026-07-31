@@ -169,9 +169,7 @@ def attack(model, X, source_, target_, device, token_signature,\
             if BENCH_BOX is None:
                 X_pgd = torch.clamp(X_pgd, 0, 1)
             else:
-                # Project into the verified box, not [0,1]: the latter
-                # is mostly outside the region, so every iterate would be an
-                # infeasible warm start.
+                # HAR model only: project each attack iterate into its [-1,1] input domain; clipping to [0,1] would leave the domain, making the found solution useless as a warm start.
                 _lo, _hi = BENCH_BOX
                 _lo_t = torch.as_tensor(_lo, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
                 _hi_t = torch.as_tensor(_hi, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
