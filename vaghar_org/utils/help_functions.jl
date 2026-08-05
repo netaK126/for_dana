@@ -38,8 +38,6 @@ global use_relaxations::Bool = false
 global relaxation_threshold::Float64 = 0.5
 # Retired relaxation's relaxed-neuron counter — stays 0.
 global relaxation_condition_count = 0
-# LIVE: in the difference-bound propagation, handle a ReLU exactly when the neuron is stable in both networks (both active: the difference passes through; both inactive: it is zero).
-global optimizing_intervals::Bool = true
 # Retired relaxation's scoring choice (triangle area vs interval width) — unused.
 global relaxation_gap_area::Bool = false
 
@@ -74,7 +72,7 @@ global bound_n2_xp_using_composed::Bool = false
 # Retired transfer switch — permanently false; kept because the encoder (core_ops.jl) checks it.
 global constrain_n2_xp_via_n1_zonotope::Bool = false
 
-# Zonotope Bound Tightening's output: per-neuron pre-activation bounds from the zonotope propagated through the network, intersected into each ReLU's [l, u] by the encoder; empty when --adv_std_zono_bounds / --nn1_zono_bounds is off.
+# Zonotope Bound Tightening's output: per-neuron pre-activation bounds from the zonotope propagated through the network over the input box (exact for both copies — every encoder bounds the perturbed input to the same box), intersected into each ReLU's [l, u] by the encoder; empty when --adv_std_zono_bounds / --nn1_zono_bounds is off.
 global n2_abs_up_bounds::Vector   = []
 global n2_abs_down_bounds::Vector = []
 

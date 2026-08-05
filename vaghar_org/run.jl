@@ -128,11 +128,6 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = false
-        "--optimizing_intervals"
-        help = "tighter per-neuron ReLU clipping in interval propagation (uses N1/N2 preact stability)"
-        arg_type = Bool
-        required = false
-        default = true
         "--force_cpu"
         help = "force CPU-only mode for hyper attack (no GPU)"
         arg_type = Bool
@@ -326,7 +321,6 @@ end
 function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    global optimizing_intervals = args["optimizing_intervals"]
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -384,22 +378,19 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
 
         # ── Zonotope Bound Tightening (paper: System, "Zonotope Bound
         # Tightening"), once per c_tag: propagate a zonotope over the input
-        # domain and perturbation space to tighten the per-neuron bounds
-        # [l,u] and [l^p,u^p]. relu() intersects them via n2_abs_*_bounds
-        # (core_ops.jl:222). Without transfer, the N_pre-derived bounds
-        # stay empty.
+        # domain to tighten the per-neuron bounds [l,u] and [l^p,u^p] — the
+        # perturbed input is bounded to the same domain by every encoder, so
+        # the one pass covers both copies. relu() intersects them via
+        # n2_abs_*_bounds (core_ops.jl:222). Without transfer, the
+        # N_pre-derived bounds stay empty.
         clear_n2_abs_bounds()
         if nn1_use_zono_bounds
-            input_dummy = zeros(Float64, 1, w, h, k)
-            p_size_b = perturbation_size[1]
-            # Full 4D (1,w,h,k) per-pixel L∞ box for both single- and multi-channel
-            # inputs. The old size[4]>1 branch seeded a malformed (k,1) matrix that
-            # collapsed the spatial dims, so conv bound-propagation computed a
-            # negative output size on multi-channel (e.g. CIFAR-10) nets.
-            I_pert_up_b   = p_size_b .* ones(Float64, size(input_dummy))
-            I_pert_down_b = -p_size_b .* ones(Float64, size(input_dummy))
+            # Full 4D (1,w,h,k) seed box so conv bound-propagation sees the
+            # spatial dims (a flat seed used to collapse them on multi-channel
+            # nets, e.g. CIFAR-10).
+            seed_lo_b, seed_hi_b = source_b_seed_box(perturbation, (1, w, h, k))
             println("Standard-mode boost: computing absolute zonotope bounds (Source B) on N1...")
-            compute_n2_bounds_zonotope_with_n1_tighten(nn, I_pert_up_b, I_pert_down_b)
+            compute_n2_bounds_zonotope_with_n1_tighten(nn, seed_lo_b, seed_hi_b)
             println("  Source B bounds computed: $(length(n2_abs_up_bounds)) ReLU layers")
         end
 
@@ -676,8 +667,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     c_tag_list = [args["ctag"]]
     # VHAGaR's dependency constraints between the two copies (equal / monotonic / anti-monotonic neurons).
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    # Tighter ReLU clipping inside the perturbation-difference interval propagation (uses each copy's stability).
-    global optimizing_intervals = args["optimizing_intervals"]
     # Translation/rotation only: fold the exact (T-I) relocation map through the first layer instead of a per-pixel envelope.
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
@@ -755,6 +744,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         # Transfer bound tightening: load N_pre's difference bounds [d_lo, d_hi] and intersect N's zonotope bounds with N_pre's bounds shifted by them.
         clear_n2_abs_bounds()
         if use_bound_tightening
+            # Blanket Δ seed, still used by compute_n2_pert_relaxation_bounds below.
             input_dummy = zeros(Float64, 1, w, h, k)
             p_size = perturbation_size[1]
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
@@ -763,10 +753,13 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             # Load the drift information — how far N can stray from N_pre ([d_lo, d_hi] + N_pre's pre-activation bounds); shared by all class pairs, shifts every reused N_pre quantity below.
             load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
 
-            # Zonotope Bound Tightening: propagate a zonotope through N, intersecting its bounds at each layer with N_pre's bounds shifted by the difference bounds.
+            # Zonotope Bound Tightening: propagate a zonotope through N over the input
+            # box (the perturbed copy is bounded to the same box by every encoder),
+            # intersecting its bounds at each layer with N_pre's bounds shifted by the difference bounds.
             if use_zono_bounds
+                seed_lo, seed_hi = source_b_seed_box(perturbation, (1, w, h, k))
                 println("Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...")
-                compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
+                compute_n2_bounds_zonotope_with_n1_tighten(nn2, seed_lo, seed_hi;
                                                            use_n1_tighten=zono_use_npre)
             end
 
@@ -921,7 +914,6 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
 
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
-    global optimizing_intervals = args["optimizing_intervals"]
     global geometric_intervals = args["geometric_intervals"]
     if geometric_intervals && !args["use_perturbed_intervals"]
         println("WARNING: --geometric_intervals requires --use_perturbed_intervals=true (it only affects the " *
@@ -950,7 +942,7 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
             # Difference zonotope: bound, per neuron, how far N's pre-activation can stray from N_pre's ([d_lo, d_hi]).
             println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
-            compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals=optimizing_intervals)
+            compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init)
             # If this folder already has saved difference bounds (from an earlier, interrupted run), keep them:
             # recomputing gives the same numbers, and all class pairs in one folder must use the same bounds.
             diff_bounds_path = joinpath(n1_state_dir, "diff_bounds.bin")

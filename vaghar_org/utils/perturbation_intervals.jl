@@ -358,7 +358,7 @@ end
 # where ε_j ∈ [-1,1]. Bounds: z_i ∈ [c_i - Σ|g_{i,j}|, c_i + Σ|g_{i,j}|].
 # Linear layers preserve correlations: W*z has generators W*G.
 # ReLU: stable neurons pass through; split neurons use DeepZ relaxation.
-function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init; optimizing_intervals::Bool=true)
+function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init)
     # Same globals as the retired interval pass
     global relu_diff_up_bounds, relu_diff_down_bounds
     global n1_preact_up_bounds, n1_preact_down_bounds
@@ -509,26 +509,20 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                     l_d = diff_down[i]
                     u_d = diff_up[i]
 
-                    # Compute N1/N2 pre-activation bounds when needed by
-                    # optimizing_intervals
-                    l_n1 = 0.0; u_n1 = 0.0; l_n2 = 0.0; u_n2 = 0.0
-                    if optimizing_intervals
-                        l_n1 = n1_pre_down_cur[i]
-                        u_n1 = n1_pre_up_cur[i]
-                        l_n2 = l_n1 + diff_down[i]
-                        u_n2 = u_n1 + diff_up[i]
-                    end
+                    # N1/N2 pre-activation bounds for the stability-aware clipping
+                    l_n1 = n1_pre_down_cur[i]
+                    u_n1 = n1_pre_up_cur[i]
+                    l_n2 = l_n1 + diff_down[i]
+                    u_n2 = u_n1 + diff_up[i]
 
-                    if optimizing_intervals
-                        if l_n1 >= 0 && l_n2 >= 0
-                            # Both active: diff passes through
-                            continue
-                        elseif u_n1 <= 0 && u_n2 <= 0
-                            # Both inactive: diff = 0
-                            diff_center[i] = 0.0
-                            diff_gens[i, :] .= 0.0
-                            continue
-                        end
+                    if l_n1 >= 0 && l_n2 >= 0
+                        # Both active: diff passes through
+                        continue
+                    elseif u_n1 <= 0 && u_n2 <= 0
+                        # Both inactive: diff = 0
+                        diff_center[i] = 0.0
+                        diff_gens[i, :] .= 0.0
+                        continue
                     end
 
                     # Mixed case: apply DeepZ relaxation to diff
@@ -563,26 +557,22 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                 diff_down = diff_center .- abs_sum
                 println("  Zonotope ReLU: $(size(diff_gens, 2)) generators, max diff width = $(maximum(diff_up .- diff_down))")
             else
-                # Interval clipping (same as the retired interval pass)
-                if optimizing_intervals
-                    for i in eachindex(diff_up)
-                        l_n1 = n1_pre_down_cur[i]
-                        u_n1 = n1_pre_up_cur[i]
-                        l_n2 = l_n1 + diff_down[i]
-                        u_n2 = u_n1 + diff_up[i]
-                        if l_n1 >= 0 && l_n2 >= 0
-                            # pass
-                        elseif u_n1 <= 0 && u_n2 <= 0
-                            diff_up[i] = 0.0
-                            diff_down[i] = 0.0
-                        else
-                            diff_up[i] = max(0.0, diff_up[i])
-                            diff_down[i] = -max(0.0, -diff_down[i])
-                        end
+                # Interval clipping (same as the retired interval pass),
+                # stability-aware per neuron
+                for i in eachindex(diff_up)
+                    l_n1 = n1_pre_down_cur[i]
+                    u_n1 = n1_pre_up_cur[i]
+                    l_n2 = l_n1 + diff_down[i]
+                    u_n2 = u_n1 + diff_up[i]
+                    if l_n1 >= 0 && l_n2 >= 0
+                        # pass
+                    elseif u_n1 <= 0 && u_n2 <= 0
+                        diff_up[i] = 0.0
+                        diff_down[i] = 0.0
+                    else
+                        diff_up[i] = max(0.0, diff_up[i])
+                        diff_down[i] = -max(0.0, -diff_down[i])
                     end
-                else
-                    diff_up   = max.(0.0, diff_up)
-                    diff_down = .- max.(0.0, .- diff_down)
                 end
             end
 
@@ -605,12 +595,34 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
     println("compute_diff_bounds_zonotope: populated $(length(relu_diff_up_bounds)) ReLU layers")
 end
 
-# Zonotope Bound Tightening: propagate a zonotope through the network over the full input domain and perturbation
-# space, and record each neuron's pre-activation bounds (into n2_abs_*_bounds, which the encoder intersects into
-# every ReLU's [l, u]). In transfer, at every ReLU layer the zonotope's bounds are first intersected with N_pre's
-# pre-activation bounds shifted by the difference bounds, so each downstream layer starts tighter. Both steps
-# over-approximate the network's true values, so adding these bounds to the MIP preserves the optimum.
-function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_down_init;
+# The input box shared by both network copies, mirroring the encoder's JuMP variable
+# bounds in perturbation_models.jl: every perturbation type bounds v_x0 to the input
+# domain (linf/max/brightness are box-aware for the internet-nets benchmarks; the
+# rest hard-code [0,1]). Returned shaped like the input tensor.
+function source_b_seed_box(perturbation::AbstractString, in_shape)
+    n = prod(in_shape)
+    if perturbation in ("linf", "max", "brightness")
+        lo, hi = input_domain_flat(n)
+    elseif perturbation in ("contrast", "occ", "patch", "translation", "rotation")
+        lo, hi = zeros(Float64, n), ones(Float64, n)
+    else
+        # A new perturbation type must be added here explicitly, with a seed box
+        # matching its encoder's v_in/v_x0 variable bounds — a silent [0,1]
+        # default would be unsound if the encoder allows out-of-domain inputs.
+        error("source_b_seed_box: unknown perturbation type \"$perturbation\"")
+    end
+    return reshape(lo, in_shape), reshape(hi, in_shape)
+end
+
+# Zonotope Bound Tightening: propagate a zonotope through the network over the input
+# domain, and record each neuron's pre-activation bounds (into n2_abs_*_bounds, which
+# the encoder intersects into every ReLU's [l, u]). The perturbed input is bounded to
+# the same domain by every encoder, so one pass covers both copies exactly. In
+# transfer, at every ReLU layer the zonotope's bounds are first intersected with
+# N_pre's pre-activation bounds shifted by the difference bounds, so each downstream
+# layer starts tighter. Both steps over-approximate the network's true values, so
+# adding these bounds to the MIP preserves the optimum.
+function compute_n2_bounds_zonotope_with_n1_tighten(nn2, seed_lo, seed_hi;
                                                     use_n1_tighten::Bool=true)
     global n2_abs_up_bounds, n2_abs_down_bounds
     global relu_diff_up_bounds, relu_diff_down_bounds
@@ -634,44 +646,21 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
         println("compute_n2_bounds_zonotope_with_n1_tighten: Source A absent — propagating absolute zonotope only (standard-mode nn1 boost path)")
     end
 
-    # Seed the absolute-N2 input zonotope from [0-ε, 1+ε]. We conservatively
-    # cover both the clean-input (network_version="org") and perturbed-input
-    # (network_version="perturbation") passes with a single set of bounds;
-    # the consumer in core_ops.jl applies them to both.
-    #
-    # Input range: center = 0.5, radius = 0.5 + ε (per input pixel).
-    I_pert_up_flat   = vec(Float64.(I_pert_up_init))
-    I_pert_down_flat = vec(Float64.(I_pert_down_init))
-    # Per-pixel half-width of the perturbation box (non-negative)
-    pert_radius = max.(abs.(I_pert_up_flat), abs.(I_pert_down_flat))
-
-    input_is_4d = ndims(I_pert_up_init) == 4
-    # Centre/radius of the input domain. For [0,1] this is the historical
-    # 0.5 / 0.5; for the ACAS box it is per-coordinate and asymmetric, so a
-    # uniform fill would not cover the region.
-    dom_lo_flat, dom_hi_flat = input_domain_flat(length(I_pert_up_flat))
-    dom_centre_flat = (dom_lo_flat .+ dom_hi_flat) ./ 2
-    dom_halfwidth_flat = (dom_hi_flat .- dom_lo_flat) ./ 2
-    if input_is_4d
-        in_shape_4d = size(I_pert_up_init)
-        n_flat = prod(in_shape_4d)
-        center_4d = reshape(dom_centre_flat, in_shape_4d)
-        radius_4d = reshape(dom_halfwidth_flat .+ pert_radius, in_shape_4d)
-    else
-        n_flat = length(I_pert_up_flat)
-        center_4d = nothing
-        in_shape_4d = (0, 0, 0, 0)
-    end
+    # Seed the absolute-N2 input zonotope from the input box (source_b_seed_box).
+    # Both the clean-input (network_version="org") and perturbed-input
+    # (network_version="perturbation") copies live in this box — every encoder
+    # bounds v_x0 to the input domain — so a single set of bounds is exact for
+    # both; the consumer in core_ops.jl applies them to both.
 
     # Running state
     zono_active = false               # zonotope representation is currently active
     center = Float64[]                # flat center vector when zono_active
-    gens   = Matrix{Float64}(undef, 0, 0)   # (n_flat × n_gens)
+    gens   = Matrix{Float64}(undef, 0, 0)   # (n_inputs × n_gens)
 
     # Interval state for pre-zonotope conv/flatten propagation (matches the
     # convention used by compute_diff_bounds_zonotope)
-    abs_up   = input_is_4d ? (reshape(dom_hi_flat, in_shape_4d) .+ reshape(pert_radius, in_shape_4d)) : (dom_hi_flat .+ pert_radius)
-    abs_down = input_is_4d ? (reshape(dom_lo_flat, in_shape_4d) .- reshape(pert_radius, in_shape_4d)) : (dom_lo_flat .- pert_radius)
+    abs_up   = Float64.(seed_hi)
+    abs_down = Float64.(seed_lo)
 
     relu_layer_idx = 0
     for (layer_idx, l2) in enumerate(nn2.layers)
@@ -730,8 +719,11 @@ function compute_n2_bounds_zonotope_with_n1_tighten(nn2, I_pert_up_init, I_pert_
                 l_hull = vec(Float64.(abs_down))
             end
 
-            # Intersect with N_pre's pre-activation bounds shifted by the difference bounds.
-            if relu_layer_idx <= length(n1_preact_up_bounds)
+            # Intersect with N_pre's pre-activation bounds shifted by the difference
+            # bounds (Source A) — only when loaded AND enabled: gating on
+            # source_a_available is what makes --adv_std_zono_npre=false actually
+            # ablate the N_pre contribution (it used to be a no-op here).
+            if source_a_available && relu_layer_idx <= length(n1_preact_up_bounds)
                 n1_up   = vec(Float64.(n1_preact_up_bounds[relu_layer_idx]))
                 n1_dn   = vec(Float64.(n1_preact_down_bounds[relu_layer_idx]))
                 diff_up = vec(Float64.(relu_diff_up_bounds[relu_layer_idx]))
@@ -867,32 +859,26 @@ function compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init
             push!(n2_preact_up_bounds,     copy(n2_pre_up_cur))
             push!(n2_preact_down_bounds,   copy(n2_pre_down_cur))
 
-            # Clip perturbation intervals through ReLU
-            if optimizing_intervals
-                # Tighter per-neuron clipping: if both N2(x) and N2(x') neurons
-                # are in the same activation state, we can preserve or zero the pert interval.
-                for i in eachindex(pert_up)
-                    l_n2     = n2_pre_down_cur[i]             # N2(x) preact lower
-                    u_n2     = n2_pre_up_cur[i]               # N2(x) preact upper
-                    l_n2_p   = l_n2 + pert_down[i]            # N2(x') preact lower
-                    u_n2_p   = u_n2 + pert_up[i]              # N2(x') preact upper
+            # Clip perturbation intervals through ReLU.
+            # Tighter per-neuron clipping: if both N2(x) and N2(x') neurons
+            # are in the same activation state, we can preserve or zero the pert interval.
+            for i in eachindex(pert_up)
+                l_n2     = n2_pre_down_cur[i]             # N2(x) preact lower
+                u_n2     = n2_pre_up_cur[i]               # N2(x) preact upper
+                l_n2_p   = l_n2 + pert_down[i]            # N2(x') preact lower
+                u_n2_p   = u_n2 + pert_up[i]              # N2(x') preact upper
 
-                    if l_n2 >= 0 && l_n2_p >= 0
-                        # both active: post-ReLU pert = pre-ReLU pert, keep as-is
-                    elseif u_n2 <= 0 && u_n2_p <= 0
-                        # both inactive: post-ReLU pert = 0
-                        pert_up[i]   = 0.0
-                        pert_down[i] = 0.0
-                    else
-                        # mixed: conservative non-expansive clipping
-                        pert_up[i]   = max(0.0, pert_up[i])
-                        pert_down[i] = -max(0.0, -pert_down[i])
-                    end
+                if l_n2 >= 0 && l_n2_p >= 0
+                    # both active: post-ReLU pert = pre-ReLU pert, keep as-is
+                elseif u_n2 <= 0 && u_n2_p <= 0
+                    # both inactive: post-ReLU pert = 0
+                    pert_up[i]   = 0.0
+                    pert_down[i] = 0.0
+                else
+                    # mixed: conservative non-expansive clipping
+                    pert_up[i]   = max(0.0, pert_up[i])
+                    pert_down[i] = -max(0.0, -pert_down[i])
                 end
-            else
-                # Original conservative clipping (non-expansive)
-                pert_up   = max.(0.0, pert_up)
-                pert_down = .- max.(0.0, .- pert_down)
             end
 
             # N2 post-activation bounds

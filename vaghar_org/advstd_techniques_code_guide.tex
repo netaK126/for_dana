@@ -218,11 +218,12 @@ every pair.
 \paragraph{What it produces.}
 \src{n2\_abs\_up\_bounds[m][k]} and \src{n2\_abs\_down\_bounds[m][k]}
 --- sound over-approximations of $\hat z^{N_2}_{m,k}$ propagated
-through $N_2$ alone, with a single zonotope whose initial hull
-covers \emph{both} the clean input box $[0,1]^n$ and the perturbed
-input box $[-\varepsilon, 1{+}\varepsilon]^n$. Initialisation:
+through $N_2$ alone, with a single zonotope seeded from the input
+box $[0,1]^n$ (\src{source\_b\_seed\_box}). Every encoder bounds the
+perturbed input to the same box, so the one hull is exact for
+\emph{both} copies. Initialisation:
 $\mathbf c^{\mathrm{B}}_0 = \tfrac12\mathbf 1$,
-$G^{\mathrm{B}}_0 = \mathrm{diag}(\tfrac12 + \varepsilon)$
+$G^{\mathrm{B}}_0 = \mathrm{diag}(\tfrac12)$
 (\fileline{utils/perturbation\_intervals.jl}{1839--1843}). The
 intersection with Source A is applied \emph{at every ReLU layer},
 \emph{before} the DeepZ relaxation (line 1921), so the relaxed tube

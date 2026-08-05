@@ -100,16 +100,16 @@ function get_perturbation_specific_keys_brightness(perturbation_size, nn::Neural
     input_range = CartesianIndices(size(input))
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 0, upper_bound = p_size)
-    global perturbed_input_in_domain = false
+    global perturbed_input_in_domain = true
     if internet_nets_benchmarks
         (input_box_lo === nothing || input_box_hi === nothing) &&
             error("--internet_nets_benchmarks is on but no input box was loaded; " *
                   "check the <model>_box.txt sidecar next to model_path.")
         v_in = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
-        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]+p_size), input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = input_box_lo[i], upper_bound = input_box_hi[i]), input_range,)
     else
         v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1),input_range,)
-        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
+        v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     end
     @constraint(m, v_x0 .== v_in .+ v_e)
 
@@ -163,7 +163,7 @@ function get_perturbation_specific_keys_contrast(perturbation_size, nn::NeuralNe
     p_size = perturbation_size[1]
     v_e = @variable(m, lower_bound = 1.0, upper_bound = 1+p_size)
     v_in = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
-    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1+p_size), input_range,)
+    v_x0 = map(i -> @variable(m, lower_bound = 0, upper_bound = 1), input_range,)
     @constraint(m, v_x0 .== v_e*v_in)
 
     # Perturbation interval: Δ = x' - x = (e-1)*x, e-1 ∈ [0, ε], x ∈ [0,1] → Δ ∈ [0, ε]

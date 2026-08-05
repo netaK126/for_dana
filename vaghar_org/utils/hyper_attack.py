@@ -11,7 +11,13 @@ from tqdm import tqdm
 
 
 def update_attack(X, eps_pgd, alpha, size_, perturbation_type, dims):
-    if perturbation_type == "brightness" or perturbation_type == "contrast":
+    if perturbation_type == "brightness":
+            eps_pgd += alpha * eps_pgd.grad.sign()
+            # The MIP bounds x' = x + b to [0,1], so b > 1 is never feasible
+            # (even b = 1 forces an all-black clean image); cap the attack at 1.
+            eps_pgd = torch.clamp(eps_pgd, 0, min(size_[0], 1.0))
+            eps_pgd.requires_grad = True
+    elif perturbation_type == "contrast":
             eps_pgd += alpha * eps_pgd.grad.sign()
             eps_pgd = torch.clamp(eps_pgd, 0, size_[0])
             eps_pgd.requires_grad = True
@@ -167,12 +173,29 @@ def attack(model, X, source_, target_, device, token_signature,\
         with torch.no_grad():
             X_pgd += alpha * X_pgd.grad.sign()
             if BENCH_BOX is None:
-                X_pgd = torch.clamp(X_pgd, 0, 1)
+                # The MIP bounds the perturbed copy to [0,1], so keep the clean
+                # iterate where the perturbed image also stays in range:
+                # brightness needs x + eps <= 1, contrast needs (1+eps)*x <= 1;
+                # otherwise the hint pair is infeasible and Gurobi rejects it.
+                if type_ == "brightness":
+                    # b is capped at min(eps, 1) in update_attack, so this stays
+                    # a valid (possibly degenerate all-black) clean range even
+                    # for eps >= 1.
+                    X_pgd = torch.clamp(X_pgd, 0, max(0.0, 1.0 - min(size_[0], 1.0)))
+                elif type_ == "contrast":
+                    X_pgd = torch.clamp(X_pgd, 0, 1.0 / (1 + size_[0]))
+                else:
+                    X_pgd = torch.clamp(X_pgd, 0, 1)
             else:
                 # HAR model only: project each attack iterate into its [-1,1] input domain; clipping to [0,1] would leave the domain, making the found solution useless as a warm start.
                 _lo, _hi = BENCH_BOX
                 _lo_t = torch.as_tensor(_lo, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
                 _hi_t = torch.as_tensor(_hi, dtype=X_pgd.dtype, device=X_pgd.device).view(1, *X_pgd.shape[1:])
+                if type_ == "brightness":
+                    # Same in-range requirement as above: x + eps <= hi.
+                    # torch.maximum keeps the range valid (pinned at lo) when
+                    # eps exceeds the box width.
+                    _hi_t = torch.maximum(_hi_t - size_[0], _lo_t)
                 X_pgd = torch.max(torch.min(X_pgd, _hi_t), _lo_t)
             X_pgd.requires_grad = True
             eps_pgd = update_attack(X_pgd, eps_pgd, alpha, size_, type_, dims)
