@@ -32,6 +32,7 @@ import time
 import re
 import glob
 import itertools
+import math
 import shutil
 
 # ── Child-process lifecycle ──────────────────────────────────────────────
@@ -163,29 +164,101 @@ def _timeout_row_is_stale_rerun(status, runtime):
     # leave it.
     return runtime < _RERUN_TIMEOUT_BUDGET - _TIMEOUT_MATCH_EPS
 
+# Results-tree root, relative to this script's directory (or absolute).
+# Default preserves the historical layout; --experiments_root retargets
+# every scan, skip-check, job output_dir, and table source in one place.
+EXP_ROOT = "paper_experiments"
+
+
+# ── --only_vaghar_pairs support ──────────────────────────────────────────
+# The \baseline ('vaghar') column pools two sources (mirrors
+# update_advstd_tex_tables._wide_column_order / _wide_combo_of_dir):
+#   * every .txt inside a vagharNoPerturbed_* dir, and
+#   * the all-off/no-PI cells inside N1/N2stdBoost_* dirs (no zono, no
+#     SibGate, no perturbed intervals, tau <= 0, not an _ablation run).
+# --only_vaghar_pairs restricts every phase's job list to the Julia-indexed
+# (c_tag, c_target) pairs those files actually contain, so a single sweep
+# invocation with union --sweep_ctag/--ct never schedules a pair that has no
+# vaghar baseline.
+_VAGHAR_PAIRS_CACHE = {}
+
+def _is_vaghar_column_txt(fname):
+    if "_ablation" in fname:
+        return False
+    if ("zono" in fname or "SibGate" in fname
+            or "PertruebedIntervals" in fname or "PerturbedIntervals" in fname):
+        return False
+    m = re.search(r"_(?:BTPR|BoundTightPertRelax)(\d+(?:\.\d+)?)", fname)
+    return not (m and float(m.group(1)) > 0.0)
+
+_VAGHAR_ROW_RE = re.compile(r"c_source=(\d+),c_target=(\d+)")
+_VAGHAR_CSV_RE = re.compile(r"^(\d+)\s*,\s*(\d+)\s*,")
+
+def _vaghar_pairs_for_cell(dataset, arch, pert_type, eps_str):
+    """Julia-indexed {(c_tag, c_target)} pairs present in the vaghar-column
+    results of one (dataset, arch, perturbation, eps) cell."""
+    key = (dataset, arch, pert_type, eps_str)
+    if key not in _VAGHAR_PAIRS_CACHE:
+        here = os.path.dirname(os.path.abspath(__file__))
+        eps_dir = os.path.join(here, EXP_ROOT, dataset, f"{arch}_exp",
+                               pert_type, f"eps_{eps_str}")
+        pairs = set()
+        for d in (glob.glob(os.path.join(eps_dir, "vagharNoPerturbed_*"))
+                  + glob.glob(os.path.join(eps_dir, "N1stdBoost_*"))
+                  + glob.glob(os.path.join(eps_dir, "N2stdBoost_*"))):
+            in_boost = os.path.basename(d).startswith(("N1stdBoost_", "N2stdBoost_"))
+            for tf in glob.glob(os.path.join(d, "*.txt")):
+                if in_boost and not _is_vaghar_column_txt(os.path.basename(tf)):
+                    continue
+                try:
+                    with open(tf, errors="replace") as fh:
+                        for line in fh:
+                            m = (_VAGHAR_ROW_RE.search(line)
+                                 or _VAGHAR_CSV_RE.match(line.strip()))
+                            if m:
+                                pairs.add((int(m.group(1)) + 1, int(m.group(2)) + 1))
+                except OSError:
+                    pass
+        _VAGHAR_PAIRS_CACHE[key] = pairs
+    return _VAGHAR_PAIRS_CACHE[key]
+
+def _filter_cts_by_vaghar(cts, dataset, arch, pert_type, eps_str, c_tag):
+    pairs = _vaghar_pairs_for_cell(dataset, arch, pert_type, eps_str)
+    return [ct for ct in cts if (c_tag, ct) in pairs]
+
+def _vaghar_c_srcs_for_arch(dataset, arch, c_srcs):
+    """c_srcs (Julia) that have at least one vaghar pair in ANY perturbation
+    cell of this (dataset, arch) — prunes delta_max normalizer runs."""
+    keep = set()
+    for _name, pert_spec in all_perturbations_for(dataset):
+        pert_type, eps_str = pert_spec.split(":", 1)
+        for cs, _ct in _vaghar_pairs_for_cell(dataset, arch, pert_type, eps_str):
+            keep.add(cs)
+    return [c for c in c_srcs if c in keep]
+
+
 # ── Perturbation configs ─────────────────────────────────────────────────
 # Each entry: (name, perturbation_spec)
 PERTURBATIONS = [
-    
+
     ("patch(1,14,14,3)",  "patch:1,14,14,3"),
     ("trans(1,1)",        "translation:1,1"),
-    # ("trans(1,1)",        "translation:1,1"),
     ("occ(14,14,9)",        "occ:14,14,9"),
-    # ("contrast(1.5)",      "contrast:1.5"),
+    ("contrast(1.5)",      "contrast:1.5"),
     ("rotation(10)",      "rotation:10"),
-    # ("linf(0.1)",         "linf:0.1"), 
-    # ("brightness(0.25)",  "brightness:0.25"), 
-    
-    # ("trans(1,3)",        "translation:1,3"),
-    # ("trans(3,1)",        "translation:3,1"),
-    # ("trans(3,3)",        "translation:3,3"),
-    # ("occ(5,5,5)",        "occ:5,5,5"),
+    ("linf(0.1)",         "linf:0.1"),
+    ("brightness(0.25)",  "brightness:0.25"),
+
+    ("trans(1,3)",        "translation:1,3"),
+    ("trans(3,1)",        "translation:3,1"),
+    ("trans(3,3)",        "translation:3,3"),
+    ("occ(5,5,5)",        "occ:5,5,5"),
     ("occ(3,3,5)",        "occ:3,3,5"),
-    # ("occ(1,1,9)",        "occ:1,1,9"),
-    # ("contrast(1.2)",      "contrast:1.2"),
-    # ("rotation(5)",      "rotation:5"),
-    # ("occ(1,1,5)",        "occ:1,1,5"),
-    # ("linf(0.05)",        "linf:0.05"),    
+    ("occ(1,1,9)",        "occ:1,1,9"),
+    ("contrast(1.2)",      "contrast:1.2"),
+    ("rotation(5)",      "rotation:5"),
+    ("occ(1,1,5)",        "occ:1,1,5"),
+    ("linf(0.05)",        "linf:0.05"),
     # ("brightness(0.1)",  "brightness:0.1")
 ]
 
@@ -457,7 +530,7 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
     """
     c_targets = [ct for ct in c_targets if ct != c_tag]
     out_dir = os.path.join(
-        cwd, "paper_experiments", dataset, f"{arch}_exp",
+        cwd, EXP_ROOT, dataset, f"{arch}_exp",
         pert_type, f"eps_{eps_str}",
         f"advStd_{arch}_N1_{n1_tag}",
     )
@@ -634,7 +707,7 @@ def _standard_n2_missing_c_targets(pert_spec, cwd, arch, dataset, n2_tag,
     """
     c_targets = [ct for ct in c_targets if ct != c_tag]
     pert_type, eps_str = pert_spec.split(":", 1)
-    eps_dir = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp",
+    eps_dir = os.path.join(cwd, EXP_ROOT, dataset, f"{arch}_exp",
                            pert_type, f"eps_{eps_str}")
     if not os.path.isdir(eps_dir):
         return list(c_targets)
@@ -683,7 +756,8 @@ def _parse_c_targets(ct_str):
 
 
 def _n1_state_missing_c_targets(n1_state_dir, c_tag, c_targets,
-                                need_pseudocosts, need_n1_preact=False):
+                                need_pseudocosts, need_n1_preact=False,
+                                need_diff_bounds_file=None):
     """Return the subset of `c_targets` for which the per-pair N1 state is
     incomplete and the N1 solve must be (re-)run.
 
@@ -698,12 +772,25 @@ def _n1_state_missing_c_targets(n1_state_dir, c_tag, c_targets,
     any N1 solve in this state dir; if `need_n1_preact` and it's missing,
     re-solving any one c_target rewrites it, so all requested c_targets are
     reported as missing in that case to force a rebuild.
+
+    `need_diff_bounds_file` works the same way for a mode-specific diff-bounds
+    file (diff_bounds_arithTransfer.bin under --arithmetic_transfer_bounds):
+    if the named file is missing, all requested c_targets are reported missing
+    so an N1 run gets scheduled. The scheduler shrinks the request back to the
+    genuinely missing pairs (or a single c_target when none are — run.jl
+    writes the file before its per-pair loop), and in arithmetic mode run.jl
+    additionally skips c_targets whose per-pair state already exists (it is
+    mode-independent), so a complete state dir costs one Julia startup plus
+    the sub-second bound pass — no Gurobi solve.
     """
     c_targets = [ct for ct in c_targets if ct != c_tag]
     if not os.path.isdir(n1_state_dir):
         return list(c_targets)
     if need_n1_preact and not os.path.isfile(
             os.path.join(n1_state_dir, "n1_preact_bounds.bin")):
+        return list(c_targets)
+    if need_diff_bounds_file and not os.path.isfile(
+            os.path.join(n1_state_dir, need_diff_bounds_file)):
         return list(c_targets)
     missing = []
     for ct in c_targets:
@@ -724,7 +811,7 @@ def _n1_state_missing_c_targets(n1_state_dir, c_tag, c_targets,
 
 
 def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False,
-                       c_tag=None, c_targets=None):
+                       c_tag=None, c_targets=None, need_diff_bounds_file=None):
     """Return True if the N1 state directory already contains everything we need
     for the given `c_tag` (Julia 1-indexed source class).
 
@@ -744,7 +831,8 @@ def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False,
             raise ValueError("c_targets requires c_tag")
         return not _n1_state_missing_c_targets(
             n1_state_dir, c_tag, c_targets,
-            need_pseudocosts, need_n1_preact=need_n1_preact)
+            need_pseudocosts, need_n1_preact=need_n1_preact,
+            need_diff_bounds_file=need_diff_bounds_file)
     if not os.path.isdir(n1_state_dir):
         return False
     if c_tag is None:
@@ -766,6 +854,9 @@ def _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=False,
         has_preact = os.path.isfile(os.path.join(n1_state_dir, "n1_preact_bounds.bin"))
         if not has_preact:
             return False
+    if need_diff_bounds_file and not os.path.isfile(
+            os.path.join(n1_state_dir, need_diff_bounds_file)):
+        return False
     return True
 
 
@@ -866,7 +957,7 @@ def _release_n1_solve_lock(lock_path):
         pass
 
 
-def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_interval_sec=30, need_n1_preact=False, c_tag=None, c_targets=None):
+def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_interval_sec=30, need_n1_preact=False, c_tag=None, c_targets=None, need_diff_bounds_file=None):
     """Block until another process finishes solving N1 and the state is ready
     for the given `c_tag` / `c_targets` (passed through to `_n1_state_complete`).
 
@@ -882,7 +973,7 @@ def _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, poll_in
             time.sleep(poll_interval_sec)
             continue
         # Lock gone. Verify the state is actually complete.
-        if _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=c_targets):
+        if _n1_state_complete(n1_state_dir, need_pseudocosts, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=c_targets, need_diff_bounds_file=need_diff_bounds_file):
             return True
         # Lock released but state incomplete — the other process likely
         # crashed or was killed. Surface this loudly; we do not try to
@@ -1172,7 +1263,7 @@ def _benchmark_class_grid(cwd, dataset, arch):
     That is what keeps a stray N1 result from widening the grid and flagging
     every row partial.
     """
-    exp = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
+    exp = os.path.join(cwd, EXP_ROOT, dataset, f"{arch}_exp")
     cts, css = set(), set()
     for tf in glob.glob(os.path.join(exp, "*", "eps_*", "*", "*.txt")):
         cell = os.path.basename(os.path.dirname(tf))
@@ -1525,6 +1616,9 @@ def _extract_advstd_file_metadata(filename):
                      else "vh_legacy" if ("varHintFix" in filename or "varHint" in filename)
                      else "no"),
         "zono_bounds": "yes" if "zonoBounds" in filename else "no",
+        # --arithmetic_transfer_bounds runs: same technique tags as the
+        # zonotope run, interval diff-bounds method (filename tag _arithTransfer).
+        "arith_transfer": "yes" if "arithTransfer" in filename else "no",
         "n1_probe": "lp" if "n1ProbeLP" in filename else "off",
         "relax_threshold": btpr_match.group(1) if btpr_match else "off",
         "relax_mode": "btpr" if btpr_match else "off",
@@ -1626,12 +1720,15 @@ def find_advstd_faster_than_standard(perts, exp_base, csv_advstd_faster, csv_sta
                     continue
                 # Leave-one-out ablation runs are not paper combos — keep them
                 # out of these rows and of every CSV built from them (ranking,
-                # tex tables). Two markers: _ablation (all component-removed
-                # combos from --advstd_ablations) and _noPI (defensive: any
+                # tex tables). Three markers: _ablation (all component-removed
+                # combos from --advstd_ablations), _noPI (defensive: any
                 # pi=false run, e.g. manually launched without the sweep — its
                 # (zb, vh, rt, sg) tags are identical to the PI run's and
-                # would otherwise silently merge into the same combo row).
-                if "_ablation" in tf_name or "_noPI" in tf_name:
+                # would otherwise silently merge into the same combo row), and
+                # _arithTransfer (--arithmetic_transfer_bounds runs: same tag
+                # identity as the zonotope run, different diff-bounds method).
+                if ("_ablation" in tf_name or "_noPI" in tf_name
+                        or "_arithTransfer" in tf_name):
                     continue
                 meta = _extract_advstd_file_metadata(tf_name)
                 advstd_results = parse_result_file(tf)
@@ -2092,7 +2189,7 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
     """
     import csv as _csv
     all_perts = all_perturbations_for(dataset)
-    combined_base = os.path.join(cwd, "paper_experiments", dataset)
+    combined_base = os.path.join(cwd, EXP_ROOT, dataset)
     os.makedirs(combined_base, exist_ok=True)
     suffix = "_vs_withPerturbed" if compare_to_with_perturbed else ""
     csv_advstd_faster = os.path.join(combined_base, f"advstd_faster_than_standard{suffix}.csv")
@@ -2102,7 +2199,7 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
 
     all_af, all_sf, all_at, all_st = [], [], [], []
     for arch, _ in arch_runs:
-        exp_base = os.path.join(cwd, "paper_experiments", dataset, f"{arch}_exp")
+        exp_base = os.path.join(cwd, EXP_ROOT, dataset, f"{arch}_exp")
         print(f"\nScanning advanced-standard results for {arch} in: {exp_base}")
         af, sf, at, st = find_advstd_faster_than_standard(
             all_perts, exp_base, csv_advstd_faster, csv_standard_faster,
@@ -2194,6 +2291,34 @@ def _generate_combo_ranking_csv(arch_runs, cwd, dataset,
     return csv_combo_ranking
 
 
+def _paper_tex_path(cwd, fname):
+    """Resolve a paper section .tex file across the paper's layout
+    generations. Historically every section lived in neta-s-paper/sections/;
+    the AAAI packaging split the paper into 01_submission_single_tex (body
+    sections flattened into one main.tex -- the AUTO markers survived the
+    flatten, so marker-based updates keep working), 03_supplementary/sections
+    (appendix sections), and 02_previous_version_multi_tex/sections (frozen
+    old tree, still the home of the full-results sources and the frozen
+    Table-1 master). Preference order: legacy path if it exists (old layout
+    untouched), then the new home of that file."""
+    legacy = os.path.join(cwd, "neta-s-paper", "sections", fname)
+    if os.path.exists(legacy):
+        return legacy
+    body_sections = {"sec_evaluation.tex", "sec_conclusion.tex", "sec_intro.tex",
+                     "sec_key_ideas.tex", "sec_system.tex", "sec_background.tex",
+                     "sec_related_work.tex"}
+    if fname in body_sections:
+        single = os.path.join(cwd, "neta-s-paper", "01_submission_single_tex",
+                              "main.tex")
+        if os.path.exists(single):
+            return single
+    for sub in ("03_supplementary", "02_previous_version_multi_tex"):
+        cand = os.path.join(cwd, "neta-s-paper", sub, "sections", fname)
+        if os.path.exists(cand):
+            return cand
+    return legacy
+
+
 def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                               compare_to_with_perturbed, combo_ranking_seeds,
                               combination_table=None,
@@ -2203,6 +2328,7 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
     try:
         sys.path.insert(0, cwd)
         import update_advstd_tex_tables as updater
+        updater.EXP_ROOT = EXP_ROOT
     except Exception as exc:  # pragma: no cover - diagnostic only
         print(f"[tex-update] skipped (import failed: {exc})")
         return
@@ -2312,8 +2438,7 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
         # solve-time charts (one ybar figure per arch x source class). The
         # full N2 per-cell tables now live in the appendix (below).
         try:
-            body_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                    "sec_evaluation.tex")
+            body_tex = _paper_tex_path(cwd, "sec_evaluation.tex")
             if os.path.exists(body_tex) and hasattr(
                     updater, "regenerate_aaai_n2_charts_section"):
                 updater.regenerate_aaai_n2_charts_section(
@@ -2330,8 +2455,7 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
 
         # N2 (target network) per-cell tables -> appendix.
         try:
-            n2_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                  "sec_appendix_percell.tex")
+            n2_tex = _paper_tex_path(cwd, "sec_appendix_percell.tex")
             if os.path.exists(n2_tex):
                 updater.regenerate_aaai_wide_perarch_section(
                     n2_tex, cwd, dataset_guess, arch_runs,
@@ -2359,34 +2483,34 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
     _recompile_neta_s_paper(cwd)
 
 
-def _recompile_neta_s_paper(cwd):
-    """Rebuild neta-s-paper/main.pdf with pdflatex+bibtex (latexmk absent).
+def _build_paper_pdf(paper_dir, src_tex, out_pdf):
+    """Rebuild one paper PDF with pdflatex+bibtex (latexmk absent).
 
     Builds under a temp jobname and atomically swaps the result into
-    main.pdf only on full success. This keeps the VSCode PDF.js preview
+    out_pdf only on full success. This keeps the VSCode PDF.js preview
     from ever reading a half-written file (which shows up as "Invalid PDF
     structure") and prevents a halted pass from clobbering the last-good
-    main.pdf with a truncated partial.
+    PDF with a truncated partial.
     """
-    paper_dir = os.path.join(cwd, "neta-s-paper")
-    main_tex = os.path.join(paper_dir, "main.tex")
-    if not os.path.exists(main_tex):
-        print(f"[paper-build] skipped (missing {main_tex})")
+    src = os.path.join(paper_dir, src_tex)
+    if not os.path.exists(src):
+        print(f"[paper-build] skipped (missing {src})")
         return
-    job = "main_build"
+    stem = os.path.splitext(out_pdf)[0]
+    job = f"{stem}_build"
     # Clear stale intermediates first. A run interrupted mid-write can leave a
-    # half-written main_build.aux; pgfplots' `legend to name` stores the
-    # legend in the .aux and reads it back at \begin{document}, so a corrupt
-    # .aux makes the next build die with "File ended while scanning
-    # definition of \pgfplots@legend@to@name@...". The first pdflatex pass
-    # regenerates these, so deleting them up front is safe.
+    # half-written .aux; pgfplots' `legend to name` stores the legend in the
+    # .aux and reads it back at \begin{document}, so a corrupt .aux makes the
+    # next build die with "File ended while scanning definition of
+    # \pgfplots@legend@to@name@...". The first pdflatex pass regenerates
+    # these, so deleting them up front is safe.
     for ext in ("aux", "out", "toc"):
         try:
             os.remove(os.path.join(paper_dir, f"{job}.{ext}"))
         except OSError:
             pass
     pdflatex = ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
-                "-jobname", job, "main.tex"]
+                "-jobname", job, src_tex]
     steps = [pdflatex, ["bibtex", job], pdflatex, pdflatex]
     for step in steps:
         try:
@@ -2397,33 +2521,57 @@ def _recompile_neta_s_paper(cwd):
             print(f"[paper-build] skipped ({step[0]} not installed)")
             return
         if proc.returncode != 0:
-            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            out_txt = proc.stdout.decode("utf-8", "replace")
+            # A document with no \cite / \bibliography (e.g. the AAAI
+            # supplementary) makes bibtex exit non-zero on the empty aux;
+            # that is not a build failure -- skip the step and keep going.
+            if step[0] == "bibtex" and ("I found no \\bibdata" in out_txt
+                                        or "I found no \bibdata" in out_txt):
+                print(f"[paper-build] {out_pdf}: no bibliography -- "
+                      f"bibtex skipped")
+                continue
+            tail = out_txt.splitlines()[-20:]
             print(f"[paper-build] {' '.join(step)} failed "
-                  f"(exit {proc.returncode}); keeping previous main.pdf. "
+                  f"(exit {proc.returncode}); keeping previous {out_pdf}. "
                   f"Last lines:")
             for line in tail:
                 print(f"  {line}")
             return
     built_pdf = os.path.join(paper_dir, f"{job}.pdf")
     if not os.path.exists(built_pdf):
-        print(f"[paper-build] no {job}.pdf produced; keeping previous main.pdf")
+        print(f"[paper-build] no {job}.pdf produced; keeping previous {out_pdf}")
         return
-    os.replace(built_pdf, os.path.join(paper_dir, "main.pdf"))
-    # Seed the plain "main" jobname's .aux/.bbl from this resolved build. An
-    # editor (e.g. VSCode LaTeX Workshop) that recompiles main.tex in a single
+    os.replace(built_pdf, os.path.join(paper_dir, out_pdf))
+    # Seed the plain jobname's .aux/.bbl from this resolved build. An editor
+    # (e.g. VSCode LaTeX Workshop) that recompiles the source in a single
     # pdflatex pass, with no bibtex, reads these at \begin{document}. Without
-    # them main.aux has no \bibcite and main.bbl is absent, so every \cite
-    # renders undefined and that stale single-pass main.pdf overwrites this
-    # good one. Copying keeps the editor preview fully resolved after each
-    # rebuild.
+    # them the .aux has no \bibcite and the .bbl is absent, so every \cite
+    # renders undefined and that stale single-pass PDF overwrites this good
+    # one. Copying keeps the editor preview fully resolved after each rebuild.
     for _ext in ("aux", "bbl"):
         _src = os.path.join(paper_dir, f"{job}.{_ext}")
         if os.path.exists(_src):
             try:
-                shutil.copyfile(_src, os.path.join(paper_dir, f"main.{_ext}"))
+                shutil.copyfile(_src, os.path.join(paper_dir, f"{stem}.{_ext}"))
             except OSError as _exc:
-                print(f"[paper-build] could not seed main.{_ext}: {_exc}")
-    print(f"[paper-build] rebuilt {os.path.join(paper_dir, 'main.pdf')}")
+                print(f"[paper-build] could not seed {stem}.{_ext}: {_exc}")
+    print(f"[paper-build] rebuilt {os.path.join(paper_dir, out_pdf)}")
+
+
+def _recompile_neta_s_paper(cwd):
+    """Rebuild the paper PDFs. Legacy layout (neta-s-paper/main.tex) builds
+    that single document; the AAAI packaging builds BOTH the submission
+    (01_submission_single_tex/main.pdf) and the supplementary
+    (03_supplementary/supplementary.pdf), since the auto tables/charts are
+    split across them."""
+    paper_dir = os.path.join(cwd, "neta-s-paper")
+    if os.path.exists(os.path.join(paper_dir, "main.tex")):
+        _build_paper_pdf(paper_dir, "main.tex", "main.pdf")
+    else:
+        _build_paper_pdf(os.path.join(paper_dir, "01_submission_single_tex"),
+                         "main.tex", "main.pdf")
+        _build_paper_pdf(os.path.join(paper_dir, "03_supplementary"),
+                         "supplementary.tex", "supplementary.pdf")
     _build_full_results_tex(cwd)
 
 
@@ -2518,12 +2666,11 @@ def _snapshot_tab_networks(cwd):
     the frozen copy keeps every network row even after the paper's own copy is
     reduced to a single run's models. Returns the master's table text, or None.
     """
-    sec_dir = os.path.join(cwd, "neta-s-paper", "sections")
-    master = os.path.join(sec_dir, _TAB_NETWORKS_MASTER)
+    master = _paper_tex_path(cwd, _TAB_NETWORKS_MASTER)
     if os.path.exists(master):
         with open(master, encoding="utf-8") as fh:
             return _extract_labeled_float(fh.read(), "tab:networks")
-    src = os.path.join(sec_dir, "sec_evaluation.tex")
+    src = _paper_tex_path(cwd, "sec_evaluation.tex")
     if not os.path.exists(src):
         return None
     with open(src, encoding="utf-8") as fh:
@@ -2558,8 +2705,7 @@ def _rendered_ds_arch_pairs(cwd):
     Labels are 'tab:safe-wide-<arch>[-solved|-timeout][-<dataset>]' and no arch
     key contains a hyphen, so the arch is the first '-' segment.
     """
-    path = os.path.join(cwd, "neta-s-paper", "sections",
-                        "sec_full_results_tables.tex")
+    path = _paper_tex_path(cwd, "sec_full_results_tables.tex")
     if not os.path.exists(path):
         return set()
     with open(path, encoding="utf-8") as fh:
@@ -2770,7 +2916,7 @@ def _filter_tab_networks(cwd, pairs, updater):
         print("[tab1] no Table 1 row matches this run's datasets/archs; "
               "leaving the paper's table unchanged")
         return
-    sec_path = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    sec_path = _paper_tex_path(cwd, "sec_evaluation.tex")
     with open(sec_path, encoding="utf-8") as fh:
         text = fh.read()
     cur = _extract_labeled_float(text, "tab:networks")
@@ -2796,6 +2942,11 @@ def _filter_tab_networks(cwd, pairs, updater):
 # tau's impact, so the headline averages count the default rows alone.
 PAPER_DEFAULT_TAU = 0.5
 
+#: The red "*" the per-cell tables put on a cell whose c_target coverage is
+#: partial (update_advstd_tex_tables' STAR). Rows carrying it are excluded from
+#: the headline numbers below.
+_PARTIAL_STAR = r"\textcolor{red}{$^*$}"
+
 
 def _report_paper_table_averages(cwd):
     """Print the average speedup and average bound-gap ratio of the 'ours' and
@@ -2814,8 +2965,7 @@ def _report_paper_table_averages(cwd):
         cell compares the remaining MIP optimality gap instead,
         (delta_u - delta_l)_VHAGaR / (delta_u - delta_l)_method.
     """
-    path = os.path.join(cwd, "neta-s-paper", "sections",
-                        "sec_appendix_percell.tex")
+    path = _paper_tex_path(cwd, "sec_appendix_percell.tex")
     if not os.path.exists(path):
         print("[paper-averages] sec_appendix_percell.tex missing; skipped")
         return
@@ -2843,6 +2993,7 @@ def _report_paper_table_averages(cwd):
     # exist only to show tau's impact, and a key whose only row carries another
     # tau contributes nothing.
     picked = {}
+    n_rows_starred = {"speedup": 0, "gap_ratio": 0}
     n_rows_off_tau = {"speedup": 0, "gap_ratio": 0}
     n_tables = {"speedup": 0, "gap_ratio": 0}
     n_rows_seen = {"speedup": 0, "gap_ratio": 0}
@@ -2873,6 +3024,15 @@ def _report_paper_table_averages(cwd):
             if len(cells) < 4:
                 continue
             n_rows_seen[metric] += 1
+            # --paper_show_partial prints rows whose c_target coverage is
+            # incomplete and marks every affected cell with a red "*". Such a
+            # row compares a full run against a partial one, so it is dropped
+            # from the headline numbers entirely -- one starred cell anywhere
+            # in the row is enough, whichever column carries it. The blue "*"
+            # (a raw, un-normalized bound) is a different flag and stays.
+            if any(_PARTIAL_STAR in c for c in cells):
+                n_rows_starred[metric] += 1
+                continue
             key = (t_i, block, cells[1].strip())    # pert (size)
             tau = _tau(cells[2])
             if abs(tau - PAPER_DEFAULT_TAU) > 1e-9:
@@ -2881,13 +3041,26 @@ def _report_paper_table_averages(cwd):
             picked[key] = (tau, metric, cells[-2], cells[-1])
 
     # {metric: {"ours": [...], "transfer": [...]}}
+    # A row counts only when BOTH columns carry a value: a row where one of the
+    # two modes is missing ('---') would otherwise shift one average without
+    # touching the other, so the two headline numbers would no longer describe
+    # the same set of experiments and could not be compared to each other.
     vals = {"speedup": {"ours": [], "transfer": []},
             "gap_ratio": {"ours": [], "transfer": []}}
+    n_rows_unpaired = {"speedup": {"ours": 0, "transfer": 0},
+                       "gap_ratio": {"ours": 0, "transfer": 0}}
     for _tau_v, metric, ours_cell, transfer_cell in picked.values():
-        for key, cell in (("ours", ours_cell), ("transfer", transfer_cell)):
-            v = _val(cell)
-            if v is not None:
-                vals[metric][key].append(v)
+        v_ours, v_transfer = _val(ours_cell), _val(transfer_cell)
+        if v_ours is None and v_transfer is None:
+            continue                    # nothing to compare, nothing dropped
+        if v_ours is None or v_transfer is None:
+            # Name the column that DID have a value, i.e. the one whose average
+            # this row would have entered had we not required the pair.
+            n_rows_unpaired[metric][
+                "ours" if v_ours is not None else "transfer"] += 1
+            continue
+        vals[metric]["ours"].append(v_ours)
+        vals[metric]["transfer"].append(v_transfer)
 
     def _mean(xs):
         return sum(xs) / len(xs) if xs else float("nan")
@@ -2898,6 +3071,18 @@ def _report_paper_table_averages(cwd):
     print(f"restricted to the default threshold tau = {PAPER_DEFAULT_TAU} "
           f"(skipped {n_rows_off_tau['speedup']} speedup and "
           f"{n_rows_off_tau['gap_ratio']} gap-ratio rows at other thresholds)")
+    if any(n_rows_starred.values()):
+        print(f"excluding rows with a red \"*\" (partial c_target coverage) "
+              f"in any cell: dropped {n_rows_starred['speedup']} speedup and "
+              f"{n_rows_starred['gap_ratio']} gap-ratio rows")
+    for metric, label in (("speedup", "speed_up"), ("gap_ratio", "gap_ratio")):
+        n_o = n_rows_unpaired[metric]["ours"]
+        n_t = n_rows_unpaired[metric]["transfer"]
+        if n_o or n_t:
+            print(f"dropped {n_o + n_t} {label} row(s) with only one of the "
+                  f"two columns ({n_o} had only 'ours', {n_t} had only "
+                  f"'ours with transfer'), so both averages cover the same "
+                  f"rows")
     print("=" * 72)
     for metric, label in (("speedup", "speed_up"),
                           ("gap_ratio", "gap_ratio")):
@@ -2908,6 +3093,23 @@ def _report_paper_table_averages(cwd):
                 v = fn(xs) if xs else float("nan")
                 print(f"  {stat}_{label:<10} [{col:<18}] = {v:7.2f}   "
                       f"(#rows = {len(xs)})")
+    # Head-to-head: which mode came out ahead on each experiment, rather than
+    # by how much. The two lists are index-aligned (a row enters both or
+    # neither), so they compare row by row. A row where the two print the same
+    # ratio is a tie and belongs to neither, which is why the three shares are
+    # reported together and sum to 100%.
+    for metric, label in (("speedup", "speed_up"),
+                          ("gap_ratio", "gap_ratio")):
+        ours, transfer = vals[metric]["ours"], vals[metric]["transfer"]
+        n = len(ours)
+        if not n:
+            continue
+        n_o = sum(1 for a, b in zip(ours, transfer) if a > b)
+        n_t = sum(1 for a, b in zip(ours, transfer) if b > a)
+        n_tie = n - n_o - n_t
+        pct = lambda c: f"{100.0 * c / n:6.2f}% ({c:>2})"
+        print(f"  win_{label:<10} ours {pct(n_o)} | transfer {pct(n_t)} | "
+              f"tie {pct(n_tie)}   (#rows = {n})")
     n_sp = len(vals["speedup"]["ours"])
     n_gp = len(vals["gap_ratio"]["ours"])
     print(f"\n  avg_speed_up  = sum{{ speed_up values over rows }}  / #rows"
@@ -2916,6 +3118,8 @@ def _report_paper_table_averages(cwd):
     print(f"  avg_gap_ratio = sum{{ gap_ratio values over rows }} / #rows"
           f"   (#rows = {n_gp})")
     print(f"  max_gap_ratio = max{{ gap_ratio values over rows }}")
+    print(f"  win_*         = share of rows where that column is strictly the "
+          f"higher of the two (equal rows count as a tie)")
     print("=" * 72)
     return vals
 
@@ -2942,7 +3146,7 @@ def _update_results_sentence(cwd, vals):
     Both are reported for BOTH modes: the "ours" column (single-network) and
     the "ours with transfer" column.
     """
-    path = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    path = _paper_tex_path(cwd, "sec_evaluation.tex")
     if not os.path.exists(path) or not vals:
         return
 
@@ -3033,7 +3237,7 @@ def _update_conclusion_sentence(cwd, vals):
     states, since the appendix also prints rows for other thresholds.
     The maxima are deliberately left out: the Conclusion states the averages.
     """
-    path = os.path.join(cwd, "neta-s-paper", "sections", "sec_conclusion.tex")
+    path = _paper_tex_path(cwd, "sec_conclusion.tex")
     if not os.path.exists(path) or not vals:
         return False
 
@@ -3079,6 +3283,144 @@ def _update_conclusion_sentence(cwd, vals):
               f"{g('gap_ratio','transfer'):.1f}x)")
         return True
     return False
+
+
+AAAI_WILCOXON_BEGIN = "% BEGIN AUTO: aaai_wilcoxon_table"
+AAAI_WILCOXON_END   = "% END AUTO: aaai_wilcoxon_table"
+
+
+def _wilcoxon_signed_rank(xs):
+    """Two-sided Wilcoxon signed-rank test of the log-ratios log(x) against 0,
+    i.e. of the null hypothesis that \\baseline and the tested verifier are
+    equally fast (equally tight). `xs` are the RATIO cells the appendix tables
+    print, t_VHAGaR / t_method or (delta_u - delta_l)_VHAGaR / (..)_method, so
+    a ratio above 1 is an improvement and its logarithm is positive. The log is
+    what makes the test symmetric: a 2x speedup and a 2x slowdown then sit the
+    same distance from 0, whereas the raw ratios put them at +1 and -0.5.
+
+    Returns (n, w_plus, w_minus, z, p), or None when fewer than two instances
+    carry a nonzero log-ratio. Following the test's definition, instances whose
+    ratio is exactly 1 contribute no information and are dropped, so `n` counts
+    the remaining ones. Tied absolute log-ratios share their average rank and
+    the variance carries the usual tie correction; the normal approximation
+    runs WITHOUT a continuity correction.
+    """
+    diffs = [math.log(x) for x in xs if x is not None and x > 0]
+    diffs = [d for d in diffs if d != 0.0]
+    n = len(diffs)
+    if n < 2:
+        return None
+    order = sorted(range(n), key=lambda i: abs(diffs[i]))
+    ranks = [0.0] * n
+    ties = []
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs(diffs[order[j + 1]]) == abs(diffs[order[i]]):
+            j += 1
+        avg = (i + j + 2) / 2.0          # average of the 1-based ranks i+1..j+1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        if j > i:
+            ties.append(j - i + 1)
+        i = j + 1
+    w_plus = sum(r for r, d in zip(ranks, diffs) if d > 0)
+    w_minus = sum(r for r, d in zip(ranks, diffs) if d < 0)
+    var = n * (n + 1) * (2 * n + 1) / 24.0 \
+        - sum(t ** 3 - t for t in ties) / 48.0
+    if var <= 0:
+        return None
+    z = (w_plus - n * (n + 1) / 4.0) / math.sqrt(var)
+    p = math.erfc(abs(z) / math.sqrt(2.0))
+    return n, w_plus, w_minus, z, p
+
+
+def _update_wilcoxon_table(cwd, vals):
+    """Rewrite the supplementary's Wilcoxon table (tab:wilcoxon) with this
+    run's own numbers.
+
+    The four tests read the very same per-instance ratios as the headline
+    averages -- `vals` from _report_paper_table_averages, i.e. the ratio
+    columns of the paper's appendix tables at the default threshold -- so the
+    table can never claim significance for a set of experiments the tables do
+    not print. `vals` is already restricted to the instances where BOTH \\tool
+    and \\tool transfer have a value, which keeps the two verifier rows of each
+    metric comparable to one another.
+      * tightness -- the '-timeout' tables, where every verifier reaches the
+        cap and only the remaining bound difference separates them;
+      * speed     -- the '-solved' tables, where at least one verifier
+        finishes.
+    """
+    path = _paper_tex_path(cwd, "sec_appendix_percell.tex")
+    if not os.path.exists(path) or not vals:
+        return False
+
+    def _p_tex(p):
+        # Below 0.001 the reader wants the exponent, above it the plain
+        # decimal; either way two significant digits carry the message.
+        if p >= 1e-3:
+            return f"${p:.3f}$"
+        exp = int(math.floor(math.log10(p)))
+        return f"${p / 10 ** exp:.1f}\\cdot 10^{{{exp}}}$"
+
+    def _w_tex(w):
+        return f"{w:.0f}" if abs(w - round(w)) < 1e-9 else f"{w:.1f}"
+
+    rows = []
+    for metric, label in (("gap_ratio", "tightness"), ("speedup", "speed")):
+        for col, name in (("ours", r"\tool         "),
+                          ("transfer", r"\tool transfer")):
+            res = _wilcoxon_signed_rank((vals.get(metric) or {}).get(col) or [])
+            if res is None:
+                print(f"[wilcoxon] skipped: too few {label} instances for "
+                      f"the '{col}' column")
+                return False
+            n, w_p, w_m, z, p = res
+            rows.append(f"{label:<9} & {name} & {n} & {_w_tex(w_p):>4} & "
+                        f"{_w_tex(w_m):>4} & {z:.2f} & {_p_tex(p)} \\\\")
+
+    table = "\n".join([
+        r"\begin{table}[t]",
+        r"\centering",
+        r"\small",
+        r"\setlength{\tabcolsep}{4pt}",
+        r"\begin{tabular}{@{}l l r r r r r@{}}",
+        r"\toprule",
+        r"metric & verifier & $n$ & $W^{+}$ & $W^{-}$ & $z$ & $p$ \\",
+        r"\midrule",
+        *rows,
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\caption{Two-sided Wilcoxon signed-rank tests of \tool and "
+        r"\tool transfer",
+        r"against \baseline.}",
+        r"\label{tab:wilcoxon}",
+        r"\end{table}",
+    ])
+
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    i, j = text.find(AAAI_WILCOXON_BEGIN), text.find(AAAI_WILCOXON_END)
+    if i >= 0 and j > i:
+        new = (text[:i] + AAAI_WILCOXON_BEGIN + "\n" + table + "\n" + text[j:])
+    else:
+        # First run: wrap the hand-written table in the marker pair, so every
+        # later run replaces the generated block instead of the section around
+        # it.
+        cur = _extract_labeled_float(text, "tab:wilcoxon")
+        if cur is None:
+            print(f"[wilcoxon] tab:wilcoxon not found in {path}; skipped")
+            return False
+        new = text.replace(cur, f"{AAAI_WILCOXON_BEGIN}\n{table}\n"
+                                f"{AAAI_WILCOXON_END}", 1)
+    if new == text:
+        return False
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(new)
+    print("[wilcoxon] wrote tab:wilcoxon (" + "; ".join(
+        r.split("&")[0].strip() + " " + r.split("&")[1].strip()
+        + f" n={r.split('&')[2].strip()}" for r in rows) + ")")
+    return True
 
 
 def _ensure_full_results_section(path, updater, marker_suffix=""):
@@ -3252,6 +3594,7 @@ def _build_full_results_tex(cwd):
     try:
         sys.path.insert(0, cwd)
         import update_advstd_tex_tables as _har_updater
+        _har_updater.EXP_ROOT = EXP_ROOT
         _har_fig_tex = _har_updater.render_har_confidence_figures(cwd)
         if _har_fig_tex:
             har_fig_chunk = ("%% ---- har_confidence_figures (auto-generated) "
@@ -3615,6 +3958,7 @@ def _layer_global_request(per_arch, global_request, arch_runs):
 
 
 def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
+                                 show_partial=False, only_vaghar_pairs=False,
                                  combination_table=None, force_timeout=None,
                                  rerun_timeout_eps=30.0,
                                  requested_c_targets=None,
@@ -3644,9 +3988,21 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     try:
         sys.path.insert(0, cwd)
         import update_advstd_tex_tables as updater
+        updater.EXP_ROOT = EXP_ROOT
     except Exception as exc:  # pragma: no cover - diagnostic only
         print(f"[paper-tables] skipped (import failed: {exc})")
         return
+    if hasattr(updater, "set_aaai_show_partial"):
+        updater.set_aaai_show_partial(show_partial)
+    if only_vaghar_pairs and hasattr(updater, "set_expected_cts_provider"):
+        # "Expected" = the vaghar-pair plan of the SAME cell, so the partial
+        # "*" flags planned-but-absent runs, not designed-away class pairs.
+        # _vaghar_pairs_for_cell returns Julia-indexed pairs; the updater
+        # works 0-indexed.
+        def _vaghar_expected(ds_, arch_, pert_, p_size_, c_src_):
+            pairs = _vaghar_pairs_for_cell(ds_, arch_, pert_, p_size_)
+            return {t - 1 for (c, t) in pairs if c == int(c_src_) + 1}
+        updater.set_expected_cts_provider(_vaghar_expected)
     if not hasattr(updater, "_load_advstd_rows_for_wide_from_txt"):
         print("[paper-tables] skipped: update_advstd_tex_tables.py is missing "
               "_load_advstd_rows_for_wide_from_txt (upgrade it).")
@@ -3719,7 +4075,7 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     # solve-time cells AND the bounds-difference clusters are returned so the
     # caller can pool BOTH across datasets into one combined figure each.
     time_cells, bd_groups = [], []
-    body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    body_tex = _paper_tex_path(cwd, "sec_evaluation.tex")
     # Ensure this dataset's chart marker exists, else regenerate_aaai_n2_charts_
     # section raises (SystemExit) on the missing marker and its time/bd cells are
     # lost -- so a new dataset (HAR) never reaches the combined figures.
@@ -3740,16 +4096,14 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
 
     # N2 (target network) per-cell tables -> appendix. (N1 source tables are
     # intentionally not regenerated in the --paper_tables_from_txt path.)
-    percell_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                               "sec_appendix_percell.tex")
+    percell_tex = _paper_tex_path(cwd, "sec_appendix_percell.tex")
     # The SAME tables are rendered twice from the same data, differing only in
     # the partial-coverage filter:
     #   * sec_full_results_tables.tex -- every row, including the ones carrying
     #     the red "*" (feeds the standalone table_full_results.pdf);
     #   * sec_appendix_percell.tex    -- only rows with no red "*" in any cell,
     #     i.e. means taken over every expected c_target.
-    full_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                            "sec_full_results_tables.tex")
+    full_tex = _paper_tex_path(cwd, "sec_full_results_tables.tex")
     _ensure_full_results_section(full_tex, updater, _mslug)
     # The main-paper appendix needs the same per-dataset marker (the ensure
     # above only covers sec_full_results_tables.tex); without it this dataset's
@@ -3758,7 +4112,8 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         percell_tex, updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
         updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug)
     _drop_supported = hasattr(updater, "set_aaai_wide_drop_partial_rows")
-    for _target, _drop in ((full_tex, False), (percell_tex, True)):
+    for _target, _drop in ((full_tex, False),
+                           (percell_tex, not show_partial)):
         if not os.path.exists(_target):
             continue
         _prev = (updater.set_aaai_wide_drop_partial_rows(_drop)
@@ -3840,21 +4195,46 @@ def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
     try:
         sys.path.insert(0, cwd)
         import update_advstd_tex_tables as updater
+        updater.EXP_ROOT = EXP_ROOT
     except Exception as exc:  # pragma: no cover - diagnostic only
         print(f"[paper-tables] combined figures skipped (import failed: {exc})")
         return
-    body_tex = os.path.join(cwd, "neta-s-paper", "sections", "sec_evaluation.tex")
+    body_tex = _paper_tex_path(cwd, "sec_evaluation.tex")
+
+    # The BODY figures are page-budgeted (AAAI): under --paper_show_partial
+    # they keep the OLD strict admission -- complete, non-partial clusters
+    # only -- so their packed geometry matches the pre-partial figures and the
+    # main text keeps its pagination. The starred partial clusters render in
+    # the appendix versions below (the supplementary has no page budget).
+    def _time_cell_complete(cell):
+        bars = cell[6]
+        return (len(bars) == 3
+                and not any(pair[1] for pair in bars.values()))
+
+    def _bd_group_complete(entry):
+        bars = entry[5]
+        return (len(bars) == 3
+                and not any(pair[1] for pair in bars.values()))
+
+    # Body keeps the starred partial clusters too (user decision: figures
+    # must stay visible mid-run; they converge to the strict complete-data
+    # shape as the sweep fills in). The _*_complete helpers above are kept
+    # for reporting how far along the figure is.
+    body_time_cells = time_cells
+    body_bd_groups = bd_groups or []
+    _n_done = sum(1 for c in time_cells if _time_cell_complete(c))
+    print(f"[paper-tables] body time figure: {len(time_cells)} clusters, "
+          f"{_n_done} complete / {len(time_cells) - _n_done} starred-partial")
     if os.path.exists(body_tex) and hasattr(
             updater, "regenerate_aaai_time_combined_section"):
         try:
             updater.regenerate_aaai_time_combined_section(
-                body_tex, time_cells, force_timeout=force_timeout)
+                body_tex, body_time_cells, force_timeout=force_timeout)
         except Exception as exc:
             print(f"[paper-tables] aaai_n2_time_combined block error: {exc}")
     # The perturbations the body does not chart go to the appendix, from the
     # same pooled cells.
-    appendix_tex = os.path.join(cwd, "neta-s-paper", "sections",
-                                "sec_appendix_percell.tex")
+    appendix_tex = _paper_tex_path(cwd, "sec_appendix_percell.tex")
     if os.path.exists(appendix_tex) and hasattr(
             updater, "regenerate_aaai_time_appendix_section"):
         try:
@@ -3879,7 +4259,7 @@ def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
             # float-only page (see the note in main.tex -- the placement
             # specifier is the sanctioned lever, not \dbltopnumber).
             updater.regenerate_aaai_bounddiff_section(
-                body_tex, bd_groups, force_timeout=force_timeout,
+                body_tex, body_bd_groups, force_timeout=force_timeout,
                 float_spec="t")
         except Exception as exc:
             print(f"[paper-tables] aaai_n2_bounddiff block error: {exc}")
@@ -3897,6 +4277,29 @@ def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--paper_show_partial", action="store_true",
+                        help="With --paper_tables_from_txt: render tables/charts even when "
+                             "results are missing, marking the gaps with a red '*' instead of "
+                             "suppressing them. Tables: rows with partially-covered or absent "
+                             "method columns are KEPT (the paper normally drops starred rows) "
+                             "and an expected-but-absent method cell prints '---*'. Charts: a "
+                             "(c_s, c_t) cluster renders when ANY method has data; a method "
+                             "with no run for that pair draws a zero-height bar with a red "
+                             "'*'. Combine with --only_vaghar_pairs to make 'expected' mean "
+                             "the vaghar-pair plan rather than all 10 classes.")
+    parser.add_argument("--only_vaghar_pairs", action="store_true",
+                        help="Restrict every phase (delta_max c_srcs, N1 state, standard-N2 "
+                             "baseline, advstd-N2, stdBoost) to the (c_tag, c_target) pairs "
+                             "that already have a vaghar-column result file "
+                             "(vagharNoPerturbed_* dirs or all-off/no-PI N1/N2stdBoost cells) "
+                             "in the SAME (dataset, arch, perturbation, eps) cell under "
+                             "--experiments_root. Pairs without a vaghar baseline are never "
+                             "scheduled, so union --sweep_ctag/--ct values are safe.")
+    parser.add_argument("--experiments_root", type=str, default="paper_experiments",
+                        help="Root directory of the results tree, relative to this "
+                             "script's directory (absolute paths also work). Every "
+                             "results scan, skip-check, job --output_dir, and table "
+                             "source uses it. Default: paper_experiments.")
     parser.add_argument("--perturbations", nargs="*", default=None,
                         help="Filter perturbations by name prefix (e.g. 'patch' 'occ' 'trans' 'rotation')")
     parser.add_argument("--benchmark_eps", nargs="*", default=None,
@@ -4217,6 +4620,14 @@ def main():
                              "zonotope; delta unchanged). run.jl adds a _geomInt filename tag, and the skip-check "
                              "keeps these separate from the non-geomInt baseline so resume is correct. No-op for "
                              "other perturbations / pi=false combos (run.jl warns and falls back).")
+    parser.add_argument("--arithmetic_transfer_bounds", action="store_true",
+                        help="Pass --arithmetic_transfer_bounds true to run.jl for advstd N1 and N2 jobs: "
+                             "the N_pre->N difference bounds are computed/loaded with plain interval "
+                             "arithmetic (restored compute_diff_and_comp_bounds) instead of the difference "
+                             "zonotope. Sound but looser; delta unchanged for exact combos. Phase 1 writes "
+                             "diff_bounds_arithTransfer.bin next to the zonotope files, the bound-tightening "
+                             "combos carry an _arithTransfer filename tag, and the skip-check keeps these "
+                             "results separate from the zonotope baseline so resume is correct.")
     parser.add_argument("--prioritize_rows", action="store_true",
                         help="In --advanced_standard mode, dispatch jobs in row-priority "
                              "order (row = (arch, perturbation)) so earlier rows finish "
@@ -4269,6 +4680,8 @@ def main():
     # Wire the rerun-on-timeout filter into module globals so
     # _parse_c_source_target_pairs can consult them without threading the
     # flag through every caller.
+    global EXP_ROOT
+    EXP_ROOT = args.experiments_root
     global _RERUN_TIMEOUTS, _TIMEOUT_VALUES, _TIMEOUT_MATCH_EPS
     global _RERUN_TIMEOUT_BUDGET
     _RERUN_TIMEOUTS = bool(args.rerun_timeouts)
@@ -4460,6 +4873,8 @@ def main():
                 pt_requested_c_sources, ds_arch_runs)
             tc, bd, rx = _regen_paper_tables_from_txt(
                 ds_arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
+                show_partial=args.paper_show_partial,
+                only_vaghar_pairs=args.only_vaghar_pairs,
                 combination_table=args.combination_table,
                 force_timeout=ds_force_timeout,
                 rerun_timeout_eps=args.rerun_timeout_eps,
@@ -4481,6 +4896,7 @@ def main():
         try:
             sys.path.insert(0, cwd)
             import update_advstd_tex_tables as _tab1_updater
+            _tab1_updater.EXP_ROOT = EXP_ROOT
             _filter_tab_networks(cwd, _rendered_ds_arch_pairs(cwd),
                                  _tab1_updater)
         except Exception as _exc:
@@ -4501,6 +4917,8 @@ def main():
         _paper_avgs = _report_paper_table_averages(cwd)
         _sentences_changed = bool(_update_results_sentence(cwd, _paper_avgs))
         if _update_conclusion_sentence(cwd, _paper_avgs):
+            _sentences_changed = True
+        if _update_wilcoxon_table(cwd, _paper_avgs):
             _sentences_changed = True
         if _sentences_changed:
             _recompile_neta_s_paper(cwd)
@@ -4594,7 +5012,7 @@ def main():
             # for each dataset so both make progress at once; idle slots spill
             # over to the other dataset's remaining jobs so no core sits unused.
             # job_group maps a job to its dataset via the output_dir path.
-            _grp_re = re.compile(r"paper_experiments/([^/]+)/")
+            _grp_re = re.compile(re.escape(EXP_ROOT) + r"/([^/]+)/")
             def _job_group(job):
                 cmd = job[1]
                 try:
@@ -5015,9 +5433,11 @@ def main():
                 # needed and is never queued.
                 for role, role_tag, role_model_p in (("N2", n2_tag, n2_model_p),):
                     dm_out_dir = os.path.join(
-                        cwd, "paper_experiments", dataset, f"{arch}_exp",
+                        cwd, EXP_ROOT, dataset, f"{arch}_exp",
                         "delta_max", f"delta_max_{arch}_{role}_{role_tag}")
                     missing_c_srcs = _delta_max_missing_c_srcs(dm_out_dir, sweep_ctag_vals)
+                    if args.only_vaghar_pairs:
+                        missing_c_srcs = _vaghar_c_srcs_for_arch(dataset, arch, missing_c_srcs)
                     if not missing_c_srcs:
                         print(f"  {arch_prefix}{role} delta_max already complete for c_srcs={list(sweep_ctag_vals)} at {dm_out_dir} — skipping")
                         continue
@@ -5088,6 +5508,14 @@ def main():
             # n1_preact_bounds.bin at the sweep level anymore (Julia still
             # crash-on-miss loads it when --adv_std_zono_bounds is active).
             need_n1_preact = False
+            # --arithmetic_transfer_bounds: Phase 2 loads the interval-mode
+            # diff-bounds file, which only an N1 run with the flag writes.
+            # Require it at the sweep level so an already-complete zonotope
+            # state dir still triggers an N1 run (shrunk below to a single
+            # c_target, whose solve run.jl then skips — the per-pair state is
+            # mode-independent) that writes the missing bin.
+            need_diff_bounds_file = ("diff_bounds_arithTransfer.bin"
+                                     if args.arithmetic_transfer_bounds else None)
 
             # Stale lock heuristic: 2× the Gurobi time limit.
             stale_lock_sec = max(2 * args.timeout, 600)
@@ -5128,7 +5556,7 @@ def main():
                         pkey = (dataset, arch, pert_spec)  # per-dataset N1 lock/chain key
 
                         n1_state_dir = os.path.join(
-                            cwd, "paper_experiments", dataset, f"{arch}_exp",
+                            cwd, EXP_ROOT, dataset, f"{arch}_exp",
                             pert_type, f"eps_{eps_str}",
                             f"n1_state_{arch}_{n1_tag}")
 
@@ -5136,7 +5564,21 @@ def main():
                             args.ct if args.ct else "2,3,4,5,6,7,8,9,10")
                         missing_c_targets = _n1_state_missing_c_targets(
                             n1_state_dir, c_tag, requested_c_targets,
-                            need_pseudocosts, need_n1_preact=need_n1_preact)
+                            need_pseudocosts, need_n1_preact=need_n1_preact,
+                            need_diff_bounds_file=need_diff_bounds_file)
+                        if args.only_vaghar_pairs:
+                            missing_c_targets = _filter_cts_by_vaghar(missing_c_targets, dataset, arch, pert_type, eps_str, c_tag)
+                        if need_diff_bounds_file and missing_c_targets:
+                            # The bin-file requirement may have inflated the list to
+                            # "all requested": recompute without it — run.jl writes the
+                            # diff-bounds file before its per-pair loop, so any N1 run
+                            # covers it and only genuinely missing pairs need solving
+                            # (one c_target when none are; run.jl skips that pair's
+                            # solve too, so the job costs startup + the diff pass).
+                            genuinely_missing = _n1_state_missing_c_targets(
+                                n1_state_dir, c_tag, missing_c_targets,
+                                need_pseudocosts, need_n1_preact=need_n1_preact)
+                            missing_c_targets = genuinely_missing or missing_c_targets[:1]
                         if not missing_c_targets:
                             print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state already complete for c_targets={requested_c_targets} at {n1_state_dir} — skipping N1 solve")
                             continue
@@ -5156,13 +5598,23 @@ def main():
                             got_lock, lock_path = _acquire_n1_solve_lock(n1_state_dir, stale_lock_sec)
                             if not got_lock:
                                 print(f"  {arch_prefix}{pert_name} c_tag={c_tag} another process is solving N1 at {n1_state_dir} — waiting (up to {wait_timeout_sec:.0f}s)")
-                                if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=missing_c_targets):
+                                if _wait_for_n1_state(n1_state_dir, need_pseudocosts, wait_timeout_sec, need_n1_preact=need_n1_preact, c_tag=c_tag, c_targets=missing_c_targets, need_diff_bounds_file=need_diff_bounds_file):
                                     print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state now ready — skipping our own N1 solve")
                                     continue
                                 print(f"  {arch_prefix}{pert_name} WARNING: timed out or other process left state incomplete for our c_targets — attempting to solve N1 ourselves")
                                 missing_c_targets = _n1_state_missing_c_targets(
                                     n1_state_dir, c_tag, requested_c_targets,
-                                    need_pseudocosts, need_n1_preact=need_n1_preact)
+                                    need_pseudocosts, need_n1_preact=need_n1_preact,
+                                    need_diff_bounds_file=need_diff_bounds_file)
+                                if args.only_vaghar_pairs:
+                                    missing_c_targets = _filter_cts_by_vaghar(missing_c_targets, dataset, arch, pert_type, eps_str, c_tag)
+                                if need_diff_bounds_file and missing_c_targets:
+                                    # See the pre-wait call site: don't re-solve complete
+                                    # pairs just to write the missing diff-bounds file.
+                                    genuinely_missing = _n1_state_missing_c_targets(
+                                        n1_state_dir, c_tag, missing_c_targets,
+                                        need_pseudocosts, need_n1_preact=need_n1_preact)
+                                    missing_c_targets = genuinely_missing or missing_c_targets[:1]
                                 if not missing_c_targets:
                                     print(f"  {arch_prefix}{pert_name} c_tag={c_tag} N1 state became complete after wait — skipping our own N1 solve")
                                     continue
@@ -5193,8 +5645,16 @@ def main():
                             "--use_hyper_attack", "true",
                             "--activate_vaghgar_deps", "true",
                             "--use_perturbed_intervals", "true",
+                            # Source B on N1's own MIP: pure speedup — sound
+                            # bound pruning, N1's delta and the saved solver
+                            # state stay exact (run.jl forces
+                            # use_n1_tighten=false in this mode, so the
+                            # N2-drift bounds are never folded into N1).
+                            "--nn1_zono_bounds", "true",
                             "--Threads_num", str(Threads_num),
                         ]
+                        if args.arithmetic_transfer_bounds:
+                            n1_cmd += ["--arithmetic_transfer_bounds", "true"]
 
                         # First N1 for this (dataset, arch, pert_spec) goes into
                         # ready; subsequent c_tags chain behind the previous N1
@@ -5229,6 +5689,8 @@ def main():
                         missing_std_cts = _standard_n2_missing_c_targets(
                             pert_spec, cwd, arch, dataset, n2_tag,
                             c_tag, requested_c_targets)
+                        if args.only_vaghar_pairs:
+                            missing_std_cts = _filter_cts_by_vaghar(missing_std_cts, dataset, arch, pert_type, eps_str, c_tag)
                         if not missing_std_cts:
                             std_skipped += 1
                             continue
@@ -5241,7 +5703,7 @@ def main():
                             print(f"  {arch_prefix}{pert_name} c_tag={c_tag} standard N2 missing — solving for c_targets={missing_std_cts}")
 
                         std_output_dir = os.path.join(
-                            "paper_experiments", dataset, f"{arch}_exp",
+                            EXP_ROOT, dataset, f"{arch}_exp",
                             pert_type, f"eps_{eps_str}",
                             f"vagharWithPerturbed_{arch}_{n2_tag}")
 
@@ -5275,7 +5737,7 @@ def main():
                         arch_prefix = _aprefix(dataset, arch)
 
                         n1_state_dir = os.path.join(
-                            cwd, "paper_experiments", dataset, f"{arch}_exp",
+                            cwd, EXP_ROOT, dataset, f"{arch}_exp",
                             pert_type, f"eps_{eps_str}",
                             f"n1_state_{arch}_{n1_tag}")
 
@@ -5288,12 +5750,14 @@ def main():
                             if sg == "true":          tech_tag += "sg"
                             if zb == "true":          tech_tag += "zb"
                             elif zb == "true_nonpre": tech_tag += "zbNoNpre"
+                            if args.arithmetic_transfer_bounds and bt == "true":
+                                tech_tag += "arith"
                             if pi == "false":         tech_tag += "noPI"
                             no_hyper = (hyp == "false")
                             if no_hyper:              tech_tag += "noHyp"
 
                             adv_output_dir = os.path.join(
-                                "paper_experiments", dataset, f"{arch}_exp",
+                                EXP_ROOT, dataset, f"{arch}_exp",
                                 pert_type, f"eps_{eps_str}",
                                 f"advStd_{arch}_N1_{n1_tag}")
 
@@ -5306,6 +5770,9 @@ def main():
                             if sg == "true":          base_name_to_save += "_SibGate"
                             if zb.startswith("true"): base_name_to_save += "_zonoBounds"
                             if zb == "true_nonpre":   base_name_to_save += "_noNpreZono"
+                            # Must mirror run.jl's n2_check/n2_name builders (incl. tag order).
+                            if args.arithmetic_transfer_bounds and bt == "true":
+                                base_name_to_save += "_arithTransfer"
                             if vh == "prev_pgd":      base_name_to_save += "_varHintPrevPGD"
                             # Component-removed combos from --advstd_ablations
                             # carry an explicit _ablation marker. The tag rides
@@ -5333,6 +5800,8 @@ def main():
                                     geometric_intervals=geom_applies_adv,
                                     perturbed_intervals=(pi == "true"),
                                     hyper_attack=not no_hyper)
+                                if args.only_vaghar_pairs:
+                                    missing_adv_cts = _filter_cts_by_vaghar(missing_adv_cts, dataset, arch, pert_type, eps_str, c_tag)
                                 if not missing_adv_cts:
                                     n2_skipped += 1
                                     continue
@@ -5386,6 +5855,8 @@ def main():
                                     "--adv_std_var_hint", vh,
                                     "--gurobi_seed", str(seed),
                                 ]
+                                if args.arithmetic_transfer_bounds:
+                                    cmd += ["--arithmetic_transfer_bounds", "true"]
                                 if pi == "false" and rt > 0.0:
                                     # PI ablation with the triangle kept: bypass
                                     # run.jl's rt>0-requires-PI guard (sound —
@@ -5587,7 +6058,7 @@ def main():
                                     target_model_p = n2_model_p
                                     target_tag     = n2_tag
                                 nn_output_dir = os.path.join(
-                                    "paper_experiments", dataset, f"{arch}_exp",
+                                    EXP_ROOT, dataset, f"{arch}_exp",
                                     pert_type, f"eps_{eps_str}",
                                     f"{role}stdBoost_{arch}_{target_tag}")
                                 base_name_to_save_nn = f"{target_tag}_{role}"
@@ -5612,6 +6083,8 @@ def main():
                                         zb, sg, rt, pi,
                                         c_tag, requested_c_targets,
                                         geometric_intervals=geom_applies_std)
+                                    if args.only_vaghar_pairs:
+                                        missing_nn_cts = _filter_cts_by_vaghar(missing_nn_cts, dataset, arch, pert_type, eps_str, c_tag)
                                     if not missing_nn_cts:
                                         n2_skipped += 1
                                         continue
@@ -5709,7 +6182,7 @@ def main():
                             ri += 1
                 _n_rows = len(_within_row)
                 # output_dir looks like .../paper_experiments/<dataset>/<arch>_exp/...
-                _ds_arch_exp_re = re.compile(r"paper_experiments/([^/]+)/([^/]+)_exp/")
+                _ds_arch_exp_re = re.compile(re.escape(EXP_ROOT) + r"/([^/]+)/([^/]+)_exp/")
 
                 def _cmd_opt(cmd, name):
                     try:

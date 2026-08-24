@@ -527,7 +527,6 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default="./models/3x10/model.pth", help='model')
     parser.add_argument('--perturbation', type=str, default="linf", help='perturbation')
     parser.add_argument('--perturbation_size', type=str, default="1", help='perturbation size')
-    parser.add_argument('--gpu', type=int, default=0, help='dataset')
     parser.add_argument('--cpu', action='store_true', help='Force CPU-only mode (no GPU)')
     parser.add_argument('--M', type=int, default=1000, help='Number of samples to attack')
     parser.add_argument('--itr', type=int, default=500, help='Number of iterations')
@@ -557,7 +556,8 @@ if __name__ == '__main__':
     if args.cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+        # Always pin the hyper attack to CUDA device 0 (PCI order).
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     if args.cpu or not torch.cuda.is_available():
         device = torch.device("cpu")
     else:

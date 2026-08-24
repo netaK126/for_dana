@@ -178,6 +178,17 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
+        "--arithmetic_transfer_bounds"
+        help = "advanced_standard: compute the N_pre->N difference bounds ([d_lo, d_hi], Source A) " *
+               "with plain interval arithmetic (the restored compute_diff_and_comp_bounds) instead " *
+               "of the default difference zonotope — sound but looser (interval width >= zonotope " *
+               "width). Phase 1 then saves the bounds under mode-suffixed filenames " *
+               "(diff_bounds_arithTransfer.bin + n1_preact_bounds_arithTransfer.bin) so one state " *
+               "dir can hold both modes; run Phase 2 with the same flag value as Phase 1. " *
+               "Filename tag _arithTransfer."
+        arg_type = Bool
+        required = false
+        default = false
         "--adv_std_n2_relax_threshold"
         help = "advanced_standard (Technique 6): replace N2/N2p ReLU binaries with a " *
                "triangle LP relaxation (no binary) when the triangle-gap-area of N1's interval " *
@@ -207,10 +218,12 @@ function parse_commandline()
         # Mirror the advstd techniques but applied to N1's own dual-copy MIP
         # (org + perturbation). See advstd_techniques.tex §3 (sec:std).
         "--nn1_zono_bounds"
-        help = "standard mode (Boosting Standard Mode): tighten N1's per-neuron ReLU pre-activation " *
-               "bounds via an absolute zonotope propagated through N1 (Source B). See §3.2 " *
-               "(sec:std_zono) of advstd_techniques.tex. Strictly tighter than interval arithmetic; " *
-               "preserves the integer optimum. Filename tag _stdBoost_zono."
+        help = "standard mode (Boosting Standard Mode) and advanced_standard_n1: tighten the " *
+               "solved network's per-neuron ReLU pre-activation bounds via an absolute zonotope " *
+               "propagated through it (Source B). See §3.2 (sec:std_zono) of advstd_techniques.tex. " *
+               "Strictly tighter than interval arithmetic; preserves the integer optimum. " *
+               "Filename tag _stdBoost_zono (standard mode); in advanced_standard_n1 it only " *
+               "speeds up the N1 solve — the saved state stays exact."
         arg_type = Bool
         required = false
         default = false
@@ -646,6 +659,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     use_zono_bounds = args["adv_std_zono_bounds"]
     # Ablation flag (zono_npre).
     zono_use_npre   = args["adv_std_zono_npre"]
+    # Difference-bounds method for Source A: zonotope (default) or plain interval arithmetic.
+    use_arith_bounds = args["arithmetic_transfer_bounds"]
     # Conditional Triangle: relax a copy's ReLU when its triangle-gap area is <= tau (read by relu() via this global).
     global adv_std_n2_relax_threshold = args["adv_std_n2_relax_threshold"]
     # Conditional Triangle emission: gate the triangle on the sibling copy's binary / couple both relaxed copies.
@@ -659,6 +674,10 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         println("WARNING: --adv_std_n2_relax_threshold >= 0 but --adv_std_bound_tightening is " *
                 "false. The relaxation block needs n1_neuron_bounds to be populated, which only " *
                 "happens when bound_tightening is true — no neurons will be relaxed in this run.")
+    end
+    if use_arith_bounds && !use_bound_tightening
+        println("WARNING: --arithmetic_transfer_bounds=true but --adv_std_bound_tightening is false. " *
+                "The difference bounds are never loaded in this configuration, so the flag has no effect.")
     end
     
     # Folder with N_pre's saved verification results (verified bounds, optimal solution, difference bounds) that transfer reuses.
@@ -684,6 +703,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Technique 4 (Bound Tightening):    $(use_bound_tightening)")
     println("  Technique 4+ (Zono Bounds):        $(use_zono_bounds)")
     println("  Zono uses N_pre (Source A):        $(zono_use_npre)")
+    println("  Diff-bounds method (Source A):     $(use_arith_bounds ? "interval arithmetic" : "zonotope")")
     println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
 
@@ -707,6 +727,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if args["adv_std_n2_sibling_gate"]; n2_check = n2_check * "_SibGate"; end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
         if use_zono_bounds && !zono_use_npre; n2_check = n2_check * "_noNpreZono"; end
+        if use_bound_tightening && use_arith_bounds; n2_check = n2_check * "_arithTransfer"; end
         if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
     if use_hyper_attack; n2_check = n2_check * "_HyperAttackHints"; end
@@ -751,7 +772,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
 
             # Load the drift information — how far N can stray from N_pre ([d_lo, d_hi] + N_pre's pre-activation bounds); shared by all class pairs, shifts every reused N_pre quantity below.
-            load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds)
+            load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds, arithmetic=use_arith_bounds)
 
             # Zonotope Bound Tightening: propagate a zonotope through N over the input
             # box (the perturbed copy is bounded to the same box by every encoder),
@@ -806,6 +827,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             d_n2[:adv_std_flags] = (
                 adv_std_bound_tightening     = args["adv_std_bound_tightening"],
                 adv_std_zono_bounds          = args["adv_std_zono_bounds"],
+                arithmetic_transfer_bounds   = args["arithmetic_transfer_bounds"],
                 adv_std_n2_relax_threshold   = args["adv_std_n2_relax_threshold"],
                 adv_std_var_hint             = var_hint_mode_label(var_hint_mode),   # "off" | "prev_pgd"
                 gurobi_seed                  = args["gurobi_seed"],
@@ -861,6 +883,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 if args["adv_std_n2_sibling_gate"]; n2_name = n2_name * "_SibGate"; end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
                 if use_zono_bounds && !zono_use_npre; n2_name = n2_name * "_noNpreZono"; end
+                if use_bound_tightening && use_arith_bounds; n2_name = n2_name * "_arithTransfer"; end
                 if var_hint_mode == VH_PREV_PGD;   n2_name = n2_name * "_varHintPrevPGD";   end
             end
             # Record in the filename how many neurons the Conditional Triangle relaxed: both copies (_both), only the clean copy (_orgDrop), only the perturbed copy (_pertDrop).
@@ -911,6 +934,10 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
     if n1_state_dir == ""
         error("advanced_standard_n1 requires --n1_state_dir (where to save N1 state)")
     end
+    # Difference-bounds method: zonotope (default) or plain interval arithmetic.
+    # Read here (not in the diff block below) because the per-pair skip in the
+    # solve loop reads it too.
+    use_arith_bounds = args["arithmetic_transfer_bounds"]
 
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
@@ -933,6 +960,21 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
 
         nn1 = get_nn(model_path, model_name, w, h, k, c, dataset)
 
+        # Absolute Zonotope Bound Tightening (Source B) on N1's own dual-copy
+        # MIP — needs no second network (seeded from the input box) and only
+        # prunes unreachable values, so N1's delta and the saved solver state
+        # stay exact. use_n1_tighten=false is REQUIRED here: in this mode the
+        # n1_preact/relu_diff globals (filled by the diff pass below) describe
+        # N2, not N1, and must not be intersected into N1's own bounds.
+        clear_n2_abs_bounds()
+        if args["nn1_zono_bounds"]
+            seed_lo_b, seed_hi_b = source_b_seed_box(perturbation, (1, w, h, k))
+            println("Advanced-standard-N1: computing absolute zonotope bounds (Source B) on N1...")
+            compute_n2_bounds_zonotope_with_n1_tighten(nn1, seed_lo_b, seed_hi_b;
+                                                       use_n1_tighten=false)
+            println("  Source B bounds computed: $(length(n2_abs_up_bounds)) ReLU layers")
+        end
+
         # Compute and save diff bounds (needs both nn1 and nn2)
         if model_path2 != ""
             nn2 = get_nn(model_path2, model_name, w, h, k, c, dataset)
@@ -940,26 +982,64 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             p_size = perturbation_size[1]
             I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
             I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-            # Difference zonotope: bound, per neuron, how far N's pre-activation can stray from N_pre's ([d_lo, d_hi]).
-            println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
-            compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init)
-            # If this folder already has saved difference bounds (from an earlier, interrupted run), keep them:
-            # recomputing gives the same numbers, and all class pairs in one folder must use the same bounds.
-            diff_bounds_path = joinpath(n1_state_dir, "diff_bounds.bin")
-            preact_path = joinpath(n1_state_dir, "n1_preact_bounds.bin")
+            # Difference bounds: bound, per neuron, how far N's pre-activation can stray from
+            # N_pre's ([d_lo, d_hi]) — difference zonotope by default, plain interval arithmetic
+            # when --arithmetic_transfer_bounds is true.
+            if use_arith_bounds
+                # Reuse the Ln1/Un1 an earlier run already saved (mode-independent:
+                # the preact recurrence is plain interval arithmetic in both modes).
+                # The zonotope run's file is checked first, then a previous
+                # arithmetic run's; a fresh dir recomputes from the models.
+                saved_preact = nothing
+                for cand in ("n1_preact_bounds.bin", "n1_preact_bounds_arithTransfer.bin")
+                    cand_path = joinpath(n1_state_dir, cand)
+                    if isfile(cand_path)
+                        saved_preact = deserialize(cand_path)
+                        println("Advanced-standard-N1: reusing saved N_pre pre-activation bounds from $cand")
+                        break
+                    end
+                end
+                println("Advanced-standard-N1: computing interval-arithmetic diff bounds between N1 and N2...")
+                compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init;
+                                             saved_n1_preact=saved_preact)
+            else
+                println("Advanced-standard-N1: computing zonotope diff bounds between N1 and N2...")
+                compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init)
+            end
+            # If this folder already has saved difference bounds for THIS mode (from an earlier,
+            # interrupted run), keep them: recomputing in the same mode gives the same numbers, and
+            # all class pairs in one folder must use the same bounds. The mode suffix keeps the two
+            # modes' files independent, so one never silently reuses the other's.
+            diff_sfx = diff_bounds_suffix(use_arith_bounds)
+            diff_bounds_path = joinpath(n1_state_dir, "diff_bounds$(diff_sfx).bin")
+            preact_path = joinpath(n1_state_dir, "n1_preact_bounds$(diff_sfx).bin")
             if !isfile(diff_bounds_path)
-                save_n1_diff_bounds(n1_state_dir)
+                save_n1_diff_bounds(n1_state_dir; arithmetic=use_arith_bounds)
             elseif !isfile(preact_path) && !isempty(n1_preact_up_bounds)
                 # Old folder from before N_pre's pre-activation bounds were saved: add just that missing file, keep the existing difference bounds.
                 serialize(preact_path, (n1_preact_up_bounds, n1_preact_down_bounds))
-                println("Advanced-standard-N1: preserved existing diff_bounds.bin; wrote new n1_preact_bounds.bin to $n1_state_dir")
+                println("Advanced-standard-N1: preserved existing $(basename(diff_bounds_path)); wrote new $(basename(preact_path)) to $n1_state_dir")
             else
-                println("Advanced-standard-N1: preserved existing diff_bounds.bin + n1_preact_bounds.bin at $n1_state_dir (partial-completion mode)")
+                println("Advanced-standard-N1: preserved existing $(basename(diff_bounds_path)) + $(basename(preact_path)) at $n1_state_dir (partial-completion mode)")
             end
         end
 
         for c_target in c_targets
             if c_tag == c_target
+                continue
+            end
+
+            # Incremental arithmetic run: the per-pair solver state is
+            # mode-independent (the diff-bounds method never enters N1's own
+            # MIP), so a pair already solved by an earlier run — typically the
+            # zonotope-mode Phase 1 — is reused instead of re-running Gurobi.
+            # The arithmetic diff bins were already written above, before this
+            # loop. Keyed on the per-pair files (not diff_bounds.bin): an
+            # interrupted earlier run may have the bin but not every pair.
+            if use_arith_bounds && model_path2 != "" &&
+               isfile(joinpath(n1_state_dir, "n1_vars_$(c_tag)_$(c_target).bin")) &&
+               isfile(joinpath(n1_state_dir, "n1_layers_$(c_tag)_$(c_target).bin"))
+                println("Advanced-standard-N1: state for c_tag=$c_tag, c_target=$c_target already on disk — skipping N1 solve (saved state is mode-independent)")
                 continue
             end
 

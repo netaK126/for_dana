@@ -95,24 +95,32 @@ function save_n1_state(state_dir::String, c_tag::Int, c_target::Int,
     println("save_n1_state: saved to $state_dir (c_tag=$c_tag, c_target=$c_target)")
 end
 
+# Filename suffix for the diff-bounds cache: "" for the default zonotope mode,
+# "_arithTransfer" for --arithmetic_transfer_bounds true, so the two modes never
+# overwrite or silently reuse each other's files in a shared state dir.
+diff_bounds_suffix(arithmetic::Bool) = arithmetic ? "_arithTransfer" : ""
+
 """
-    save_n1_diff_bounds(state_dir)
+    save_n1_diff_bounds(state_dir; arithmetic=false)
 
 Save diff bounds (computed once, shared across all c_target pairs) to disk.
 Also writes an auxiliary `n1_preact_bounds.bin` when the N1 per-layer
 pre-activation bounds are available — these are required by the
 --adv_std_zono_bounds Source B pass in Phase 2 but are optional (legacy
 state dirs without this file simply disable Source B).
+With `arithmetic=true` (--arithmetic_transfer_bounds) both files carry the
+`_arithTransfer` suffix so the two modes coexist in one state dir.
 """
-function save_n1_diff_bounds(state_dir::String)
+function save_n1_diff_bounds(state_dir::String; arithmetic::Bool=false)
     mkpath(state_dir)
-    serialize(joinpath(state_dir, "diff_bounds.bin"),
+    sfx = diff_bounds_suffix(arithmetic)
+    serialize(joinpath(state_dir, "diff_bounds$(sfx).bin"),
              (relu_diff_up_bounds, relu_diff_down_bounds))
     if !isempty(n1_preact_up_bounds)
-        serialize(joinpath(state_dir, "n1_preact_bounds.bin"),
+        serialize(joinpath(state_dir, "n1_preact_bounds$(sfx).bin"),
                   (n1_preact_up_bounds, n1_preact_down_bounds))
         println("save_n1_diff_bounds: saved $(length(relu_diff_up_bounds)) ReLU layers " *
-                "(+ n1_preact_bounds.bin) to $state_dir")
+                "(+ n1_preact_bounds$(sfx).bin) to $state_dir")
     else
         println("save_n1_diff_bounds: saved $(length(relu_diff_up_bounds)) ReLU layers to $state_dir")
     end
@@ -139,31 +147,39 @@ function load_n1_state(state_dir::String, c_tag::Int, c_target::Int)
 end
 
 """
-    load_n1_diff_bounds!(state_dir; require_preact::Bool=false)
+    load_n1_diff_bounds!(state_dir; require_preact::Bool=false, arithmetic::Bool=false)
 
 Load diff bounds from disk and set the globals. `diff_bounds.bin` is always
 required (crash on miss). `n1_preact_bounds.bin` is required iff `require_preact`
 is true (pass `true` when `--adv_std_zono_bounds` is active, since Source B
 depends on it); otherwise its absence is tolerated and the n1_preact globals
-are cleared.
+are cleared. With `arithmetic=true` (--arithmetic_transfer_bounds) both files
+carry the `_arithTransfer` suffix, i.e. the bounds Phase 1 computed with plain
+interval arithmetic are loaded instead of the zonotope ones.
 """
-function load_n1_diff_bounds!(state_dir::String; require_preact::Bool=false)
+function load_n1_diff_bounds!(state_dir::String; require_preact::Bool=false, arithmetic::Bool=false)
     global relu_diff_up_bounds, relu_diff_down_bounds
     global n1_preact_up_bounds, n1_preact_down_bounds
-    diff_path = joinpath(state_dir, "diff_bounds.bin")
-    isfile(diff_path) || error("load_n1_diff_bounds!: mandatory file missing: $diff_path — re-run Phase 1 on this state dir")
+    sfx = diff_bounds_suffix(arithmetic)
+    diff_path = joinpath(state_dir, "diff_bounds$(sfx).bin")
+    if !isfile(diff_path)
+        other_path = joinpath(state_dir, "diff_bounds$(diff_bounds_suffix(!arithmetic)).bin")
+        hint = isfile(other_path) ?
+            " (found $(basename(other_path)): this state dir was built with --arithmetic_transfer_bounds $(!arithmetic) — pass the same value here, or re-run Phase 1 with --arithmetic_transfer_bounds $(arithmetic))" : ""
+        error("load_n1_diff_bounds!: mandatory file missing: $diff_path — re-run Phase 1 on this state dir$hint")
+    end
     relu_diff_up_bounds, relu_diff_down_bounds = deserialize(diff_path)
-    preact_path = joinpath(state_dir, "n1_preact_bounds.bin")
+    preact_path = joinpath(state_dir, "n1_preact_bounds$(sfx).bin")
     if isfile(preact_path)
         n1_preact_up_bounds, n1_preact_down_bounds = deserialize(preact_path)
         println("load_n1_diff_bounds!: loaded $(length(relu_diff_up_bounds)) ReLU layers " *
-                "(+ n1_preact_bounds.bin) from $state_dir")
+                "(+ $(basename(preact_path))) from $state_dir")
     elseif require_preact
         error("load_n1_diff_bounds!: mandatory file missing: $preact_path — required when --adv_std_zono_bounds is active (Source B). Re-run Phase 1 with zono-bound extraction, or disable --adv_std_zono_bounds.")
     else
         n1_preact_up_bounds   = Array{Float64}[]
         n1_preact_down_bounds = Array{Float64}[]
         println("load_n1_diff_bounds!: loaded $(length(relu_diff_up_bounds)) ReLU layers from $state_dir " *
-                "(no n1_preact_bounds.bin; --adv_std_zono_bounds disabled, so not required)")
+                "(no $(basename(preact_path)); --adv_std_zono_bounds disabled, so not required)")
     end
 end

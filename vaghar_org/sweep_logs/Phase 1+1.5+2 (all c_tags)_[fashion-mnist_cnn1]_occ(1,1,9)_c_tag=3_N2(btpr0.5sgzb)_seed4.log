@@ -1,0 +1,404 @@
+source: 2 target: 1 model_arch: cnn1 perturbation type: occ perturbation size: [0, 1.0, 1.0, 9.0] dataset: fmnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   1%|          | 4/500 [00:00<00:12, 39.30it/s]Attack:   7%|▋         | 36/500 [00:00<00:02, 200.89it/s]Attack:  13%|█▎        | 67/500 [00:00<00:01, 250.05it/s]Attack:  20%|█▉        | 99/500 [00:00<00:01, 274.14it/s]Attack:  26%|██▌       | 130/500 [00:00<00:01, 285.70it/s]Attack:  32%|███▏      | 161/500 [00:00<00:01, 291.20it/s]Attack:  38%|███▊      | 192/500 [00:00<00:01, 296.06it/s]Attack:  44%|████▍     | 222/500 [00:00<00:00, 296.84it/s]Attack:  50%|█████     | 252/500 [00:00<00:00, 296.84it/s]Attack:  57%|█████▋    | 283/500 [00:01<00:00, 299.58it/s]Attack:  63%|██████▎   | 314/500 [00:01<00:00, 301.24it/s]Attack:  69%|██████▉   | 346/500 [00:01<00:00, 305.09it/s]Attack:  76%|███████▌  | 379/500 [00:01<00:00, 311.28it/s]Attack:  82%|████████▏ | 411/500 [00:01<00:00, 307.01it/s]Attack:  88%|████████▊ | 442/500 [00:01<00:00, 307.25it/s]Attack:  95%|█████████▍| 473/500 [00:01<00:00, 307.54it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 290.67it/s]
+best_val 8.180456161499023
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+WARNING: --geometric_intervals only applies to translation/rotation (pixel-relocation moves); perturbation 'occ' is unaffected. Falling back to geometric_intervals=off.
+Advanced-standard mode: techniques enabled:
+  Technique 4 (Bound Tightening):    true
+  Technique 4+ (Zono Bounds):        true
+  Zono uses N_pre (Source A):        true
+  Diff-bounds method (Source A):     zonotope
+  Technique 5 (Variable Hints):      prev_pgd
+  Technique 6 (N2 Relax Threshold):  0.5
+load_n1_diff_bounds!: loaded 3 ReLU layers (+ n1_preact_bounds.bin) from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19
+Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...
+compute_n2_bounds_zonotope_with_n1_tighten: populated 3 ReLU layers
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=2) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=2, 3384 vars, 904 neurons)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=2) ══
+set_n1_neuron_bounds: loaded 904 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=324 org-only=0 pert-only=9 none=136 (plus 81 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 8.1804561614990234e+00
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 8.1804561614990234e+00
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  8.1804561614990234e+00
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 5192 rows, 2750 columns and 86614 nonzeros (Max)
+Model fingerprint: 0xd2f068c4
+Model has 1 linear objective coefficients
+Variable types: 2475 continuous, 275 integer (275 binary)
+Coefficient statistics:
+  Matrix range     [7e-06, 1e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [8e-02, 1e+02]
+  RHS range        [3e-02, 6e+01]
+
+User MIP start produced solution with objective 12.8277 (0.09s)
+Loaded user MIP start with objective 12.8277
+
+Presolve removed 4004 rows and 1314 columns
+Presolve time: 0.06s
+Presolved: 1188 rows, 1436 columns, 33460 nonzeros
+Variable types: 1281 continuous, 155 integer (155 binary)
+Root relaxation presolve removed 135 rows and 135 columns
+Root relaxation presolved: 1053 rows, 1301 columns, 33055 nonzeros
+
+
+Root relaxation: objective 2.804208e+01, 849 iterations, 0.07 seconds (0.09 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0   28.04208    0   93   12.82768   28.04208   119%     -    0s
+     0     0   26.96901    0  106   12.82768   26.96901   110%     -    0s
+     0     0   26.96901    0  105   12.82768   26.96901   110%     -    0s
+     0     0   26.96901    0  105   12.82768   26.96901   110%     -    0s
+     0     0   24.86836    0  107   12.82768   24.86836  93.9%     -    1s
+     0     0   24.86836    0  107   12.82768   24.86836  93.9%     -    1s
+     0     0   24.86428    0  107   12.82768   24.86428  93.8%     -    1s
+     0     0   20.47582    0  108   12.82768   20.47582  59.6%     -    1s
+     0     0   20.47582    0  108   12.82768   20.47582  59.6%     -    1s
+     0     0   20.47582    0  108   12.82768   20.47582  59.6%     -    1s
+     0     0   19.58925    0  111   12.82768   19.58925  52.7%     -    1s
+     0     0   19.55413    0  108   12.82768   19.55413  52.4%     -    1s
+     0     0   19.55413    0  109   12.82768   19.55413  52.4%     -    1s
+     0     0   19.34297    0  102   12.82768   19.34297  50.8%     -    2s
+     0     0   19.34297    0  102   12.82768   19.34297  50.8%     -    2s
+     0     0   19.34297    0  102   12.82768   19.34297  50.8%     -    2s
+     0     0   19.19360    0  102   12.82768   19.19360  49.6%     -    2s
+     0     0   19.19360    0  102   12.82768   19.19360  49.6%     -    2s
+     0     2   19.19360    0  102   12.82768   19.19360  49.6%     -    3s
+    21    18   19.07274    6   63   12.82768   19.19360  49.6%   731    5s
+H  394   344                      12.8276881   18.32571  42.9%   467    8s
+H  616   597                      12.8276881   17.85326  39.2%   393    9s
+   710   691   16.71952   20   35   12.82769   17.26139  34.6%   385   10s
+  1288  1292   16.73383   17   43   12.82769   16.78647  30.9%   446   15s
+H 1632  1583                      12.8276881   16.50457  28.7%   476   17s
+  2122  1971   15.44750   14   52   12.82769   15.99341  24.7%   515   20s
+H 2740  2285                      12.8276881   15.48335  20.7%   527   23s
+  3122  2705   13.58968   25   37   12.82769   15.24528  18.8%   528   25s
+  3504  2852   14.52935   23  102   12.82769   15.08137  17.6%   515   44s
+  3506  2853   14.58550   23   92   12.82769   15.08137  17.6%   515   45s
+H 3506  2710                      12.8277005   15.08137  17.6%   515   45s
+  3514  2716   13.64812   31  106   12.82770   15.08137  17.6%   514   52s
+  3534  2718   15.08137   14   88   12.82770   15.08137  17.6%   517   55s
+  3812  2735   14.31967   25   55   12.82770   14.37386  12.1%   523   60s
+  4069  2656   13.23437   31   57   12.82770   13.23929  3.21%   537   65s
+
+Cutting planes:
+  Gomory: 44
+  Projected implied bound: 294
+  MIR: 1172
+  Mixing: 5
+  Flow cover: 253
+  RLT: 160
+  Relax-and-lift: 2033
+
+Explored 4241 nodes (2282048 simplex iterations) in 68.10 seconds (120.58 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 3: 12.8277 12.8277 12.8277 
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 1.282770049303e+01, best bound 1.292854506014e+01, gap 0.7861%
+
+User-callback calls 26063, time in user-callback 0.03 sec
+source: 2 target: 3 model_arch: cnn1 perturbation type: occ perturbation size: [0, 1.0, 1.0, 9.0] dataset: fmnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   0%|          | 2/500 [00:00<00:25, 19.71it/s]Attack:   7%|▋         | 33/500 [00:00<00:02, 186.80it/s]Attack:  13%|█▎        | 63/500 [00:00<00:01, 237.91it/s]Attack:  19%|█▉        | 94/500 [00:00<00:01, 265.26it/s]Attack:  25%|██▌       | 125/500 [00:00<00:01, 278.98it/s]Attack:  31%|███       | 156/500 [00:00<00:01, 288.61it/s]Attack:  37%|███▋      | 187/500 [00:00<00:01, 294.24it/s]Attack:  44%|████▍     | 219/500 [00:00<00:00, 299.60it/s]Attack:  50%|█████     | 251/500 [00:00<00:00, 303.14it/s]Attack:  56%|█████▋    | 282/500 [00:01<00:00, 305.07it/s]Attack:  63%|██████▎   | 313/500 [00:01<00:00, 304.27it/s]Attack:  69%|██████▉   | 344/500 [00:01<00:00, 302.15it/s]Attack:  75%|███████▌  | 375/500 [00:01<00:00, 300.90it/s]Attack:  81%|████████  | 406/500 [00:01<00:00, 300.03it/s]Attack:  87%|████████▋ | 437/500 [00:01<00:00, 299.60it/s]Attack:  94%|█████████▎| 468/500 [00:01<00:00, 300.88it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 301.62it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 286.46it/s]
+best_val 12.146065711975098
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 296 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 9 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 275 of 275 N2 binaries (pgd-silent-filled=191, pgd-agreed-nop=84, pgd-disagreed-withdrew=0, flipped=6, no-N1-match=0, Tech2-eliminated-but-survived=0)
+12.827700493025802  12.928545060144065  68.10521507263184
+Clean sample classification: 3
+Perturbed sample classification: 3
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=4) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=4, 3378 vars, 904 neurons)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=4) ══
+set_n1_neuron_bounds: loaded 904 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=324 org-only=0 pert-only=9 none=136 (plus 81 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 1.2146065711975098e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 1.2146065711975098e+01
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  1.2146065711975098e+01
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 5192 rows, 2750 columns and 86614 nonzeros (Max)
+Model fingerprint: 0xea126e2a
+Model has 1 linear objective coefficients
+Variable types: 2475 continuous, 275 integer (275 binary)
+Coefficient statistics:
+  Matrix range     [7e-06, 1e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [8e-02, 1e+02]
+  RHS range        [1e-02, 6e+01]
+
+User MIP start produced solution with objective 15.7568 (0.08s)
+Loaded user MIP start with objective 15.7568
+
+Presolve removed 4004 rows and 1314 columns
+Presolve time: 0.06s
+Presolved: 1188 rows, 1436 columns, 33460 nonzeros
+Variable types: 1281 continuous, 155 integer (155 binary)
+Root relaxation presolve removed 135 rows and 135 columns
+Root relaxation presolved: 1053 rows, 1301 columns, 33055 nonzeros
+
+
+Root relaxation: objective 2.804208e+01, 921 iterations, 0.07 seconds (0.09 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0   28.04208    0   91   15.75685   28.04208  78.0%     -    0s
+     0     0   24.92982    0  106   15.75685   24.92982  58.2%     -    0s
+     0     0   24.92982    0  106   15.75685   24.92982  58.2%     -    0s
+     0     0   24.92982    0  103   15.75685   24.92982  58.2%     -    1s
+     0     0   19.77148    0  102   15.75685   19.77148  25.5%     -    1s
+     0     0   19.73760    0  104   15.75685   19.73760  25.3%     -    1s
+     0     0   19.73760    0  104   15.75685   19.73760  25.3%     -    1s
+     0     0   19.49759    0   99   15.75685   19.49759  23.7%     -    1s
+     0     0   19.49759    0   98   15.75685   19.49759  23.7%     -    2s
+     0     0   19.27439    0   98   15.75685   19.27439  22.3%     -    2s
+     0     0   19.22314    0   94   15.75685   19.22314  22.0%     -    2s
+     0     0   19.21124    0   95   15.75685   19.21124  21.9%     -    2s
+     0     0   19.20899    0   96   15.75685   19.20899  21.9%     -    2s
+     0     0   19.05418    0  103   15.75685   19.05418  20.9%     -    2s
+     0     0   19.05418    0  103   15.75685   19.05418  20.9%     -    2s
+     0     0   19.05418    0  103   15.75685   19.05418  20.9%     -    3s
+     0     0   18.97171    0  101   15.75685   18.97171  20.4%     -    3s
+     0     0   18.97171    0  101   15.75685   18.97171  20.4%     -    3s
+     0     2   18.97171    0  101   15.75685   18.97171  20.4%     -    3s
+    37    64   18.97171    8   72   15.75685   18.97171  20.4%   604    5s
+   511   277   15.89559   12   64   15.75685   16.88132  7.14%   567   10s
+H 1169   375                      15.7568478   16.22539  2.97%   399   12s
+  3354  1145   15.91732   21   36   15.75685   15.93823  1.15%   196   15s
+
+Cutting planes:
+  Gomory: 62
+  Projected implied bound: 327
+  MIR: 1209
+  Mixing: 74
+  Flow cover: 911
+  RLT: 251
+  Relax-and-lift: 526
+
+Explored 3738 nodes (696437 simplex iterations) in 15.69 seconds (27.42 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 2: 15.7568 15.7568 
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 1.575684775804e+01, best bound 1.588779023645e+01, gap 0.8310%
+
+User-callback calls 10810, time in user-callback 0.00 sec
+source: 2 target: 4 model_arch: cnn1 perturbation type: occ perturbation size: [0, 1.0, 1.0, 9.0] dataset: fmnist
+Attack:   0%|          | 0/500 [00:00<?, ?it/s]Attack:   1%|          | 4/500 [00:00<00:12, 39.55it/s]Attack:   7%|▋         | 34/500 [00:00<00:02, 190.55it/s]Attack:  13%|█▎        | 65/500 [00:00<00:01, 240.89it/s]Attack:  19%|█▉        | 95/500 [00:00<00:01, 263.55it/s]Attack:  25%|██▌       | 125/500 [00:00<00:01, 275.66it/s]Attack:  31%|███       | 156/500 [00:00<00:01, 284.07it/s]Attack:  37%|███▋      | 186/500 [00:00<00:01, 288.55it/s]Attack:  43%|████▎     | 216/500 [00:00<00:00, 291.99it/s]Attack:  49%|████▉     | 246/500 [00:00<00:00, 293.56it/s]Attack:  55%|█████▌    | 276/500 [00:01<00:00, 293.31it/s]Attack:  61%|██████    | 306/500 [00:01<00:00, 294.27it/s]Attack:  67%|██████▋   | 337/500 [00:01<00:00, 296.63it/s]Attack:  74%|███████▍  | 371/500 [00:01<00:00, 309.34it/s]Attack:  81%|████████  | 406/500 [00:01<00:00, 319.40it/s]Attack:  88%|████████▊ | 440/500 [00:01<00:00, 325.54it/s]Attack:  95%|█████████▌| 475/500 [00:01<00:00, 330.13it/s]Attack: 100%|█████████▉| 499/500 [00:01<00:00, 294.00it/s]
+best_val 13.3445463180542
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 296 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 9 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 275 of 275 N2 binaries (pgd-silent-filled=156, pgd-agreed-nop=117, pgd-disagreed-withdrew=2, flipped=1, no-N1-match=0, Tech2-eliminated-but-survived=0)
+15.756847758040621  15.887790236449336  15.694593906402588
+Clean sample classification: 3
+Perturbed sample classification: 3
+
+══ Advanced-standard: loading N1 state from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=5) ══
+load_n1_state: loaded from /root/Downloads/for_dana/vaghar_org/paper_experiments_with_zono_fix/fashion-mnist/cnn1_exp/occ/eps_1,1,9/n1_state_cnn1_model_seed42_itr19 (c_tag=3, c_target=5, 3378 vars, 904 neurons)
+
+══ Advanced-standard PASS 2: solving N2 with N1 info (c_tag=3, c_target=5) ══
+set_n1_neuron_bounds: loaded 904 neuron bounds from N1
+compute_n2_pert_relaxation_bounds: populated 3 ReLU layers
+compute_n2_relax_decision!: τ=0.5, both=324 org-only=0 pert-only=9 none=136 (plus 81 stable neurons)
+[notice | Main.MIPVerify]: Determining upper and lower bounds for the input to each non-linear unit.
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter TimeLimit to value 5
+Set parameter TimeLimit to value 5
+Set parameter WLSAccessID
+Set parameter WLSSecret
+Set parameter LicenseID to value 2478548
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 13.3445463180542
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Set parameter MIPGap to value 0.01
+Set parameter Seed to value 4
+Set parameter Seed to value 4
+Set parameter MIPGap to value 0.01
+Set parameter MIPFocus to value 3
+Set parameter Cutoff to value 13.3445463180542
+Set parameter Threads to value 32
+Set parameter TimeLimit to value 10800
+Gurobi Optimizer version 13.0.0 build v13.0.0rc1 (linux64 - "Ubuntu 20.04.2 LTS")
+
+CPU model: AMD EPYC 7713 64-Core Processor, instruction set [SSE2|AVX|AVX2]
+Thread count: 127 physical cores, 255 logical processors, using up to 32 threads
+
+Non-default parameters:
+Cutoff  13.3445463180542
+TimeLimit  10800
+MIPGap  0.01
+MIPFocus  3
+Seed  4
+Threads  32
+
+Academic license 2478548 - for non-commercial use only - registered to ne___@campus.technion.ac.il
+Optimize a model with 5192 rows, 2750 columns and 86614 nonzeros (Max)
+Model fingerprint: 0xf21d6bdd
+Model has 1 linear objective coefficients
+Variable types: 2475 continuous, 275 integer (275 binary)
+Coefficient statistics:
+  Matrix range     [7e-06, 1e+02]
+  Objective range  [1e+00, 1e+00]
+  Bounds range     [8e-02, 1e+02]
+  RHS range        [3e-02, 6e+01]
+
+User MIP start produced solution with objective 16.5596 (0.08s)
+Loaded user MIP start with objective 16.5596
+
+Presolve removed 4004 rows and 1314 columns
+Presolve time: 0.06s
+Presolved: 1188 rows, 1436 columns, 33460 nonzeros
+Variable types: 1281 continuous, 155 integer (155 binary)
+Root relaxation presolve removed 135 rows and 135 columns
+Root relaxation presolved: 1053 rows, 1301 columns, 33055 nonzeros
+
+
+Root relaxation: objective 2.804208e+01, 788 iterations, 0.07 seconds (0.08 work units)
+
+    Nodes    |    Current Node    |     Objective Bounds      |     Work
+ Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time
+
+     0     0   28.04208    0   90   16.55960   28.04208  69.3%     -    0s
+     0     0   26.97255    0  104   16.55960   26.97255  62.9%     -    0s
+     0     0   26.97255    0  104   16.55960   26.97255  62.9%     -    0s
+     0     0   26.97255    0  104   16.55960   26.97255  62.9%     -    0s
+     0     0   21.11885    0  106   16.55960   21.11885  27.5%     -    0s
+     0     0   21.05705    0  106   16.55960   21.05705  27.2%     -    0s
+     0     0   19.93152    0  102   16.55960   19.93152  20.4%     -    1s
+     0     0   19.93152    0  100   16.55960   19.93152  20.4%     -    1s
+     0     0   19.49759    0  105   16.55960   19.49759  17.7%     -    1s
+     0     0   19.48143    0  104   16.55960   19.48143  17.6%     -    1s
+     0     0   19.46970    0  105   16.55960   19.46970  17.6%     -    1s
+     0     0   19.28629    0  104   16.55960   19.28629  16.5%     -    2s
+     0     0   19.28629    0  103   16.55960   19.28629  16.5%     -    2s
+     0     0   19.16320    0  103   16.55960   19.16320  15.7%     -    2s
+     0     0   19.16320    0  103   16.55960   19.16320  15.7%     -    2s
+     0     2   19.16320    0  103   16.55960   19.16320  15.7%     -    3s
+    69    41   18.55924   10   57   16.55960   18.58731  12.2%   528    5s
+  1479  1032     cutoff   40        16.55960   17.48892  5.61%   197   10s
+  4178  2549   16.78569   43   18   16.55960   17.20585  3.90%   195   15s
+  6821  3659   16.86013   38   26   16.55960   17.07837  3.13%   192   20s
+H 7069  3718                      16.5697858   17.06018  2.96%   194   23s
+  8966  4238   16.74402   47   13   16.56979   17.01836  2.71%   189   25s
+ 13664  3865     cutoff   25        16.56979   16.84833  1.68%   178   30s
+
+Cutting planes:
+  Gomory: 53
+  Projected implied bound: 323
+  MIR: 1229
+  Mixing: 74
+  Flow cover: 769
+  RLT: 197
+  Relax-and-lift: 654
+
+Explored 17134 nodes (2851472 simplex iterations) in 32.43 seconds (64.06 work units)
+Thread count was 32 (of 255 available processors)
+
+Solution count 2: 16.5698 16.5596 
+
+Optimal solution found (tolerance 1.00e-02)
+Best objective 1.656978576772e+01, best bound 1.673205773301e+01, gap 0.9793%
+
+User-callback calls 39233, time in user-callback 0.01 sec
+Encoding the two copies...
+apply_sibgate_constraints!: emitted 296 coupling lines (both-thin), 0 conditional triangles on org (org-dropped), 9 conditional triangles on pert (pert-dropped).
+Encoding dependencies (activation_start=1, layers_offset=3)...
+apply_n1_var_hints!: mode=VH_PREV_PGD, Start-consensus on 275 of 275 N2 binaries (pgd-silent-filled=152, pgd-agreed-nop=123, pgd-disagreed-withdrew=0, flipped=4, no-N1-match=0, Tech2-eliminated-but-survived=0)
+16.569785767719765  16.732057733008755  32.43430304527283
+Clean sample classification: 3
+Perturbed sample classification: 3

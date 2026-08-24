@@ -349,6 +349,228 @@ function perturbed_interval_constraints_plain(m, nn, clean_prefix, pert_prefix)
 end
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# compute_diff_and_comp_bounds  (restored from 44a56ff93~1)
+#
+# Plain interval-arithmetic diff-bound propagation — the pre-zonotope method,
+# selected by --arithmetic_transfer_bounds true. Analytically propagates, per
+# ReLU layer:
+#   • diff bounds   [l_diff, u_diff]  =  z_n2_org - z_n1_org
+#   • pert bounds   [l_pert, u_pert]  =  z_n2_pert - z_n2_org
+#   • comp bounds   [l_comp, u_comp]  =  l_diff+l_pert, u_diff+u_pert
+#   • N1 pre-activation bounds        =  bounds on zˆ_n1 before ReLU
+#
+# saved_n1_preact: pass the deserialized (up, down) tuple of an existing
+# n1_preact_bounds*.bin to REUSE the saved Ln1/Un1 instead of recomputing
+# them — they are mode-independent (pure interval arithmetic in both modes)
+# and depend only on the N1 model + input domain. The prefix up to the first
+# ReLU is still computed and validated against the file, so a stale file
+# (wrong model / domain) errors out instead of poisoning the diff bounds.
+#
+# Results are stored in the SAME globals compute_diff_bounds_zonotope fills
+# (see help_functions.jl), so Phase 2 consumes either method's bounds
+# transparently.
+# ═══════════════════════════════════════════════════════════════════════════
+function compute_diff_and_comp_bounds(nn1, nn2, I_pert_up_init, I_pert_down_init;
+                                      saved_n1_preact::Union{Nothing,Tuple}=nothing)
+    # ── Activation conditional-triangle relaxation (n2_org) ──────────────────
+    # diff bounds: z_n2_org - z_n1_org, used with a_n1_org + N1 preact bounds
+    global relu_diff_up_bounds, relu_diff_down_bounds
+    global n1_preact_up_bounds, n1_preact_down_bounds
+    # ── Perturbation conditional-triangle relaxation (n2_pert) ───────────────
+    # composed bounds: (z_n2_pert - z_n1_org) = diff + pert
+    global relu_comp_up_bounds, relu_comp_down_bounds
+
+    relu_diff_up_bounds   = Array{Float64}[]
+    relu_diff_down_bounds = Array{Float64}[]
+    n1_preact_up_bounds   = Array{Float64}[]
+    n1_preact_down_bounds = Array{Float64}[]
+    relu_comp_up_bounds   = Array{Float64}[]
+    relu_comp_down_bounds = Array{Float64}[]
+
+    # Ln1/Un1 reuse state (see the header comment)
+    reuse_preact   = saved_n1_preact !== nothing
+    saved_pre_up   = reuse_preact ? saved_n1_preact[1] : nothing
+    saved_pre_down = reuse_preact ? saved_n1_preact[2] : nothing
+    relu_idx = 0
+
+    # Running interval state (4D for CNNs, flattened to 1D at Flatten layer)
+    diff_up   = zeros(Float64, size(I_pert_up_init))   # z_n2_org - z_n1_org
+    diff_down = zeros(Float64, size(I_pert_down_init))
+    pert_up   = copy(Float64.(I_pert_up_init))          # z_n2_pert - z_n2_org
+    pert_down = copy(Float64.(I_pert_down_init))
+
+    # N1 post-activation bounds, initialised to the input domain ([0,1] for the
+    # image nets, the per-coordinate box under --internet_nets_benchmarks)
+    n1_act_down, n1_act_up = input_domain_shaped(size(I_pert_up_init))
+
+    # Will be set at each Linear layer, read at the following ReLU layer
+    n1_pre_up_cur   = Float64[]
+    n1_pre_down_cur = Float64[]
+
+    # Track post-ReLU diff bounds (kept for symmetry with the zonotope pass)
+    last_relu_diff_up   = zeros(Float64, size(diff_up))
+    last_relu_diff_down = zeros(Float64, size(diff_down))
+
+    for (layer_idx, l) in enumerate(nn1.layers)
+        l2 = nn2.layers[layer_idx]
+
+        if occursin("Flatten", string(typeof(l)))
+            if ndims(diff_up) > 1
+                diff_up   = vec(diff_up   |> l)
+                diff_down = vec(diff_down |> l)
+                pert_up   = vec(pert_up   |> l)
+                pert_down = vec(pert_down |> l)
+                n1_act_up   = vec(n1_act_up   |> l)
+                n1_act_down = vec(n1_act_down |> l)
+            end
+
+        elseif occursin("Linear", string(typeof(l)))
+            W1 = Float64.(transpose(l.matrix))
+            W2 = Float64.(transpose(l2.matrix))
+            b1 = Float64.(l.bias)
+            b2 = Float64.(l2.bias)
+            ΔW = W2 - W1
+            Δb = b2 - b1
+
+            # diff:  ΔW·z_n1 + W2·diff_prev + Δb  (paper eq. 3)
+            r1_min, r1_max = interval_matrix_vector_multiplication(
+                ΔW, ΔW, n1_act_down, n1_act_up)
+            r2_min, r2_max = interval_matrix_vector_multiplication(
+                W2, W2, diff_down, diff_up)
+            diff_down = r1_min .+ r2_min .+ Δb
+            diff_up   = r1_max .+ r2_max .+ Δb
+
+            # pert:  W2·pert_prev  (bias cancels in the difference)
+            rp_min, rp_max = interval_matrix_vector_multiplication(
+                W2, W2, pert_down, pert_up)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N1 pre-activation bounds (before ReLU). With reuse, only the
+            # prefix up to the first ReLU is computed — it validates the saved
+            # file against the current model at the first ReLU below.
+            if !reuse_preact || relu_idx == 0
+                rn_min, rn_max = interval_matrix_vector_multiplication(
+                    W1, W1, n1_act_down, n1_act_up)
+                n1_pre_up_cur   = rn_max .+ b1
+                n1_pre_down_cur = rn_min .+ b1
+            end
+
+        elseif occursin("Conv", string(typeof(l)))
+            F1 = Float64.(l.filter);  F2 = Float64.(l2.filter)
+            b1 = Float64.(l.bias);    b2 = Float64.(l2.bias)
+            ΔF = F2 - F1;             Δb = b2 - b1
+            zero_bias = zeros(Float64, length(b1))
+
+            # Ensure 4D shape for conv operation
+            n1_4d_down  = ndims(n1_act_down) == 4 ? n1_act_down : reshape(n1_act_down, 1, :, 1, 1)
+            n1_4d_up    = ndims(n1_act_up)   == 4 ? n1_act_up   : reshape(n1_act_up,   1, :, 1, 1)
+            diff_4d_down = ndims(diff_down)  == 4 ? diff_down   : reshape(diff_down,   1, :, 1, 1)
+            diff_4d_up   = ndims(diff_up)    == 4 ? diff_up     : reshape(diff_up,     1, :, 1, 1)
+            pert_4d_down = ndims(pert_down)  == 4 ? pert_down   : reshape(pert_down,   1, :, 1, 1)
+            pert_4d_up   = ndims(pert_up)    == 4 ? pert_up     : reshape(pert_up,     1, :, 1, 1)
+
+            # diff = ΔF·a_n1 + F2·diff_prev + Δb
+            r1_min, r1_max = interval_conv2d_bounds(ΔF, ΔF, n1_4d_down, n1_4d_up, zero_bias, l.stride, l.padding)
+            r2_min, r2_max = interval_conv2d_bounds(F2, F2, diff_4d_down, diff_4d_up, zero_bias, l.stride, l.padding)
+            diff_down = r1_min .+ r2_min
+            diff_up   = r1_max .+ r2_max
+            # Broadcast Δb into the spatial dimensions (4th dim = out_channels)
+            for oc in 1:length(Δb)
+                diff_down[:, :, :, oc] .+= Δb[oc]
+                diff_up[:, :, :, oc]   .+= Δb[oc]
+            end
+
+            # pert = F2·pert_prev
+            rp_min, rp_max = interval_conv2d_bounds(F2, F2, pert_4d_down, pert_4d_up, zero_bias, l.stride, l.padding)
+            pert_down = rp_min
+            pert_up   = rp_max
+
+            # N1 preact bounds (F1·a_n1 + b1, bias handled inside
+            # interval_conv2d_bounds); same reuse prefix rule as the Linear branch.
+            if !reuse_preact || relu_idx == 0
+                rn_min, rn_max = interval_conv2d_bounds(F1, F1, n1_4d_down, n1_4d_up, Float64.(b1), l.stride, l.padding)
+                n1_pre_up_cur   = rn_max
+                n1_pre_down_cur = rn_min
+            end
+
+        elseif occursin("ReLU", string(typeof(l)))
+            relu_idx += 1
+            if reuse_preact
+                relu_idx <= length(saved_pre_up) ||
+                    error("compute_diff_and_comp_bounds: saved n1_preact bounds cover " *
+                          "$(length(saved_pre_up)) ReLU layers but the network has more — " *
+                          "stale n1_preact_bounds file? Delete it and re-run.")
+                if relu_idx == 1
+                    # Stale-file guard: the first ReLU's preact was recomputed
+                    # above from the current model — it must match the file.
+                    ok = size(Float64.(saved_pre_up[1])) == size(n1_pre_up_cur) &&
+                         all(isapprox.(Float64.(saved_pre_up[1]),   n1_pre_up_cur;   atol=1e-8, rtol=1e-8)) &&
+                         all(isapprox.(Float64.(saved_pre_down[1]), n1_pre_down_cur; atol=1e-8, rtol=1e-8))
+                    ok || error("compute_diff_and_comp_bounds: saved n1_preact bounds do not match " *
+                                "the current N1 model / input domain — stale file. Delete it (or " *
+                                "re-run zonotope Phase 1) and retry.")
+                end
+                n1_pre_up_cur   = Float64.(saved_pre_up[relu_idx])
+                n1_pre_down_cur = Float64.(saved_pre_down[relu_idx])
+                size(n1_pre_up_cur) == size(diff_up) ||
+                    error("compute_diff_and_comp_bounds: saved n1_preact bounds shape mismatch " *
+                          "at ReLU $relu_idx — stale n1_preact_bounds file?")
+            end
+            # ── Activation conditional-triangle relaxation (n2_org) ──────────
+            # diff bounds: z_n2_org - z_n1_org (pre-activation, before clipping)
+            # N1 preact bounds: used to form conditional intervals in core_ops.jl
+            push!(relu_diff_up_bounds,   copy(diff_up))
+            push!(relu_diff_down_bounds, copy(diff_down))
+            push!(n1_preact_up_bounds,   copy(n1_pre_up_cur))
+            push!(n1_preact_down_bounds, copy(n1_pre_down_cur))
+
+            # ── Perturbation conditional-triangle relaxation (n2_pert) ───────
+            # composed bounds: z_n2_pert - z_n1_org = diff + pert (pre-activation)
+            push!(relu_comp_up_bounds,   diff_up   .+ pert_up)
+            push!(relu_comp_down_bounds, diff_down .+ pert_down)
+
+            # Clip intervals through ReLU: tighter per-neuron clipping using
+            # N1/N2 preact stability (same rule as the zonotope pass's
+            # interval branch)
+            for i in eachindex(diff_up)
+                l_n1 = n1_pre_down_cur[i]
+                u_n1 = n1_pre_up_cur[i]
+                l_n2 = l_n1 + diff_down[i]
+                u_n2 = u_n1 + diff_up[i]
+
+                if l_n1 >= 0 && l_n2 >= 0
+                    # both active: post-ReLU diff = pre-ReLU diff, keep as-is
+                elseif u_n1 <= 0 && u_n2 <= 0
+                    # both inactive: post-ReLU diff = 0
+                    diff_up[i] = 0.0
+                    diff_down[i] = 0.0
+                else
+                    # mixed: use conservative non-expansive clipping
+                    diff_up[i] = max(0.0, diff_up[i])
+                    diff_down[i] = -max(0.0, -diff_down[i])
+                end
+            end
+            pert_up   = max.(0.0, pert_up)
+            pert_down = .- max.(0.0, .- pert_down)
+
+            # N1 post-activation bounds
+            n1_act_up   = max.(0.0, n1_pre_up_cur)
+            n1_act_down = max.(0.0, n1_pre_down_cur)
+
+            # Save post-ReLU diff bounds (overwritten each ReLU; last one survives)
+            last_relu_diff_up   = copy(diff_up)
+            last_relu_diff_down = copy(diff_down)
+        end
+    end
+
+    println("compute_diff_and_comp_bounds: output-layer diff bounds width = $(maximum(vec(Float64.(diff_up)) .- vec(Float64.(diff_down))))")
+    println("compute_diff_and_comp_bounds: populated $(length(relu_diff_up_bounds)) ReLU layers" *
+            (reuse_preact ? " (Ln1/Un1 reused from saved n1_preact bounds)" : ""))
+end
+
+
 # ── Zonotope-based diff bound propagation ──────────────────────────────
 # Computes the diff bounds with a zonotope (affine
 # arithmetic) for the diff propagation through FC layers. Zonotope activates
