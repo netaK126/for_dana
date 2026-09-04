@@ -32,6 +32,7 @@ import time
 import re
 import glob
 import itertools
+import json
 import math
 import shutil
 
@@ -225,6 +226,67 @@ def _vaghar_pairs_for_cell(dataset, arch, pert_type, eps_str):
 def _filter_cts_by_vaghar(cts, dataset, arch, pert_type, eps_str, c_tag):
     pairs = _vaghar_pairs_for_cell(dataset, arch, pert_type, eps_str)
     return [ct for ct in cts if (c_tag, ct) in pairs]
+
+
+#: Frozen (c_source, c_target) plan of the vaghar sweep, 0-indexed, keyed
+#: '<dataset>|<arch>|<perturbation>|eps_<size>'. It is the yardstick the paper
+#: tables measure c_target coverage against; see _vaghar_expected_from_plan.
+DEFAULT_VAGHAR_PLAN = "zono_fix_vaghar_pair_inventory.json"
+_VAGHAR_PLAN_CACHE = {}
+#: Messages already printed about which yardstick is in use (one per run, not
+#: one per dataset).
+_VAGHAR_PLAN_ANNOUNCED = set()
+
+
+def _load_vaghar_plan(path):
+    """Read a frozen vaghar-pair inventory into
+    {(dataset, arch, pert, eps_str): {c_source: {c_targets}}} (all 0-indexed),
+    or None when `path` does not exist or cannot be read.
+
+    The tables need a plan that does NOT move between two invocations of the
+    same command. _vaghar_pairs_for_cell derives the same map by scanning the
+    baseline result files, but a sweep running alongside keeps appending
+    c_targets to those files: a \\baseline run that finishes before its
+    ours/transfer siblings raises the coverage bar while the data behind it is
+    still being computed, so rows counted by one invocation are flagged partial
+    and dropped by the next. Reading the plan from a file written once keeps
+    the bar still.
+    """
+    if path in _VAGHAR_PLAN_CACHE:
+        return _VAGHAR_PLAN_CACHE[path]
+    plan = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            plan = {}
+            for key, cs_map in raw.items():
+                parts = key.split("|")
+                if len(parts) != 4:
+                    continue
+                ds, arch, pert, eps = parts
+                eps_str = eps[len("eps_"):] if eps.startswith("eps_") else eps
+                plan[(ds, arch, pert, eps_str)] = {
+                    int(cs): {int(ct) for ct in cts}
+                    for cs, cts in cs_map.items()}
+        except (OSError, ValueError) as exc:
+            print(f"[paper-tables] vaghar plan {path} unreadable ({exc}); "
+                  f"falling back to the live scan")
+            plan = None
+    _VAGHAR_PLAN_CACHE[path] = plan
+    return plan
+
+
+def _vaghar_expected_from_plan(plan, dataset, arch, pert_type, eps_str, c_src):
+    """0-indexed target classes the plan runs for this (cell, c_source), or
+    None when the cell is absent from it -- the caller then falls back to the
+    requested '@CT' / --ct grid, which is the plan for a cell the inventory
+    never covered."""
+    entry = plan.get((dataset, arch, pert_type, eps_str))
+    if not entry:
+        return None
+    cts = entry.get(int(c_src))
+    return set(cts) if cts else None
 
 def _vaghar_c_srcs_for_arch(dataset, arch, c_srcs):
     """c_srcs (Julia) that have at least one vaghar pair in ANY perturbation
@@ -500,6 +562,19 @@ def _filename_dropped_binaries(fname):
     if bm:
         return float(bm.group(1)) > 0.0
     return False
+
+
+def _reraise_if_process_exit(exc):
+    """Re-raise a SystemExit that carries a NUMERIC code.
+
+    update_advstd_tex_tables raises SystemExit with a MESSAGE for the cases the
+    callers below skip over (a bad --combination_table spec, missing AUTO
+    markers). A numeric code comes from _signal_handler instead
+    (sys.exit(128 + signum)), i.e. the run is being torn down by Ctrl+C or a
+    kill: swallowing that would carry on to the next block and finish the run
+    as though nothing had happened."""
+    if isinstance(exc.code, int):
+        raise exc
 
 
 def _is_pre_fix_dropped(fname):
@@ -2372,6 +2447,7 @@ def _update_advstd_tex_tables(cwd, combined_base, arch_runs,
                                end_mark=updater.END_MARK + _mslug,
                                label_suffix=_lslug)
         except SystemExit as exc:
+            _reraise_if_process_exit(exc)
             print(f"[tex-update] {exc}")
         except Exception as exc:
             print(f"[tex-update] error: {exc}")
@@ -2947,6 +3023,12 @@ PAPER_DEFAULT_TAU = 0.5
 #: the headline numbers below.
 _PARTIAL_STAR = r"\textcolor{red}{$^*$}"
 
+#: A model every one of whose runs finishes below this many minutes -- across
+#: \baseline, \tool and \tool with transfer -- is easy for all three verifiers,
+#: so its rows separate the methods by seconds. _report_paper_table_averages
+#: names those models; the tables print t in minutes.
+PAPER_FAST_MODEL_MINUTES = 15.0
+
 
 def _report_paper_table_averages(cwd):
     """Print the average speedup and average bound-gap ratio of the 'ours' and
@@ -2978,6 +3060,36 @@ def _report_paper_table_averages(cwd):
         m = re.match(r"^\s*([0-9.]+)\s*\$\\times\$\s*$", cell)
         return float(m.group(1)) if m else None
 
+    def _plain_arch(cell):
+        """'\\textbf{\\emph{conv1} / $N$}' -> 'conv1',
+        '\\textbf{3$\\times$50 / $N$}' -> '3x50'. The model label of a block
+        sits in its first column, sometimes inside a \\shortstack."""
+        m = re.search(r"\\textbf\{(.+?)\s*/\s*\$N", cell)
+        if not m:
+            return None
+        s = m.group(1)
+        s = re.sub(r"\\emph\{(.*?)\}", r"\1", s)
+        s = s.replace(r"$\times$", "x").replace("\\", "").strip()
+        return s or None
+
+    def _table_dataset(tab):
+        """Dataset of a table, from its '\\label{tab:safe-wide-<arch>
+        [-solved|-timeout][-<dataset>]}'. MNIST is the default and carries no
+        suffix (the same _lslug convention the generator writes)."""
+        for m in re.finditer(r"\\label\{tab:safe-wide-([^}]*)\}", tab):
+            parts = [p for p in m.group(1).split("-")
+                     if p not in ("solved", "timeout")]
+            if len(parts) > 1:
+                return "-".join(parts[1:])
+        return "mnist"
+
+    def _minutes(cell):
+        # A solve-time cell renders as '122.1', or as '180\textcolor{red}{$^*$}'
+        # when the mean behind it covers only part of the c_targets. '---'
+        # (the method has no run for that row) returns None.
+        m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)", cell.strip())
+        return float(m.group(1)) if m else None
+
     def _tau(cell):
         # The tau column renders as '$0.25$'; '---' (no threshold recorded)
         # returns infinity, so such a row is never mistaken for the default.
@@ -2993,6 +3105,12 @@ def _report_paper_table_averages(cwd):
     # exist only to show tau's impact, and a key whose only row carries another
     # tau contributes nothing.
     picked = {}
+    # Rows every verifier finishes quickly: EVERY row the tables print, at any
+    # tau and starred rows included -- the question is what the runs cost, not
+    # which rows carry the headline numbers. A row where a method has no time
+    # at all ('---') cannot be called fast and is counted apart.
+    fast_rows = []
+    by_model = {}
     n_rows_starred = {"speedup": 0, "gap_ratio": 0}
     n_rows_off_tau = {"speedup": 0, "gap_ratio": 0}
     n_tables = {"speedup": 0, "gap_ratio": 0}
@@ -3009,6 +3127,24 @@ def _report_paper_table_averages(cwd):
             continue
         n_tables[metric] += 1
         body = tab[tab.index("\\midrule"):tab.index("\\bottomrule")]
+        ds_name = _table_dataset(tab)
+        # A table holds one block per (arch, c_s), and the block's model label
+        # and its 'c_s{=}k' sit in the first column of its first rows -- often
+        # NOT on the same row, so both are read from the whole block before its
+        # rows are attributed to them.
+        blk_meta, _blk, _arch = {}, 0, None
+        for line in body.splitlines():
+            if line.strip() == r"\midrule":
+                _blk += 1
+                continue
+            col0 = line.split("&", 1)[0]
+            _arch = _plain_arch(col0) or _arch
+            _cs = re.search(r"c_s\{=\}(\d+)", col0)
+            meta = blk_meta.setdefault(_blk, {"arch": _arch, "c_s": None})
+            if meta["arch"] is None:
+                meta["arch"] = _arch
+            if _cs:
+                meta["c_s"] = int(_cs.group(1))
         block = 0
         for line in body.splitlines():
             if line.strip() == r"\midrule":
@@ -3024,6 +3160,23 @@ def _report_paper_table_averages(cwd):
             if len(cells) < 4:
                 continue
             n_rows_seen[metric] += 1
+            # Solve times of the three methods, before any of the headline
+            # filters: t sits third in each method's (delta_l, delta_u, t)
+            # triple, so cells 5 / 8 / 11 of the 14-cell row.
+            _mm = blk_meta.get(block, {})
+            _model = (ds_name, _mm.get("arch") or "?")
+            _slot = by_model.setdefault(_model, {"rows": 0, "fast": 0,
+                                                 "unknown": 0})
+            _slot["rows"] += 1
+            _ts = [_minutes(cells[i]) for i in (5, 8, 11)]
+            _fast_row = (all(t is not None for t in _ts)
+                         and max(_ts) < PAPER_FAST_MODEL_MINUTES)
+            if any(t is None for t in _ts):
+                _slot["unknown"] += 1
+            elif _fast_row:
+                _slot["fast"] += 1
+                fast_rows.append((_model[0], _model[1], _mm.get("c_s"),
+                                  cells[1].strip(), _ts))
             # --paper_show_partial prints rows whose c_target coverage is
             # incomplete and marks every affected cell with a red "*". Such a
             # row compares a full run against a partial one, so it is dropped
@@ -3038,33 +3191,116 @@ def _report_paper_table_averages(cwd):
             if abs(tau - PAPER_DEFAULT_TAU) > 1e-9:
                 n_rows_off_tau[metric] += 1
                 continue
-            picked[key] = (tau, metric, cells[-2], cells[-1])
+            _m = blk_meta.get(block, {})
+            where = (ds_name, _m.get("arch") or "?", _m.get("c_s"),
+                     cells[1].strip())
+            picked[key] = (tau, metric, cells[-2], cells[-1], where,
+                           _fast_row)
 
     # {metric: {"ours": [...], "transfer": [...]}}
     # A row counts only when BOTH columns carry a value: a row where one of the
     # two modes is missing ('---') would otherwise shift one average without
     # touching the other, so the two headline numbers would no longer describe
     # the same set of experiments and could not be compared to each other.
-    vals = {"speedup": {"ours": [], "transfer": []},
-            "gap_ratio": {"ours": [], "transfer": []}}
-    n_rows_unpaired = {"speedup": {"ours": 0, "transfer": 0},
-                       "gap_ratio": {"ours": 0, "transfer": 0}}
-    for _tau_v, metric, ours_cell, transfer_cell in picked.values():
-        v_ours, v_transfer = _val(ours_cell), _val(transfer_cell)
-        if v_ours is None and v_transfer is None:
-            continue                    # nothing to compare, nothing dropped
-        if v_ours is None or v_transfer is None:
-            # Name the column that DID have a value, i.e. the one whose average
-            # this row would have entered had we not required the pair.
-            n_rows_unpaired[metric][
-                "ours" if v_ours is not None else "transfer"] += 1
-            continue
-        vals[metric]["ours"].append(v_ours)
-        vals[metric]["transfer"].append(v_transfer)
+    # Rows where a method does NOT come out ahead of \baseline: a speedup below
+    # 1 is a slower run, a gap ratio below 1 is a wider remaining bound. Listed
+    # before the averages so the cases behind a mean are named, not just
+    # counted. The test is on the ratio the table PRINTS, so it flags exactly
+    # the cells a reader can see (a 0.96 rendered as '1$\times$' is not one).
+    def _tally(rows):
+        """(vals, unpaired, behind) over `rows`, the (tau, metric, ours_cell,
+        transfer_cell, where, fast) tuples of one population."""
+        vals = {"speedup": {"ours": [], "transfer": []},
+                "gap_ratio": {"ours": [], "transfer": []}}
+        unpaired = {"speedup": {"ours": 0, "transfer": 0},
+                    "gap_ratio": {"ours": 0, "transfer": 0}}
+        behind = []
+        for _tau_v, metric, ours_cell, transfer_cell, where, _fast in rows:
+            v_ours, v_transfer = _val(ours_cell), _val(transfer_cell)
+            if v_ours is None and v_transfer is None:
+                continue                # nothing to compare, nothing dropped
+            if v_ours is None or v_transfer is None:
+                # Name the column that DID have a value, i.e. the one whose
+                # average this row would have entered had we not required the
+                # pair.
+                unpaired[metric][
+                    "ours" if v_ours is not None else "transfer"] += 1
+                continue
+            vals[metric]["ours"].append(v_ours)
+            vals[metric]["transfer"].append(v_transfer)
+            if v_ours < 1.0 or v_transfer < 1.0:
+                behind.append((metric, where, v_ours, v_transfer))
+        return vals, unpaired, behind
 
     def _mean(xs):
         return sum(xs) / len(xs) if xs else float("nan")
 
+    vals, n_rows_unpaired, behind = _tally(picked.values())
+
+    if behind:
+        print("\n" + "=" * 72)
+        print("ROWS WHERE \\tool OR \\tool WITH TRANSFER IS BEHIND \\baseline "
+              "(ratio < 1)")
+        print("speed_up < 1: slower than \\baseline; "
+              "gap_ratio < 1: wider remaining bound")
+        print("=" * 72)
+        for metric, label in (("speedup", "speed_up"),
+                              ("gap_ratio", "gap_ratio")):
+            rows_m = sorted((b for b in behind if b[0] == metric),
+                            key=lambda b: (b[1][0], b[1][1],
+                                           -1 if b[1][2] is None else b[1][2],
+                                           b[1][3]))
+            for _m, (ds_, arch_, cs_, pert_), v_o, v_t in rows_m:
+                cs_txt = "c_s=?" if cs_ is None else f"c_s={cs_}"
+                flag = ("ours" if v_o < 1.0 <= v_t else
+                        "transfer" if v_t < 1.0 <= v_o else "both")
+                print(f"  {label:<10} {ds_} / {arch_} / {cs_txt} / {pert_}"
+                      f"   ours {v_o:.2f}x  transfer {v_t:.2f}x   "
+                      f"[behind: {flag}]")
+        n_sp = sum(1 for b in behind if b[0] == "speedup")
+        n_gp = len(behind) - n_sp
+        print(f"  {n_sp} of {len(vals['speedup']['ours'])} speed_up rows and "
+              f"{n_gp} of {len(vals['gap_ratio']['ours'])} gap_ratio rows")
+
+    # Rows no verifier struggles with: all three finished under
+    # PAPER_FAST_MODEL_MINUTES, so the row separates the methods by seconds.
+    print("\n" + "=" * 72)
+    print(f"ROWS WHERE VHAGaR, BLEND AND BLEND+TRANSFER ALL FINISHED UNDER "
+          f"{PAPER_FAST_MODEL_MINUTES:g} MINUTES")
+    print("=" * 72)
+    for ds_, arch_, cs_, pert_, ts in sorted(
+            fast_rows, key=lambda r: (r[0], r[1],
+                                      -1 if r[2] is None else r[2], r[3])):
+        cs_txt = "c_s=?" if cs_ is None else f"c_s={cs_}"
+        left = f"{ds_} / {arch_} / {cs_txt} / {pert_}"
+        print(f"  {left:<50}  VHAGaR {ts[0]:5.1f}  BLEND {ts[1]:5.1f}  "
+              f"+transfer {ts[2]:5.1f} min")
+    if not fast_rows:
+        print("  (none)")
+    _n_rows = sum(s["rows"] for s in by_model.values())
+    print(f"  {len(fast_rows)} of {_n_rows} rendered rows: "
+          + ", ".join(f"{d}/{a} {by_model[(d, a)]['fast']}/"
+                      f"{by_model[(d, a)]['rows']}"
+                      for d, a in sorted(by_model)))
+    _unknown = sorted(m for m, s in by_model.items() if s["unknown"])
+    if _unknown:
+        print("  rows where a method has no time at all ('---'), not "
+              "considered: "
+              + ", ".join(f"{d}/{a} {by_model[(d, a)]['unknown']}"
+                          for d, a in _unknown))
+
+    # The measurements twice, side by side: over every row the tables print,
+    # and over the rows that actually separate the verifiers -- a row all
+    # three finish under PAPER_FAST_MODEL_MINUTES is decided in minutes either
+    # way, so its ratio says little about the techniques.
+    _hard = [r for r in picked.values() if not r[5]]
+    _vals_hard, _unpaired_hard, _ = _tally(_hard)
+    _n_fast = len(picked) - len(_hard)
+
+    _cols = (("all rows", vals, n_rows_unpaired),
+             (f"drop <{PAPER_FAST_MODEL_MINUTES:g} min", _vals_hard,
+              _unpaired_hard))
+    _W = 40                                  # label column
     print("\n" + "=" * 72)
     print("PAPER TABLE AVERAGE AND MAX VALUES "
           "(neta-s-paper appendix tables only)")
@@ -3075,51 +3311,65 @@ def _report_paper_table_averages(cwd):
         print(f"excluding rows with a red \"*\" (partial c_target coverage) "
               f"in any cell: dropped {n_rows_starred['speedup']} speedup and "
               f"{n_rows_starred['gap_ratio']} gap-ratio rows")
-    for metric, label in (("speedup", "speed_up"), ("gap_ratio", "gap_ratio")):
-        n_o = n_rows_unpaired[metric]["ours"]
-        n_t = n_rows_unpaired[metric]["transfer"]
-        if n_o or n_t:
-            print(f"dropped {n_o + n_t} {label} row(s) with only one of the "
-                  f"two columns ({n_o} had only 'ours', {n_t} had only "
-                  f"'ours with transfer'), so both averages cover the same "
-                  f"rows")
+    print(f"'drop <{PAPER_FAST_MODEL_MINUTES:g} min' leaves out the "
+          f"{_n_fast} row(s) of {len(picked)} where VHAGaR, BLEND and "
+          f"BLEND+transfer all finished under "
+          f"{PAPER_FAST_MODEL_MINUTES:g} minutes")
+    for _cname, _cvals, _cunp in _cols:
+        for metric, label in (("speedup", "speed_up"),
+                              ("gap_ratio", "gap_ratio")):
+            n_o = _cunp[metric]["ours"]
+            n_t = _cunp[metric]["transfer"]
+            if n_o or n_t:
+                print(f"{_cname}: dropped {n_o + n_t} {label} row(s) with "
+                      f"only one of the two columns ({n_o} had only 'ours', "
+                      f"{n_t} had only 'ours with transfer'), so both "
+                      f"averages cover the same rows")
     print("=" * 72)
+    print(f"  {'measure':<{_W}}" + "".join(f"{c[0]:>15}" for c in _cols))
+    print("  " + "-" * (_W + 30))
     for metric, label in (("speedup", "speed_up"),
                           ("gap_ratio", "gap_ratio")):
         for stat, fn in (("avg", _mean), ("max", max)):
             for key, col in (("ours", "ours"),
                              ("transfer", "ours with transfer")):
-                xs = vals[metric][key]
-                v = fn(xs) if xs else float("nan")
-                print(f"  {stat}_{label:<10} [{col:<18}] = {v:7.2f}   "
-                      f"(#rows = {len(xs)})")
-    # Head-to-head: which mode came out ahead on each experiment, rather than
-    # by how much. The two lists are index-aligned (a row enters both or
-    # neither), so they compare row by row. A row where the two print the same
-    # ratio is a tie and belongs to neither, which is why the three shares are
-    # reported together and sum to 100%.
-    for metric, label in (("speedup", "speed_up"),
-                          ("gap_ratio", "gap_ratio")):
-        ours, transfer = vals[metric]["ours"], vals[metric]["transfer"]
-        n = len(ours)
-        if not n:
-            continue
-        n_o = sum(1 for a, b in zip(ours, transfer) if a > b)
-        n_t = sum(1 for a, b in zip(ours, transfer) if b > a)
-        n_tie = n - n_o - n_t
-        pct = lambda c: f"{100.0 * c / n:6.2f}% ({c:>2})"
-        print(f"  win_{label:<10} ours {pct(n_o)} | transfer {pct(n_t)} | "
-              f"tie {pct(n_tie)}   (#rows = {n})")
-    n_sp = len(vals["speedup"]["ours"])
-    n_gp = len(vals["gap_ratio"]["ours"])
-    print(f"\n  avg_speed_up  = sum{{ speed_up values over rows }}  / #rows"
-          f"   (#rows = {n_sp})")
-    print(f"  max_speed_up  = max{{ speed_up values over rows }}")
-    print(f"  avg_gap_ratio = sum{{ gap_ratio values over rows }} / #rows"
-          f"   (#rows = {n_gp})")
-    print(f"  max_gap_ratio = max{{ gap_ratio values over rows }}")
-    print(f"  win_*         = share of rows where that column is strictly the "
-          f"higher of the two (equal rows count as a tie)")
+                cells = []
+                for _cname, _cvals, _cunp in _cols:
+                    xs = _cvals[metric][key]
+                    v = fn(xs) if xs else float("nan")
+                    cells.append(f"{v:>15.2f}")
+                print(f"  {stat + '_' + label + '  [' + col + ']':<{_W}}"
+                      + "".join(cells))
+        # Head-to-head: which mode came out ahead on each experiment, rather
+        # than by how much. The two lists are index-aligned (a row enters both
+        # or neither), so they compare row by row. A row where the two print
+        # the same ratio is a tie and belongs to neither, which is why the
+        # three shares are reported together and sum to 100%.
+        _shares = {}
+        for _cname, _cvals, _cunp in _cols:
+            ours, transfer = _cvals[metric]["ours"], _cvals[metric]["transfer"]
+            n = len(ours)
+            n_o = sum(1 for a, b in zip(ours, transfer) if a > b)
+            n_t = sum(1 for a, b in zip(ours, transfer) if b > a)
+            _shares[_cname] = (n, n_o, n_t, n - n_o - n_t)
+        for _i, _who in ((1, "ours"), (2, "ours with transfer"), (3, "tie")):
+            cells = []
+            for _cname, _cvals, _cunp in _cols:
+                n, *counts = _shares[_cname]
+                c = counts[_i - 1]
+                cells.append(f"{(100.0 * c / n if n else float('nan')):6.2f}%"
+                             f" ({c:>2})".rjust(15))
+            print(f"  {'win_' + label + '  [' + _who + ']':<{_W}}"
+                  + "".join(cells))
+        cells = [f"{len(v[metric]['ours']):>15}" for _c, v, _u in _cols]
+        print(f"  {'#rows ' + label:<{_W}}" + "".join(cells))
+        if metric == "speedup":
+            print("  " + "-" * (_W + 30))
+    print("\n  avg_* / max_* = mean / maximum of that column's ratio over "
+          "the rows")
+    print("  win_*         = share of rows where that column is strictly the "
+          "higher of the two")
+    print("                  (equal rows count as a tie)")
     print("=" * 72)
     return vals
 
@@ -3177,9 +3427,9 @@ def _update_results_sentence(cwd, vals):
         f"(up to ${g('speedup','ours','max'):.1f}\\times$), and "
         f"${g('speedup','transfer','avg'):.1f}\\times$ faster" "\n"
         f"(up to ${g('speedup','transfer','max'):.1f}\\times$) with transfer. "
-        r"Figure~\ref{fig:n2-bounddiff} focuses on the most challenging" "\n"
+        r"On the most challenging" "\n"
         r"instances, where all three approaches reach the three-hour timeout, "
-        r"and thus shows only the tightness." "\n"
+        r"only the tightness differs." "\n"
         r"There, \tool's bound difference is "
         f"${g('gap_ratio','ours','avg'):.1f}\\times$ smaller than "
         r"\baseline's on average" "\n"
@@ -3957,6 +4207,67 @@ def _layer_global_request(per_arch, global_request, arch_runs):
     return out
 
 
+#: Progress chatter of --paper_tables_from_txt: the per-dataset headers, the
+#: per-block bookkeeping and the settings echo. A table run is read for the
+#: paths it rebuilt and for the measurement block at the end, and these lines
+#: bury both, so they are dropped unless --verbose_paper_tables is given.
+#: Anything NOT listed here still prints, so an error, a warning or a message
+#: added later stays visible.
+_TABLE_NOISE_RES = [re.compile(p) for p in (
+    r"^\[paper-tables\] (restricting|per-cell tables render|charts draw|"
+    r"combos admitted|c_target coverage measured|body time figure)",
+    r"^\[arch-scope\] ",
+    r"^\[tab1\] ",
+    r"^\[relax-precision\] ",
+    r"^\[update_advstd_tex_tables\] (no changes to|wrote) ",
+    r"^===== Regenerating .*=====$",
+    r"^\[paper-build\] .*: no bibliography -- bibtex skipped$",
+)]
+
+
+class _QuietTableOutput:
+    """sys.stdout wrapper that drops the lines matching _TABLE_NOISE_RES and
+    collapses the blank lines they leave behind. Everything else -- the
+    '[paper-build] rebuilt <path>' lines and the measurement block included --
+    passes through untouched."""
+
+    def __init__(self, stream):
+        self.wrapped = stream
+        self._buf = ""
+        self._blank = True          # suppress a run of blank lines
+
+    def write(self, text):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line)
+        return len(text)
+
+    def _emit(self, line):
+        if any(rx.search(line) for rx in _TABLE_NOISE_RES):
+            return
+        if not line.strip():
+            if self._blank:
+                return
+            self._blank = True
+        else:
+            self._blank = False
+        self.wrapped.write(line + "\n")
+
+    def flush(self):
+        self.wrapped.flush()
+
+    def drain(self):
+        """Emit whatever the last print left without a trailing newline."""
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
+        self.wrapped.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
+
+
 def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                                  show_partial=False, only_vaghar_pairs=False,
                                  combination_table=None, force_timeout=None,
@@ -3967,7 +4278,8 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                                  paper_chart_taus=None,
                                  recompile=True,
                                  ablation_tables=False,
-                                 ablation_expected=None):
+                                 ablation_expected=None,
+                                 vaghar_pairs_from="auto"):
     """Regenerate ONLY the neta-s-paper per-cell tables + N2 charts, sourcing
     the transfer (advstd N2) column DIRECTLY from the advStd .txt files (no
     CSVs, no standard-baseline pairing). Honors --combination_table (combo
@@ -3997,9 +4309,44 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     if only_vaghar_pairs and hasattr(updater, "set_expected_cts_provider"):
         # "Expected" = the vaghar-pair plan of the SAME cell, so the partial
         # "*" flags planned-but-absent runs, not designed-away class pairs.
+        # The plan is read from the FROZEN inventory (DEFAULT_VAGHAR_PLAN)
+        # rather than re-derived from the baseline files on every invocation:
+        # those files grow while a sweep runs, so the live map raises the
+        # coverage bar of a cell whose ours/transfer runs are still in flight
+        # and silently drops rows the previous invocation counted. A cell the
+        # inventory does not list falls back (None) to the '@CT' / --ct grid.
+        # '--vaghar_pairs_from live' restores the old scan.
+        _plan = None
+        if vaghar_pairs_from != "live":
+            _plan_path = (DEFAULT_VAGHAR_PLAN if vaghar_pairs_from == "auto"
+                          else vaghar_pairs_from)
+            if not os.path.isabs(_plan_path):
+                _plan_path = os.path.join(cwd, _plan_path)
+            _plan = _load_vaghar_plan(_plan_path)
+            if _plan is None and vaghar_pairs_from != "auto":
+                print(f"[paper-tables] vaghar plan {_plan_path} not found; "
+                      f"falling back to the live scan")
+        # One line per invocation, not per dataset: the yardstick is the same
+        # for all of them.
+        if _plan is not None:
+            _msg = (f"[paper-tables] c_target coverage measured against the "
+                    f"frozen vaghar plan ({len(_plan)} cells); a cell it does "
+                    f"not list falls back to the requested '@CT' grid")
+        else:
+            _msg = ("[paper-tables] c_target coverage measured against a LIVE "
+                    "scan of the baseline files; a sweep writing into "
+                    f"{EXP_ROOT} can change it between two runs of this "
+                    f"command")
+        if _msg not in _VAGHAR_PLAN_ANNOUNCED:
+            _VAGHAR_PLAN_ANNOUNCED.add(_msg)
+            print(_msg)
+
         # _vaghar_pairs_for_cell returns Julia-indexed pairs; the updater
         # works 0-indexed.
         def _vaghar_expected(ds_, arch_, pert_, p_size_, c_src_):
+            if _plan is not None:
+                return _vaghar_expected_from_plan(
+                    _plan, ds_, arch_, pert_, p_size_, c_src_)
             pairs = _vaghar_pairs_for_cell(ds_, arch_, pert_, p_size_)
             return {t - 1 for (c, t) in pairs if c == int(c_src_) + 1}
         updater.set_expected_cts_provider(_vaghar_expected)
@@ -4010,6 +4357,7 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     try:
         combination_filter = updater.parse_combination_spec(combination_table)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[paper-tables] {exc}")
         return
 
@@ -4295,6 +4643,21 @@ def main():
                              "in the SAME (dataset, arch, perturbation, eps) cell under "
                              "--experiments_root. Pairs without a vaghar baseline are never "
                              "scheduled, so union --sweep_ctag/--ct values are safe.")
+    parser.add_argument("--verbose_paper_tables", action="store_true",
+                        help="With --paper_tables_from_txt: also print the per-dataset "
+                             "progress (settings echo, '===== Regenerating =====' headers, "
+                             "per-block 'wrote/no changes', [arch-scope], [tab1], "
+                             "[relax-precision]). Without it the run prints the rebuilt PDF "
+                             "paths, the measurement block, and any error or warning.")
+    parser.add_argument("--vaghar_pairs_from", type=str, default="auto",
+                        help="With --paper_tables_from_txt --only_vaghar_pairs: where the "
+                             "c_target coverage yardstick (the red '*') comes from. 'auto' "
+                             f"(default) reads the frozen plan {DEFAULT_VAGHAR_PLAN} when it "
+                             "exists, a PATH reads that inventory JSON, and 'live' re-derives "
+                             "the plan from the baseline result files as before. The live scan "
+                             "moves while a sweep appends c_targets to those files, so a "
+                             "\\baseline run finishing ahead of its ours/transfer siblings "
+                             "drops rows the previous run of the same command counted.")
     parser.add_argument("--experiments_root", type=str, default="paper_experiments",
                         help="Root directory of the results tree, relative to this "
                              "script's directory (absolute paths also work). Every "
@@ -4780,6 +5143,12 @@ def main():
 
     # ── Paper-tables mode: regenerate neta-s-paper tables from advStd txt ──
     if args.paper_tables_from_txt:
+        # Keep the terminal to the rebuilt PDF paths and the measurement block;
+        # --verbose_paper_tables prints the per-dataset progress too.
+        _quiet_out = None
+        if not args.verbose_paper_tables:
+            _quiet_out = _QuietTableOutput(sys.stdout)
+            sys.stdout = _quiet_out
         # --dataset may be comma-separated; regenerate each dataset's
         # neta-s-paper per-cell tables + N2 charts straight from the advStd
         # .txt files (no CSVs), reusing the same --arch_models.
@@ -4885,7 +5254,8 @@ def main():
                 recompile=False,
                 ablation_tables=args.ablation_tables,
                 ablation_expected=_parse_ablation_expected(
-                    args.ablation_expected))
+                    args.ablation_expected),
+                vaghar_pairs_from=args.vaghar_pairs_from)
             all_time_cells += tc
             all_bd_groups += bd
             all_relax_rows += rx
@@ -4922,6 +5292,9 @@ def main():
             _sentences_changed = True
         if _sentences_changed:
             _recompile_neta_s_paper(cwd)
+        if _quiet_out is not None:
+            _quiet_out.drain()
+            sys.stdout = _quiet_out.wrapped
         return
 
     # ── Analysis mode: find advanced-standard faster than standard ───

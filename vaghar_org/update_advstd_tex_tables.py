@@ -3760,6 +3760,7 @@ def regenerate_nn1_section(tex_path, cwd, dataset, arch_runs,
         update_nn1_tex(tex_path, body, begin_mark=begin_mark,
                        end_mark=end_mark, label_suffix=ds_label_suffix)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] nn1 block skipped: {exc}")
     except Exception as exc:
         print(f"[update_advstd_tex_tables] nn1 block error: {exc}")
@@ -3919,19 +3920,46 @@ def _wide_column_short_label(col):
     return "+".join(parts)
 
 
-def _wide_row_file_rank(row):
+def _wide_row_file_rank(row, force_timeout=None, rerun_timeout_eps=30.0):
     """Sort key deciding WHICH result file wins when several of them carry a
-    line for the same (column, c_source, c_target) cell. Prefer a file from a
+    line for the same (column, c_source, c_target) cell. Prefer a run whose
+    reported solve time matches the requested cap, then a file from a
     stdBoost_*/advStd_* dir over one from a vaghar{No,With}Perturbed_*
     baseline dir, then the most recent run (the leading timestamp in the file
-    name), then the name itself so the choice never depends on glob order."""
+    name), then the name itself so the choice never depends on glob order.
+
+    The cap comes first, ahead of the timestamp: the caller drops a timeout
+    recorded under another wall-clock cap anyway, so letting the newest file
+    win the cell only to be dropped afterwards empties a cell an older at-cap
+    run had already answered. har / linf 0.01 / c_s=0 / c_t=1 held three
+    \\baseline timeouts -- 18000s, 12000s and 10802s -- and under a 10800s cap
+    the newest (18000s) won the cell and was then discarded, so the 10802s run
+    that answers the request was lost. `force_timeout=None` keeps the old
+    order."""
     fname = row.get("src_file") or ""
     m = re.match(r"(\d+)", fname)
     stamp = int(m.group(1)) if m else -1
-    return (1 if row.get("src_baseline_dir") else 0, -stamp, fname)
+    cap_mismatch = 1 if (force_timeout is not None
+                         and _aaai_is_timeout_mismatch(
+                             row, force_timeout, rerun_timeout_eps)) else 0
+    return (cap_mismatch, 1 if row.get("src_baseline_dir") else 0, -stamp,
+            fname)
 
 
-def _dedupe_wide_rows(rows):
+def _reraise_if_process_exit(exc):
+    """Re-raise a SystemExit that carries a NUMERIC code.
+
+    Every SystemExit this module raises carries a message (a bad
+    --combination_table spec, missing AUTO markers, ...), and the callers below
+    catch those to skip one block and carry on. A numeric code comes from the
+    supervisor's SIGINT/SIGTERM handler instead (sys.exit(128 + signum)):
+    swallowing it would let a Ctrl+C fall through to the next block and finish
+    the run as though nothing happened."""
+    if isinstance(exc.code, int):
+        raise exc
+
+
+def _dedupe_wide_rows(rows, force_timeout=None, rerun_timeout_eps=30.0):
     """Keep ONE row per (arch, role, perturbation, size, combo, c_source,
     c_target, geom) cell.
 
@@ -3947,20 +3975,29 @@ def _dedupe_wide_rows(rows):
 
     `seed` is deliberately NOT part of the key: the baseline dirs bypass
     --combo_ranking_seeds, so a seed-0 baseline file and the seed-filtered
-    boost file describe the SAME cell and must not both survive."""
+    boost file describe the SAME cell and must not both survive.
+
+    `force_timeout` (a scalar or the per-arch dict) makes the winner a run at
+    the requested cap wherever the cell has one, so a cross-cap re-run cannot
+    evict the answer the caller asked for; see _wide_row_file_rank."""
     best = {}
+
+    def _rank(r):
+        return _wide_row_file_rank(r, force_timeout, rerun_timeout_eps)
+
     for r in rows:
         key = (r.get("arch"), r.get("role"), r.get("perturbation"),
                r.get("perturbation_size"), r.get("combo"),
                r.get("c_source"), r.get("c_target"), bool(r.get("geom")))
         cur = best.get(key)
-        if cur is None or _wide_row_file_rank(r) < _wide_row_file_rank(cur):
+        if cur is None or _rank(r) < _rank(cur):
             best[key] = r
     return list(best.values())
 
 
 def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
-                                 seeds_filter=None, stale_fn=None):
+                                 seeds_filter=None, stale_fn=None,
+                                 force_timeout=None, rerun_timeout_eps=30.0):
     """Walk each arch's results dir and yield per-cell timing rows for the
     per-arch wide comparison section. One row per (.txt file, cs, ct) cell.
     The combo field is 'vaghar', 'PI', or one of the 8 boost masks.
@@ -3970,6 +4007,11 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
     >=1 binary. None disables the gate (keeps the prior behavior). Applies to
     the relaxed combos (e.g. "ours" at tau=0.5); all-off/vaghar files dropped
     no binary so they pass through unchanged.
+
+    `force_timeout` is not a filter here -- the callers still drop cross-cap
+    timeouts themselves -- but it decides which of several runs of the SAME
+    cell survives the dedup, so a re-run under another cap cannot evict the
+    at-cap run the caller is about to keep.
     """
     import glob
     rows = []
@@ -4092,7 +4134,7 @@ def _collect_wide_perarch_cells(arch_runs, cwd, dataset, parse_result_file,
                                 "src_file": fname,
                                 "src_baseline_dir": (src_kind != "boost"),
                             })
-    return _dedupe_wide_rows(rows)
+    return _dedupe_wide_rows(rows, force_timeout, rerun_timeout_eps)
 
 
 def _load_delta_max_values(cwd, dataset, archs):
@@ -6439,7 +6481,9 @@ def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
     rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                        parse_result_file,
                                        seeds_filter=seeds_filter,
-                                       stale_fn=stale_fn)
+                                       stale_fn=stale_fn,
+                                       force_timeout=force_timeout,
+                                       rerun_timeout_eps=rerun_timeout_eps)
     archs = sorted((a for a, _ in arch_runs), key=_tab1_arch_sort_key)
     if advstd_meta_fn is not None and perts is not None:
         rows += _load_advstd_rows_for_wide_from_txt(
@@ -6807,6 +6851,7 @@ def regenerate_aaai_relax_precision_section(tex_path, model_rows):
                                      begin_mark=AAAI_RELAX_PREC_BEGIN_MARK,
                                      end_mark=AAAI_RELAX_PREC_END_MARK)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_relax_precision block "
               f"skipped: {exc}")
     except Exception as exc:
@@ -6851,7 +6896,9 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                             parse_result_file,
                                             seeds_filter=seeds_filter,
-                                            stale_fn=stale_fn)
+                                            stale_fn=stale_fn,
+                                            force_timeout=force_timeout,
+                                            rerun_timeout_eps=rerun_timeout_eps)
         # Emit archs in Table-1 order so the per-cell tables follow the paper's
         # Networks table rather than the --arch_timeouts command order.
         archs = sorted((a for a, _ in arch_runs), key=_tab1_arch_sort_key)
@@ -6902,6 +6949,7 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                          end_mark=end_mark,
                                          label_suffix=ds_label_suffix)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_safe_wide block skipped: "
               f"{exc}")
     except Exception as exc:
@@ -7263,6 +7311,15 @@ _AAAI_BD_CEIL_SLACK = 10.0
 # tick numbers plus the rotated "bounds diff" label. Only the row's last panel
 # draws them, so the row pays this once.
 _AAAI_RIGHT_DECO_PT = 34.0
+
+# Total width a solve-time ROW spends on decoration: the rotated
+# "time (minutes)" label and its tick numbers on the left, plus the
+# bound-difference tick numbers and rotated label on the right. Measured on the
+# compiled rows -- every single-panel row came out at exactly its axis width
+# plus 70.77pt -- with a few points of air for a wider tick number. A panel is
+# chunked against \textwidth MINUS this, so a row never outgrows the standalone
+# box and loses its right-hand label to the crop.
+_AAAI_TIME_ROW_DECO_PT = 76.0
 
 # Width a LATER panel of a row reserves on its left. It keeps its own time
 # scale and so prints its own tick numbers, but NOT the rotated unit name
@@ -7731,8 +7788,9 @@ _AAAI_LABEL_PT_MAX = 9.0
 # lifted for it (see _aaai_vlabel_ymax).
 # NOTE: 6pt is below AAAI guideline 3's 9pt floor for text inside figures; a
 # 9pt rotated numeral is ~6.3pt wide and would touch the adjacent bar. Set this
-# to 0.0 to switch the labels off again.
-_AAAI_VLABEL_PT = 6.0
+# to 0.0 to switch the labels off again -- which is where it stands now (user
+# request: no numbers above the bars), so no figure text is under the floor.
+_AAAI_VLABEL_PT = 0.0
 # Air between the bar's tallest decoration and the first digit, and again above
 # the last digit (the node's inner sep).
 _AAAI_VLABEL_SEP_PT = 1.5
@@ -7847,22 +7905,31 @@ def _aaai_render_chart_pdf(body_lines, basename, tex_dir, height_frac=0.88):
     tex_file = os.path.join(figdir, basename + ".tex")
     with open(tex_file, "w") as fh:
         fh.write(src)
-    proc = subprocess.run(
-        ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
-         basename + ".tex"],
-        cwd=figdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    pdf_file = os.path.join(figdir, basename + ".pdf")
-    if proc.returncode != 0 or not os.path.exists(pdf_file):
-        tail = proc.stdout.decode("utf8", "replace").splitlines()[-25:]
-        raise RuntimeError(
-            "pdflatex failed for figure %s:\n%s" % (basename, "\n".join(tail)))
-    # Drop the per-figure build droppings; keep only .tex (the source of record)
-    # and .pdf (what the paper imports).
-    for ext in (".aux", ".log"):
-        try:
-            os.remove(os.path.join(figdir, basename + ext))
-        except OSError:
-            pass
+    # pdflatex writes its output into a TEMP directory and the finished PDF is
+    # moved into place, so the figure the paper imports is either the previous
+    # one or the new one and never a half-written file: a Ctrl+C during the
+    # figure loop used to leave a truncated .pdf behind, and every later
+    # supplementary build then died on "Couldn't read xref table". cwd stays
+    # `figdir` so the document's '\input{../figure_defs}' still resolves, and
+    # -output-directory keeps the .aux/.log droppings out of the paper tree.
+    import shutil
+    import tempfile
+    outdir = tempfile.mkdtemp(prefix=".build-" + basename + "-", dir=figdir)
+    try:
+        proc = subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
+             "-output-directory=" + outdir, basename + ".tex"],
+            cwd=figdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        built_pdf = os.path.join(outdir, basename + ".pdf")
+        if proc.returncode != 0 or not os.path.exists(built_pdf):
+            tail = proc.stdout.decode("utf8", "replace").splitlines()[-25:]
+            raise RuntimeError(
+                "pdflatex failed for figure %s:\n%s"
+                % (basename, "\n".join(tail)))
+        # Same filesystem (outdir sits inside figdir), so this is atomic.
+        os.replace(built_pdf, os.path.join(figdir, basename + ".pdf"))
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
     # Cap the height too (keepaspectratio): a wide/short figure still binds on
     # width (unchanged), but a tall one -- e.g. the 1-plot-per-row per-(c_s,c_t)
     # solve-time figure -- scales DOWN to fit a float page instead of overrunning
@@ -9561,7 +9628,9 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                            parse_result_file,
                                            seeds_filter=seeds_filter,
-                                           stale_fn=stale_fn)
+                                           stale_fn=stale_fn,
+                                           force_timeout=force_timeout,
+                                           rerun_timeout_eps=rerun_timeout_eps)
         # Emit archs in Table-1 order so the per-arch charts (and the combined
         # cross-dataset grids, which follow encounter order) match the paper's
         # Networks table rather than the --arch_timeouts command order.
@@ -9597,6 +9666,7 @@ def regenerate_aaai_n2_charts_section(tex_path, cwd, dataset, arch_runs,
             label_suffix=ds_label_suffix)
         return time_cells, bd_groups
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_n2_charts block skipped: "
               f"{exc}")
     except Exception as exc:
@@ -9611,11 +9681,39 @@ AAAI_N2_TIME_COMBINED_END_MARK   = "% END AUTO: aaai_n2_time_combined"
 AAAI_N2_TIME_APPENDIX_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_time_appendix"
 AAAI_N2_TIME_APPENDIX_END_MARK   = "% END AUTO: aaai_n2_time_appendix"
 
+#: Every solve-time and bounds-difference figure is emitted into the
+#: SUPPLEMENTARY (user request), so that a figure can take a full \textwidth
+#: row of its own and its labels stay readable. The Evaluation's own AUTO
+#: blocks then render a comment instead of a figure, and the appendix blocks
+#: render EVERY cluster rather than only the ones the body leaves out. The
+#: body/appendix split (_time_in_body, _bd_in_body) is kept: it still fixes
+#: the ORDER in which the appendix opens, headline slots first.
+AAAI_FIGURES_IN_APPENDIX_ONLY = True
+
 # The perturbations whose solve-time figures go in the EVALUATION body, one
 # pooled figure each; every other perturbation goes to the appendix. Matched
 # against the normalised perturbation key, so the display form ($\ell_\infty$)
 # and the raw name (linf) both resolve.
 _AAAI_BODY_PERT_KEYS = ("patch", "rotation", "linf", "translation")
+
+
+#: Solve-time blocks that get a FIGURE OF THEIR OWN, placed BEFORE every other
+#: row (user request), as (dataset display, arch display, perturbation key,
+#: size). Every source class of such a block shares that one figure; the row
+#: packer never joins another panel to it.
+_AAAI_TIME_OWN_FIGURE_FIRST = (
+    ("MNIST", r"3$\times$50", "patch", "1,14,14,3"),
+)
+
+
+def _time_own_figure_key(entry):
+    """The _AAAI_TIME_OWN_FIGURE_FIRST entry this cluster belongs to, or None.
+    `entry` is a (dataset_disp, arch, arch_disp, type_disp, c_src, item_label,
+    bars) tuple."""
+    size = _aaai_label_parts(entry[5])[1].strip().strip("()").replace(" ", "")
+    here = (str(entry[0]).strip(), str(entry[2]).strip(),
+            _aaai_pert_key(entry[3]), size)
+    return here if here in _AAAI_TIME_OWN_FIGURE_FIRST else None
 
 
 #: Solve-time clusters the Evaluation does NOT show even though their
@@ -9707,7 +9805,8 @@ def _aaai_fig_dataset_name(ds_disp):
 def _aaai_chart_taus():
     """Thresholds the bar charts draw a cluster for, headline first so a
     cluster and its off-headline twin land next to each other."""
-    taus = [t for t in _AAAI_WIDE_TAUS if t != "0.0"] or [
+    taus = [t for t in _AAAI_WIDE_TAUS
+            if t != "0.0" and t in _AAAI_CHART_TAUS] or [
         _AAAI_CHART_HEADLINE_TAU]
     return sorted(taus, key=lambda t: (t != _AAAI_CHART_HEADLINE_TAU, t))
 
@@ -9859,7 +9958,10 @@ def _aaai_time_pooled_rows(entries, force_timeout=None, gap_ymax=None):
     pooled = sorted(entries, key=lambda g: (g[2], g[0], g[3],
                                             _aaai_label_parts(g[5])[1],
                                             g[4], g[5]))
-    plotbox = max(_AAAI_TEXTWIDTH_PT - 1.5 * _AAAI_PT_PER_CM, 1.0)
+    # A solve-time panel carries a y axis on BOTH sides (time on the left,
+    # $\delta_u-\delta_l$ on the right), so it reserves _AAAI_TIME_ROW_DECO_PT
+    # rather than the 1.5cm the one-sided bounds-difference panels allow for.
+    plotbox = max(_AAAI_TEXTWIDTH_PT - _AAAI_TIME_ROW_DECO_PT, 1.0)
     model_extra = ((_AAAI_MODEL_GAP_PT - _AAAI_CLUSTER_GAP_PT)
                    / _AAAI_SLOT_PT)
     # Indivisible packing units: a (size, model, dataset, c_s) block never
@@ -9872,19 +9974,35 @@ def _aaai_time_pooled_rows(entries, force_timeout=None, gap_ymax=None):
             blocks.append([])
             prev_key = key
         blocks[-1].append(g)
-    chunks, cur = [], []
+    # A block pinned by _AAAI_TIME_OWN_FIGURE_FIRST forces a chunk boundary on
+    # both sides, and consecutive blocks of the SAME pin (its source classes)
+    # collect into that one chunk. `pins` records the pin of each chunk, so the
+    # caller can give it a row -- and a figure -- of its own.
+    chunks, pins, cur, cur_pin = [], [], [], None
     for blk in blocks:
+        pin = _time_own_figure_key(blk[0])
+        if pin is not None or cur_pin is not None:
+            if pin == cur_pin and cur:
+                cur += blk
+                continue
+            if cur:
+                chunks.append(cur)
+                pins.append(cur_pin)
+            cur, cur_pin = list(blk), pin
+            continue
         cand = cur + blk
         w = _aaai_panel_span(_groups3(cand), sort_by_label=True,
                              run_gap_extra=0.0,
                              group_gap_extra=model_extra) * _AAAI_SLOT_PT
         if cur and w > plotbox:
             chunks.append(cur)
+            pins.append(None)
             cur = list(blk)
         else:
             cur = cand
     if cur:
         chunks.append(cur)
+        pins.append(cur_pin)
 
     panels = []
     for fi, chunk in enumerate(chunks):
@@ -9944,6 +10062,9 @@ def _aaai_time_pooled_rows(entries, force_timeout=None, gap_ymax=None):
             # "timeout on the left, 100% on the right" (user request). The
             # smallest cap is used: it is the level the caption names.
             "cap_pos": ((caps[0] / 60.0) ** power) if caps else None,
+            # Set for a _AAAI_TIME_OWN_FIGURE_FIRST block: this panel takes a
+            # row, and so a figure, of its own, ahead of the packed ones.
+            "own_figure": pins[fi],
         })
     return panels, one_model
 
@@ -9963,23 +10084,33 @@ _AAAI_TIME_APP_CAPTION = (r"Execution time (bars) and analysis tightness "
                           r"remaining perturbations.")
 
 
+def _aaai_part_caption(caption, i, n):
+    """The caption of figure `i` of `n` showing the same results. Every row of
+    results is its own figure, so the caption says which part it is; a single
+    figure keeps the caption as written."""
+    if n <= 1:
+        return caption
+    return caption.rstrip().rstrip(".") + f" (part {i} of {n})."
+
+
 def _aaai_time_single_figure(by_pert, order, force_timeout=None,
                              tex_dir=None, basename="n2_time",
                              label_base="fig:n2-time", extra_labels=(),
                              gap_ymax=None, float_spec="tp",
                              caption=_AAAI_TIME_CAPTION, height_frac=0.88):
-    """ONE figure holding the solve-time rows of EVERY perturbation given
-    (user request: a single figure in the Evaluation and a single one in the
-    appendix, rather than one per perturbation).
+    """The solve-time figures of every perturbation given, ONE FIGURE PER
+    PACKED ROW (user request: a row of results per figure, so the bars and the
+    labels are big enough to read).
 
     Each perturbation contributes one or more rows from _aaai_time_pooled_rows;
-    the rows are stacked in `order`, the legend is drawn once at the top, and
-    the whole stack renders to a single PDF that one figure* imports. The
+    the rows are first-fit packed exactly as before, but each one now renders
+    to its OWN PDF under its OWN figure*, carrying the legend of its own. A
+    single row is short, so the \\includegraphics binds on width and is never
+    scaled down to fit the height cap the way a many-row stack was. The
     perturbation is named on each block's label (\"<type>(<size>)\"), so the
     caption does not have to enumerate them.
     """
-    graphic = []
-    graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
+    legend = _aaai_standalone_legend(series=_AAAI_CHART_SERIES)
     # ONE packing pass PER PERTURBATION (user request): a panel never mixes
     # perturbation types. Several such panels then SHARE a row when they fit
     # \textwidth together, which is what keeps the figure short without ever
@@ -9992,6 +10123,10 @@ def _aaai_time_single_figure(by_pert, order, force_timeout=None,
         pans, _one_model = _aaai_time_pooled_rows(
             cells, force_timeout=force_timeout, gap_ymax=gap_ymax)
         panels += pans
+    # A panel pinned by _AAAI_TIME_OWN_FIGURE_FIRST is held out of the packing
+    # and opens the section as a row -- and so a figure -- of its own.
+    own = [p for p in panels if p.get("own_figure")]
+    panels = [p for p in panels if not p.get("own_figure")]
     # First-fit into rows. A row pays the left decoration once (the rotated
     # "time (minutes)" label and its tick numbers), the right decoration once
     # (the shared bound-difference axis), and the separation between panels.
@@ -10009,8 +10144,17 @@ def _aaai_time_single_figure(by_pert, order, force_timeout=None,
         else:
             rows.append([pan])
             row_w.append(_AAAI_PANEL_DECO_PT + pan["w"])
+    rows = [[p] for p in own] + rows
     n_rows = len(rows)
+    if not n_rows:
+        return []
+    out = []
     for ri, row in enumerate(rows):
+        # A row is a figure of its own: its graphic starts from the legend and
+        # ends with its single tikzpicture. The \par is load-bearing -- a row
+        # narrow enough to sit beside the legend would otherwise share its
+        # line and ride up on the legend's baseline.
+        graphic = list(legend)
         graphic.append(r"\par\smallskip")
         graphic.append(r"\begin{tikzpicture}")
         for ci, pan in enumerate(row):
@@ -10082,17 +10226,21 @@ def _aaai_time_single_figure(by_pert, order, force_timeout=None,
                             f"(axis cs:{px:.4g},{pg:.4g}) {{}};")
                 graphic.append(r"\end{axis}")
         graphic.append(r"\end{tikzpicture}")
-    if not n_rows:
-        return []
-    out = [r"\begin{figure*}[" + float_spec + "]", r"\centering",
-           _aaai_render_chart_pdf(graphic, basename, tex_dir,
-                                  height_frac=height_frac)]
-    out.append(f"\\caption{{{caption}}}")
-    out.append(f"\\label{{{label_base}}}")
-    for lb in extra_labels:
-        out.append(f"\\label{{{lb}}}")
-    out.append(r"\end{figure*}")
-    out.append("")
+        # The FIRST row keeps the plain basename and the plain label (plus the
+        # per-perturbation aliases), so a PDF filename and a \ref written
+        # before the split still resolve; the rest are numbered from 2.
+        name = basename if ri == 0 else f"{basename}_{ri + 1}"
+        label = label_base if ri == 0 else f"{label_base}-{ri + 1}"
+        out += [r"\begin{figure*}[" + float_spec + "]", r"\centering",
+                _aaai_render_chart_pdf(graphic, name, tex_dir,
+                                       height_frac=height_frac)]
+        out.append(f"\\caption{{{_aaai_part_caption(caption, ri + 1, n_rows)}}}")
+        out.append(f"\\label{{{label}}}")
+        if ri == 0:
+            for lb in extra_labels:
+                out.append(f"\\label{{{lb}}}")
+        out.append(r"\end{figure*}")
+        out.append("")
     return out
 
 
@@ -10152,27 +10300,44 @@ def regenerate_aaai_time_appendix_section(
         tex_path, time_cells, force_timeout=None,
         begin_mark=AAAI_N2_TIME_APPENDIX_BEGIN_MARK,
         end_mark=AAAI_N2_TIME_APPENDIX_END_MARK):
-    """The solve-time figures for every perturbation the body does NOT show
-    (user request: patch, rotation and linf in the Evaluation, anything else
-    here), one pooled figure per perturbation, same layout as the body's."""
+    """The solve-time figures of the supplementary: under
+    AAAI_FIGURES_IN_APPENDIX_ONLY every perturbation renders here, one figure
+    per packed row; otherwise only the perturbations the body does not show."""
     try:
-        _body, rest = _aaai_time_cells_by_pert(time_cells)
+        head, rest = _aaai_time_cells_by_pert(time_cells)
+        if AAAI_FIGURES_IN_APPENDIX_ONLY:
+            # Every cluster renders here, the body slots first so the
+            # supplementary opens with the results the Evaluation discusses.
+            merged = {}
+            for src in (head, rest):
+                for key, (disp, cells) in src.items():
+                    merged.setdefault(key, (disp, []))[1].extend(cells)
+            rest = merged
         if rest:
             tex_dir = _fig_root_for_tex(tex_path)
+            # Body perturbations first, then the rest alphabetically.
+            order = ([k for k in _AAAI_BODY_PERT_KEYS if k in rest]
+                     + sorted(k for k in rest
+                              if k not in _AAAI_BODY_PERT_KEYS))
             figs = _aaai_time_single_figure(
-                rest, sorted(rest), force_timeout=force_timeout,
+                rest, order, force_timeout=force_timeout,
                 tex_dir=tex_dir, basename="n2_time_app",
                 label_base="fig:n2-time-app",
                 gap_ymax=_aaai_time_gap_ymax(time_cells),
-                caption=_AAAI_TIME_APP_CAPTION,
-                height_frac=_AAAI_TIME_APP_HEIGHT, float_spec="p")
+                caption=(_AAAI_TIME_CAPTION if AAAI_FIGURES_IN_APPENDIX_ONLY
+                         else _AAAI_TIME_APP_CAPTION),
+                # One row per figure: the height cap can be generous, since a
+                # row binds on width and shrinking it would cost legibility.
+                height_frac=(0.88 if AAAI_FIGURES_IN_APPENDIX_ONLY
+                             else _AAAI_TIME_APP_HEIGHT), float_spec="p")
             body_tex = "\n".join(figs).rstrip("\n")
         else:
-            body_tex = r"% (every perturbation is shown in the body)"
+            body_tex = r"% (no solve-time clusters)"
         update_aaai_wide_perarch_tex(tex_path, body_tex,
                                      begin_mark=begin_mark,
                                      end_mark=end_mark, label_suffix="")
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_n2_time_appendix block "
               f"skipped: {exc}")
     except Exception as exc:
@@ -10190,6 +10355,14 @@ def regenerate_aaai_time_combined_section(
     emitted by regenerate_aaai_time_appendix_section instead. `time_cells` is a
     list of (dataset_disp, arch, arch_disp, type_disp, c_src, item_label,
     bars)."""
+    if AAAI_FIGURES_IN_APPENDIX_ONLY:
+        # Every solve-time figure lives in the supplementary (user request):
+        # the Evaluation's block holds a comment and no float.
+        update_aaai_wide_perarch_tex(
+            tex_path,
+            r"% (the solve-time figures are in the supplementary)",
+            begin_mark=begin_mark, end_mark=end_mark, label_suffix="")
+        return
     try:
         body, _rest = _aaai_time_cells_by_pert(time_cells)
         if body:
@@ -10215,6 +10388,7 @@ def regenerate_aaai_time_combined_section(
                                      end_mark=end_mark,
                                      label_suffix="")
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_n2_time_combined block skipped: "
               f"{exc}")
     except Exception as exc:
@@ -10479,6 +10653,26 @@ _AAAI_BODY_BD_SLOTS = {
 }
 
 
+#: Models whose bounds-difference clusters share ONE figure of their own, ahead
+#: of every other row, as (dataset, arch fragment) -- matched the same way as
+#: _AAAI_BODY_BD_SLOTS. No other model appears in that figure, and these models
+#: appear in no other (user request: HAR and conv4 together, and only them).
+_AAAI_BD_OWN_FIGURE = (
+    ("har", "1times500"),
+    ("cifar-10", "conv4"),
+)
+
+
+def _bd_own_figure(entry):
+    """True for a cluster whose model is named in _AAAI_BD_OWN_FIGURE."""
+    ds = _norm_ds(entry[0])
+    arch_norm = re.sub(r"[^0-9a-z]+", "",
+                       str(entry[3] if len(entry) > 3 else "").lower()
+                       .replace("\\times", "times"))
+    return any(w_ds == ds and w_arch in arch_norm
+               for (w_ds, w_arch) in _AAAI_BD_OWN_FIGURE)
+
+
 def _bd_in_body(entry):
     """True for the bounds-difference clusters the EVALUATION shows. Pinned
     to the submitted paper's Figure 5 via _AAAI_BODY_BD_SLOTS (user request);
@@ -10566,9 +10760,14 @@ def regenerate_aaai_bounddiff_appendix_section(
         tex_path, bd_groups, force_timeout=None,
         begin_mark=AAAI_N2_BOUNDDIFF_APP_BEGIN_MARK,
         end_mark=AAAI_N2_BOUNDDIFF_APP_END_MARK):
-    """The bounds-difference figures for every cluster the body does NOT show
-    (see _bd_in_body). Same renderer as the body's, different AUTO block."""
-    _body, rest = _bd_split(bd_groups)
+    """The bounds-difference figures of the supplementary: under
+    AAAI_FIGURES_IN_APPENDIX_ONLY every cluster renders here, otherwise only
+    the clusters the body does not show (see _bd_in_body). Same renderer as
+    the body's, different AUTO block."""
+    body, rest = _bd_split(bd_groups)
+    if AAAI_FIGURES_IN_APPENDIX_ONLY:
+        # The renderer re-sorts, so the two halves can simply be concatenated.
+        rest = body + rest
     return regenerate_aaai_bounddiff_section(
         tex_path, rest, force_timeout=force_timeout,
         begin_mark=begin_mark, end_mark=end_mark,
@@ -10582,14 +10781,23 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                                       label_stem="fig:n2-bounddiff",
                                       basename_stem="n2_bounddiff",
                                       preselected=False, float_spec="tp"):
-    """Emit EXACTLY TWO bounds-difference figures (user request: no
-    per-dataset split anymore). `bd_groups` is the pooled list of
-    (dataset_disp, type_disp, size_disp, x_label, bars) clusters from every
-    dataset; here they are sorted so clusters sharing a perturbation type and
-    size sit TOGETHER (stable, so within a type+size the dataset/arch/c_s
-    order is preserved), then split in half across the two `figure*`s. The
-    x labels carry the dataset ("arch, dataset" line), so no figure belongs
-    to a dataset. Both figures live in the one AUTO block."""
+    """Emit the bounds-difference figures, ONE PER PACKED ROW of results (user
+    request, so a row keeps the full \\textwidth and reads at full size).
+    `bd_groups` is the pooled list of (dataset_disp, type_disp, size_disp,
+    x_label, bars) clusters from every dataset; here they are sorted so
+    clusters sharing a perturbation type and size sit TOGETHER (stable, so
+    within a type+size the dataset/arch/c_s order is preserved), then packed
+    into rows, each row becoming its own `figure*`. The x labels carry the
+    dataset ("arch, dataset" line), so no figure belongs to a dataset. Every
+    figure lives in the one AUTO block."""
+    if AAAI_FIGURES_IN_APPENDIX_ONLY and not preselected:
+        # The body keeps no bounds-difference figure of its own (user
+        # request); regenerate_aaai_bounddiff_appendix_section draws them all.
+        update_aaai_wide_perarch_tex(
+            tex_path,
+            r"% (the bounds-difference figures are in the supplementary)",
+            begin_mark=begin_mark, end_mark=end_mark, label_suffix="")
+        return
     if not preselected:
         # The EVALUATION shows only the selected clusters; the rest are
         # emitted by regenerate_aaai_bounddiff_appendix_section.
@@ -10637,66 +10845,90 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
             plotbox = max(_AAAI_TEXTWIDTH_PT - 1.5 * _AAAI_PT_PER_CM, 1.0)
             model_extra = ((_AAAI_MODEL_GAP_PT - _AAAI_CLUSTER_GAP_PT)
                            / _AAAI_SLOT_PT)
-            blocks, prev_key = [], None
-            for g in pooled:
-                # A twin pair is ONE packing unit: the two never land in
-                # different figures.
-                key = (g[3], g[0], g[1], g[2], g[4],
-                       (g[7] if len(g) > 7 else 0))
-                if key != prev_key:
-                    blocks.append([])
-                    prev_key = key
-                blocks[-1].append(g)
-            chunks, cur = [], []
-            for blk in blocks:
-                cand = cur + blk
-                w = _aaai_panel_span(
-                    _groups3(cand), sort_by_label=True,
-                    run_gap_extra=model_extra) * _AAAI_SLOT_PT
-                if cur and w > plotbox:
-                    chunks.append(cur)
-                    cur = list(blk)
-                else:
-                    cur = cand
-            if cur:
-                chunks.append(cur)
-            # ONE figure holding EVERY chunk (user request): the chunks
-            # become stacked rows of a single graphic, the legend is drawn
-            # once, and the lot renders to one PDF under one caption.
+            def _chunk(entries):
+                """Pack `entries` into rows. A (type, size, model, c_s) block
+                -- a twin pair included -- is the indivisible unit."""
+                blocks, prev_key = [], None
+                for g in entries:
+                    key = (g[3], g[0], g[1], g[2], g[4],
+                           (g[7] if len(g) > 7 else 0))
+                    if key != prev_key:
+                        blocks.append([])
+                        prev_key = key
+                    blocks[-1].append(g)
+                out, cur = [], []
+                for blk in blocks:
+                    cand = cur + blk
+                    w = _aaai_panel_span(
+                        _groups3(cand), sort_by_label=True,
+                        run_gap_extra=model_extra) * _AAAI_SLOT_PT
+                    if cur and w > plotbox:
+                        out.append(cur)
+                        cur = list(blk)
+                    else:
+                        cur = cand
+                if cur:
+                    out.append(cur)
+                return out
+
+            # The models named in _AAAI_BD_OWN_FIGURE are packed on their own
+            # and lead the section, so they share a figure that holds nothing
+            # else and appear in no other.
+            own = [g for g in pooled if _bd_own_figure(g)]
+            chunks = _chunk(own) + _chunk(
+                [g for g in pooled if not _bd_own_figure(g)])
+            # ONE FIGURE PER CHUNK (user request): a chunk is one row of
+            # results, so it renders to its own PDF under its own caption,
+            # with its own legend, and keeps the full \textwidth.
             tex_dir = _fig_root_for_tex(tex_path)
-            graphic = []
-            graphic += _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
-            ds_all = []
-            for chunk in chunks:
+            legend = _aaai_standalone_legend(series=_AAAI_CHART_SERIES_GAP)
+            _is_app = is_app
+            # The appendix figure holds the cells the body does not, and says
+            # so in one line; the body figure names the timeout it is about.
+            # Once every figure is in the supplementary, "remaining" would be
+            # wrong: they are ALL the timeout instances.
+            cap = ((r"Analysis tightness $\delta_u-\delta_l$ on the remaining "
+                    r"timeout instances.")
+                   if (_is_app and not AAAI_FIGURES_IN_APPENDIX_ONLY) else
+                   (r"Analysis tightness $\delta_u-\delta_l$ on the hardest "
+                    r"instances, where all three approaches reach the "
+                    r"three-hour timeout."))
+            figs = []
+            for ci, chunk in enumerate(chunks):
+                ds_all = []
                 for g in chunk:
                     if g[0] not in ds_all:
                         ds_all.append(g[0])
+                graphic = list(legend)
+                # \par: a narrow chunk must not share the legend's line.
                 graphic.append(r"\par\smallskip")
                 graphic += _aaai_bd_single_figure(
                     _groups3(chunk), force_timeout=force_timeout,
                     tex_dir=tex_dir)
-            _is_app = is_app
-            figs = [r"\begin{figure*}[" + float_spec + "]", r"\centering",
-                    _aaai_render_chart_pdf(
-                        graphic, f"{basename_stem}_1", tex_dir,
-                        height_frac=(_AAAI_BD_APP_HEIGHT if _is_app else 0.88))]
-            # The appendix figure holds the cells the body does not, and says
-            # so in one line; the body figure names the timeout it is about.
-            cap = ((r"Analysis tightness $\delta_u-\delta_l$ on the remaining "
-                    r"timeout instances.") if _is_app else
-                   (r"Analysis tightness $\delta_u-\delta_l$ on the hardest "
-                    r"instances, where all three approaches reach the "
-                    r"three-hour timeout."))
-            figs.append(f"\\caption{{{cap}}}")
-            figs.append(f"\\label{{{label_stem}}}")
-            if label_stem == "fig:n2-bounddiff":
-                for d in ds_all:
-                    figs.append(
-                        "\\label{" + label_stem + "-"
-                        + re.sub(r"[^a-z0-9]+", "-", d.lower()).strip("-")
-                        + "}")
-            figs.append(r"\end{figure*}")
-            body = "\n".join(figs)
+                # The first chunk keeps the plain label and the _1 basename,
+                # so filenames and \refs written before the split still hold.
+                label = label_stem if ci == 0 else f"{label_stem}-{ci + 1}"
+                figs += [r"\begin{figure*}[" + float_spec + "]", r"\centering",
+                         _aaai_render_chart_pdf(
+                             graphic, f"{basename_stem}_{ci + 1}", tex_dir,
+                             # One row per figure: the cap is generous, since
+                             # a row binds on width.
+                             height_frac=(_AAAI_BD_APP_HEIGHT
+                                          if (_is_app and not
+                                              AAAI_FIGURES_IN_APPENDIX_ONLY)
+                                          else 0.88))]
+                figs.append(
+                    f"\\caption{{{_aaai_part_caption(cap, ci + 1, len(chunks))}}}")
+                figs.append(f"\\label{{{label}}}")
+                if ci == 0 and label_stem == "fig:n2-bounddiff":
+                    for d in ds_all:
+                        figs.append(
+                            "\\label{" + label_stem + "-"
+                            + re.sub(r"[^a-z0-9]+", "-", d.lower()).strip("-")
+                            + "}")
+                figs.append(r"\end{figure*}")
+                figs.append("")
+            body = "\n".join(figs).rstrip("\n")
         else:
             body = (r"% (no cluster has all three methods at the timeout -- "
                     r"no bounds-difference figure)")
@@ -10705,6 +10937,7 @@ def regenerate_aaai_bounddiff_section(tex_path, bd_groups, force_timeout=None,
                                      end_mark=end_mark,
                                      label_suffix="")
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_n2_bounddiff block skipped: "
               f"{exc}")
     except Exception as exc:
@@ -10942,7 +11175,9 @@ def regenerate_aaai_summary_section(tex_path, cwd, dataset, arch_runs,
     try:
         rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                            parse_result_file,
-                                           seeds_filter=seeds_filter)
+                                           seeds_filter=seeds_filter,
+                                           force_timeout=force_timeout,
+                                           rerun_timeout_eps=rerun_timeout_eps)
         archs = [a for a, _ in arch_runs]
         rows += _load_advstd_rows_for_wide(cwd, dataset, archs,
                                            seeds_filter=seeds_filter)
@@ -10952,6 +11187,7 @@ def regenerate_aaai_summary_section(tex_path, cwd, dataset, arch_runs,
         body = _render_aaai_summary_body(stats, archs)
         update_aaai_summary_tex(tex_path, body)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] aaai_summary block skipped: "
               f"{exc}")
     except Exception as exc:
@@ -11251,6 +11487,7 @@ def regenerate_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                 end_mark=end_mark,
                                 label_suffix=ds_label_suffix)
     except SystemExit as exc:
+        _reraise_if_process_exit(exc)
         print(f"[update_advstd_tex_tables] wide_perarch block skipped: "
               f"{exc}")
     except Exception as exc:
