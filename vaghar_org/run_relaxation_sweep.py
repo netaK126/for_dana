@@ -3673,6 +3673,193 @@ def _update_wilcoxon_table(cwd, vals):
     return True
 
 
+AAAI_ABLATION_BEGIN = "% BEGIN AUTO: aaai_ablation_table"
+AAAI_ABLATION_END   = "% END AUTO: aaai_ablation_table"
+
+#: Rows of the supplementary ablation table: (variant, row label, modes).
+#: A variant is listed under a mode only where the component exists -- the
+#: single-network \tool has no N_pre, so the two N_pre rows are transfer-only
+#: and print "--" in the \tool columns rather than a misleading number.
+_SUPP_ABLATION_ROWS = (
+    ("full",           r"none (full \tool)",             ("ours", "transfer")),
+    ("zono",           r"zonotope on $N$, $N^p$",        ("ours", "transfer")),
+    ("pert_intervals", r"perturbation difference",       ("ours", "transfer")),
+    ("npre_bounds",    r"$N_{pre}$ bounds",              ("transfer",)),
+    ("var_hint",       r"$N_{pre}$ warm start",          ("transfer",)),
+)
+
+_SUPP_ABLATION_MODES = (("ours", r"\tool"), ("transfer", r"\tool+transfer"))
+
+
+def _ablation_roots(cwd):
+    """[(dataset, arch, root)] for every ablation sub-tree under EXP_ROOT.
+
+    An ablation sweep writes into its own nested experiments root so its runs
+    never mix with the paper's (the N_pre state behind it may be relaxed, and
+    its control combos share filenames with the paper's). The tree lives at
+    `EXP_ROOT/<ds>/<arch>_exp/ablation/` and repeats the root layout inside,
+    so pointing EXP_ROOT at it makes every existing collector work unchanged.
+    """
+    out = []
+    for d in sorted(glob.glob(os.path.join(cwd, EXP_ROOT, "*", "*_exp",
+                                           "ablation"))):
+        arch_exp = os.path.basename(os.path.dirname(d))
+        dataset = os.path.basename(os.path.dirname(os.path.dirname(d)))
+        out.append((dataset, arch_exp[:-len("_exp")],
+                    os.path.relpath(d, cwd)))
+    return out
+
+
+def _supp_ablation_stats(cells, mode):
+    """{variant: (mean_time, n_solved, n_cells)} for one mode.
+
+    The mean is taken over the cells EVERY variant of this mode completed, so
+    the times down a column compare like for like; the solved count is over
+    that variant's own cells, which is what shows a component's removal
+    costing coverage rather than time.
+    """
+    have = {v: cells.get((mode, v)) for v, _, modes in _SUPP_ABLATION_ROWS
+            if mode in modes and cells.get((mode, v))}
+    if not have:
+        return {}
+    common = set.intersection(*(set(c) for c in have.values()))
+    out = {}
+    for v, c in have.items():
+        mean_t = (sum(c[k][0] for k in common) / len(common)) if common else None
+        solved = sum(1 for k in c if (c[k][1] or "") == "OPTIMAL")
+        out[v] = (mean_t, solved, len(c))
+    return out
+
+
+def _render_supp_ablation_table(dataset, arch, cells, tau, updater):
+    """One booktabs table for (dataset, arch), or None when nothing ablated.
+
+    Techniques are ROWS and the two methods the only data columns, so the
+    table fits one AAAI text column with no \\resizebox (banned) and its body
+    stays at the 9pt floor.
+    """
+    stats = {m: _supp_ablation_stats(cells, m) for m, _ in _SUPP_ABLATION_MODES}
+    if not any(v != "full" for s in stats.values() for v in s):
+        return None
+    # Values already carry their own \emph{...}; conv4's data key is cnn5.
+    disp = getattr(updater, "_AAAI_ARCH_DISPLAY", {}).get(arch, arch)
+    ds_disp = {"cifar": "CIFAR-10", "fashion-mnist": "Fashion-MNIST",
+               "mnist": "MNIST", "har": "HAR"}.get(dataset, dataset)
+    rows = []
+    for v, label, modes in _SUPP_ABLATION_ROWS:
+        cs = []
+        for m, _ in _SUPP_ABLATION_MODES:
+            st = stats.get(m, {}).get(v)
+            if m not in modes or st is None:
+                cs += ["--", "--"]
+            else:
+                # The two cells fail independently: mid-sweep the variants of
+                # a column may share no finished pair yet, which leaves the
+                # comparable mean undefined while the coverage each variant
+                # already has is perfectly well known.
+                cs += ["--" if st[0] is None
+                       else updater._fmt_ablation_time(st[0]),
+                       f"{st[1]}/{st[2]}"]
+        rows.append(f"{label} & " + " & ".join(cs) + r" \\")
+    tau_txt = ("" if tau is None else
+               f" at $\\tau{{=}}{('%g' % tau)}$")
+    return "\n".join([
+        r"\begin{table}[t]",
+        r"\centering",
+        "{" + getattr(updater, "_TABLE_BODY_FONT", r"\small"),
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\begin{tabular}{@{}lrrrr@{}}",
+        r"\toprule",
+        r" & \multicolumn{2}{c}{\textbf{\tool}} & "
+        r"\multicolumn{2}{c}{\textbf{\tool+transfer}} \\",
+        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}",
+        r"\textbf{component removed} & time & solved & time & solved \\",
+        r"\midrule",
+        *rows,
+        r"\bottomrule",
+        r"\end{tabular}",
+        "}",
+        rf"\caption{{Component ablation on {ds_disp} {disp}{tau_txt}. "
+        r"Each row removes one component from \tool and from \tool+transfer. "
+        r"Time is the mean solve time in seconds over the class pairs every "
+        r"variant of that column finished, so the column compares like for "
+        r"like; solved counts the pairs proved optimal. A dash marks a "
+        r"component the single-network \tool does not have.}",
+        rf"\label{{tab:ablation-{dataset}-{arch}}}",
+        r"\end{table}",
+    ])
+
+
+def _update_ablation_table(cwd, paper_taus=None):
+    """Render the supplementary component-ablation table(s) from the nested
+    ablation experiment tree(s), and splice them into sec_appendix_percell.tex.
+
+    A no-op (returns False, prints nothing) when no ablation tree exists, so
+    every ordinary --paper_tables_from_txt run is unaffected.
+    """
+    roots = _ablation_roots(cwd)
+    if not roots:
+        return False
+    try:
+        sys.path.insert(0, cwd)
+        import update_advstd_tex_tables as updater
+    except Exception as exc:
+        print(f"[ablation-table] skipped (import failed: {exc})")
+        return False
+    taus = None
+    if paper_taus:
+        taus = [t.strip() for t in str(paper_taus).split(",") if t.strip()]
+    tables, seen = [], []
+    saved_root = updater.EXP_ROOT
+    for dataset, arch, root in roots:
+        try:
+            updater.EXP_ROOT = root
+            cells, tau = updater._collect_ablation_cells(
+                cwd, dataset, arch, parse_result_file, unify_taus=taus)
+        except Exception as exc:
+            print(f"[ablation-table] {dataset}/{arch}: collect failed ({exc})")
+            continue
+        finally:
+            updater.EXP_ROOT = saved_root
+        tbl = _render_supp_ablation_table(dataset, arch, cells, tau, updater)
+        if tbl is None:
+            print(f"[ablation-table] {dataset}/{arch}: no ablated variant has "
+                  f"data in {root} — skipped")
+            continue
+        tables.append(tbl)
+        seen.append(f"{dataset}/{arch}"
+                    + ("" if tau is None else f" tau={'%g' % tau}"))
+    if not tables:
+        return False
+    block = "\n\n".join(tables)
+    path = _paper_tex_path(cwd, "sec_appendix_percell.tex")
+    if not os.path.exists(path):
+        print(f"[ablation-table] {path} not found; skipped")
+        return False
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    i, j = text.find(AAAI_ABLATION_BEGIN), text.find(AAAI_ABLATION_END)
+    if i >= 0 and j > i:
+        new = text[:i] + AAAI_ABLATION_BEGIN + "\n" + block + "\n" + text[j:]
+    else:
+        # First run: open the section and the marker pair at the end of the
+        # appendix, so every later run replaces only the generated block.
+        new = text.rstrip("\n") + "\n\n" + "\n".join([
+            r"\section{Component Ablation}",
+            r"\label{sec:appendix-ablation}",
+            AAAI_ABLATION_BEGIN,
+            block,
+            AAAI_ABLATION_END,
+        ]) + "\n"
+    if new == text:
+        return False
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(new)
+    print(f"[ablation-table] wrote {len(tables)} table(s) to "
+          f"{os.path.basename(path)} ({'; '.join(seen)})")
+    return True
+
+
 def _ensure_full_results_section(path, updater, marker_suffix=""):
     """Make sure `path` holds a BEGIN/END AUTO marker pair for this dataset,
     creating the file (or appending the dataset's pair) when missing.
@@ -4460,6 +4647,11 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
         percell_tex, updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
         updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug)
     _drop_supported = hasattr(updater, "set_aaai_wide_drop_partial_rows")
+    # Rows for the tau trade-off figure, harvested from the appendix per-cell
+    # tables as they render so the figure plots the numbers they print. Only
+    # the per-cell target fills the list: the full-results copy renders the
+    # same cells again and would double every point.
+    tau_rows = []
     for _target, _drop in ((full_tex, False),
                            (percell_tex, not show_partial)):
         if not os.path.exists(_target):
@@ -4471,7 +4663,9 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
                 _target, cwd, dataset, arch_runs, roles={"N2"},
                 begin_mark=updater.AAAI_WIDE_N2_APPENDIX_BEGIN_MARK + _mslug,
                 end_mark=updater.AAAI_WIDE_N2_APPENDIX_END_MARK + _mslug,
-                ds_label_suffix=_lslug, **common)
+                ds_label_suffix=_lslug,
+                tau_rows_out=(tau_rows if _target == percell_tex else None),
+                **common)
         except Exception as exc:
             print(f"[paper-tables] aaai_safe_wide (N2, {os.path.basename(_target)}) "
                   f"block error: {exc}")
@@ -4530,16 +4724,22 @@ def _regen_paper_tables_from_txt(arch_runs, cwd, dataset, combo_ranking_seeds,
     # (recompile=False) and returns the pooled data.
     if recompile:
         _recompile_neta_s_paper(cwd)
-    return time_cells, bd_groups, relax_rows
+    return time_cells, bd_groups, relax_rows, tau_rows
 
 
 def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
                                    relax_rows=None,
-                                   force_timeout=None):
+                                   tau_rows=None,
+                                   force_timeout=None,
+                                   recompile=True):
     """Emit the SINGLE combined solve-time grid (columns = networks) AND the
     SINGLE combined bounds-difference figure, pooling `time_cells`/`bd_groups`
     across every dataset, then recompile. Run once after the per-dataset
-    _regen_paper_tables_from_txt calls."""
+    _regen_paper_tables_from_txt calls.
+
+    `recompile=False` leaves the PDFs to the caller: the headline sentences are
+    written after this step, so --paper_tables_from_txt builds once at the very
+    end instead of building here and again after the measurements."""
     try:
         sys.path.insert(0, cwd)
         import update_advstd_tex_tables as updater
@@ -4619,7 +4819,17 @@ def _regen_paper_combined_from_txt(cwd, time_cells, bd_groups,
                 body_tex, relax_rows or [])
         except Exception as exc:
             print(f"[paper-tables] aaai_relax_precision block error: {exc}")
-    _recompile_neta_s_paper(cwd)
+    # The threshold trade-off figures: only cells run at more than one tau
+    # earn a slot, so the block is empty on a single-threshold run.
+    if os.path.exists(appendix_tex) and hasattr(
+            updater, "regenerate_aaai_tau_tradeoff_section"):
+        try:
+            updater.regenerate_aaai_tau_tradeoff_section(
+                appendix_tex, tau_rows or [], force_timeout=force_timeout)
+        except Exception as exc:
+            print(f"[paper-tables] aaai_n2_tau_tradeoff block error: {exc}")
+    if recompile:
+        _recompile_neta_s_paper(cwd)
 
 
 def main():
@@ -4794,8 +5004,9 @@ def main():
     parser.add_argument("--paper_taus", type=str, default=None,
                         metavar="TAU[,TAU,...]",
                         help="Relaxation thresholds the neta-s-paper per-cell appendix "
-                             "tables render, as ROWS (one row per tau per cell), in the "
-                             "given order. Default '0.0,0.5'; pass e.g. "
+                             "tables render, as ROWS (one row per tau per cell), always "
+                             "ordered from the LARGEST tau down to the smallest whatever "
+                             "order they are listed in here. Default '0.0,0.5'; pass e.g. "
                              "'0.0,0.25,0.5' to also pull in the tau=0.25 runs. This "
                              "widens the tables vertically only -- the tau column names "
                              "which threshold each row is -- and never adds a column. A "
@@ -4820,6 +5031,13 @@ def main():
                         help="Run advanced_standard mode: solve standard on N1, then accelerated "
                              "standard on N2 using N1's solver info. Replaces standard+transfer. "
                              "Sweeps over technique flag combinations (excluding all-false).")
+    parser.add_argument("--n1_solve_relax_threshold", type=float, default=None,
+                        help="Solve Phase 1 (the N_pre state-building solve) with the "
+                             "Conditional Triangle at this tau and SibGate on, instead of the "
+                             "exact solve. Sound: relaxing drops binaries but never widens "
+                             "[l,u], so the bounds Phase 1 saves stay valid to transfer. Use "
+                             "when N_pre times out with no incumbent and the warm-start hints "
+                             "come back empty. Default: exact, as today.")
     parser.add_argument("--sweep_adv_std_bound_tightening", nargs="*", type=str, default=None,
                         help="Values for adv_std_bound_tightening (e.g. 'true false'). Default: ['true'].")
     parser.add_argument("--sweep_adv_std_zono_bounds", nargs="*", type=str, default=None,
@@ -4912,6 +5130,12 @@ def main():
                              "propagates, it is just not intersected with N_pre's pre-activation "
                              "bounds or the N_pre->N difference zonotope; needs the base "
                              "zono_bounds=true; filename tag _noNpreZono) | "
+                             "npre_bounds (alias 'npre': BOTH N_pre bound paths off at once — "
+                             "N_pre's verified bounds shifted by the difference bounds are not "
+                             "intersected into N's [l,u], and the zonotope drops its N_pre input. "
+                             "The zonotope on N/N^p and the hints stay, so the hints become the "
+                             "only remaining transfer; needs the base zono_bounds=true; filename "
+                             "tag _noNpreBounds) | "
                              "triangle (adv_std_n2_relax_threshold=0, sibling_gate=false — whole "
                              "technique off) | "
                              "zono_triangle (BOTH bound-tightening techniques off: "
@@ -5210,6 +5434,7 @@ def main():
         all_time_cells = []
         all_bd_groups = []
         all_relax_rows = []
+        all_tau_rows = []
         # Caps of every arch that actually ran, MERGED across datasets. The
         # combined figures pool cells from all of them, and a dataset-scoped
         # '<ds>:<arch>=' entry never reaches the unscoped map -- so passing
@@ -5240,7 +5465,7 @@ def main():
                 (ds_cs if (arch_c_sources is not None
                            or ds_cs) else pt_requested_c_sources),
                 pt_requested_c_sources, ds_arch_runs)
-            tc, bd, rx = _regen_paper_tables_from_txt(
+            tc, bd, rx, tr = _regen_paper_tables_from_txt(
                 ds_arch_runs, cwd, pt_dataset, args.combo_ranking_seeds,
                 show_partial=args.paper_show_partial,
                 only_vaghar_pairs=args.only_vaghar_pairs,
@@ -5259,6 +5484,7 @@ def main():
             all_time_cells += tc
             all_bd_groups += bd
             all_relax_rows += rx
+            all_tau_rows += tr
         # Table 1 in the paper lists only the networks this run produced
         # results for. It runs AFTER the per-dataset loop because it reads back
         # which per-cell tables were rendered; the frozen master keeps the full
@@ -5273,25 +5499,32 @@ def main():
             print(f"[tab1] skipped ({_exc})")
 
         # One combined solve-time grid + one combined bounds-difference figure
-        # + one relaxation/precision table across all datasets, then the single
-        # final recompile.
+        # + one relaxation/precision table across all datasets. The recompile
+        # is deferred to the end of this block (recompile=False).
         _regen_paper_combined_from_txt(
             cwd, all_time_cells, all_bd_groups,
             relax_rows=all_relax_rows,
-            force_timeout=(all_force_timeout or effective_force_timeout))
-        # Headline averages of the paper's own tables, printed last so they are
-        # the final thing on screen.
-        # The numbers are read back OUT of the appendix tables, so they are
-        # only known after those tables are written. Recompile when the
-        # sentence actually changed, or main.pdf would lag one run behind.
+            tau_rows=all_tau_rows,
+            force_timeout=(all_force_timeout or effective_force_timeout),
+            recompile=False)
+        # Headline averages of the paper's own tables. The numbers are read
+        # back OUT of the appendix tables, so they are only known after those
+        # tables are written, and the sentences they feed are the last thing
+        # written into main.tex.
         _paper_avgs = _report_paper_table_averages(cwd)
-        _sentences_changed = bool(_update_results_sentence(cwd, _paper_avgs))
-        if _update_conclusion_sentence(cwd, _paper_avgs):
-            _sentences_changed = True
-        if _update_wilcoxon_table(cwd, _paper_avgs):
-            _sentences_changed = True
-        if _sentences_changed:
-            _recompile_neta_s_paper(cwd)
+        _update_results_sentence(cwd, _paper_avgs)
+        _update_conclusion_sentence(cwd, _paper_avgs)
+        _update_wilcoxon_table(cwd, _paper_avgs)
+        # Component ablation: read from the nested ablation tree(s), which the
+        # paper's own collectors never see. No ablation tree => silent no-op.
+        try:
+            _update_ablation_table(cwd, paper_taus=args.paper_taus)
+        except Exception as _exc:
+            print(f"[ablation-table] skipped ({_exc})")
+        # The ONE build of the run, after the measurement block, so the
+        # "[paper-build] rebuilt" lines are the last thing on screen and the
+        # PDFs always carry the sentences just written.
+        _recompile_neta_s_paper(cwd)
         if _quiet_out is not None:
             _quiet_out.drain()
             sys.stdout = _quiet_out.wrapped
@@ -5500,6 +5733,8 @@ def main():
                     _tok = _tok_raw.strip().lower()
                     if _tok == "pi":
                         _tok = "pert_intervals"
+                    if _tok == "npre":
+                        _tok = "npre_bounds"
                     bt, zb, rt, vh, sg, pi, hyp = _base
                     if _tok == "none":
                         pass
@@ -5555,6 +5790,18 @@ def main():
                                   f"out of); base has zono_bounds={zb}.")
                             sys.exit(1)
                         zb = "true_nonpre"
+                    elif _tok == "npre_bounds":
+                        # Zonotope KEPT on N/N^p, every N_pre bound source gone:
+                        # both N_pre's verified bounds shifted by the difference
+                        # bounds and Source A. The hints survive, so they are the
+                        # only remaining transfer. Encoded as a zb VALUE for the
+                        # same reason zono_npre is.
+                        if zb != "true":
+                            print(f"ERROR: --advstd_ablations npre_bounds needs the base "
+                                  f"zono_bounds=true (there is no zonotope to take N_pre "
+                                  f"out of); base has zono_bounds={zb}.")
+                            sys.exit(1)
+                        zb = "true_nonpre_bounds"
                     elif _tok == "pert_intervals":
                         # PI off ONLY — rt/SibGate kept (true leave-one-out).
                         # When rt > 0 the job builder adds
@@ -5564,7 +5811,8 @@ def main():
                     else:
                         print(f"ERROR: unknown --advstd_ablations component '{_tok_raw}' "
                               f"(expected none | var_hint | warm_start | zono | "
-                              f"zono_npre | triangle | zono_triangle | pert_intervals)")
+                              f"zono_npre | npre_bounds | triangle | zono_triangle | "
+                              f"pert_intervals)")
                         sys.exit(1)
                     combo = (bt, zb, rt, vh, sg, pi, hyp)
                     # A misconfigured base (not a mere no-op) is an error here —
@@ -6028,6 +6276,10 @@ def main():
                         ]
                         if args.arithmetic_transfer_bounds:
                             n1_cmd += ["--arithmetic_transfer_bounds", "true"]
+                        if args.n1_solve_relax_threshold is not None:
+                            n1_cmd += ["--nn1_relax_threshold",
+                                       str(args.n1_solve_relax_threshold),
+                                       "--nn1_sibling_gate", "true"]
 
                         # First N1 for this (dataset, arch, pert_spec) goes into
                         # ready; subsequent c_tags chain behind the previous N1
@@ -6123,6 +6375,7 @@ def main():
                             if sg == "true":          tech_tag += "sg"
                             if zb == "true":          tech_tag += "zb"
                             elif zb == "true_nonpre": tech_tag += "zbNoNpre"
+                            elif zb == "true_nonpre_bounds": tech_tag += "zbNoNpreBounds"
                             if args.arithmetic_transfer_bounds and bt == "true":
                                 tech_tag += "arith"
                             if pi == "false":         tech_tag += "noPI"
@@ -6143,6 +6396,7 @@ def main():
                             if sg == "true":          base_name_to_save += "_SibGate"
                             if zb.startswith("true"): base_name_to_save += "_zonoBounds"
                             if zb == "true_nonpre":   base_name_to_save += "_noNpreZono"
+                            elif zb == "true_nonpre_bounds": base_name_to_save += "_noNpreBounds"
                             # Must mirror run.jl's n2_check/n2_name builders (incl. tag order).
                             if args.arithmetic_transfer_bounds and bt == "true":
                                 base_name_to_save += "_arithTransfer"
@@ -6220,7 +6474,7 @@ def main():
                                     # "true_nonpre" is the zono_npre ablation:
                                     # zonotope ON, its N_pre input OFF.
                                     "--adv_std_zono_bounds",
-                                    ("true" if zb == "true_nonpre" else zb),
+                                    ("true" if zb.startswith("true") else zb),
                                     "--adv_std_zono_npre",
                                     ("false" if zb == "true_nonpre" else "true"),
                                     "--adv_std_n2_relax_threshold", str(rt),
@@ -6228,6 +6482,10 @@ def main():
                                     "--adv_std_var_hint", vh,
                                     "--gurobi_seed", str(seed),
                                 ]
+                                if zb == "true_nonpre_bounds":
+                                    # npre_bounds ablation: closes BOTH N_pre bound
+                                    # paths (set_n1_neuron_bounds and Source A).
+                                    cmd += ["--adv_std_ablate_npre_bounds", "true"]
                                 if args.arithmetic_transfer_bounds:
                                     cmd += ["--arithmetic_transfer_bounds", "true"]
                                 if pi == "false" and rt > 0.0:

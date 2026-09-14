@@ -5172,19 +5172,97 @@ def _aaai_wide_cell_has_data(cell_dict, col):
     return bool(cell and (cell.get("t_base") or cell.get("t_geom")))
 
 
+#: The order the paper lists the perturbations in (main.tex: "$\ell_\infty$,
+#: brightness, contrast, patch, occlusion, translation, and rotation"), so every
+#: model block of the per-cell tables reads them in the same sequence whatever
+#: subset of them a model actually ran. A perturbation missing from this list
+#: sorts after all of them, alphabetically.
+_AAAI_PERT_ORDER = ("linf", "brightness", "contrast", "patch", "occ",
+                    "translation", "rotation")
+
+#: Raw perturbation keys that mean the same thing as an _AAAI_PERT_ORDER entry.
+_AAAI_PERT_ALIASES = {"occlusion": "occ", "trans": "translation",
+                      "linfinity": "linf", "l_infty": "linf"}
+
+
+def _aaai_pert_sort_key(pert, p_size):
+    """Sort key placing a cell's (perturbation, size) at its canonical spot.
+
+    The perturbation ranks by _AAAI_PERT_ORDER, and the size by its NUMBERS
+    rather than its text, so occlusion runs (1,1,5), (1,1,9), (3,3,5), (5,5,5),
+    (14,14,9) instead of the string order that puts (14,14,9) before (3,3,5)."""
+    name = _AAAI_PERT_ALIASES.get(_aaai_pert_key(pert), _aaai_pert_key(pert))
+    try:
+        rank = _AAAI_PERT_ORDER.index(name)
+    except ValueError:
+        rank = len(_AAAI_PERT_ORDER)
+    nums = tuple(float(n) for n in
+                 re.findall(r"-?\d+(?:\.\d+)?", str(p_size)))
+    return (rank, name, len(nums), nums, str(p_size))
+
+
+def _tau_sort_value(tau):
+    """A tau's numeric value for ordering; a non-numeric one sorts last."""
+    try:
+        return float(tau)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
 def _aaai_wide_taus_for_cell(cell_dict):
     """The tau values this cell actually has ours / ours-with-transfer data
-    for, in _AAAI_WIDE_TAUS order. Empty when only the baseline ran, in which
-    case the caller still emits one row so the baseline stays visible."""
-    return [t for t in _AAAI_WIDE_TAUS
-            if any(_aaai_wide_cell_has_data(cell_dict, c)
-                   for c in _aaai_wide_columns_for_tau(t)[1:])]
+    for, LARGEST FIRST. Empty when only the baseline ran, in which case the
+    caller still emits one row so the baseline stays visible.
+
+    The order is the numeric one, not the order --paper_taus lists them in, so
+    a cell that ran several thresholds always reads from the loosest relaxation
+    down to the tightest."""
+    return sorted((t for t in _AAAI_WIDE_TAUS
+                   if any(_aaai_wide_cell_has_data(cell_dict, c)
+                          for c in _aaai_wide_columns_for_tau(t)[1:])),
+                  key=_tau_sort_value, reverse=True)
 
 
 # The tau=0.5 instance, kept as a module-level constant because the Evaluation
 # relaxation/precision table (which has no tau column) pins itself to it below.
 _AAAI_WIDE_COLUMNS = tuple(
     zip(_aaai_wide_columns_for_tau("0.5"), _AAAI_WIDE_COLUMN_HEADERS))
+
+
+# ── The two ratios the per-cell tables print in their trailing columns ────────
+# Lifted out of _render_aaai_wide_perarch_body so the tau trade-off figure plots
+# the SAME numbers the tables print rather than its own arithmetic. Each takes
+# the DISPLAYED (rounded, [0,100]-clamped, geom-preferred) values, which is what
+# makes both reproducible from the printed cells; the renderer's closures keep
+# the formatting and the partial-row rule.
+
+
+def _speedup_value(t_baseline, t_method):
+    """t_baseline / t_method: the baseline's solve time over the method's, so
+    higher is faster and below 1 means the method is slower. None when either
+    time is missing or the method's printed time is 0."""
+    if t_baseline is None or t_method is None or t_method <= 0:
+        return None
+    return t_baseline / t_method
+
+
+def _gap_value(bounds_pct):
+    """delta_u - delta_l of one column, in percentage points of delta_max, from
+    its (lb, ub) displayed pair. None when the pair is missing."""
+    if bounds_pct is None:
+        return None
+    return bounds_pct[1] - bounds_pct[0]
+
+
+def _gap_ratio_value(gap_baseline, gap_method):
+    """gap_baseline / gap_method: above 1 the method's bound is tighter than the
+    baseline's, below 1 the baseline's is tighter. None when a gap is missing OR
+    when the method's gap is 0 -- the ratio is then unbounded, which the tables
+    print as '---' and the tau figure draws as a marker pinned at the axis top
+    (the run proved optimality)."""
+    if gap_baseline is None or gap_method is None or gap_method <= 0:
+        return None
+    return gap_baseline / gap_method
 
 
 def _as_int(v):
@@ -5488,10 +5566,17 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                                     rerun_timeout_eps=30.0,
                                     roles=None,
                                     label_suffix="",
-                                    requested_c_targets=None):
+                                    requested_c_targets=None,
+                                    tau_rows_out=None):
     """Slim version of _render_wide_perarch_body: only the four safe-combo
     columns and table* (two-column-spanning) floats, suitable for inclusion
     in the AAAI 2026 paper's evaluation section.
+
+    `tau_rows_out`, when given, receives one dict per rendered (cell, tau) row
+    carrying that row's PRINTED numbers -- the displayed bounds, the two speedup
+    fractions and the two gap ratios. The tau trade-off figure plots them, so a
+    point and its table cell are the same measurement rather than two
+    computations that could drift apart.
 
     `roles`, when given, keeps only blocks for those network roles (e.g.
     {"N2"} for the target-network tables in the body or {"N1"} for the
@@ -5613,7 +5698,9 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
         arch_keys = sorted(
             (k for k in buckets
              if k[0] == arch and (roles is None or k[1] in roles)),
-            key=lambda k: (k[1], k[4], k[2], k[3]),  # role, c_src, pert, p_size
+            # role, c_src, then the perturbation at its canonical rank and the
+            # size by its numbers, so every model block reads them alike.
+            key=lambda k: (k[1], k[4]) + _aaai_pert_sort_key(k[2], k[3]),
         )
         if not arch_keys:
             continue
@@ -5980,11 +6067,10 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     time is 0."""
                     if row_partial:
                         return None, "---"
-                    tv = _disp_time(columns[0])
-                    tc = _disp_time(cmp_c)
-                    if tv is None or tc is None or tc <= 0:
+                    s = _speedup_value(_disp_time(columns[0]),
+                                       _disp_time(cmp_c))
+                    if s is None:
                         return None, "---"
-                    s = tv / tc
                     return s, _fmt_trim(s) + r"$\times$"
 
                 # Two speedup columns, left to right: speedup-single-net (vaghar
@@ -6022,18 +6108,16 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     return lb, max(lb, ub)
 
                 def _gap_pct(c):
-                    b = _bounds_pct(c)
-                    return None if b is None else b[1] - b[0]
+                    return _gap_value(_bounds_pct(c))
 
                 def _bounddiff_cell(cmp_c):
-                    gb = _gap_pct(columns[0])   # baseline gap
-                    gc = _gap_pct(cmp_c)        # method gap
                     # Ratio g_baseline / g_method: >1 => method tighter, <1 =>
                     # baseline tighter. Blank when a gap is missing or the method
                     # gap is 0 (ratio undefined / unbounded).
-                    if gb is None or gc is None or gc <= 0:
+                    r = _gap_ratio_value(_gap_pct(columns[0]), _gap_pct(cmp_c))
+                    if r is None:
                         return "---"
-                    return _fmt_trim(gb / gc) + r"$\times$"
+                    return _fmt_trim(r) + r"$\times$"
 
                 bounddiff_cells = [_bounddiff_cell(columns[1]),
                                    _bounddiff_cell(columns[2])]
@@ -6140,29 +6224,66 @@ def _render_aaai_wide_perarch_body(rows, archs, dataset,
                     continue
                 block_rows.append((row_sort, pert, p_size, data_cells,
                                    all_timeout, speedup_cells, bounddiff_cells,
-                                   row_color))
+                                   row_color, tau))
+
+                # Side channel for the tau trade-off figure: this row's printed
+                # numbers, keyed by method. Emitted from inside the row loop so
+                # the figure cannot compute anything the table does not print.
+                if tau_rows_out is not None and tau is not None:
+                    _mkeys = ("vaghar", "ours", "transfer")
+                    _fracs = {"vaghar": None, "ours": std_frac,
+                              "transfer": trans_frac}
+                    tau_rows_out.append({
+                        "dataset": dataset, "arch": arch,
+                        "arch_disp": arch_disp, "role": role,
+                        "pert": pert, "p_size": p_size,
+                        "c_src": c_src, "tau": tau,
+                        # (delta_l, delta_u) as printed, in %delta_max.
+                        "bounds": {k: _bounds_pct(c)
+                                   for k, c in zip(_mkeys, columns)},
+                        # Solve time in minutes, as printed.
+                        "time": {k: _disp_time(c)
+                                 for k, c in zip(_mkeys, columns)},
+                        # The wall-clock cap this cell ran under, so the figure
+                        # can draw the line the timed-out runs are pinned at.
+                        "cap_min": _cap_min,
+                        # t_vaghar / t_method, None on a partial row.
+                        "speedup": _fracs,
+                        # gap_vaghar / gap_method, None when the method's gap is
+                        # 0 -- it proved optimality and the ratio is unbounded.
+                        "gap_ratio": {
+                            k: _gap_ratio_value(_gap_pct(columns[0]),
+                                                _gap_pct(c))
+                            for k, c in zip(_mkeys, columns)},
+                        # Whether each method proved optimality, by the same
+                        # solve_status test the all-timeout split uses. None
+                        # when no wall-clock cap is known, since _hit_the_cap
+                        # then has no cap to fall back on.
+                        "converged": {
+                            k: (None if _cap_min is None
+                                else not _hit_the_cap(c))
+                            for k, c in zip(_mkeys, columns)},
+                        "all_timeout": all_timeout,
+                        "partial": row_partial,
+                    })
 
             if not block_rows:
                 continue
 
-            # Two-level ordering that keeps each perturbation TYPE contiguous:
-            #  (1) cluster the rows by perturbation name and order the clusters
-            #      by their best (largest) speedup -- a cluster whose rows all
-            #      lack a speedup sinks below every cluster that has one;
-            #  (2) within a cluster, order rows by that speedup (largest first)
-            #      with the speedup-less ("---") rows kept at the END of THAT
-            #      cluster (not the block);
-            #  (3) ties broken by perturbation size for a stable order.
-            # row_sort is (0, -speedup) when a speedup exists and (1, 0.0)
-            # otherwise, so min(row_sort) over a cluster is its best rank and
-            # smaller sorts earlier.
-            best_by_pert = {}
-            for row_sort, pert_name, _ps, _dc, _at, _sp, _bd, _rc in block_rows:
-                cur = best_by_pert.get(pert_name)
-                if cur is None or row_sort < cur:
-                    best_by_pert[pert_name] = row_sort
-            block_rows.sort(key=lambda r: (best_by_pert[r[1]], r[1],
-                                           r[0], r[2]))
+            # Ordering that depends ONLY on what a row IS, never on the numbers
+            # it reports, so the same command lists the perturbations of every
+            # model in the same sequence run after run (user request):
+            #  (1) perturbation TYPE at its canonical rank (_AAAI_PERT_ORDER),
+            #      which keeps each type contiguous and identical across models;
+            #  (2) within a type, the size read as NUMBERS, so occlusion runs
+            #      (1,1,5), (1,1,9), (3,3,5), (5,5,5), (14,14,9);
+            #  (3) within a (type, size) cell, the threshold from the LARGEST
+            #      tau down to the smallest.
+            # An earlier version ranked the clusters by their best speedup and
+            # the rows within a cluster by their own speedup, which reordered
+            # the table whenever the measurements changed.
+            block_rows.sort(key=lambda r: _aaai_pert_sort_key(r[1], r[2])
+                            + (-_tau_sort_value(r[8]),))
             # Keep each row as (data_cells, all_timeout, speedup_cells,
             # bounddiff_cells, row_color) in sorted order; the split, the
             # trailing-column choice, and label distribution happen per emitted
@@ -6454,29 +6575,28 @@ def _relax_gap_loss(m_row, b_row, dmax):
     return (ml - bl) / abs(dmax) * 100.0
 
 
-def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
-                                      parse_result_file,
-                                      seeds_filter=None,
-                                      force_timeout=None,
-                                      rerun_timeout_eps=30.0,
-                                      advstd_meta_fn=None,
-                                      perts=None,
-                                      combination_filter=None,
-                                      requested_c_targets=None,
-                                      requested_c_sources=None,
-                                      stale_fn=None):
-    """Aggregate one dataset's N2 runs into per-network relaxation/precision
-    rows for the Evaluation relaxation table.
+def _collect_relax_by_cell(cwd, dataset, arch_runs,
+                           parse_result_file,
+                           seeds_filter=None,
+                           force_timeout=None,
+                           rerun_timeout_eps=30.0,
+                           advstd_meta_fn=None,
+                           perts=None,
+                           combination_filter=None,
+                           requested_c_targets=None,
+                           requested_c_sources=None,
+                           stale_fn=None):
+    """One dataset's N2 runs, indexed per cell and column.
 
-    Assembles rows exactly as regenerate_aaai_wide_perarch_section does, so this
-    table describes the same runs the per-cell tables display (same seed, combo,
-    timeout, c_target/c_source and staleness filters, and the same
-    geometric-range side preference). Returns a list of dicts, one per network:
+    Assembles rows exactly as regenerate_aaai_wide_perarch_section does, so
+    every consumer describes the same runs the per-cell tables display (same
+    seed, combo, timeout, c_target/c_source and staleness filters, and the same
+    geometric-range side preference). Shared by the Evaluation relaxation table
+    (collect_aaai_relax_precision_rows) and the tau trade-off figure
+    (collect_aaai_tau_figure_rows), so the two can never describe different
+    runs. Returns (by_cell, archs, ds_key, delta_max_by_key, rows) where
 
-        {"dataset", "arch",
-         "relaxed_ours", "relaxed_transfer",   # mean binaries dropped, N+N'
-         "loss_ours", "loss_transfer",         # mean dl - dl_baseline, % dmax
-         "cells_ours", "cells_transfer"}       # runs behind each mean
+        by_cell[(arch, pert, size, c_src, c_tgt)][combo] = result row
     """
     rows = _collect_wide_perarch_cells(arch_runs, cwd, dataset,
                                        parse_result_file,
@@ -6524,6 +6644,36 @@ def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
     # delta_max per (arch, role, c_src): the scale the loss is normalized by,
     # the same one the per-cell tables render delta_l/delta_u against.
     delta_max_by_key = _load_delta_max_values(cwd, dataset, archs)
+    return by_cell, archs, ds_key, delta_max_by_key, rows
+
+
+def collect_aaai_relax_precision_rows(cwd, dataset, arch_runs,
+                                      parse_result_file,
+                                      seeds_filter=None,
+                                      force_timeout=None,
+                                      rerun_timeout_eps=30.0,
+                                      advstd_meta_fn=None,
+                                      perts=None,
+                                      combination_filter=None,
+                                      requested_c_targets=None,
+                                      requested_c_sources=None,
+                                      stale_fn=None):
+    """Aggregate one dataset's N2 runs into per-network relaxation/precision
+    rows for the Evaluation relaxation table. Returns a list of dicts, one per
+    network:
+
+        {"dataset", "arch",
+         "relaxed_ours", "relaxed_transfer",   # mean binaries dropped, N+N'
+         "loss_ours", "loss_transfer",         # mean dl - dl_baseline, % dmax
+         "cells_ours", "cells_transfer"}       # runs behind each mean
+    """
+    by_cell, archs, ds_key, delta_max_by_key, rows = _collect_relax_by_cell(
+        cwd, dataset, arch_runs, parse_result_file,
+        seeds_filter=seeds_filter, force_timeout=force_timeout,
+        rerun_timeout_eps=rerun_timeout_eps, advstd_meta_fn=advstd_meta_fn,
+        perts=perts, combination_filter=combination_filter,
+        requested_c_targets=requested_c_targets,
+        requested_c_sources=requested_c_sources, stale_fn=stale_fn)
     from collections import defaultdict
     acc = defaultdict(lambda: {"relax_ours": [], "relax_transfer": [],
                                "loss_ours": [], "loss_transfer": []})
@@ -6874,7 +7024,8 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
                                           combination_filter=None,
                                           requested_c_targets=None,
                                           requested_c_sources=None,
-                                          stale_fn=None):
+                                          stale_fn=None,
+                                          tau_rows_out=None):
     """Mirror regenerate_wide_perarch_section, but emit the slim 4-column
     AAAI variant into the neta_s_paper evaluation section. When
     `force_timeout` is set (in seconds), cells whose Gurobi run hit a
@@ -6925,7 +7076,8 @@ def regenerate_aaai_wide_perarch_section(tex_path, cwd, dataset, arch_runs,
             rerun_timeout_eps=rerun_timeout_eps,
             roles=roles,
             label_suffix=label_suffix,
-            requested_c_targets=requested_c_targets)
+            requested_c_targets=requested_c_targets,
+            tau_rows_out=tau_rows_out)
         head, _sep, tail = body.partition(_WIDE_KIND_SPLIT)
         solved_begin = AAAI_WIDE_N2_SOLVED_BEGIN_MARK + ds_label_suffix
         solved_end = AAAI_WIDE_N2_SOLVED_END_MARK + ds_label_suffix
@@ -7769,6 +7921,11 @@ def _aaai_fmt_bar_value(v):
 # (\textwidth - overhead)/ncol_max, the panel's x-range is `nmax` slots, and a
 # bar is _AAAI_BAR_W data-units wide.
 _AAAI_TEXTWIDTH_PT = 505.89
+
+#: \textheight of the AAAI style (aaai2027.sty: "\setlength\textheight{9.0in}"),
+#: in cm. The figure* floats that size themselves against \textheight need it as
+#: a number to divide a page budget between their rows.
+_AAAI_TEXTHEIGHT_CM = 22.86
 _AAAI_PT_PER_CM = 28.4527
 _AAAI_LABEL_FIT_FRAC = 0.86
 # AAAI guideline 3: text inside figures must render at >=9pt. The per-bar
@@ -10756,6 +10913,524 @@ def _bd_split(bd_groups):
     return keep, rest + moved
 
 
+AAAI_N2_TAU_BEGIN_MARK = "% BEGIN AUTO: aaai_n2_tau_tradeoff"
+AAAI_N2_TAU_END_MARK   = "% END AUTO: aaai_n2_tau_tradeoff"
+
+#: Narrowest a tau slot may become before the packer opens another row, and the
+#: height of ONE of a slot's three panels.
+_AAAI_TAU_SLOT_MIN_PT = 148.0
+_AAAI_TAU_PANEL_H_CM = 1.75
+
+#: Geometry of the trade-off grid. The slots are the ROWS (one per cell) and the
+#: three quantities the COLUMNS, which is what fits all of them in ONE figure:
+#: stacking each slot's panels into a column instead caps a figure at three
+#: slots and spills the rest into a second float.
+#: The reserves are horizontal room for the rotated row identity and for each
+#: panel's own y tick labels -- a column's rows keep independent scales, since
+#: cells differ by orders of magnitude and a shared scale would flatten most of
+#: them into a line.
+#: Trimmed to the ink they actually carry -- a three-line rotated identity, a
+#: two-or-three digit tick, one inter-column channel -- because every point they
+#: give back widens the panels, and the panels have to be wide enough to print
+#: the thresholds UPRIGHT: 0.2 and 0.3 sit a tenth apart and collide on a narrow
+#: axis, which is the whole reason these are not the roomier defaults.
+_AAAI_TAU_ROW_LABEL_PT = 46.0
+_AAAI_TAU_YTICK_PT = 23.0
+_AAAI_TAU_COL_GAP_PT = 11.0
+_AAAI_TAU_ROW_GAP_PT = 14.0
+_AAAI_TAU_GRID_PANEL_H_CM = 2.5
+
+#: The columns, in order: (field, column title). The title is drawn on the top
+#: row only, so the quantity is named once per column instead of once per panel.
+_AAAI_TAU_PANELS = (
+    ("loss", r"precision loss (\%$\delta_{\max}$)"),
+    ("time", r"time (min)"),
+    ("gap", r"$\delta_u-\delta_l$ (\%$\delta_{\max}$)"),
+)
+
+#: The curves, as (row key, legend text, colour, converged mark, timed-out
+#: mark). Two separate hues from the paper's own palette, not two shades of one,
+#: and two mark SHAPES, so they stay apart in grayscale too. \baseline is not
+#: drawn: it takes no threshold, so its curve is flat and says nothing this
+#: figure is about. It stays the fallback reference of the precision panel,
+#: which the panel names when it uses it.
+_AAAI_TAU_SERIES = (
+    ("ours", r"\tool without transfer", "bddiffours", "*", "o"),
+    ("transfer", r"\tool with transfer", "oursgreen", "square*", "square"),
+)
+
+
+def _aaai_tau_slots(tau_rows):
+    """Group the per-row side channel into the figure's slots.
+
+    A slot is one (dataset, architecture, perturbation, size, source class) that
+    ran MORE THAN ONE threshold: a single-threshold cell has no trade-off to
+    draw and the per-cell tables already report it. Returns the slots in the
+    tables' own order, each carrying its thresholds ascending and the reference
+    its precision panel is measured against."""
+    by_slot = {}
+    for r in tau_rows or ():
+        if r.get("role") != "N2" or r.get("tau") is None:
+            continue
+        key = (r["dataset"], r["arch"], r["pert"], r["p_size"], r["c_src"])
+        by_slot.setdefault(key, {})[str(r["tau"])] = r
+    out = []
+    for key, rows_by_tau in by_slot.items():
+        if len(rows_by_tau) < 2:
+            continue
+        taus = sorted(rows_by_tau, key=_tau_sort_value)
+        first = rows_by_tau[taus[0]]
+        # Reference for the precision panel: the cell's own tau=0 run of the
+        # same method, and \baseline where the cell has no tau=0 run.
+        zero = next((t for t in taus if _tau_sort_value(t) == 0.0), None)
+        ref = {}
+        for mkey, _leg, _col, _fm, _hm in _AAAI_TAU_SERIES:
+            dl = None
+            if zero is not None:
+                b = (rows_by_tau[zero].get("bounds") or {}).get(mkey)
+                dl = None if b is None else b[0]
+            if dl is None:
+                b = (first.get("bounds") or {}).get("vaghar")
+                dl = None if b is None else b[0]
+                ref[mkey] = (dl, "vaghar")
+            else:
+                ref[mkey] = (dl, "tau0")
+        out.append({
+            "key": key,
+            "dataset": first["dataset"],
+            "arch_disp": first["arch_disp"],
+            "pert": first["pert"],
+            "p_size": first["p_size"],
+            "c_src": first["c_src"],
+            "taus": taus,
+            "rows": rows_by_tau,
+            "ref": ref,
+            "cap_min": first.get("cap_min"),
+        })
+    out.sort(key=lambda s: (s["dataset"], s["arch_disp"])
+             + _aaai_pert_sort_key(s["pert"], s["p_size"])
+             + (int(s["c_src"]),))
+    return out
+
+
+def _aaai_tau_series_points(slot, mkey, field):
+    """(all, converged, timedout) point lists of one series.
+
+    `field` is "loss" (precision, against this method's reference), "time"
+    (minutes) or "gap" (delta_u - delta_l in points of delta_max). Every panel
+    plots ONE field, so a panel never carries more than one curve per method."""
+    allp, conv, tout = [], [], []
+    dl_ref = (slot["ref"].get(mkey) or (None, None))[0]
+    for t in slot["taus"]:
+        r = slot["rows"][t]
+        x = _tau_sort_value(t)
+        if field == "loss":
+            b = (r.get("bounds") or {}).get(mkey)
+            y = None if (b is None or dl_ref is None) else b[0] - dl_ref
+        elif field == "gap":
+            y = _gap_value((r.get("bounds") or {}).get(mkey))
+        else:
+            y = (r.get(field) or {}).get(mkey)
+        if y is None:
+            continue
+        allp.append((x, y))
+        done = (r.get("converged") or {}).get(mkey)
+        (conv if done else tout).append((x, y))
+    return allp, conv, tout
+
+
+def _aaai_tau_ref_label(slot):
+    """The note naming what the precision panel measures against, when that is
+    not simply the cell's own $\\tau{=}0$ run: a method without one falls back
+    to \\baseline, and a slot can carry both references at once. Empty in the
+    plain case, where the $\\tau{=}0$ point sitting at zero says it already."""
+    refs = [v[1] for v in slot["ref"].values() if v[0] is not None]
+    if not refs or all(r == "tau0" for r in refs):
+        return ""
+    if all(r == "vaghar" for r in refs):
+        return r", ref \baseline"
+    return r", ref $\tau{=}0$/\baseline"
+
+
+def _aaai_tau_field_range(slot, field):
+    """(ymin, ymax, log?) of one panel, from the values that panel plots."""
+    vals = []
+    for mkey, _leg, _col, _fm, _hm in _AAAI_TAU_SERIES:
+        vals += [y for _x, y in _aaai_tau_series_points(slot, mkey, field)[0]]
+    if field == "loss":
+        # Keep 0 in view: it is the height this row's own reference sits at.
+        lo = min(vals + [0.0]) if vals else 0.0
+        hi = max(vals + [0.0]) if vals else 1.0
+        pad = max((hi - lo) * 0.15, 1.0)
+        return lo - pad, hi + pad, False
+    if field == "time":
+        # Minutes on a LINEAR axis from 0, ticked and headroomed exactly like
+        # the solve-time bar figures (_aaai_yaxis at _AAAI_YAXIS_POWER == 1),
+        # so a reader carries one notion of "how long" between the two.
+        cap = slot.get("cap_min")
+        hi = max(vals + ([cap] if cap else [])) if vals else 1.0
+        return 0.0, hi * 1.10, False
+    # Bound gap: 0 is meaningful here (the run closed its bound), so linear.
+    hi = max(vals) if vals else 1.0
+    return -0.06 * hi, hi * 1.18, False
+
+
+def _aaai_tau_slot_row(slot, idx, width_pt, panel_h_cm, prev_name, show_x):
+    """The three axes of ONE slot, laid left to right over a shared tau axis.
+
+    The slot is a ROW: its cell is named once, in the rotated label on the
+    leftmost panel, and each column carries one quantity -- what the threshold
+    costs in precision, what it costs in time, and how tight a bound it leaves.
+    The quantity is named by the column title on the top row, so it is not
+    repeated on every panel. Columns are placed by an explicit xshift off this
+    row's first panel rather than by a label-relative anchor, so a long tick
+    label on one panel cannot push the next one out of the grid.
+
+    `prev_name` is the first panel of the row above (None on the top row), and
+    `show_x` prints the tick labels and the $\\tau$ title -- given to the bottom
+    row, or to every row when the rows do not share one threshold set."""
+    taus = [_tau_sort_value(t) for t in slot["taus"]]
+    lo, hi = min(taus), max(taus)
+    # Tight margins: the padding is dead width, and here it is width the
+    # upright threshold labels need. Enough to keep the end marks off the frame,
+    # no more.
+    pad = max((hi - lo) * 0.06, 0.02)
+    xmin, xmax = lo - pad, hi + pad
+    xtick = ",".join(_fmt_trim(t) for t in taus)
+
+    ds_disp = _aaai_fig_dataset_name(_dataset_display_name(slot["dataset"]))
+    pert_disp = (_WIDE_PERT_DISPLAY.get(slot["pert"], slot["pert"])
+                 .replace("_", r"\_").replace("linf", r"$\ell_\infty$"))
+    ident = (r"\textbf{" + slot["arch_disp"] + "}, " + ds_disp + r"\\"
+             + pert_disp + " (" + str(slot["p_size"]) + r")\\"
+             + r"$c_s{=}" + str(slot["c_src"]) + "$"
+             + _aaai_tau_ref_label(slot))
+
+    common = (f"scale only axis, width={width_pt:.1f}pt, "
+              f"height={panel_h_cm:.2f}cm, "
+              f"xmin={xmin:.4g}, xmax={xmax:.4g}, xtick={{{xtick}}}, "
+              "axis background/.style={fill=black!4}, "
+              "ymajorgrids, major grid style={gray!25}, "
+              "y tick label style={font=\\small}, "
+              "ylabel style={font=\\small}")
+    step = width_pt + _AAAI_TAU_YTICK_PT + _AAAI_TAU_COL_GAP_PT
+    out = []
+    first = f"tau{idx}_0"
+    for ci, (field, col_title) in enumerate(_AAAI_TAU_PANELS):
+        name = f"tau{idx}_{ci}"
+        opts = [f"name={name}"]
+        if ci == 0:
+            if prev_name is not None:
+                opts.append(f"at={{({prev_name}.below south west)}}, "
+                            f"anchor=north west, "
+                            f"yshift=-{_AAAI_TAU_ROW_GAP_PT:.0f}pt")
+        else:
+            opts.append(f"at={{({first}.north west)}}, anchor=north west, "
+                        f"xshift={ci * step:.1f}pt")
+        opts.append(common)
+        ymin, ymax, is_log = _aaai_tau_field_range(slot, field)
+        if is_log:
+            opts.append("ymode=log")
+        opts.append(f"ymin={ymin:.4g}, ymax={ymax:.4g}")
+        if show_x:
+            opts.append(r"xlabel={$\tau$}, xlabel style={font=\small}, "
+                        r"x tick label style={font=\small}")
+        else:
+            opts.append("xticklabels=\\empty")
+        if ci == 0:
+            # The row identity rides in the leftmost panel's rotated label:
+            # the cell is named once per row, not once per panel.
+            opts.append("ylabel={" + ident + "}, "
+                        r"ylabel style={align=center, font=\small}")
+        if prev_name is None:
+            opts.append("title={" + col_title + "}, "
+                        r"title style={font=\small}")
+        out.append(r"\begin{axis}[" + ", ".join(opts) + "]")
+        if field == "loss":
+            out.append(r"\addplot[gray, dashed, forget plot] coordinates {"
+                       f"({xmin:.4g},0) ({xmax:.4g},0)" + "};")
+        elif field == "time" and slot.get("cap_min"):
+            # The wall-clock cap, dashed as the bar figures draw it: every curve
+            # touching it was stopped there rather than finishing, which the
+            # hollow marks say point by point.
+            cap = slot["cap_min"]
+            out.append(r"\addplot[gray, dashed, forget plot] coordinates {"
+                       f"({xmin:.4g},{cap:.6g}) ({xmax:.4g},{cap:.6g})" + "};")
+        out += _aaai_tau_plots(slot, field)
+        out.append(r"\end{axis}")
+    return out, first
+
+
+def _aaai_tau_mean_series(slots, mkey, field, taus):
+    """(all, converged, timedout, n_cells): `field` averaged across cells.
+
+    Only the cells carrying a value at EVERY threshold are averaged, so the
+    curve is one fixed set of cells measured at each threshold rather than a
+    different set per point -- otherwise a cell dropping out at one threshold
+    would move the mean on its own and read as an effect of the threshold.
+    A mark is filled only when every averaged run at that threshold proved
+    optimal, so a mean resting on any timed-out run is never shown as solved.
+    """
+    keys = [round(_tau_sort_value(t), 6) for t in taus]
+    per_cell = []
+    for slot in slots:
+        allp, _c, _t = _aaai_tau_series_points(slot, mkey, field)
+        by_tau = {round(x, 6): y for x, y in allp}
+        if not all(k in by_tau for k in keys):
+            continue
+        conv = {round(_tau_sort_value(t), 6):
+                bool((slot["rows"][t].get("converged") or {}).get(mkey))
+                for t in slot["taus"]}
+        per_cell.append((by_tau, conv))
+    if not per_cell:
+        return [], [], [], 0
+    allp, cv, to = [], [], []
+    for t, k in zip(taus, keys):
+        y = sum(d[k] for d, _c in per_cell) / len(per_cell)
+        pt = (_tau_sort_value(t), y)
+        allp.append(pt)
+        (cv if all(c.get(k) for _d, c in per_cell) else to).append(pt)
+    return allp, cv, to, len(per_cell)
+
+
+def _aaai_tau_mean_row(slots, width_pt, panel_h_cm):
+    """The averaged companion: one row of the same three columns, each curve the
+    mean over the cells of the per-cell figure.
+
+    Same geometry, colours and mark convention as the per-cell figure, so the
+    two read as one pair; only the row identity changes, to the count of cells
+    the mean rests on."""
+    taus = sorted({t for s in slots for t in s["taus"]}, key=_tau_sort_value)
+    if len(taus) < 2:
+        return None
+    xs = [_tau_sort_value(t) for t in taus]
+    pad = max((max(xs) - min(xs)) * 0.06, 0.02)
+    xmin, xmax = min(xs) - pad, max(xs) + pad
+    xtick = ",".join(_fmt_trim(x) for x in xs)
+
+    # One cap only when every averaged cell ran under the same wall clock;
+    # mixed caps have no single line to draw.
+    caps = {s.get("cap_min") for s in slots}
+    cap = caps.pop() if len(caps) == 1 else None
+
+    series = {}
+    n_cells = 0
+    for field, _title in _AAAI_TAU_PANELS:
+        for mkey, _leg, _col, _fm, _hm in _AAAI_TAU_SERIES:
+            a, c, t, n = _aaai_tau_mean_series(slots, mkey, field, taus)
+            series[(field, mkey)] = (a, c, t)
+            n_cells = max(n_cells, n)
+    if not any(v[0] for v in series.values()):
+        return None
+
+    common = (f"scale only axis, width={width_pt:.1f}pt, "
+              f"height={panel_h_cm:.2f}cm, "
+              f"xmin={xmin:.4g}, xmax={xmax:.4g}, xtick={{{xtick}}}, "
+              "axis background/.style={fill=black!4}, "
+              "ymajorgrids, major grid style={gray!25}, "
+              "y tick label style={font=\\small}, "
+              "ylabel style={font=\\small}")
+    step = width_pt + _AAAI_TAU_YTICK_PT + _AAAI_TAU_COL_GAP_PT
+    ident = (r"mean over\\" + str(n_cells) + r" cells")
+    out = [r"\begin{tikzpicture}[font=\small]"]
+    first = "taumean_0"
+    for ci, (field, col_title) in enumerate(_AAAI_TAU_PANELS):
+        name = f"taumean_{ci}"
+        opts = [f"name={name}"]
+        if ci:
+            opts.append(f"at={{({first}.north west)}}, anchor=north west, "
+                        f"xshift={ci * step:.1f}pt")
+        opts.append(common)
+        vals = [y for mkey, _l, _c, _f, _h in _AAAI_TAU_SERIES
+                for _x, y in series[(field, mkey)][0]]
+        if field == "loss":
+            lo = min(vals + [0.0]) if vals else 0.0
+            hi = max(vals + [0.0]) if vals else 1.0
+            p = max((hi - lo) * 0.15, 1.0)
+            opts.append(f"ymin={lo - p:.4g}, ymax={hi + p:.4g}")
+        elif field == "time":
+            # Linear minutes from 0, as in the bar figures (see
+            # _aaai_tau_field_range).
+            hi = max(vals + ([cap] if cap else [])) if vals else 1.0
+            opts.append(f"ymin=0, ymax={hi * 1.10:.4g}")
+        else:
+            hi = max(vals) if vals else 1.0
+            opts.append(f"ymin={-0.06 * hi:.4g}, ymax={hi * 1.18:.4g}")
+        opts.append(r"xlabel={$\tau$}, xlabel style={font=\small}, "
+                    r"x tick label style={font=\small}")
+        if ci == 0:
+            opts.append("ylabel={" + ident + "}, "
+                        r"ylabel style={align=center, font=\small}")
+        opts.append("title={" + col_title + "}, "
+                    r"title style={font=\small}")
+        out.append(r"\begin{axis}[" + ", ".join(opts) + "]")
+        if field == "loss":
+            out.append(r"\addplot[gray, dashed, forget plot] coordinates {"
+                       f"({xmin:.4g},0) ({xmax:.4g},0)" + "};")
+        elif field == "time" and cap:
+            out.append(r"\addplot[gray, dashed, forget plot] coordinates {"
+                       f"({xmin:.4g},{cap:.6g}) ({xmax:.4g},{cap:.6g})" + "};")
+        for mkey, _leg, col, fmark, hmark in _AAAI_TAU_SERIES:
+            allp, conv, tout = series[(field, mkey)]
+            if allp:
+                coords = " ".join(f"({x:.4g},{y:.6g})" for x, y in allp)
+                out.append(f"\\addplot[{col}, line width=0.7pt, "
+                           "mark=none, forget plot] coordinates {"
+                           + coords + "};")
+            for pts, mark in ((conv, fmark), (tout, hmark)):
+                if not pts:
+                    continue
+                coords = " ".join(f"({x:.4g},{y:.6g})" for x, y in pts)
+                out.append(f"\\addplot[{col}, only marks, mark={mark}, "
+                           "mark size=1.7pt, forget plot] coordinates {"
+                           + coords + "};")
+        out.append(r"\end{axis}")
+    out.append(r"\end{tikzpicture}")
+    return out, n_cells
+
+
+def _aaai_tau_plots(slot, field):
+    """The \\addplot lines of one field: per series, the connecting curve and
+    then its converged and timed-out marks."""
+    lines = []
+    for mkey, _leg, col, fmark, hmark in _AAAI_TAU_SERIES:
+        allp, conv, tout = _aaai_tau_series_points(slot, mkey, field)
+        if allp:
+            coords = " ".join(f"({x:.4g},{y:.6g})" for x, y in allp)
+            lines.append(f"\\addplot[{col}, line width=0.7pt, "
+                         "mark=none, forget plot] coordinates {"
+                         + coords + "};")
+        for pts, mark in ((conv, fmark), (tout, hmark)):
+            if not pts:
+                continue
+            coords = " ".join(f"({x:.4g},{y:.6g})" for x, y in pts)
+            lines.append(f"\\addplot[{col}, only marks, mark={mark}, "
+                         "mark size=1.7pt, forget plot] coordinates {"
+                         + coords + "};")
+    return lines
+
+
+def _aaai_tau_legend():
+    """The figure's legend, on two lines: the three curves, then what a filled
+    and a hollow mark mean. Nothing about dashes: each panel plots one
+    quantity, so a curve is told apart by colour and mark shape alone."""
+    out = [r"\begin{tikzpicture}[font=\small]"]
+    prev = None
+    for i, (_k, leg, col, fmark, _hm) in enumerate(_AAAI_TAU_SERIES):
+        pos = "" if prev is None else f", right=16pt of {prev}"
+        # A short segment with the mark sitting on it, exactly as the series is
+        # drawn in the panels.
+        out.append(f"\\node[inner sep=0pt{pos}] (lm{i}) "
+                   "{\\tikz{\\draw[" + col + ", line width=0.7pt] (0,0) -- "
+                   "(0.5,0); \\draw[" + col + f"] plot[mark={fmark}, "
+                   "mark size=1.6pt] coordinates {(0.25,0)};}};")
+        out.append(f"\\node[right=3pt of lm{i}, inner sep=1pt] (lt{i}) "
+                   "{" + leg + "};")
+        prev = f"lt{i}"
+    out.append(r"\end{tikzpicture}")
+    out.append(r"\par")
+    out.append(r"\begin{tikzpicture}[font=\small]")
+    out.append(r"\node[inner sep=1pt] {filled: proved optimal\quad "
+               r"hollow: reached the timeout};")
+    out.append(r"\end{tikzpicture}")
+    return out
+
+
+def regenerate_aaai_tau_tradeoff_section(
+        tex_path, tau_rows, force_timeout=None,
+        begin_mark=AAAI_N2_TAU_BEGIN_MARK,
+        end_mark=AAAI_N2_TAU_END_MARK):
+    """Emit the threshold trade-off figures: for every cell that ran more than
+    one tau, what the threshold costs in precision and what it buys in speed and
+    in bound tightness.
+
+    Every number comes from the side channel the per-cell tables fill while they
+    render, so a point and its table cell are one measurement. Slots are packed
+    several to a row and each packed row becomes one figure*, which is what
+    keeps the float count down."""
+    try:
+        slots = _aaai_tau_slots(tau_rows)
+        if not slots:
+            update_aaai_wide_perarch_tex(
+                tex_path,
+                r"% (no cell ran more than one relaxation threshold -- "
+                r"no trade-off figure)",
+                begin_mark=begin_mark, end_mark=end_mark, label_suffix="")
+            return
+        tex_dir = _fig_root_for_tex(tex_path)
+        cap = (r"Precision loss, execution time and analysis tightness "
+               r"$\delta_u-\delta_l$ per relaxation threshold $\tau$, on the "
+               r"cells run at more than one threshold.")
+        # ONE figure: slots are rows, quantities are columns. The panels shrink
+        # with the slot count instead of spilling into a second float, so the
+        # trade-off is read without turning a page.
+        width = (_AAAI_TEXTWIDTH_PT - _AAAI_TAU_ROW_LABEL_PT
+                 - 3 * _AAAI_TAU_YTICK_PT
+                 - 2 * _AAAI_TAU_COL_GAP_PT) / 3.0
+        # Keep the grid inside the float: 0.88\textheight less the legend and
+        # the column titles, shared by the rows. Never taller than the original
+        # per-slot panel budget, so a two-slot figure does not balloon.
+        avail_cm = 0.88 * _AAAI_TEXTHEIGHT_CM - 3.4
+        panel_h = max(1.35, min(_AAAI_TAU_GRID_PANEL_H_CM,
+                                avail_cm / max(1, len(slots))
+                                - _AAAI_TAU_ROW_GAP_PT / 28.45))
+        # One threshold set across the rows means the tick labels need printing
+        # only under the bottom one; differing sets make a shared axis a lie, so
+        # then every row prints its own.
+        shared_x = len({tuple(s["taus"]) for s in slots}) == 1
+        graphic = list(_aaai_tau_legend())
+        graphic.append(r"\par\smallskip")
+        graphic.append(r"\begin{tikzpicture}[font=\small]")
+        prev = None
+        for si, slot in enumerate(slots):
+            lines, first = _aaai_tau_slot_row(
+                slot, si, width, panel_h, prev,
+                show_x=(not shared_x) or si == len(slots) - 1)
+            graphic += lines
+            prev = first
+        graphic.append(r"\end{tikzpicture}")
+        figs = [r"\begin{figure*}[p]", r"\centering",
+                _aaai_render_chart_pdf(graphic, "n2_tau_tradeoff_1", tex_dir,
+                                       height_frac=0.88),
+                f"\\caption{{{cap}}}",
+                r"\label{fig:n2-tau}",
+                r"\end{figure*}", ""]
+        print(f"[aaai-charts] tau trade-off: {len(slots)} slot(s) as rows in "
+              f"1 figure ({width:.0f}pt x {panel_h:.2f}cm panels)")
+
+        # The same three quantities averaged over those cells: the per-cell
+        # figure shows every trade-off, this one shows the trade-off.
+        mean = _aaai_tau_mean_row(slots, width, _AAAI_TAU_GRID_PANEL_H_CM)
+        if mean is not None:
+            mean_lines, n_cells = mean
+            mgraphic = list(_aaai_tau_legend())
+            mgraphic.append(r"\par\smallskip")
+            mgraphic += mean_lines
+            mcap = (r"Precision loss, execution time and analysis tightness "
+                    r"$\delta_u-\delta_l$ per relaxation threshold $\tau$, "
+                    r"averaged over the " + str(n_cells) + r" cells of "
+                    r"Figure~\ref{fig:n2-tau}. A mark is filled only where "
+                    r"every averaged run proved optimal.")
+            figs += [r"\begin{figure*}[p]", r"\centering",
+                     _aaai_render_chart_pdf(mgraphic, "n2_tau_tradeoff_mean",
+                                            tex_dir, height_frac=0.88),
+                     f"\\caption{{{mcap}}}",
+                     r"\label{fig:n2-tau-mean}",
+                     r"\end{figure*}", ""]
+            print(f"[aaai-charts] tau trade-off mean: {n_cells} cell(s) "
+                  f"averaged into 1 figure")
+        update_aaai_wide_perarch_tex(tex_path, "\n".join(figs).rstrip("\n"),
+                                     begin_mark=begin_mark,
+                                     end_mark=end_mark, label_suffix="")
+    except SystemExit as exc:
+        _reraise_if_process_exit(exc)
+        print(f"[update_advstd_tex_tables] aaai_n2_tau_tradeoff block "
+              f"skipped: {exc}")
+    except Exception as exc:
+        print(f"[update_advstd_tex_tables] aaai_n2_tau_tradeoff block "
+              f"error: {exc}")
+
+
 def regenerate_aaai_bounddiff_appendix_section(
         tex_path, bd_groups, force_timeout=None,
         begin_mark=AAAI_N2_BOUNDDIFF_APP_BEGIN_MARK,
@@ -11611,6 +12286,11 @@ def _classify_ablation_filename(fname):
             # otherwise class it as the untouched control.
             if "_noNpreZono" in fname:
                 return ("transfer", "zono_npre")
+            # npre_bounds keeps _zonoBounds too (the zonotope on N/N^p stays;
+            # only N_pre leaves its bounds), so it must be tested before the
+            # tag-absence checks below for the same reason zono_npre is.
+            if "_noNpreBounds" in fname:
+                return ("transfer", "npre_bounds")
             if "_zonoBounds" not in fname and "_SibGate" not in fname:
                 return ("transfer", "zono_triangle")
             if "_zonoBounds" not in fname:
@@ -11621,6 +12301,7 @@ def _classify_ablation_filename(fname):
         # control: the full paper combo at τ > 0 (τ=0 wide-grid rows and
         # partial combos are not the ablation reference).
         if ("_noPI" not in fname and "_noNpreZono" not in fname
+                and "_noNpreBounds" not in fname
                 and "_varHintPrevPGD" in fname
                 and "_zonoBounds" in fname and "_SibGate" in fname
                 and tau > 0.0):

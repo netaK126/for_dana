@@ -178,6 +178,13 @@ function parse_commandline()
         arg_type = Bool
         required = false
         default = true
+        "--adv_std_ablate_npre_bounds"
+        help = "Ablation: N's bounds ignore N_pre — neither N_pre's bounds shifted by the " *
+               "difference bounds nor N_pre inside the zonotope. Hints stay on. " *
+               "Filename tag _noNpreBounds."
+        arg_type = Bool
+        required = false
+        default = false
         "--arithmetic_transfer_bounds"
         help = "advanced_standard: compute the N_pre->N difference bounds ([d_lo, d_hi], Source A) " *
                "with plain interval arithmetic (the restored compute_diff_and_comp_bounds) instead " *
@@ -205,6 +212,14 @@ function parse_commandline()
                "binary in the 'one thin' tier and a pre-activation coupling line in the 'both " *
                "thin' tier. Sound over-approximation: delta_relaxed >= delta_exact. Requires " *
                "--adv_std_n2_relax_threshold >= 0. Filename tag _SibGate with per-tier counts."
+        arg_type = Bool
+        required = false
+        default = false
+        "--n1_save_results"
+        help = "advanced_standard_n1 only: also write N_pre's own result file (delta, solve " *
+               "time) into --output_dir, named exactly as standard mode names it, so a single " *
+               "N_pre run yields both the BLEND-without-transfer result and the transfer state. " *
+               "Default false: Phase 1 writes state only, as before."
         arg_type = Bool
         required = false
         default = false
@@ -659,6 +674,8 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     use_zono_bounds = args["adv_std_zono_bounds"]
     # Ablation flag (zono_npre).
     zono_use_npre   = args["adv_std_zono_npre"]
+    # Ablation flag (npre_bounds): drop BOTH N_pre bound paths — the shifted verified bounds and Source A — leaving the hints as the only transfer.
+    ablate_npre_bounds = args["adv_std_ablate_npre_bounds"]
     # Difference-bounds method for Source A: zonotope (default) or plain interval arithmetic.
     use_arith_bounds = args["arithmetic_transfer_bounds"]
     # Conditional Triangle: relax a copy's ReLU when its triangle-gap area is <= tau (read by relu() via this global).
@@ -706,6 +723,9 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
     println("  Diff-bounds method (Source A):     $(use_arith_bounds ? "interval arithmetic" : "zonotope")")
     println("  Technique 5 (Variable Hints):      $(var_hint_mode_label(var_hint_mode))")
     println("  Technique 6 (N2 Relax Threshold):  $(adv_std_n2_relax_threshold)")
+    if ablate_npre_bounds
+        println("  ABLATION: N_pre removed from N's bounds (hints kept)")
+    end
 
     # Build the filename signature of this exact configuration (one tag per active technique); results whose
     # filename carries this signature were produced by the same configuration, so they can be skipped below.
@@ -727,6 +747,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         if args["adv_std_n2_sibling_gate"]; n2_check = n2_check * "_SibGate"; end
         if use_zono_bounds;           n2_check = n2_check * "_zonoBounds"; end
         if use_zono_bounds && !zono_use_npre; n2_check = n2_check * "_noNpreZono"; end
+        if use_bound_tightening && ablate_npre_bounds; n2_check = n2_check * "_noNpreBounds"; end
         if use_bound_tightening && use_arith_bounds; n2_check = n2_check * "_arithTransfer"; end
         if var_hint_mode == VH_PREV_PGD;   n2_check = n2_check * "_varHintPrevPGD";   end
     end
@@ -781,7 +802,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 seed_lo, seed_hi = source_b_seed_box(perturbation, (1, w, h, k))
                 println("Advanced-standard: computing N1-tightened absolute N2 zonotope (Source B)...")
                 compute_n2_bounds_zonotope_with_n1_tighten(nn2, seed_lo, seed_hi;
-                                                           use_n1_tighten=zono_use_npre)
+                                                           use_n1_tighten=(zono_use_npre && !ablate_npre_bounds))
             end
 
         end
@@ -836,7 +857,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             mip_reset()
 
             # Transfer bound tightening: expose N_pre's verified per-neuron bounds so the encoder intersects each of N's bounds with them, shifted by the difference bounds.
-            if use_bound_tightening
+            if use_bound_tightening && !ablate_npre_bounds
                 set_n1_neuron_bounds(n1_layers_info)
             end
 
@@ -883,6 +904,7 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
                 if args["adv_std_n2_sibling_gate"]; n2_name = n2_name * "_SibGate"; end
                 if use_zono_bounds;           n2_name = n2_name * "_zonoBounds"; end
                 if use_zono_bounds && !zono_use_npre; n2_name = n2_name * "_noNpreZono"; end
+                if use_bound_tightening && ablate_npre_bounds; n2_name = n2_name * "_noNpreBounds"; end
                 if use_bound_tightening && use_arith_bounds; n2_name = n2_name * "_arithTransfer"; end
                 if var_hint_mode == VH_PREV_PGD;   n2_name = n2_name * "_varHintPrevPGD";   end
             end
@@ -939,6 +961,13 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
     # solve loop reads it too.
     use_arith_bounds = args["arithmetic_transfer_bounds"]
 
+    # Solve N_pre with the Conditional Triangle instead of exactly: relax a copy's
+    # ReLU when its triangle-gap area is <= tau. Same globals main_standard drives,
+    # read by relu() and compute_n2_relax_decision!. Relaxing drops binaries but never
+    # widens [l,u], so the bounds this run saves stay sound to transfer.
+    global adv_std_n2_relax_threshold = args["nn1_relax_threshold"]
+    global adv_std_n2_sibling_gate    = args["nn1_sibling_gate"]
+
     c_tag_list = [args["ctag"]]
     activate_vaghgar_deps = args["activate_vaghgar_deps"]
     global geometric_intervals = args["geometric_intervals"]
@@ -953,6 +982,9 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
     end
 
     for c_tag in c_tag_list
+        # Accumulates N_pre's result rows when it is solved as BLEND (tau >= 0);
+        # stays empty and unused in the exact mode, which writes no results.
+        results_n1 = Results("")
         c_targets = parse_numbers_to_Int64(args["ct"])
         timout = args["timout"]
         w, h, k, c = get_dataset_params(dataset)
@@ -1056,12 +1088,31 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             d_n1[:suboptimal_time] = suboptimal_time_n1
             mip_reset()
             clear_n1_neuron_bounds()
+
+            # Conditional Triangle inputs + decision, mirroring main_standard. Skipped
+            # entirely at the default tau = -1, so the exact N_pre solve is untouched.
+            if adv_std_n2_relax_threshold >= 0.0
+                if adv_std_n2_sibling_gate
+                    input_dummy_s = zeros(Float64, 1, w, h, k)
+                    p_size_s = perturbation_size[1]
+                    I_pert_up_s   =  p_size_s .* ones(Float64, size(input_dummy_s))
+                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
+                    compute_n2_pert_relaxation_bounds(nn1, I_pert_up_s, I_pert_down_s)
+                end
+                clear_n2_relaxed_counters!()
+                clear_sibgate_tier_counters!()
+                compute_n2_relax_decision!(adv_std_n2_relax_threshold)
+            end
+
             bounds_time_n1 = @elapsed begin
                 merge!(d_n1, get_model(w, h, k, perturbation, perturbation_size, nn1, zeros(Float64, 1, w, h, k), optimizer,
                 get_default_tightening_options(optimizer), DEFAULT_TIGHTENING_ALGORITHM))
             end
             d_n1[:bounds_time] = bounds_time_n1
             m_n1 = d_n1[:Model]
+            if adv_std_n2_relax_threshold >= 0.0
+                apply_sibgate_constraints!(m_n1)
+            end
             if use_hyper_attack
                 hyper_attack_hints(m_n1, token_signature, c_tag, c_target)
             end
