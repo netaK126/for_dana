@@ -12267,7 +12267,12 @@ def _classify_ablation_filename(fname):
     tau = float(bm.group(1)) if bm else -1.0
     if "_N2_advStd" in fname:
         if is_abl:
-            if "_noPI" in fname:
+            # Perturbed intervals off leaves NO tag of its own: run.jl writes
+            # "_PerturbedIntervals" when they are on and nothing when they are
+            # not, so absence is the signal. (An earlier "_noPI" tag was
+            # documented but never actually stamped, which silently dropped
+            # every transfer pert_intervals run out of this table.)
+            if "_PerturbedIntervals" not in fname:
                 return ("transfer", "pert_intervals")
             if "_varHint" not in fname:
                 # Both warm-start ablations set var_hint=off; the PGD tag is
@@ -12303,9 +12308,13 @@ def _classify_ablation_filename(fname):
         if ("_noPI" not in fname and "_noNpreZono" not in fname
                 and "_noNpreBounds" not in fname
                 and "_varHintPrevPGD" in fname
-                and "_zonoBounds" in fname and "_SibGate" in fname
-                and tau > 0.0):
-            return ("transfer", "full")
+                and "_zonoBounds" in fname and "_SibGate" in fname):
+            if tau > 0.0:
+                return ("transfer", "full")
+            if tau == 0.0:
+                # Same combo at threshold 0: every neuron keeps its binary, so
+                # this IS the relaxation-removed variant.
+                return ("transfer", "tau0")
         return None
     if "_stdBoost_" in fname:
         if is_abl:
@@ -12319,8 +12328,11 @@ def _classify_ablation_filename(fname):
                 return ("ours", "triangle")
             return None
         if ("_PertruebedIntervals" in fname and "_stdBoost_zono" in fname
-                and "_SibGate" in fname and tau > 0.0):
-            return ("ours", "full")
+                and "_SibGate" in fname):
+            if tau > 0.0:
+                return ("ours", "full")
+            if tau == 0.0:
+                return ("ours", "tau0")
         return None
     return None
 

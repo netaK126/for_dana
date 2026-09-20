@@ -626,9 +626,12 @@ def _advstd_missing_c_targets(cwd, dataset, arch, pert_type, eps_str, n1_tag,
             if ("_geomInt" in fname) != geometric_intervals:
                 continue
             # Perturbed-interval ablation runs share base_name_to_save with
-            # their PI siblings too; run.jl stamps _noPI on the pi=false
-            # files, so require its presence to match this run's pi setting.
-            if ("_noPI" in fname) != (not perturbed_intervals):
+            # their PI siblings too. run.jl tags only the ON case
+            # ("_PerturbedIntervals") and writes nothing when they are off, so
+            # presence of THAT tag is the discriminator. (This used to test for
+            # a "_noPI" tag that run.jl never stamps, so a pi=false cell never
+            # counted as done and was re-scheduled on every resume.)
+            if ("_PerturbedIntervals" in fname) != perturbed_intervals:
                 continue
             # Warm-start ablation (use_hyper_attack=false) shares the base
             # name with hyper-on runs; run.jl stamps _HyperAttackHints /
@@ -3680,15 +3683,61 @@ AAAI_ABLATION_END   = "% END AUTO: aaai_ablation_table"
 #: A variant is listed under a mode only where the component exists -- the
 #: single-network \tool has no N_pre, so the two N_pre rows are transfer-only
 #: and print "--" in the \tool columns rather than a misleading number.
+#: Labels are the paper's own names for these techniques (\paragraph headings of
+#: the System section: Zonotope Bound Tightening, Perturbation-Difference
+#: Interval, Warm Start) and its wording for the bound reuse transfer performs,
+#: "$\Npre$'s verified bounds" -- so a row and the text describing it never
+#: drift apart. \Npre is defined in supplementary.tex.
 _SUPP_ABLATION_ROWS = (
-    ("full",           r"none (full \tool)",             ("ours", "transfer")),
-    ("zono",           r"zonotope on $N$, $N^p$",        ("ours", "transfer")),
-    ("pert_intervals", r"perturbation difference",       ("ours", "transfer")),
-    ("npre_bounds",    r"$N_{pre}$ bounds",              ("transfer",)),
-    ("var_hint",       r"$N_{pre}$ warm start",          ("transfer",)),
+    ("full",           r"none (full \tool)",              ("ours", "transfer")),
+    ("tau0",           r"relaxation ($\tau{=}0$)",        ("ours", "transfer")),
+    ("zono",           r"zonotope bound tightening",      ("ours", "transfer")),
+    ("pert_intervals", r"perturbation-difference interval", ("ours", "transfer")),
+    ("var_hint",       r"warm start from $\Npre$",        ("transfer",)),
 )
 
 _SUPP_ABLATION_MODES = (("ours", r"\tool"), ("transfer", r"\tool+transfer"))
+
+#: A component whose removal means something different per mode. The zonotope
+#: row is the case: single-network \tool has only the absolute zonotope, so its
+#: row drops that. \tool+transfer additionally tightens N's bounds with
+#: $\Npre$'s verified bounds shifted by a DIFFERENCE zonotope
+#: (compute_diff_bounds_zonotope -> relu_diff_*, applied in
+#: intersect_per_copy_bounds), so for transfer the row drops that $\Npre$
+#: contribution and keeps the absolute pass. Mirrors _ABLATION_MODE_COMPONENT,
+#: which the paper's Table 3 already uses for the same reason.
+_SUPP_ABLATION_MODE_VARIANT = {("transfer", "zono"): "npre_bounds"}
+
+
+def _supp_variant(mode, variant):
+    """The result variant a (mode, row) actually reads."""
+    return _SUPP_ABLATION_MODE_VARIANT.get((mode, variant), variant)
+
+
+def _arch_neurons(cwd, dataset, arch, updater):
+    """Neuron count of one architecture, read from the frozen Table-1 master
+    (tab_networks_full.tex) so the ablation table's percentages and the paper's
+    Networks table can never disagree. None when the row is not found."""
+    path = _paper_tex_path(cwd, "tab_networks_full.tex")
+    disp = getattr(updater, "_AAAI_ARCH_DISPLAY", {}).get(arch, arch)
+    want_a = re.sub(r"\s+", "", disp)
+    want_d = re.sub(r"[^a-z0-9]", "", str(dataset).lower())
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                cols = [c.strip() for c in line.split("&")]
+                if len(cols) < 4:
+                    continue
+                if re.sub(r"\s+", "", cols[1]) != want_a:
+                    continue
+                if want_d not in re.sub(r"[^a-z0-9]", "", cols[0].lower()):
+                    continue
+                m = re.search(r"\d[\d,]*", cols[3])
+                if m:
+                    return int(m.group(0).replace(",", ""))
+    except OSError:
+        pass
+    return None
 
 
 def _ablation_roots(cwd):
@@ -3710,48 +3759,68 @@ def _ablation_roots(cwd):
     return out
 
 
-def _supp_ablation_stats(cells, mode):
-    """{variant: (mean_time, n_solved, n_cells)} for one mode.
+def _supp_ablation_stats(cells, mode, cap_min=None):
+    """{variant: (mean_minutes, n_solved, n_cells)} for one mode.
 
     The mean is taken over the cells EVERY variant of this mode completed, so
     the times down a column compare like for like; the solved count is over
     that variant's own cells, which is what shows a component's removal
     costing coverage rather than time.
+
+    Times are minutes, clamped to `cap_min`: a run stopped at the wall clock
+    records a little MORE than the cap (Gurobi notices the limit slightly after
+    it passes), and printing 180.3 where the cap is 180 reads as a measurement
+    rather than as the timeout it is.
     """
-    have = {v: cells.get((mode, v)) for v, _, modes in _SUPP_ABLATION_ROWS
-            if mode in modes and cells.get((mode, v))}
+    have = {v: cells.get((mode, _supp_variant(mode, v)))
+            for v, _, modes in _SUPP_ABLATION_ROWS
+            if mode in modes and cells.get((mode, _supp_variant(mode, v)))}
     if not have:
         return {}
     common = set.intersection(*(set(c) for c in have.values()))
+
+    def _min(sec):
+        m = sec / 60.0
+        return min(m, cap_min) if cap_min else m
+
     out = {}
     for v, c in have.items():
-        mean_t = (sum(c[k][0] for k in common) / len(common)) if common else None
+        mean_t = (sum(_min(c[k][0]) for k in common) / len(common)
+                  if common else None)
         solved = sum(1 for k in c if (c[k][1] or "") == "OPTIMAL")
-        out[v] = (mean_t, solved, len(c))
+        # Relaxed binaries, averaged over the same common pairs as the time so
+        # the two columns describe one set of runs. The recorded count sums
+        # BOTH MIP copies, so `denom` is doubled by the caller.
+        rel = [c[k][4] for k in common if c[k][4] is not None]
+        out[v] = (mean_t, solved, len(c),
+                  (sum(rel) / len(rel)) if rel else None)
     return out
 
 
-def _render_supp_ablation_table(dataset, arch, cells, tau, updater):
+def _render_supp_ablation_table(dataset, arch, cells, tau, updater,
+                                cap_min=None, neurons=None, label_sfx=""):
     """One booktabs table for (dataset, arch), or None when nothing ablated.
 
     Techniques are ROWS and the two methods the only data columns, so the
     table fits one AAAI text column with no \\resizebox (banned) and its body
     stays at the 9pt floor.
     """
-    stats = {m: _supp_ablation_stats(cells, m) for m, _ in _SUPP_ABLATION_MODES}
+    stats = {m: _supp_ablation_stats(cells, m, cap_min)
+             for m, _ in _SUPP_ABLATION_MODES}
     if not any(v != "full" for s in stats.values() for v in s):
         return None
     # Values already carry their own \emph{...}; conv4's data key is cnn5.
     disp = getattr(updater, "_AAAI_ARCH_DISPLAY", {}).get(arch, arch)
     ds_disp = {"cifar": "CIFAR-10", "fashion-mnist": "Fashion-MNIST",
                "mnist": "MNIST", "har": "HAR"}.get(dataset, dataset)
+    denom = 2.0 * neurons if neurons else None   # both MIP copies
     rows = []
     for v, label, modes in _SUPP_ABLATION_ROWS:
         cs = []
         for m, _ in _SUPP_ABLATION_MODES:
             st = stats.get(m, {}).get(v)
             if m not in modes or st is None:
-                cs += ["--", "--"]
+                cs += ["--", "--", "--"]
             else:
                 # The two cells fail independently: mid-sweep the variants of
                 # a column may share no finished pair yet, which leaves the
@@ -3759,38 +3828,59 @@ def _render_supp_ablation_table(dataset, arch, cells, tau, updater):
                 # already has is perfectly well known.
                 cs += ["--" if st[0] is None
                        else updater._fmt_ablation_time(st[0]),
-                       f"{st[1]}/{st[2]}"]
+                       f"{st[1]}/{st[2]}",
+                       "--" if (st[3] is None or not denom)
+                       else f"{100.0 * st[3] / denom:.1f}\\%"]
         rows.append(f"{label} & " + " & ".join(cs) + r" \\")
     tau_txt = ("" if tau is None else
                f" at $\\tau{{=}}{('%g' % tau)}$")
+    # Scope, read off the cells so the caption can never claim a perturbation
+    # or a class the table does not actually cover.
+    keys = [k for v in cells.values() for k in v]
+    pd_map = getattr(updater, "_WIDE_PERT_DISPLAY", {})
+    perts = sorted({(k[0], k[1]) for k in keys})
+    pert_txt = " and ".join(f"{pd_map.get(p, p)} ({e})" for p, e in perts)
+    css = sorted({k[2] for k in keys})
+    cts = sorted({k[3] for k in keys})
+    # Escaped braces: bare {} are TeX grouping and would render as nothing.
+    _set = lambda xs: (r"\{" + ",".join(str(x) for x in xs) + r"\}")
+    scope = (pert_txt + r", $c_s{\in}" + _set(css)
+             + r"$, $c_t{\in}" + _set(cts) + "$")
     return "\n".join([
-        r"\begin{table}[t]",
+        # table*: at its natural width the tabular runs ~20pt past a single
+        # AAAI column, and \centering sets a tabular at its natural width, so
+        # LaTeX never warns -- it silently prints into the gutter. A full-width
+        # float also leaves room to name the count properly.
+        r"\begin{table*}[t]",
         r"\centering",
         "{" + getattr(updater, "_TABLE_BODY_FONT", r"\small"),
         r"\setlength{\tabcolsep}{3pt}",
-        r"\begin{tabular}{@{}lrrrr@{}}",
+        r"\begin{tabular}{@{}lrrrrrr@{}}",
         r"\toprule",
-        r" & \multicolumn{2}{c}{\textbf{\tool}} & "
-        r"\multicolumn{2}{c}{\textbf{\tool+transfer}} \\",
-        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}",
-        r"\textbf{component removed} & time & solved & time & solved \\",
+        r" & \multicolumn{3}{c}{\textbf{\tool}} & "
+        r"\multicolumn{3}{c}{\textbf{\tool+transfer}} \\",
+        r"\cmidrule(lr){2-4}\cmidrule(lr){5-7}",
+        # Two header lines: the count is a fraction, and naming it on one
+        # line ("before timeout") does not say what is counted, nor out of what.
+        r"\textbf{component removed} & time & \#finished before timeout & "
+        r"relaxed & time & \#finished before timeout & relaxed \\",
+        r" & (min) & / \#experiments & neurons & (min) & / \#experiments & "
+        r"neurons \\",
         r"\midrule",
         *rows,
         r"\bottomrule",
         r"\end{tabular}",
         "}",
-        rf"\caption{{Component ablation on {ds_disp} {disp}{tau_txt}. "
-        r"Each row removes one component from \tool and from \tool+transfer. "
-        r"Time is the mean solve time in seconds over the class pairs every "
-        r"variant of that column finished, so the column compares like for "
-        r"like; solved counts the pairs proved optimal. A dash marks a "
-        r"component the single-network \tool does not have.}",
-        rf"\label{{tab:ablation-{dataset}-{arch}}}",
-        r"\end{table}",
+        rf"\caption{{Ablation study on {ds_disp} {disp}{tau_txt}: "
+        rf"{scope}. Under \tool+transfer the zonotope row removes "
+        r"$\Npre$'s contribution to the bounds and keeps the absolute "
+        r"zonotope.}",
+        rf"\label{{tab:ablation-{dataset}-{arch}{label_sfx}}}",
+        r"\end{table*}",
     ])
 
 
-def _update_ablation_table(cwd, paper_taus=None):
+def _update_ablation_table(cwd, paper_taus=None, force_timeout=None):
     """Render the supplementary component-ablation table(s) from the nested
     ablation experiment tree(s), and splice them into sec_appendix_percell.tex.
 
@@ -3821,7 +3911,43 @@ def _update_ablation_table(cwd, paper_taus=None):
             continue
         finally:
             updater.EXP_ROOT = saved_root
-        tbl = _render_supp_ablation_table(dataset, arch, cells, tau, updater)
+        # The wall clock this arch ran under (--arch_timeouts / --force_timeout),
+        # so a timed-out run prints AS the cap instead of a hair above it.
+        try:
+            ft = updater._ft_for(force_timeout, arch)
+        except Exception:
+            ft = None
+        # The tau=0 variant (relaxation removed) is usually not part of the
+        # ablation sweep -- it was already run as an ordinary combo in the
+        # paper's own tree. Pull it from there for whichever mode the ablation
+        # tree does not carry it, gating the collector to tau=0 so no tau>0
+        # file can leak in.
+        missing0 = [m for m, _ in _SUPP_ABLATION_MODES
+                    if not cells.get((m, "tau0"))]
+        borrowed = []
+        if missing0:
+            try:
+                updater.EXP_ROOT = saved_root
+                base_cells, _ = updater._collect_ablation_cells(
+                    cwd, dataset, arch, parse_result_file, unify_taus=["0"])
+                for m in missing0:
+                    got = base_cells.get((m, "tau0"))
+                    if got:
+                        cells[(m, "tau0")] = got
+                        borrowed.append(m)
+            except Exception as exc:
+                print(f"[ablation-table] {dataset}/{arch}: tau=0 lookup "
+                      f"failed ({exc})")
+            finally:
+                updater.EXP_ROOT = saved_root
+        if borrowed:
+            print(f"[ablation-table] {dataset}/{arch}: tau=0 row for "
+                  f"{', '.join(borrowed)} taken from {saved_root} "
+                  f"(not from the ablation tree)")
+        neurons = _arch_neurons(cwd, dataset, arch, updater)
+        tbl = _render_supp_ablation_table(
+            dataset, arch, cells, tau, updater,
+            cap_min=(ft / 60.0 if ft else None), neurons=neurons)
         if tbl is None:
             print(f"[ablation-table] {dataset}/{arch}: no ablated variant has "
                   f"data in {root} — skipped")
@@ -5518,7 +5644,9 @@ def main():
         # Component ablation: read from the nested ablation tree(s), which the
         # paper's own collectors never see. No ablation tree => silent no-op.
         try:
-            _update_ablation_table(cwd, paper_taus=args.paper_taus)
+            _update_ablation_table(
+                cwd, paper_taus=args.paper_taus,
+                force_timeout=(all_force_timeout or effective_force_timeout))
         except Exception as _exc:
             print(f"[ablation-table] skipped ({_exc})")
         # The ONE build of the run, after the measurement block, so the
