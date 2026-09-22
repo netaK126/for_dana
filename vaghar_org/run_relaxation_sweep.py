@@ -3986,6 +3986,315 @@ def _update_ablation_table(cwd, paper_taus=None, force_timeout=None):
     return True
 
 
+AAAI_REPLICATE_BEGIN = "% BEGIN AUTO: aaai_replicate_table"
+AAAI_REPLICATE_END   = "% END AUTO: aaai_replicate_table"
+
+
+def _replicate_root(cwd):
+    """The results root holding a repeat of cells from EXP_ROOT, or None.
+
+    A repeat has to live in its own root: re-running into the paper's tree at
+    an unchanged seed schedules nothing (the skip-check finds the originals),
+    and at a different seed the two land in the same per-cell table cell,
+    whose combo key carries no seed field. Found by convention rather than a
+    flag, so the ordinary table command picks it up with no extra argument.
+    """
+    for cand in (EXP_ROOT.rstrip("/") + "_rerun", "paper_experiments_rerun"):
+        if os.path.isdir(os.path.join(cwd, cand)):
+            return cand
+    return None
+
+
+def _replicate_cells(cwd, dataset, arch, root, updater, taus):
+    """{mode: {(pert, eps, cs, ct): (t, status, ...)}} of the paper combo in
+    `root`, reusing the ablation collector -- its 'full' variant IS the
+    un-ablated paper combo, so the two runs are read by identical rules."""
+    saved = updater.EXP_ROOT
+    try:
+        updater.EXP_ROOT = root
+        cells, _tau = updater._collect_ablation_cells(
+            cwd, dataset, arch, parse_result_file, unify_taus=taus)
+    finally:
+        updater.EXP_ROOT = saved
+    return {m: cells.get((m, "full")) or {} for m in ("ours", "transfer")}
+
+
+def _replicate_rows(orig, repl, base, cap_of, dmax_of):
+    """One (pert, eps, c_s) entry per repeated cell, carrying BOTH runs in the
+    regular results table's own quantities: each verifier's mean delta_l and
+    delta_u as percentages of delta_max, its mean solve time in minutes, and
+    the two speedups over \\baseline.
+
+    Averaged over the pairs the FIRST run covers, so the repeat is measured on
+    the original's experiment set. `missing` counts the pairs the repeat has
+    not produced yet -- those rows get the tables' red partial star.
+
+    `cap_of(c_s)` gives the wall clock in MINUTES for one source class: an
+    architecture can carry a different cap per class (MNIST 3x100 ran c_s 0
+    and 4 for five hours and c_s 1 for three), and a single per-arch cap
+    prints 180 where the published table prints 300.
+    """
+    import collections
+    cells = collections.defaultdict(set)
+    for m in ("ours", "transfer"):
+        for k in orig[m]:
+            cells[(k[0], k[1], k[2])].add(k)
+    def inst_all_timeout(k):
+        """True when every verifier timed out on this one experiment."""
+        sts = [d.get(k) for d in (base, orig["ours"], orig["transfer"])]
+        norm = [v[1].upper().replace(" ", "_") for v in sts if v and v[1]]
+        return len(norm) == 3 and all("TIME_LIMIT" in n for n in norm)
+
+    out = []
+    for (pert, eps, cs) in sorted(cells):
+        ks = sorted(k for k in cells[(pert, eps, cs)]
+                    if k in orig["ours"] and k in orig["transfer"])
+        if not ks:
+            continue
+        # The split is per CELL, not per experiment: a cell goes to the
+        # bound-gap table only when EVERY one of its experiments timed out on
+        # every verifier; otherwise the whole cell goes to the speedup table
+        # and is averaged over ALL its experiments, timed-out ones included.
+        # (The captions say "instances", but the code groups cells -- following
+        # the wording instead of the code splits one published row in two and
+        # reproduces neither.) Verified against all 98 published rows.
+        _emit(out, orig, repl, base, cap_of(cs), dmax_of,
+              pert, eps, cs, ks, all(inst_all_timeout(k) for k in ks))
+    return out
+
+
+def _emit(out, orig, repl, base, cap_min, dmax_of,
+          pert, eps, cs, ks, is_timeout):
+    """Append one row for this cell restricted to the instances in `ks`."""
+    if True:
+        have = [k for k in ks
+                if k in repl["ours"] and k in repl["transfer"]]
+        if not have:
+            return
+        dmax = dmax_of(cs)
+
+        def col(d, keys):
+            """(delta_l%, delta_u%, minutes) of one verifier over `keys`."""
+            vals = [d[k] for k in keys if d.get(k)]
+            if not vals:
+                return (None, None, None)
+            t = sum(v[0] / 60.0 for v in vals) / len(vals)
+            if cap_min:
+                t = min(t, cap_min)
+            lb = [v[2] for v in vals if v[2] is not None]
+            ub = [v[3] for v in vals if v[3] is not None]
+
+            def pc(xs, lo=None, hi=None):
+                """Mean bound as a percentage of delta_max, clamped to the
+                range a percentage of delta_max can occupy: a bound below 0 or
+                above delta_max is the solver's slack, not a tighter or looser
+                result, and printing it reads as one."""
+                if not xs or not dmax:
+                    return None
+                v = 100.0 * (sum(xs) / len(xs)) / dmax
+                if lo is not None:
+                    v = max(lo, v)
+                if hi is not None:
+                    v = min(hi, v)
+                return v
+
+            return (pc(lb, lo=0.0), pc(ub, hi=100.0), t)
+
+        row = {"pert": pert, "eps": eps, "cs": cs,
+               "n": len(ks), "missing": len(ks) - len(have),
+               "all_timeout": is_timeout}
+        for tag, src, keys in (("o", orig, ks), ("r", repl, have)):
+            row[tag] = {"base": col(base, keys),
+                        "ours": col(src["ours"], keys),
+                        "transfer": col(src["transfer"], keys)}
+        out.append(row)
+
+
+def _render_replicate_table(rows, updater, cap_min, all_timeout=False):
+    """One table per dataset and metric, in the regular results table's own
+    column layout, with the repeat printed directly under the original.
+
+    Follows the paper's own split: cells every verifier timed out on carry the
+    $\\delta_u-\\delta_l$ RATIO in the trailing columns (and the matching
+    \\aaaisafewideheaderbd header), because they have no solve time to compare;
+    every other cell carries the speedup."""
+    pd_map = getattr(updater, "_WIDE_PERT_DISPLAY", {})
+    ad_map = getattr(updater, "_AAAI_ARCH_DISPLAY", {})
+    # Escape first, substitute second: the other order eats the underscore of
+    # $\ell_\infty$ and prints it as $\ell\_\infty$.
+    pdisp = lambda p: (pd_map.get(p, p).replace("_", r"\_")
+                       .replace("linf", r"$\ell_\infty$"))
+    DS = {"cifar": "CIFAR-10", "fashion-mnist": "Fashion-MNIST",
+          "mnist": "MNIST", "har": "HAR"}
+    STAR = getattr(updater, "_WIDE_PARTIAL_STAR", r"\textcolor{red}{$^*$}")
+    sig, trim = updater._fmt_sig, updater._fmt_trim
+    body, n_cells, n_partial = [], 0, 0
+
+    def trio(c):
+        return [("---" if c[0] is None else sig(c[0])),
+                ("---" if c[1] is None else sig(c[1])),
+                ("---" if c[2] is None else trim(c[2]))]
+
+    def trail(bc, mc):
+        """The trailing ratio, chosen the way the paper's two table families
+        choose it: a cell every verifier timed out on has no solve time to
+        compare, so it carries the $\\delta_u-\\delta_l$ ratio; any other cell
+        carries the speedup."""
+        if all_timeout:
+            v = updater._gap_ratio_value(updater._gap_value(bc[:2]),
+                                         updater._gap_value(mc[:2]))
+        else:
+            v = updater._speedup_value(bc[2], mc[2])
+        return "---" if v is None else trim(v) + r"$\times$"
+
+    for r in rows:
+        arch = r["arch"]
+        if True:
+            n_cells += 1
+            if r["missing"]:
+                n_partial += 1
+            # Datasets share one table now, so the model cell carries both.
+            head = (DS.get(r["dataset"], r["dataset"]) + " "
+                    + ad_map.get(arch, arch))
+            for tag, label in (("o", head), ("r", r"\quad repeat")):
+                d = r[tag]
+                # The star rides on the repeat's label: it is the repeat that
+                # is short of the original's experiments, not the cell.
+                star = STAR if (tag == "r" and r["missing"]) else ""
+                pert = (f"{pdisp(r['pert'])} ({r['eps']}), $c_s{{=}}{r['cs']}$"
+                        if tag == "o" else "")
+                body.append(" & ".join(
+                    [label + star, pert, "$0.5$"]
+                    + trio(d["base"]) + trio(d["ours"]) + trio(d["transfer"])
+                    + [trail(d["base"], d["ours"]),
+                       trail(d["base"], d["transfer"])]) + r" \\")
+            body.append(r"\midrule")
+    if not body:
+        return None, 0, 0
+    body = body[:-1]
+    return "\n".join([
+        r"\begin{table*}[t]",
+        r"\centering",
+        r"\small",
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\begin{adjustbox}{max width=\textwidth,center}%",
+        r"\begin{tabular}{@{}l l l | r r r | r r r | r r r | r r@{}}",
+        r"\toprule",
+        (r"\aaaisafewideheaderbd" if all_timeout
+         else r"\aaaisafewideheader"),
+        r"\midrule",
+        *body,
+        r"\bottomrule",
+        r"\end{tabular}%",
+        r"\end{adjustbox}",
+        r"\caption{Repeat of the cells whose verifiers did not "
+        r"finish in the order \tool transfer, \tool, \baseline. Each cell "
+        r"gives the original run and, beneath it, the repeat, averaged over "
+        r"the original's experiments; \baseline was not repeated. " + STAR
+        + r" marks a repeat that has not yet produced every experiment of "
+        r"the original.}",
+        r"\label{tab:replicate"
+        + ("-timeout" if all_timeout else "-solved") + "}",
+        r"\end{table*}",
+    ]), n_cells, n_partial
+
+
+def _update_replicate_table(cwd, paper_taus=None, force_timeout=None,
+                            ds_scoped=None):
+    """Render the original-vs-repeat tables, if a repeat root exists.
+
+    Silent no-op without one, so an ordinary table run is unaffected."""
+    root = _replicate_root(cwd)
+    if root is None:
+        return False
+    try:
+        sys.path.insert(0, cwd)
+        import update_advstd_tex_tables as updater
+    except Exception as exc:
+        print(f"[replicate-table] skipped (import failed: {exc})")
+        return False
+    taus = ([t.strip() for t in str(paper_taus).split(",") if t.strip()]
+            if paper_taus else ["0.5"])
+    pairs = []
+    for d in sorted(glob.glob(os.path.join(cwd, root, "*", "*_exp"))):
+        arch = os.path.basename(d)[:-4]
+        pairs.append((os.path.basename(os.path.dirname(d)), arch))
+    all_rows = []
+    for ds, arch in pairs:
+        try:
+            repl = _replicate_cells(cwd, ds, arch, root, updater, taus)
+            if not any(repl.values()):
+                continue
+            orig = _replicate_cells(cwd, ds, arch, EXP_ROOT, updater, taus)
+            base = updater._collect_ablation_baseline(
+                cwd, ds, arch, all_perturbations_for(ds), parse_result_file)
+            # The SAME class grid the regular tables use: --arch_timeouts'
+            # '@CT' / '#CS' for this (dataset, arch). Without it these rows
+            # average over every experiment on disk while the published rows
+            # average over the restricted grid, and the two disagree for a
+            # reason that has nothing to do with the repeat.
+            scope = ((ds_scoped or {}).get(ds) or {}).get(arch) or {}
+            keep_ct, keep_cs = scope.get("ct"), scope.get("cs")
+            if keep_ct or keep_cs:
+                def _in(k):
+                    return ((not keep_ct or k[3] in keep_ct)
+                            and (not keep_cs or k[2] in keep_cs))
+                base = {k: v for k, v in base.items() if _in(k)}
+                for d in (orig, repl):
+                    for m in list(d):
+                        d[m] = {k: v for k, v in d[m].items() if _in(k)}
+            dm = updater._load_delta_max_values(cwd, ds, [arch])
+            dmax_of = (lambda c, _dm=dm, _a=arch:
+                       (_dm.get((_a, "N2", c)) or {}).get("upper"))
+            # Resolved per source class, the way the regular tables do it.
+            def cap_of(c, _a=arch, _ft=force_timeout):
+                v = updater._ft_for(_ft, _a, c)
+                return (v / 60.0) if v else None
+            rows = _replicate_rows(orig, repl, base, cap_of, dmax_of)
+        except Exception as exc:
+            print(f"[replicate-table] {ds}/{arch}: skipped ({exc})")
+            continue
+        for r in rows:
+            r["dataset"], r["arch"] = ds, arch
+        all_rows += rows
+    all_rows.sort(key=lambda r: (r["dataset"], r["arch"], r["pert"],
+                                 r["eps"], r["cs"]))
+    # Exactly two tables across every dataset: one judged on speedup, one on
+    # the bound-gap ratio, matching the paper's own two table families.
+    tables, tot, flips = [], 0, 0
+    for at in (False, True):
+        sub = [r for r in all_rows if r["all_timeout"] == at]
+        if not sub:
+            continue
+        ft = updater._ft_for(force_timeout, sub[0]["arch"])
+        tbl, n, fl = _render_replicate_table(
+            sub, updater, ft / 60.0 if ft else None, all_timeout=at)
+        if tbl:
+            tables.append(tbl); tot += n; flips += fl
+    if not tables:
+        print(f"[replicate-table] {root} has no cell both runs finished yet "
+              f"— nothing to render")
+        return False
+    block = "\n\n".join(tables)
+    path = _paper_tex_path(cwd, "sec_appendix_percell.tex")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    i, j = text.find(AAAI_REPLICATE_BEGIN), text.find(AAAI_REPLICATE_END)
+    if i >= 0 and j > i:
+        newt = text[:i] + AAAI_REPLICATE_BEGIN + "\n" + block + "\n" + text[j:]
+    else:
+        newt = text.rstrip("\n") + "\n\n" + "\n".join([
+            r"\section{Repeated Experiments}",
+            r"\label{sec:appendix-replicate}",
+            AAAI_REPLICATE_BEGIN, block, AAAI_REPLICATE_END]) + "\n"
+    if newt != text:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(newt)
+    print(f"[replicate-table] {len(tables)} table(s) from {root}: "
+          f"{tot} repeated cell(s), {flips} still incomplete (red star)")
+    return True
+
+
 def _ensure_full_results_section(path, updater, marker_suffix=""):
     """Make sure `path` holds a BEGIN/END AUTO marker pair for this dataset,
     creating the file (or appending the dataset's pair) when missing.
@@ -5649,6 +5958,15 @@ def main():
                 force_timeout=(all_force_timeout or effective_force_timeout))
         except Exception as _exc:
             print(f"[ablation-table] skipped ({_exc})")
+        # Repeated experiments: original beside repeat, read from the repeat
+        # root. No repeat root => silent no-op.
+        try:
+            _update_replicate_table(
+                cwd, paper_taus=args.paper_taus,
+                force_timeout=(all_force_timeout or effective_force_timeout),
+                ds_scoped=arch_ds_scoped)
+        except Exception as _exc:
+            print(f"[replicate-table] skipped ({_exc})")
         # The ONE build of the run, after the measurement block, so the
         # "[paper-build] rebuilt" lines are the last thing on screen and the
         # PDFs always carry the sentences just written.
