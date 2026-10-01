@@ -10940,6 +10940,18 @@ _AAAI_TAU_COL_GAP_PT = 11.0
 _AAAI_TAU_ROW_GAP_PT = 14.0
 _AAAI_TAU_GRID_PANEL_H_CM = 2.5
 
+#: The averaged figure's confidence I-beams, DODGED sideways: the two series
+#: overlap heavily at several thresholds (at tau=0.2 on the precision panel the
+#: transfer interval sits wholly inside the other one), so a whisker drawn on
+#: the mark would bury one series under the other. Each series is offset half of
+#: _AAAI_TAU_IBEAM_DODGE_PT to its own side of the threshold, which keeps every
+#: I-beam nearer its own mark than its neighbour's while the marks and the
+#: curves stay on the true threshold, aligned with the ticks. The cap is a fixed
+#: width in points rather than in threshold units, so it does not stretch when
+#: the panels do.
+_AAAI_TAU_IBEAM_DODGE_PT = 7.0
+_AAAI_TAU_IBEAM_CAP_PT = 1.8
+
 #: The columns, in order: (field, column title). The title is drawn on the top
 #: row only, so the quantity is named once per column instead of once per panel.
 _AAAI_TAU_PANELS = (
@@ -11162,7 +11174,7 @@ def _aaai_tau_slot_row(slot, idx, width_pt, panel_h_cm, prev_name, show_x):
 
 
 def _aaai_tau_mean_series(slots, mkey, field, taus):
-    """(all, converged, timedout, n_cells): `field` averaged across cells.
+    """(all, converged, timedout, n_cells, ci): `field` averaged across cells.
 
     Only the cells carrying a value at EVERY threshold are averaged, so the
     curve is one fixed set of cells measured at each threshold rather than a
@@ -11170,6 +11182,14 @@ def _aaai_tau_mean_series(slots, mkey, field, taus):
     would move the mean on its own and read as an effect of the threshold.
     A mark is filled only when every averaged run at that threshold proved
     optimal, so a mean resting on any timed-out run is never shown as solved.
+
+    `ci` maps a threshold to the half-width of the 95% confidence interval of
+    its mean (`_aaai_ci_halfwidth`), the I-beam's half-height. The sample is the
+    averaged CELLS, which is the unit the figure's own "mean over n cells" label
+    claims: each cell value is already a mean over target classes and seeds,
+    taken verbatim from the per-cell table. A threshold maps to None when fewer
+    than three cells are averaged and to 0.0 when they all carry the same value,
+    and both mean the point draws no I-beam.
     """
     keys = [round(_tau_sort_value(t), 6) for t in taus]
     per_cell = []
@@ -11183,14 +11203,55 @@ def _aaai_tau_mean_series(slots, mkey, field, taus):
                 for t in slot["taus"]}
         per_cell.append((by_tau, conv))
     if not per_cell:
-        return [], [], [], 0
-    allp, cv, to = [], [], []
+        return [], [], [], 0, {}
+    allp, cv, to, cis = [], [], [], {}
     for t, k in zip(taus, keys):
-        y = sum(d[k] for d, _c in per_cell) / len(per_cell)
+        vals = [d[k] for d, _c in per_cell]
+        y = sum(vals) / len(vals)
         pt = (_tau_sort_value(t), y)
         allp.append(pt)
+        cis[k] = _aaai_ci_halfwidth(vals)
         (cv if all(c.get(k) for _d, c in per_cell) else to).append(pt)
-    return allp, cv, to, len(per_cell)
+    return allp, cv, to, len(per_cell), cis
+
+
+def _aaai_tau_ibeam_bounds(pts, cis, floor):
+    """(low, high) of each point's I-beam, for the points that draw one.
+
+    `floor` cuts the lower arm where a value below it has no meaning -- minutes
+    and a bound gap are both non-negative, and the transfer mean at $\\tau=0.5$
+    is 87.9 minutes either side of 119.1, so its arm would otherwise reach well
+    below zero."""
+    out = []
+    for x, y in pts:
+        half = cis.get(round(x, 6))
+        if not half:               # None (too few cells) or 0.0 (no spread)
+            continue
+        lo = y - half if floor is None else max(y - half, floor)
+        out.append((x, lo, y + half))
+    return out
+
+
+def _aaai_tau_ibeam_lines(col, pts, cis, floor, off):
+    """The confidence I-beams of ONE series on ONE panel: a stem and two caps
+    per point, in the series' own colour so a whisker belongs to its curve.
+
+    Drawn by hand rather than with pgfplots' error bars, which drew no caps here
+    and left a stray cycle-list mark at every dodged position. `off` shifts the
+    whole I-beam off the threshold so the two series do not overlap; the caps
+    are shifted in points, so they keep one width whatever the panel scale."""
+    cap = _AAAI_TAU_IBEAM_CAP_PT
+    lines = []
+    for x, lo, hi in _aaai_tau_ibeam_bounds(pts, cis, floor):
+        xc = x + off
+        lines.append(f"\\draw[{col}, line width=0.5pt] "
+                     f"(axis cs:{xc:.4g},{lo:.6g}) -- "
+                     f"(axis cs:{xc:.4g},{hi:.6g});")
+        for yy in (lo, hi):
+            lines.append(f"\\draw[{col}, line width=0.5pt] "
+                         f"([xshift=-{cap}pt]axis cs:{xc:.4g},{yy:.6g}) -- "
+                         f"([xshift={cap}pt]axis cs:{xc:.4g},{yy:.6g});")
+    return lines
 
 
 def _aaai_tau_mean_row(slots, width_pt, panel_h_cm):
@@ -11217,8 +11278,8 @@ def _aaai_tau_mean_row(slots, width_pt, panel_h_cm):
     n_cells = 0
     for field, _title in _AAAI_TAU_PANELS:
         for mkey, _leg, _col, _fm, _hm in _AAAI_TAU_SERIES:
-            a, c, t, n = _aaai_tau_mean_series(slots, mkey, field, taus)
-            series[(field, mkey)] = (a, c, t)
+            a, c, t, n, cis = _aaai_tau_mean_series(slots, mkey, field, taus)
+            series[(field, mkey)] = (a, c, t, cis)
             n_cells = max(n_cells, n)
     if not any(v[0] for v in series.values()):
         return None
@@ -11241,20 +11302,32 @@ def _aaai_tau_mean_row(slots, width_pt, panel_h_cm):
             opts.append(f"at={{({first}.north west)}}, anchor=north west, "
                         f"xshift={ci * step:.1f}pt")
         opts.append(common)
-        vals = [y for mkey, _l, _c, _f, _h in _AAAI_TAU_SERIES
-                for _x, y in series[(field, mkey)][0]]
+        # The panel has to hold the I-beams, not just the means: an interval
+        # running past the frame would be cut there and read as if it ended
+        # there. Every point contributes its own ends, and a point without an
+        # I-beam contributes its mean twice.
+        floor = None if field == "loss" else 0.0
+        lows, highs = [], []
+        for mkey, _l, _c, _f, _h in _AAAI_TAU_SERIES:
+            allp, _cv, _to, cis = series[(field, mkey)]
+            ends = dict((x, (lo, hi)) for x, lo, hi
+                        in _aaai_tau_ibeam_bounds(allp, cis, floor))
+            for x, y in allp:
+                lo, hi = ends.get(x, (y, y))
+                lows.append(lo)
+                highs.append(hi)
         if field == "loss":
-            lo = min(vals + [0.0]) if vals else 0.0
-            hi = max(vals + [0.0]) if vals else 1.0
+            lo = min(lows + [0.0]) if lows else 0.0
+            hi = max(highs + [0.0]) if highs else 1.0
             p = max((hi - lo) * 0.15, 1.0)
             opts.append(f"ymin={lo - p:.4g}, ymax={hi + p:.4g}")
         elif field == "time":
             # Linear minutes from 0, as in the bar figures (see
             # _aaai_tau_field_range).
-            hi = max(vals + ([cap] if cap else [])) if vals else 1.0
+            hi = max(highs + ([cap] if cap else [])) if highs else 1.0
             opts.append(f"ymin=0, ymax={hi * 1.10:.4g}")
         else:
-            hi = max(vals) if vals else 1.0
+            hi = max(highs) if highs else 1.0
             opts.append(f"ymin={-0.06 * hi:.4g}, ymax={hi * 1.18:.4g}")
         opts.append(r"xlabel={$\tau$}, xlabel style={font=\small}, "
                     r"x tick label style={font=\small}")
@@ -11270,13 +11343,19 @@ def _aaai_tau_mean_row(slots, width_pt, panel_h_cm):
         elif field == "time" and cap:
             out.append(r"\addplot[gray, dashed, forget plot] coordinates {"
                        f"({xmin:.4g},{cap:.6g}) ({xmax:.4g},{cap:.6g})" + "};")
-        for mkey, _leg, col, fmark, hmark in _AAAI_TAU_SERIES:
-            allp, conv, tout = series[(field, mkey)]
+        dodge = (_AAAI_TAU_IBEAM_DODGE_PT * (xmax - xmin) / width_pt
+                 / max(1, len(_AAAI_TAU_SERIES) - 1))
+        for si, (mkey, _leg, col, fmark, hmark) in enumerate(_AAAI_TAU_SERIES):
+            allp, conv, tout, cis = series[(field, mkey)]
             if allp:
                 coords = " ".join(f"({x:.4g},{y:.6g})" for x, y in allp)
                 out.append(f"\\addplot[{col}, line width=0.7pt, "
                            "mark=none, forget plot] coordinates {"
                            + coords + "};")
+            # Before the marks, so a mark sits on top of its own I-beam.
+            out += _aaai_tau_ibeam_lines(
+                col, allp, cis, floor,
+                (si - (len(_AAAI_TAU_SERIES) - 1) / 2.0) * dodge)
             for pts, mark in ((conv, fmark), (tout, hmark)):
                 if not pts:
                     continue
@@ -11410,7 +11489,11 @@ def regenerate_aaai_tau_tradeoff_section(
                     r"$\delta_u-\delta_l$ per relaxation threshold $\tau$, "
                     r"averaged over the " + str(n_cells) + r" cells of "
                     r"Figure~\ref{fig:n2-tau}. A mark is filled only where "
-                    r"every averaged run proved optimal.")
+                    r"every averaged run proved optimal. The I-beam beside a "
+                    r"mark is the 95\% confidence interval of its mean, "
+                    r"$t_{0.975," + str(n_cells - 1) + r"}\,s/\sqrt{"
+                    + str(n_cells) + r"}$ for $s$ the standard deviation "
+                    r"across those cells.")
             figs += [r"\begin{figure*}[p]", r"\centering",
                      _aaai_render_chart_pdf(mgraphic, "n2_tau_tradeoff_mean",
                                             tex_dir, height_frac=0.88),
