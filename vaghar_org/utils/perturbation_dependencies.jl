@@ -121,6 +121,31 @@ function dep_additional(m, layers_n, layer, phi_dep, phi_dep_l, perturbation, pe
     return phi_dep
 end
 
+# Min needs a proven lower bound on the diff z - z^p; Max needs a proven upper bound on it.
+# Both are objective_bound, which holds even with no solution found. objective_value bounds
+# the diff from the opposite side, so it cannot prove a relation that holds at every point.
+# Stops once the bound crosses zero or a point refutes it; NaN or Inf means nothing proven.
+function probe_diff_bound(m, v_org, v_pert, is_min, tol)
+    v_obj = @variable(m)
+    @constraint(m, v_obj == v_org - v_pert)
+    if is_min
+        @objective(m, Min, v_obj)
+        set_optimizer_attribute(m, "BestObjStop", -tol)
+    else
+        @objective(m, Max, v_obj)
+        set_optimizer_attribute(m, "BestObjStop", tol)
+    end
+    set_optimizer_attribute(m, "BestBdStop", 0.0)
+    optimize!(m)
+    # These states give no trustworthy number; infeasible or unbounded give an infinite bound.
+    st = JuMP.termination_status(m)
+    if st == MOI.OPTIMIZE_NOT_CALLED || st == MOI.INVALID_MODEL ||
+       st == MOI.NUMERICAL_ERROR || st == MOI.OTHER_ERROR
+        return NaN
+    end
+    return try JuMP.objective_bound(m) catch; NaN end
+end
+
 function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_tolerance = 1e-4)
     av = JuMP.all_variables(m)
     if length(size(phi_dep)) == 4
@@ -176,24 +201,25 @@ function encode_dependencies(m, layers_n, phi_dep, activation_cnt, non_equality_
                     else
                         l_diff = Inf
                         u_diff = Inf
-                        if (u_o>=u_p) .& (l_o>=l_p)
-                            v_obj = @variable(m)
-                            @constraint(m, v_obj == av[ind_o+1]-av[ind_p+1])
-                            @objective(m, Min, v_obj)
-                            set_optimizer_attribute(m, "Cutoff", 0)
-                            optimize!(m)
-                            if result_count(m) > 0
-                                l_diff = JuMP.objective_value(m)
+                        guard_ge = (u_o>=u_p) & (l_o>=l_p)
+                        guard_le = (u_p>=u_o) & (l_p>=l_o)
+                        if dep_audit.enabled
+                            # Audit: probe both directions and record the verdict, but add
+                            # no relation, so the ones under test cannot prejudge each other.
+                            dep_audit_neuron!(m, av[ind_o+1], av[ind_p+1], activation_cnt, n,
+                                              guard_ge, guard_le, (l_o, u_o, l_p, u_p))
+                        else
+                            if guard_ge
+                                b = probe_diff_bound(m, av[ind_o+1], av[ind_p+1], true, non_equality_tolerance)
+                                if isfinite(b)
+                                    l_diff = b
+                                end
                             end
-                        end
-                        if (u_p>=u_o) .& (l_p>=l_o)
-                            v_obj = @variable(m)
-                            @constraint(m, v_obj == av[ind_o+1]-av[ind_p+1])
-                            @objective(m, Max, v_obj)
-                            set_optimizer_attribute(m, "Cutoff", 0)
-                            optimize!(m)
-                            if result_count(m) > 0
-                                u_diff = JuMP.objective_value(m)
+                            if guard_le
+                                b = probe_diff_bound(m, av[ind_o+1], av[ind_p+1], false, non_equality_tolerance)
+                                if isfinite(b)
+                                    u_diff = b
+                                end
                             end
                         end
                         if (l_diff != Inf) & (l_diff>-non_equality_tolerance)

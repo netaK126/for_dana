@@ -475,10 +475,21 @@ function create_perturbation_string(perturbation_size)
     return perturbation_size_string
 end
 
+# Audit runs pin Threads and Seed here because mip_set_attr runs only after the dependency
+# probes, so without this both the tightening and the probes take whatever cores taskset
+# exposes and their results shift with the machine's load. 0 keeps Gurobi's default.
+dep_audit_threads = 0
+
 function get_default_tightening_options(optimizer)::Dict
+    global dep_audit_threads
     optimizer_type_name = string(typeof(optimizer()))
     if optimizer_type_name == "Gurobi.Optimizer"
-        return Dict("OutputFlag" => 0, "TimeLimit" => 5)
+        d = Dict{String,Any}("OutputFlag" => 0, "TimeLimit" => 5)
+        if dep_audit_threads > 0
+            d["Threads"] = dep_audit_threads
+            d["Seed"] = 0
+        end
+        return d
     elseif optimizer_type_name == "Cbc.Optimizer"
         return Dict("logLevel" => 0, "seconds" => 20)
     else

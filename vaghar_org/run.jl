@@ -25,6 +25,7 @@ const DEFAULT_TIGHTENING_ALGORITHM = mip
 
 include("utils/MIPVerify.jl/src/vendor/ConditionalJuMP.jl")
 include("utils/MIPVerify.jl/src/net_components.jl")
+include("utils/dep_audit.jl")
 include("utils/perturbation_dependencies.jl")
 include("utils/MIPVerify.jl/src/logging.jl")
 include("utils/MIPVerify.jl/src/models.jl")
@@ -143,6 +144,16 @@ function parse_commandline()
         arg_type = Int
         required = false
         default = 0
+        "--dep_probe_audit"
+        help = "Directory for the dependency-sign audit. When set, each probed neuron's sign is refuted or proved and written to a CSV, no dependency is added, and the run stops after perturbation_dependencies (no objective, no solve, no result file)."
+        arg_type = String
+        required = false
+        default = ""
+        "--dep_probe_threads"
+        help = "Gurobi Threads for the audit's bound tightening and probes. mip_set_attr runs after the probes, so --Threads_num never reaches them; this pins them so verdicts do not depend on how many jobs share the machine."
+        arg_type = Int
+        required = false
+        default = 1
         # ── Advanced-standard mode flags ─────────────────────────────────
         "--adv_std_var_hint"
         help = "advanced_standard variable-hint mode (Technique 5): off | prev_pgd. " *
@@ -302,6 +313,21 @@ function main()
     perturbation_size = parse_numbers_to_Float64(args["perturbation_size"])
     mode = args["mode"]
 
+    # Dependency-sign audit: probe each neuron the dependency code would probe, record
+    # whether the sign it stamps is refuted or proved, and stop before the solve.
+    if args["dep_probe_audit"] != ""
+        global dep_audit_threads = args["dep_probe_threads"]
+        tag = string(dataset, "__", model_name, "__", perturbation, "__",
+                     replace(args["perturbation_size"], "," => "-"), "__", name_to_save)
+        tag = replace(tag, r"[^A-Za-z0-9._-]" => "_")
+        dep_audit_begin!(args["dep_probe_audit"], tag,
+                         [dataset, model_name, name_to_save, perturbation,
+                          args["perturbation_size"]];
+                         threads = args["dep_probe_threads"])
+        println("dep-audit: on, writing $(joinpath(args["dep_probe_audit"], tag * ".csv")), " *
+                "Threads=$(args["dep_probe_threads"])")
+    end
+
     # ── HAR benchmark support (behind --internet_nets_benchmarks) ──
     global internet_nets_benchmarks = args["internet_nets_benchmarks"]
     if dataset == "har" && !internet_nets_benchmarks
@@ -344,6 +370,7 @@ function main()
     else
         error("unknown --mode \"$mode\"; expected standard | advanced_standard_n1 | advanced_standard_n2")
     end
+    dep_audit_end!()
 end
 
 function main_standard(args, dataset, model_name, model_path, perturbation, perturbation_size, name_to_save, use_hyper_attack)
@@ -476,10 +503,20 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
                 hyper_attack_hints(m, token_signature, c_tag, c_target)
                 name_to_save = name_to_save*"_HyperAttackHints"
             end
+            if dep_audit.enabled
+                dep_audit_set_model!(nn, d[:v_in], d[:v_in_p])
+            end
             if activate_vaghgar_deps
                 name_to_save = name_to_save*"_VagharDeps_depGuardFix"
                 perturbation_dependencies(m, nn, perturbation, perturbation_size, w, h, k;
                                           perturbation_var=d[:Perturbation])
+            end
+            if dep_audit.enabled
+                # The audit only asks about the dependency signs, so everything downstream
+                # of this point — the objective, the solve, the result file — is skipped.
+                println("dep-audit: probes done for c_tag=$c_tag c_target=$c_target; stopping before the solve")
+                m = nothing
+                continue
             end
             if args["use_perturbed_intervals"]
                 name_to_save = name_to_save*"_PertruebedIntervals"
