@@ -466,17 +466,6 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             d[:suboptimal_time] = suboptimal_time
             mip_reset()
 
-            # Conditional Triangle inputs: per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
-            if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
-                input_dummy_s = zeros(Float64, 1, w, h, k)
-                p_size_s = perturbation_size[1]
-                # Full 4D per-pixel box for single- and multi-channel inputs
-                # (the size[4]>1 multichannel branch was malformed — see fix above).
-                I_pert_up_s   = p_size_s .* ones(Float64, size(input_dummy_s))
-                I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
-                compute_n2_pert_relaxation_bounds(nn, I_pert_up_s, I_pert_down_s)
-            end
-
             # Reset the per-pair relaxation counters (reported in the filename and result line).
             clear_n2_relaxed_counters!()
             clear_sibgate_tier_counters!()
@@ -494,6 +483,12 @@ function main_standard(args, dataset, model_name, model_path, perturbation, pert
             end
             d[:bounds_time] = bounds_time
             m = d[:Model]
+
+            # Conditional Triangle inputs: per-neuron perturbation-difference intervals + per-copy pre-activation bounds, seeded from the input difference of this perturbation (get_model above is what computes it).
+            if nn1_use_sibling_gate && nn1_relax_threshold >= 0.0
+                I_pert_up_s, I_pert_down_s = encoder_input_diff_box(perturbation, w, h, k)
+                compute_n2_pert_relaxation_bounds(nn, I_pert_up_s, I_pert_down_s)
+            end
 
             # Add the Conditional Triangle constraints: when one copy keeps its binary, its sibling's triangle is gated on it; when both are relaxed, the two copies are tied together by their perturbation-difference interval.
 
@@ -823,12 +818,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
         # Transfer bound tightening: load N_pre's difference bounds [d_lo, d_hi] and intersect N's zonotope bounds with N_pre's bounds shifted by them.
         clear_n2_abs_bounds()
         if use_bound_tightening
-            # Blanket Δ seed, still used by compute_n2_pert_relaxation_bounds below.
-            input_dummy = zeros(Float64, 1, w, h, k)
-            p_size = perturbation_size[1]
-            I_pert_up_init = p_size .* ones(Float64, size(input_dummy))
-            I_pert_down_init = -p_size .* ones(Float64, size(input_dummy))
-
             # Load the drift information — how far N can stray from N_pre ([d_lo, d_hi] + N_pre's pre-activation bounds); shared by all class pairs, shifts every reused N_pre quantity below.
             load_n1_diff_bounds!(n1_state_dir; require_preact=use_zono_bounds, arithmetic=use_arith_bounds)
 
@@ -902,11 +891,6 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             clear_n2_relaxed_counters!()
             clear_sibgate_tier_counters!()
 
-            # Conditional Triangle inputs: (compute) per-neuron perturbation-difference intervals + per-copy pre-activation bounds.
-            if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
-                compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
-            end
-
             # Conditional Triangle decision: per neuron, relax the copies whose triangle-gap area (on the tightened bounds) is <= tau.
             if adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
                 compute_n2_relax_decision!(adv_std_n2_relax_threshold)
@@ -920,6 +904,12 @@ function main_advanced_standard(args, dataset, model_name, model_path, perturbat
             end
             d_n2[:bounds_time] = bounds_time_n2
             m_n2 = d_n2[:Model]
+
+            # Conditional Triangle inputs: (compute) per-neuron perturbation-difference intervals + per-copy pre-activation bounds, seeded from the input difference of this perturbation (get_model above is what computes it).
+            if adv_std_n2_sibling_gate && adv_std_n2_relax_threshold >= 0.0 && use_bound_tightening
+                I_pert_up_init, I_pert_down_init = encoder_input_diff_box(perturbation, w, h, k)
+                compute_n2_pert_relaxation_bounds(nn2, I_pert_up_init, I_pert_down_init)
+            end
 
             # Add the Conditional Triangle constraints: when one copy keeps its binary, its sibling's triangle is gated on it; when both are relaxed, the two copies are tied by their pre-activation difference interval.
             apply_sibgate_constraints!(m_n2)
@@ -1126,16 +1116,9 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             mip_reset()
             clear_n1_neuron_bounds()
 
-            # Conditional Triangle inputs + decision, mirroring main_standard. Skipped
+            # Conditional Triangle decision, mirroring main_standard. Skipped
             # entirely at the default tau = -1, so the exact N_pre solve is untouched.
             if adv_std_n2_relax_threshold >= 0.0
-                if adv_std_n2_sibling_gate
-                    input_dummy_s = zeros(Float64, 1, w, h, k)
-                    p_size_s = perturbation_size[1]
-                    I_pert_up_s   =  p_size_s .* ones(Float64, size(input_dummy_s))
-                    I_pert_down_s = -p_size_s .* ones(Float64, size(input_dummy_s))
-                    compute_n2_pert_relaxation_bounds(nn1, I_pert_up_s, I_pert_down_s)
-                end
                 clear_n2_relaxed_counters!()
                 clear_sibgate_tier_counters!()
                 compute_n2_relax_decision!(adv_std_n2_relax_threshold)
@@ -1148,6 +1131,11 @@ function main_advanced_standard_n1(args, dataset, model_name, model_path, pertur
             d_n1[:bounds_time] = bounds_time_n1
             m_n1 = d_n1[:Model]
             if adv_std_n2_relax_threshold >= 0.0
+                # Conditional Triangle inputs, seeded from the input difference of this perturbation (get_model above is what computes it).
+                if adv_std_n2_sibling_gate
+                    I_pert_up_s, I_pert_down_s = encoder_input_diff_box(perturbation, w, h, k)
+                    compute_n2_pert_relaxation_bounds(nn1, I_pert_up_s, I_pert_down_s)
+                end
                 apply_sibgate_constraints!(m_n1)
             end
             if use_hyper_attack

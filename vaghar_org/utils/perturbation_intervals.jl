@@ -747,24 +747,22 @@ function compute_diff_bounds_zonotope(nn1, nn2, I_pert_up_init, I_pert_down_init
                         continue
                     end
 
-                    # Mixed case: apply DeepZ relaxation to diff
-                    if l_d >= 0
-                        # Diff always non-negative: pass through
-                    elseif u_d <= 0
-                        # Diff always non-positive: clip to 0
-                        diff_center[i] = 0.0
-                        diff_gens[i, :] .= 0.0
-                    else
-                        # Both split: generic DeepZ — λ * z + μ ± μ * ε_new
-                        λ = u_d / (u_d - l_d)
-                        μ = -u_d * l_d / (2.0 * (u_d - l_d))
-                        diff_center[i] = λ * diff_center[i] + μ
-                        diff_gens[i, :] .*= λ
-                        # New generator for this neuron
-                        new_col = zeros(n)
-                        new_col[i] = μ
-                        push!(new_gen_cols, new_col)
-                    end
+                    # Mixed case: at least one copy is split, so the two ReLUs do
+                    # not cancel and the post-ReLU difference is NOT the ReLU of
+                    # the pre-ReLU difference. ReLU is monotone and 1-Lipschitz,
+                    # so the post-ReLU difference lies between 0 and the pre-ReLU
+                    # difference; bounding each copy on its own gives a second
+                    # range, and the two intersect.
+                    lo = max(min(0.0, l_d), max(0.0, l_n2) - max(0.0, u_n1))
+                    hi = min(max(0.0, u_d), max(0.0, u_n2) - max(0.0, l_n1))
+                    # The range carries no generator correlations, so this neuron
+                    # drops its share of the existing generators and takes one
+                    # fresh independent generator instead.
+                    diff_center[i] = (lo + hi) / 2
+                    diff_gens[i, :] .= 0.0
+                    new_col = zeros(n)
+                    new_col[i] = (hi - lo) / 2
+                    push!(new_gen_cols, new_col)
                 end
 
                 # Add new generator columns
@@ -834,6 +832,40 @@ function source_b_seed_box(perturbation::AbstractString, in_shape)
         error("source_b_seed_box: unknown perturbation type \"$perturbation\"")
     end
     return reshape(lo, in_shape), reshape(hi, in_shape)
+end
+
+# The input perturbation-difference interval of $x^p_k - x_k$, as the perturbation's own encoder
+# computed it (I_pert_prev_*, filled by get_model): $[-\ep,\ep]$ under an additive perturbation,
+# the patched or occluded pixels alone under patch and occ, and $(T-I)x$'s range under a geometric
+# perturbation. Shaped like the input tensor; the additive encoders store one value per channel for
+# multi-channel inputs, which is broadcast back over that channel's pixels.
+function encoder_input_diff_box(perturbation::AbstractString, w::Int, h::Int, k::Int)
+    global I_pert_prev_up, I_pert_prev_down
+    shape = (1, w, h, k)
+
+    # "max" encodes one copy (its :v_in_p is :v_in), so the difference is zero.
+    if perturbation == "max"
+        return zeros(Float64, shape), zeros(Float64, shape)
+    end
+
+    (isempty(I_pert_prev_up) || isempty(I_pert_prev_down)) &&
+        error("encoder_input_diff_box: I_pert_prev_* is empty — call this after get_model")
+
+    up, dn = I_pert_prev_up, I_pert_prev_down
+    if size(up) == shape && size(dn) == shape
+        return Float64.(up), Float64.(dn)
+    end
+    if length(up) == k && length(dn) == k
+        U = Array{Float64}(undef, shape)
+        D = Array{Float64}(undef, shape)
+        for ch in 1:k
+            U[1, :, :, ch] .= Float64(up[ch])
+            D[1, :, :, ch] .= Float64(dn[ch])
+        end
+        return U, D
+    end
+    # An unexpected shape means the encoder and this pass disagree on the input.
+    error("encoder_input_diff_box: I_pert_prev_* has shape $(size(up)), expected $(shape)")
 end
 
 # Zonotope Bound Tightening: propagate a zonotope through the network over the input

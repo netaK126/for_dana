@@ -1,6 +1,6 @@
 # The Conditional Triangle's constraint emission, run once per build after both copies are encoded. When BOTH copies of a
-# neuron are relaxed, their triangles alone would let the copies drift apart, so one constraint ties the two pre-activations
-# together by the perturbation-difference interval; when only ONE copy is relaxed, its triangle is made conditional on the
+# neuron are relaxed, their triangles alone would let the copies drift apart, so the perturbation-difference interval ties
+# their pre-activations together, and their post-activations; when only ONE copy is relaxed, its triangle is made conditional on the
 # sibling's surviving binary — a tighter envelope for each of the sibling's phases. Every point feasible under the exact
 # encoding satisfies these constraints, so delta_relaxed >= delta_exact.
 # ────────────────────────────────────────────────────────────────────────────
@@ -51,6 +51,9 @@ function apply_sibgate_constraints!(model)
                 # Both copies relaxed: no binary survives to condition on, so tie the two pre-activations together by the perturbation-difference interval — without this the two triangles could drift apart independently.
                 @constraint(model, st_pert.preact - st_org.preact <= u_int)
                 @constraint(model, st_pert.preact - st_org.preact >= l_int)
+                # The same interval, clipped through the ReLU, on the post-activations: the two standard triangles leave the outputs free of each other.
+                @constraint(model, st_pert.x_rect - st_org.x_rect <= max(0.0, u_int))
+                @constraint(model, st_pert.x_rect - st_org.x_rect >= min(0.0, l_int))
                 n_coupling += 1
                 continue
             end

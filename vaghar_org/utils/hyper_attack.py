@@ -42,10 +42,15 @@ def create_attacked(X, eps, perturbation_type,size_,dims):
         Xout = X+0.0
         Xout[:, :, row_start:row_start+length, col_start:col_start+length] = torch.clamp(X[:, :, row_start:row_start+length, col_start:col_start+length]+eps,0,1)
     elif perturbation_type == "rotation":
-        angle = int(size_[1])
+        angle = float(size_[1])
         Xout = X - X # + size_[0]
         height, width = dims[1],dims[2]
-        center = (width // 2, height // 2)
+        # Pivot on the pixel the MIP pivots on. perturbation_models.jl rotates
+        # about 1-based width/2, which is this pixel in 0-based coordinates;
+        # width//2 pivoted one pixel away, so the attacked copy was a sub-pixel
+        # shift of the one the MIP encodes and the returned margin was not a
+        # valid lower bound for it.
+        center = (width / 2.0 - 1.0, height / 2.0 - 1.0)
         for i in range(height):
             for j in range(width):
                 j_c = j - center[0]
